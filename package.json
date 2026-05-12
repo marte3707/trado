@@ -1,0 +1,16 @@
+{
+  "name": "trado",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "frontend:dev": "npm --prefix frontend run dev",
+    "frontend:build": "npm --prefix frontend run build",
+    "backend:test": "./venv/bin/python -m pytest backend/tests",
+    "backend:lint": "./venv/bin/python -m ruff check backend/app backend/tests",
+    "backend:typecheck": "./venv/bin/python -m mypy backend/app"
+  }
+}
+
