@@ -41,6 +41,7 @@ from app.db.models import (
     StrategyConfig,
 )
 from app.db.session import get_db
+from app.engine.auto_tuner import AutoTuner
 from app.engine.calibration import AutoCalibrationEngine, serialize_calibration
 from app.engine.diagnostics import build_diagnostics_report
 from app.engine.execution import OrderExecutionEngine
@@ -760,6 +761,36 @@ def calibration_preview(db: Session = Depends(get_db)) -> dict:
 def run_auto_calibration(db: Session = Depends(get_db)) -> dict:
     result = AutoCalibrationEngine().run(db, force=True)
     return serialize_calibration(result)
+
+
+@router.get("/auto-tuner/status")
+def auto_tuner_status(db: Session = Depends(get_db)) -> dict:
+    return AutoTuner().status(db)
+
+
+@router.post("/auto-tuner/run")
+def auto_tuner_run(db: Session = Depends(get_db)) -> dict:
+    return AutoTuner().run(db)
+
+
+@router.post("/auto-tuner/pause")
+def auto_tuner_pause(db: Session = Depends(get_db)) -> dict:
+    return AutoTuner().pause(db)
+
+
+@router.post("/auto-tuner/resume")
+def auto_tuner_resume(db: Session = Depends(get_db)) -> dict:
+    return AutoTuner().resume(db)
+
+
+@router.post("/auto-tuner/rollback")
+def auto_tuner_rollback(db: Session = Depends(get_db)) -> dict:
+    return AutoTuner().rollback_current(db)
+
+
+@router.post("/auto-tuner/reset")
+def auto_tuner_reset(db: Session = Depends(get_db)) -> dict:
+    return AutoTuner().reset(db)
 
 
 @router.post("/auto-calibration/baseline/reset")

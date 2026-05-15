@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import get_settings
 from app.core.enums import OrderMode
+from app.core.runtime_settings import effective_live_execution_settings
 from app.db.models import DecisionLog, Market, Order, Position
 from app.services.hyperliquid import HyperliquidTradingClient
 
@@ -23,6 +24,14 @@ _RECONCILED_EXIT_TYPES = ("tp1", "tp2", "tp3", "stop_loss")
 # Order statuses we still consider "pending" — anything else (filled/canceled)
 # is terminal and not eligible for fill reconciliation.
 _TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled"})
+
+# Maps our internal order_type to the tpsl string expected by Hyperliquid.
+_TPSL_BY_ORDER_TYPE: dict[str, str] = {
+    "tp1": "tp",
+    "tp2": "tp",
+    "tp3": "tp",
+    "stop_loss": "sl",
+}
 
 
 def _decimal(value: str | int | float | Decimal | None) -> Decimal | None:
@@ -180,6 +189,144 @@ def _reconcile_exit_fills(
     return realized_delta
 
 
+def _sz_decimals(market: Market | None) -> int:
+    if market is None:
+        return 8
+    try:
+        return int((market.metadata_json or {}).get("raw", {}).get("szDecimals", 8))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _round_size(size: Decimal, decimals: int) -> Decimal:
+    return size.quantize(Decimal(10) ** -decimals)
+
+
+def _index_open_orders(open_orders: list[dict]) -> tuple[set[int], set[str]]:
+    """Return (oids, normalised_cloids) for quick membership tests."""
+    oids: set[int] = set()
+    cloids: set[str] = set()
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        oid = order.get("oid")
+        if isinstance(oid, int):
+            oids.add(oid)
+        cloid = order.get("cloid")
+        if isinstance(cloid, str) and cloid:
+            cloids.add(cloid.lower().removeprefix("0x"))
+    return oids, cloids
+
+
+def _resubmit_missing_protection_orders(
+    db: Session,
+    position: Position,
+    coin: str,
+    hl_open_oids: set[int],
+    hl_open_cloids: set[str],
+    trading: HyperliquidTradingClient,
+    expires_after_seconds: int,
+    sz_decimals: int,
+) -> None:
+    """Detect protection orders that have disappeared from HL and re-submit them.
+
+    An order is considered missing when its recorded oid (and cloid) are absent
+    from the live HL open-orders list AND the order is still in a non-terminal
+    state in our DB (i.e. we haven't already processed a fill for it).
+    """
+    pending_orders = (
+        db.query(Order)
+        .filter(
+            Order.position_id == position.id,
+            Order.mode == OrderMode.LIVE.value,
+            Order.order_type.in_(_RECONCILED_EXIT_TYPES),
+            Order.status.notin_(_TERMINAL_ORDER_STATUSES),
+        )
+        .all()
+    )
+    if not pending_orders:
+        return
+
+    close_is_buy = position.side.lower() == "short"
+
+    for order in pending_orders:
+        if order.status in _TERMINAL_ORDER_STATUSES:
+            continue
+        oid_int: int | None = None
+        if order.hyperliquid_order_id:
+            try:
+                oid_int = int(order.hyperliquid_order_id)
+            except (TypeError, ValueError):
+                pass
+
+        normalised_cloid = (order.cloid or "").lower().removeprefix("0x")
+
+        if (oid_int is not None and oid_int in hl_open_oids) or (
+            normalised_cloid and normalised_cloid in hl_open_cloids
+        ):
+            continue  # order is still open on HL — nothing to do
+
+        if order.price is None:
+            continue
+
+        tpsl = _TPSL_BY_ORDER_TYPE.get(order.order_type)
+        if tpsl is None:
+            continue
+
+        logger.warning(
+            "live_protection_order_missing_from_hl",
+            position_id=position.id,
+            order_id=order.id,
+            order_type=order.order_type,
+            coin=coin,
+            old_oid=oid_int,
+        )
+
+        try:
+            result = trading.submit_trigger_order(
+                coin=coin,
+                is_buy=close_is_buy,
+                size=_round_size(order.size, sz_decimals),
+                trigger_price=order.price,
+                tpsl=tpsl,
+                expires_after_seconds=expires_after_seconds,
+                cloid=None,  # no cloid: avoids HL duplicate-cloid rejection
+            )
+            old_oid = order.hyperliquid_order_id
+            order.hyperliquid_order_id = result.oid
+            order.status = result.status
+            raw = dict(order.raw_response or {})
+            raw.setdefault("resubmits", []).append(
+                {"old_oid": old_oid, "new_oid": result.oid, "response": result.raw_response}
+            )
+            order.raw_response = raw
+            db.add(order)
+            db.add(
+                DecisionLog(
+                    event_type="live_protection_order_resubmitted",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message=f"Protection order {order.order_type} re-submitted: missing from HL",
+                    data={
+                        "coin": coin,
+                        "order_id": order.id,
+                        "order_type": order.order_type,
+                        "old_oid": old_oid,
+                        "new_oid": result.oid,
+                        "status": result.status,
+                    },
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "live_protection_order_resubmit_failed",
+                position_id=position.id,
+                order_id=order.id,
+                order_type=order.order_type,
+                error=str(exc),
+            )
+
+
 def reconcile_live_positions(
     db: Session,
     trading_client: HyperliquidTradingClient | None = None,
@@ -206,6 +353,19 @@ def reconcile_live_positions(
         logger.warning("live_reconciliation_user_fills_failed", error=str(exc))
         raw_fills = []
     fills_by_cloid, fills_by_oid = _index_fills(raw_fills or [])
+
+    open_orders_available = True
+    try:
+        raw_open_orders = trading.open_orders(settings.hyperliquid_account_address)
+    except Exception as exc:
+        logger.warning("live_reconciliation_open_orders_failed", error=str(exc))
+        raw_open_orders = []
+        open_orders_available = False
+    hl_open_oids, hl_open_cloids = _index_open_orders(raw_open_orders)
+
+    live_settings = effective_live_execution_settings(db, settings)
+    expires_after_seconds = int(live_settings["order_expires_after_seconds"])
+
     updated = 0
     now = datetime.now(timezone.utc)
     for position in positions:
@@ -241,6 +401,18 @@ def reconcile_live_positions(
             )
             updated += 1
             continue
+
+        if open_orders_available:
+            _resubmit_missing_protection_orders(
+                db,
+                position,
+                coin,
+                hl_open_oids,
+                hl_open_cloids,
+                trading,
+                expires_after_seconds,
+                _sz_decimals(position.market),
+            )
 
         remote_size = _decimal(remote.get("szi"))
         if remote_size is not None:

@@ -22,6 +22,39 @@ class FundingRate:
     predicted_rate: float  # 8h rate as decimal fraction (e.g. 0.0001 = 0.01%/8h)
 
 
+@dataclass(frozen=True)
+class OrderBookLevel:
+    price: float
+    size: float
+
+
+@dataclass(frozen=True)
+class L2BookSnapshot:
+    bids: list[OrderBookLevel]  # ordinati per prezzo decrescente
+    asks: list[OrderBookLevel]  # ordinati per prezzo crescente
+
+
+def fetch_l2_book(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapshot | None:
+    """Ritorna snapshot L2 dell'order book per `coin`. None in caso di errore."""
+    try:
+        with httpx.Client(timeout=5) as client:
+            response = client.post(
+                info_url,
+                json={"type": "l2Book", "coin": coin, "nLevels": n_levels},
+            )
+            if response.is_error:
+                return None
+            data = response.json()
+            raw_levels = data.get("levels", [])
+            if len(raw_levels) < 2:
+                return None
+            bids = [OrderBookLevel(price=float(l["px"]), size=float(l["sz"])) for l in raw_levels[0]]
+            asks = [OrderBookLevel(price=float(l["px"]), size=float(l["sz"])) for l in raw_levels[1]]
+            return L2BookSnapshot(bids=bids, asks=asks)
+    except Exception:
+        return None
+
+
 def fetch_predicted_fundings(info_url: str) -> dict[str, float]:
     """Returns coin → predicted 8h funding rate (decimal fraction). Empty dict on failure."""
     try:
@@ -206,6 +239,11 @@ class HyperliquidTradingClient:
         info = self._info()
         fills = info.user_fills(address or self._account_address())
         return fills if isinstance(fills, list) else []
+
+    def open_orders(self, address: str | None = None) -> list[dict[str, Any]]:
+        info = self._info()
+        result = info.open_orders(address or self._account_address())
+        return result if isinstance(result, list) else []
 
     def submit_market_order(
         self,

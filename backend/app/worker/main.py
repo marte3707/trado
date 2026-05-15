@@ -12,6 +12,7 @@ from app.db.init_db import create_schema, seed_defaults
 from app.db.migrations import apply_migrations
 from app.db.models import AppSetting, DecisionLog, Market, Position
 from app.db.session import SessionLocal
+from app.engine.auto_tuner import AutoTuner
 from app.engine.calibration import AutoCalibrationEngine
 from app.engine.execution import OrderExecutionEngine
 from app.engine.signal_engine import SignalEngine
@@ -130,6 +131,23 @@ def run_calibration(db, calibration_engine: AutoCalibrationEngine) -> bool:
         return False
 
 
+def run_auto_tuner(db) -> dict:
+    try:
+        return AutoTuner().run(db)
+    except Exception as exc:
+        db.rollback()
+        db.add(
+            DecisionLog(
+                event_type="auto_tuner_failed",
+                message="Auto tuner failed",
+                data={"error": str(exc)},
+            )
+        )
+        db.commit()
+        logger.exception("auto_tuner_failed", error=str(exc))
+        return {"status": "error", "error": str(exc)}
+
+
 async def run_once(
     signal_engine: SignalEngine,
     candle_sync: CandleSyncService,
@@ -165,6 +183,7 @@ async def run_once(
     if should_run_calibration(db, closed):
         calibrated = run_calibration(db, calibration_engine)
         calibration_attempted = True
+        run_auto_tuner(db)
     if not active_timeframes:
         try:
             db.add(DecisionLog(

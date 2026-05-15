@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from app.core.enums import Direction
 from app.indicators.core import atr
 from app.strategies.base import CandleInput
+
+if TYPE_CHECKING:
+    from app.engine.orderbook import OrderBookAnalysis
 
 MIN_RISK_REWARD = 2.0
 PIVOT_WINDOW = 4
@@ -30,6 +36,7 @@ class RiskManager:
         min_risk_reward: float = MIN_RISK_REWARD,
         min_atr_multiplier: float = 1.5,
         min_stop_distance_pct: float = MIN_STOP_DISTANCE_PCT,
+        ob_analysis: OrderBookAnalysis | None = None,
     ) -> RiskPlan | None:
         if len(candles) < 30 or direction == Direction.NEUTRAL:
             return None
@@ -65,6 +72,12 @@ class RiskManager:
                 tp2 = entry + risk * max(risk_reward_floor, 2.0)
             if tp3 <= tp2:
                 tp3 = entry + risk * (target_rr + 1)
+            if ob_analysis is not None:
+                wall_buf = latest_atr * 0.15
+                tp1 = _adjust_tp_for_walls(direction, entry, tp1, ob_analysis.ask_walls, wall_buf)
+                tp2 = _adjust_tp_for_walls(direction, entry, tp2, ob_analysis.ask_walls, wall_buf)
+                if tp3 is not None:
+                    tp3 = _adjust_tp_for_walls(direction, entry, tp3, ob_analysis.ask_walls, wall_buf)
         else:
             resistance = _nearest_above(resistance_levels, entry) or max(highs[-20:])
             swing_stop = max(highs[-20:]) + buffer
@@ -82,6 +95,12 @@ class RiskManager:
                 tp2 = entry - risk * max(risk_reward_floor, 2.0)
             if tp3 >= tp2:
                 tp3 = entry - risk * (target_rr + 1)
+            if ob_analysis is not None:
+                wall_buf = latest_atr * 0.15
+                tp1 = _adjust_tp_for_walls(direction, entry, tp1, ob_analysis.bid_walls, wall_buf)
+                tp2 = _adjust_tp_for_walls(direction, entry, tp2, ob_analysis.bid_walls, wall_buf)
+                if tp3 is not None:
+                    tp3 = _adjust_tp_for_walls(direction, entry, tp3, ob_analysis.bid_walls, wall_buf)
         actual_risk_reward = abs(tp2 - entry) / risk
         if actual_risk_reward < risk_reward_floor:
             return None
@@ -161,3 +180,28 @@ def _target_before_resistance(levels: list[float], target: float, buffer: float)
 def _target_before_support(levels: list[float], target: float, buffer: float) -> float:
     support = _first_level_at_or_below(levels, target - buffer)
     return support + buffer if support is not None else target
+
+
+def _adjust_tp_for_walls(
+    direction: Direction,
+    entry: float,
+    tp: float,
+    walls: list,  # list[WallLevel] — usa stringa per evitare import circolare
+    buffer: float,
+) -> float:
+    """Sposta il TP appena prima di un muro OB che blocca il percorso verso il target."""
+    if direction in {Direction.LONG, Direction.STRONG_LONG}:
+        blocking = [w for w in walls if entry < w.price < tp]
+        if blocking:
+            nearest = min(blocking, key=lambda w: w.price)
+            adjusted = nearest.price - buffer
+            return max(adjusted, entry)
+    else:
+        blocking = [w for w in walls if tp < w.price < entry]
+        if blocking:
+            nearest = max(blocking, key=lambda w: w.price)
+            adjusted = nearest.price + buffer
+            return min(adjusted, entry)
+    return tp
+
+

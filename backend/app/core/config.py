@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     funding_rate_weight: int = 5
     max_long_funding_rate_pct: float = 0.05  # 0.05%/8h → blocca long oltre questa soglia
 
+    ob_imbalance_weight: int = 8
+    ob_imbalance_n_levels: int = 10  # top N livelli bid/ask da usare per l'OBI
+
     kill_switch_enabled: bool = False
     max_risk_per_trade_pct: float = 1.0
     max_daily_loss_pct: float = 3.0

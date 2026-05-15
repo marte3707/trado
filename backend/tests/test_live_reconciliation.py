@@ -35,6 +35,9 @@ class FakeDb:
             return _Query(rows=self.orders)
         return _Query(rows=self.positions)
 
+    def get(self, _model: type[Any], _key: Any) -> None:
+        return None
+
     def add(self, row: Any) -> None:
         self.added.append(row)
 
@@ -42,20 +45,56 @@ class FakeDb:
         self.committed += 1
 
 
+@dataclass
+class _FakeOrderResult:
+    oid: str | None
+    status: str
+    raw_response: dict[str, Any] = field(default_factory=dict)
+    avg_price: Any = None
+    filled_size: Any = None
+
+
 class FakeTrading:
     def __init__(
         self,
         remote_positions: list[dict[str, Any]],
         fills: list[dict[str, Any]] | None = None,
+        open_order_oids: list[int] | None = None,
+        resubmit_oid: str = "88888",
     ) -> None:
         self._remote = remote_positions
         self._fills = fills or []
+        # oids of orders currently open on HL (for protection-order detection tests)
+        self._open_order_oids: list[int] | None = open_order_oids
+        self._resubmit_oid = resubmit_oid
+        self.resubmitted: list[dict[str, Any]] = []
 
     def user_state(self, _address: str) -> dict[str, Any]:
         return {"assetPositions": [{"position": p} for p in self._remote]}
 
     def user_fills(self, _address: str) -> list[dict[str, Any]]:
         return list(self._fills)
+
+    def open_orders(self, _address: str) -> list[dict[str, Any]]:
+        if self._open_order_oids is None:
+            raise AttributeError("open_orders not configured")
+        return [{"oid": oid} for oid in self._open_order_oids]
+
+    def submit_trigger_order(
+        self,
+        *,
+        coin: str,
+        is_buy: bool,
+        size: Any,
+        trigger_price: Any,
+        tpsl: str,
+        expires_after_seconds: int,
+        cloid: str | None = None,
+    ) -> _FakeOrderResult:
+        self.resubmitted.append(
+            {"coin": coin, "is_buy": is_buy, "size": size, "tpsl": tpsl}
+        )
+        return _FakeOrderResult(oid=self._resubmit_oid, status="ok")
 
 
 def _make_market() -> Market:
@@ -185,12 +224,13 @@ def _make_tp_order(
     level: str = "tp1",
     size: str = "0.5",
     price: str = "110",
+    oid_str: str = "9999",
 ) -> Order:
     return Order(
         id=42,
         position_id=10,
         signal_id=None,
-        hyperliquid_order_id="9999",
+        hyperliquid_order_id=oid_str,
         cloid=cloid,
         mode="live",
         order_type=level,
@@ -334,3 +374,116 @@ def test_reconciliation_skips_already_filled_orders() -> None:
     assert position.realized_pnl == Decimal("5")
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_reconciliation_tp1_filled" not in events
+
+
+# ---------------------------------------------------------------------------
+# Protection-order resubmission tests
+# ---------------------------------------------------------------------------
+
+def _make_sl_order(oid: int = 8888) -> Order:
+    return Order(
+        id=55,
+        position_id=10,
+        signal_id=None,
+        hyperliquid_order_id=str(oid),
+        cloid="slcloid",
+        mode="live",
+        order_type="stop_loss",
+        side="buy",
+        price=Decimal("90"),
+        size=Decimal("1.0"),
+        status="ok",
+        reduce_only=True,
+        raw_response={},
+    )
+
+
+def test_resubmit_missing_tp1_when_not_in_hl_open_orders() -> None:
+    """TP1 order oid absent from HL open orders → must be re-submitted."""
+    position = _make_position(size="1.0")
+    tp1_order = _make_tp_order(oid_str="9999")
+    db = FakeDb(
+        positions=[position],
+        orders=[tp1_order],
+    )
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        # open_order_oids is empty → tp1 oid 9999 is absent
+        open_order_oids=[],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert len(trading.resubmitted) == 1
+    assert trading.resubmitted[0]["tpsl"] == "tp"
+    assert tp1_order.hyperliquid_order_id == "77777"
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_resubmitted" in events
+
+
+def test_no_resubmit_when_tp1_present_in_hl_open_orders() -> None:
+    """TP1 oid found in HL open orders → no re-submission."""
+    position = _make_position(size="1.0")
+    tp1_order = _make_tp_order(oid_str="9999")
+    db = FakeDb(positions=[position], orders=[tp1_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        open_order_oids=[9999],  # tp1 oid present
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert trading.resubmitted == []
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_resubmitted" not in events
+
+
+def test_no_resubmit_when_open_orders_api_fails() -> None:
+    """If HL open_orders() raises, resubmission must be skipped entirely."""
+    position = _make_position(size="1.0")
+    tp1_order = _make_tp_order(oid_str="9999")
+    db = FakeDb(positions=[position], orders=[tp1_order])
+    # open_order_oids=None → open_orders() raises AttributeError
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        open_order_oids=None,
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert trading.resubmitted == []
+
+
+def test_no_resubmit_for_terminal_status_order() -> None:
+    """A protection order already marked 'filled' or 'canceled' must not be re-submitted."""
+    position = _make_position(size="0.5")
+    tp1_order = _make_tp_order(oid_str="9999")
+    tp1_order.status = "filled"
+    db = FakeDb(positions=[position], orders=[tp1_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "0.5", "entryPx": "100"}],
+        open_order_oids=[],  # oid absent, but status is terminal
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert trading.resubmitted == []
+
+
+def test_resubmit_sl_order_with_correct_tpsl_flag() -> None:
+    """A missing stop_loss order must be re-submitted with tpsl='sl'."""
+    position = _make_position(size="1.0")
+    sl_order = _make_sl_order(oid=8888)
+    db = FakeDb(positions=[position], orders=[sl_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        open_order_oids=[],  # 8888 absent
+        resubmit_oid="66666",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert len(trading.resubmitted) == 1
+    assert trading.resubmitted[0]["tpsl"] == "sl"
+    assert sl_order.hyperliquid_order_id == "66666"

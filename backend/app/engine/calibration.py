@@ -552,14 +552,18 @@ class AutoCalibrationEngine:
             key="auto_calibration_state",
             value={},
         )
-        state.value = {
-            "last_run_at": now,
-            "last_trade_count": overall.trades,
-            "last_summary": serialize_stats(overall),
-            "last_changes": serialized_changes,
-            "last_reason": reason,
-            "last_status": status,
-        }
+        merged_value = dict(state.value) if isinstance(state.value, dict) else {}
+        merged_value.update(
+            {
+                "last_run_at": now,
+                "last_trade_count": overall.trades,
+                "last_summary": serialize_stats(overall),
+                "last_changes": serialized_changes,
+                "last_reason": reason,
+                "last_status": status,
+            }
+        )
+        state.value = merged_value
         db.add(state)
         db.add(
             DecisionLog(

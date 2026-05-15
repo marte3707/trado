@@ -8,6 +8,7 @@ from app.core.config import get_settings
 from app.core.enums import Direction, SignalStatus
 from app.db.models import AppSetting, Candle, Indicator, Market, Signal, StrategyConfig
 from app.engine.mtf import check_mtf_confluence, higher_timeframe
+from app.engine.orderbook import OrderBookAnalysis, analyze_order_book, ob_imbalance_result
 from app.engine.performance import SignalPerformanceAnalyzer
 from app.engine.regime import apply_regime_filter
 from app.engine.risk import RiskManager
@@ -19,7 +20,7 @@ from app.services.coinmarketcap import (
     FearGreedIndex,
     MarketQuote,
 )
-from app.services.hyperliquid import fetch_predicted_fundings
+from app.services.hyperliquid import fetch_l2_book, fetch_predicted_fundings
 from app.services.whale_alert import WhaleAlertClient, WhaleFlow
 from app.strategies.base import CandleInput, StrategyContext
 from app.strategies.base import StrategyResult
@@ -389,6 +390,18 @@ class SignalEngine:
         if funding_result is not None:
             results.append(funding_result)
             weights[funding_result.strategy_name] = max(0, settings.funding_rate_weight)
+        ob_analysis: OrderBookAnalysis | None = None
+        ob_snapshot = fetch_l2_book(settings.info_url, str(coin), n_levels=settings.ob_imbalance_n_levels)
+        if ob_snapshot is not None:
+            ob_analysis = analyze_order_book(
+                ob_snapshot,
+                entry=candles[-1].close,
+                n_levels=settings.ob_imbalance_n_levels,
+            )
+            ob_result = ob_imbalance_result(context, ob_analysis)
+            if ob_result is not None:
+                results.append(ob_result)
+                weights[ob_result.strategy_name] = max(0, settings.ob_imbalance_weight)
         self._persist_indicators(db, market, timeframe, latest_candle_open_time, results)
         existing_signal = (
             db.query(Signal)
@@ -443,6 +456,17 @@ class SignalEngine:
             "rate": funding_rate_value,
             "rate_pct": funding_rate_value * 100 if funding_rate_value is not None else None,
         }
+        if ob_analysis is not None:
+            score.breakdown["_order_book"] = {
+                "obi": round(ob_analysis.obi, 4),
+                "spread_pct": round(ob_analysis.spread_pct * 100, 4),
+                "bid_volume": round(ob_analysis.bid_volume, 4),
+                "ask_volume": round(ob_analysis.ask_volume, 4),
+                "bid_wall_count": len(ob_analysis.bid_walls),
+                "ask_wall_count": len(ob_analysis.ask_walls),
+                "bid_walls": [{"price": w.price, "size": w.size} for w in ob_analysis.bid_walls],
+                "ask_walls": [{"price": w.price, "size": w.size} for w in ob_analysis.ask_walls],
+            }
         score.breakdown["_market_context"] = {
             "hyperliquid_average_quote_volume_usd": hyperliquid_average_quote_volume,
             "global_quote": {
@@ -547,6 +571,7 @@ class SignalEngine:
             min_risk_reward,
             min_atr_multiplier=min_atr_multiplier,
             min_stop_distance_pct=min_stop_distance_pct,
+            ob_analysis=ob_analysis,
         )
         if risk_plan is None or risk_plan.risk_reward < min_risk_reward:
             logger.debug(

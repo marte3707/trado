@@ -306,3 +306,26 @@ Usa `down -v` solo se vuoi cancellare completamente il database locale.
 - Backend Render: usare start command `uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
 - Worker Render: usare start command `python -m app.worker.main`.
 - PostgreSQL: impostare `DATABASE_URL` compatibile SQLAlchemy.
+
+## Vedere stato
+
+launchctl print gui/$(id -u)/com.trado.backend | grep -E 'state|pid|exit'
+launchctl print gui/$(id -u)/com.trado.worker  | grep -E 'state|pid|exit'
+
+## Log live
+
+tail -f ~/Library/Logs/trado-backend.err.log
+tail -f ~/Library/Logs/trado-worker.err.log
+
+## Stop/start temporaneo (es. per dev con --reload)
+
+launchctl bootout gui/$(id -u)/com.trado.backend
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trado.backend.plist
+
+## Disinstallare tutto
+
+bash scripts/launchd/uninstall.sh
+
+## 3. Controlla che il tuner abbia ripreso bene
+
+curl -s <http://localhost:8000/api/auto-tuner/status> | jq
