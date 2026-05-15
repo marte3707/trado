@@ -290,31 +290,6 @@ input, select { font: inherit; color: inherit; }
 .crumbs .sep { color: var(--fg-4); }
 .crumbs .here { color: var(--fg); }
 .topbar-spacer { flex: 1; }
-.topbar-search {
-  display: flex; align-items: center; gap: 8px;
-  background: var(--bg-1);
-  border: 1px solid var(--border);
-  padding: 5px 10px;
-  border-radius: var(--radius);
-  min-width: 200px;
-  color: var(--fg-3);
-  font-size: var(--fz-sm);
-}
-.topbar-search input {
-  background: none; border: none; outline: none;
-  color: var(--fg);
-  flex: 1; min-width: 0;
-  font-size: var(--fz-sm);
-}
-.topbar-search kbd {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  background: var(--bg-2);
-  border: 1px solid var(--border);
-  padding: 1px 5px;
-  border-radius: 3px;
-  color: var(--fg-3);
-}
 
 /* ─── Mode selector ───────────────────────────────────────────────────── */
 .mode-selector {
@@ -455,6 +430,8 @@ input, select { font: inherit; color: inherit; }
 }
 .tbl td { color: var(--fg-2); }
 .tbl td.fg { color: var(--fg); }
+.tbl td.up { color: var(--long); }
+.tbl td.down { color: var(--short); }
 .tbl td.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; text-align: right; }
 .tbl tr:hover td { background: var(--bg-2); }
 .tbl tr:last-child td { border-bottom: 0; }

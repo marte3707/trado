@@ -39,12 +39,14 @@ class SupportResistanceStrategy:
             rejected_support = (
                 support_distance is not None
                 and support_distance <= tolerance_pct
+                and nearest_support is not None
                 and candle.low <= nearest_support
                 and candle.close > candle.open
             )
             rejected_resistance = (
                 resistance_distance is not None
                 and resistance_distance <= tolerance_pct
+                and nearest_resistance is not None
                 and candle.high >= nearest_resistance
                 and candle.close < candle.open
             )

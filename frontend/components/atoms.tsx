@@ -19,6 +19,7 @@ const ICONS: Record<string, React.ReactNode> = {
   history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8" {...stroke}/><path d="M3 3v5h5" {...stroke}/><path d="M12 7v5l3 2" {...stroke}/></>,
   bell: <><path d="M6 8a6 6 0 0 1 12 0c0 7 3 7 3 9H3c0-2 3-2 3-9" {...stroke}/><path d="M10 21a2 2 0 0 0 4 0" {...stroke}/></>,
   watch: <><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z" {...stroke}/><circle cx="12" cy="12" r="3" {...stroke}/></>,
+  wallet: <><path d="M4 7h15a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h13" {...stroke}/><path d="M16 13h5" {...stroke}/><circle cx="17" cy="13" r="1" fill="currentColor"/></>,
   search: <><circle cx="11" cy="11" r="7" {...stroke}/><path d="m20 20-3.5-3.5" {...stroke}/></>,
   power: <><path d="M12 3v9" {...stroke}/><path d="M5.6 7.6a8 8 0 1 0 12.8 0" {...stroke}/></>,
   chevron: <><path d="m9 6 6 6-6 6" {...stroke}/></>,
@@ -150,8 +151,6 @@ export const SectionLabel = ({ children }: { children: React.ReactNode }) => (
 );
 
 /* ─── Formatting utilities ──────────────────────────────────────────────── */
-const DEFAULT_CURRENCY = "EUR";
-
 export const fmt = {
   price(p: number | string | null | undefined): string {
     if (p == null || p === "") return "—";
@@ -168,11 +167,11 @@ export const fmt = {
   },
   money(x: number | null | undefined): string {
     if (x == null || !isFinite(x)) return "—";
-    return x.toLocaleString("it-IT", { style: "currency", currency: DEFAULT_CURRENCY, minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return x.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 });
   },
   pnl(x: number | null | undefined): string {
     if (x == null || !isFinite(x)) return "—";
-    const formatted = Math.abs(x).toLocaleString("it-IT", { style: "currency", currency: DEFAULT_CURRENCY, minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const formatted = Math.abs(x).toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 });
     return (x >= 0 ? "+" : "-") + formatted;
   },
   relTime(iso: string | null): string {

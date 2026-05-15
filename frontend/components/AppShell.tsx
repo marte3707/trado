@@ -7,14 +7,17 @@ import { DashboardData } from "@/components/Dashboard";
 import { DashboardScreen } from "@/components/screens/DashboardScreen";
 import { SignalsScreen } from "@/components/screens/SignalsScreen";
 import { CoinScreen } from "@/components/screens/CoinScreen";
+import { AccountMonitorScreen } from "@/components/screens/AccountMonitorScreen";
 import { StrategiesScreen } from "@/components/screens/StrategiesScreen";
+import { CalibrationScreen } from "@/components/screens/CalibrationScreen";
 import { HistoryScreen } from "@/components/screens/HistoryScreen";
 import { AlertsScreen } from "@/components/screens/AlertsScreen";
 import { SettingsScreen } from "@/components/screens/SettingsScreen";
 import {
   apiGet, apiPatch, apiPost,
-  Health, Market, Signal, Position, Order, AppSettings, Strategy, DecisionLog, MarketIntelligence
+  Health, Market, Signal, Position, Order, AppSettings, Strategy, DecisionLog, MarketIntelligence, Calibration, CalibrationHistoryEntry
 } from "@/lib/api";
+import { hydrateOpenPositionSourceSignals } from "@/lib/signalHydration";
 
 interface AppShellProps {
   initialData: DashboardData;
@@ -71,6 +74,8 @@ export function AppShell({ initialData }: AppShellProps) {
   const [settings, setSettings] = useState(initialData.settings);
   const [strategies, setStrategies] = useState(initialData.strategies);
   const [logs, setLogs] = useState(initialData.logs);
+  const [calibration, setCalibration] = useState<Calibration>(initialData.calibration);
+  const [calibrationHistory, setCalibrationHistory] = useState<CalibrationHistoryEntry[]>(initialData.calibrationHistory);
   const [marketIntelligence, setMarketIntelligence] = useState<MarketIntelligence>(
     initialData.marketIntelligence
   );
@@ -100,7 +105,7 @@ export function AppShell({ initialData }: AppShellProps) {
   /* ── refresh ─────────────────────────────────────────────────────────── */
   const refresh = useCallback(async () => {
     try {
-      const [h, m, cm, s, p, o, st, str, l, mi] = await Promise.all([
+      const [h, m, cm, s, p, o, st, str, l, cal, calHistory, mi] = await Promise.all([
         apiGet<Health>("/api/health"),
         apiGet<Market[]>("/api/markets"),
         apiGet<Market[]>("/api/markets?active=true&has_candles=true"),
@@ -110,17 +115,22 @@ export function AppShell({ initialData }: AppShellProps) {
         apiGet<AppSettings>("/api/settings"),
         apiGet<Strategy[]>("/api/strategies"),
         apiGet<DecisionLog[]>("/api/logs"),
+        apiGet<Calibration>("/api/analytics/calibration"),
+        apiGet<CalibrationHistoryEntry[]>("/api/analytics/calibration/history"),
         apiGet<MarketIntelligence>("/api/market-intelligence").catch(() => marketIntelligence),
       ]);
+      const hydratedSignals = await hydrateOpenPositionSourceSignals(s, p);
       setHealth(h);
       setMarkets(m);
       setChartMarkets(cm);
-      setSignals(s);
+      setSignals(hydratedSignals);
       setPositions(p);
       setOrders(o);
       setSettings(st);
       setStrategies(str);
       setLogs(l);
+      setCalibration(cal);
+      setCalibrationHistory(calHistory);
       setMarketIntelligence(mi);
     } catch (e) {
       console.error("refresh failed", e);
@@ -206,7 +216,6 @@ export function AppShell({ initialData }: AppShellProps) {
               marketIntelligence={marketIntelligence}
               threshold={tweaks.scoreThreshold}
               onRefresh={refresh}
-              onOpenSignal={openSignalChart}
               onOpenPosition={openPositionChart}
             />
           )}
@@ -238,12 +247,25 @@ export function AppShell({ initialData }: AppShellProps) {
             />
           )}
 
+          {route === "account" && (
+            <AccountMonitorScreen health={health} />
+          )}
+
           {route === "strategies" && (
               <StrategiesScreen
                 strategies={strategies}
                 settings={settings}
                 threshold={tweaks.scoreThreshold}
               onThresholdChange={saveScoreThreshold}
+              onRefresh={refresh}
+            />
+          )}
+
+          {route === "calibration" && (
+            <CalibrationScreen
+              calibration={calibration}
+              history={calibrationHistory}
+              settings={settings}
               onRefresh={refresh}
             />
           )}
@@ -257,7 +279,7 @@ export function AppShell({ initialData }: AppShellProps) {
           )}
 
           {route === "alerts" && (
-            <AlertsScreen logs={logs} settings={settings} onRefresh={refresh} />
+            <AlertsScreen logs={logs} markets={markets} settings={settings} onRefresh={refresh} />
           )}
 
           {route === "settings" && (

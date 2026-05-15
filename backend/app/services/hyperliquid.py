@@ -1,14 +1,53 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from importlib import import_module
 from typing import Any
 
 import httpx
 
 from app.core.config import Settings
 from app.core.enums import MarketType
+from app.services._circuit import CircuitBreakerOpen, hyperliquid_info_breaker
+
+
+@dataclass(frozen=True)
+class FundingRate:
+    coin: str
+    predicted_rate: float  # 8h rate as decimal fraction (e.g. 0.0001 = 0.01%/8h)
+
+
+def fetch_predicted_fundings(info_url: str) -> dict[str, float]:
+    """Returns coin → predicted 8h funding rate (decimal fraction). Empty dict on failure."""
+    try:
+        with httpx.Client(timeout=10) as client:
+            response = client.post(info_url, json={"type": "predictedFundings"})
+            if response.is_error:
+                return {}
+            data = response.json()
+            result: dict[str, float] = {}
+            for entry in data:
+                if not isinstance(entry, list) or len(entry) < 2:
+                    continue
+                coin = entry[0]
+                venues = entry[1]
+                if not isinstance(venues, list):
+                    continue
+                for venue_entry in venues:
+                    if isinstance(venue_entry, list) and len(venue_entry) >= 2:
+                        try:
+                            result[coin] = float(venue_entry[1])
+                        except (ValueError, TypeError):
+                            pass
+                        break
+            return result
+    except Exception:
+        return {}
 
 
 class HyperliquidError(RuntimeError):
@@ -24,6 +63,23 @@ class HyperliquidClient:
         self.settings = settings
 
     async def _post_info(self, payload: dict[str, Any]) -> Any:
+        if not hyperliquid_info_breaker.allow():
+            raise HyperliquidTransientError(
+                "Hyperliquid info circuit breaker is open"
+            )
+        try:
+            result = await self._post_info_raw(payload)
+        except HyperliquidTransientError:
+            hyperliquid_info_breaker.record_failure()
+            raise
+        except HyperliquidError:
+            # non-transient (4xx other than rate-limit, etc.) should not trip the breaker
+            raise
+        else:
+            hyperliquid_info_breaker.record_success()
+            return result
+
+    async def _post_info_raw(self, payload: dict[str, Any]) -> Any:
         async with httpx.AsyncClient(timeout=20) as client:
             last_status: int | None = None
             last_text = ""
@@ -63,6 +119,21 @@ class HyperliquidClient:
 
     async def spot_user_state(self, address: str) -> dict[str, Any]:
         return await self._post_info({"type": "spotClearinghouseState", "user": address})
+
+    async def open_orders(self, address: str) -> list[dict[str, Any]]:
+        return await self._post_info({"type": "openOrders", "user": address})
+
+    async def frontend_open_orders(self, address: str) -> list[dict[str, Any]]:
+        return await self._post_info({"type": "frontendOpenOrders", "user": address})
+
+    async def predicted_fundings(self) -> list[Any]:
+        return await self._post_info({"type": "predictedFundings"})
+
+    async def user_funding(self, address: str, start_ms: int, end_ms: int | None = None) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {"type": "userFunding", "user": address, "startTime": start_ms}
+        if end_ms is not None:
+            payload["endTime"] = end_ms
+        return await self._post_info(payload)
 
     @staticmethod
     def perp_markets(meta: dict[str, Any]) -> list[dict[str, Any]]:
@@ -104,6 +175,251 @@ class HyperliquidClient:
             )
         return markets
 
+
+@dataclass(frozen=True)
+class HyperliquidOrderResult:
+    status: str
+    oid: str | None
+    avg_price: Decimal | None
+    filled_size: Decimal | None
+    raw_response: dict[str, Any]
+
+
+class HyperliquidTradingClient:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    def account_value(self) -> Decimal:
+        address = self._account_address()
+        state = self.user_state(address)
+        margin = state.get("marginSummary", {})
+        value = margin.get("accountValue")
+        if value is None:
+            raise HyperliquidError("Hyperliquid user_state did not include accountValue")
+        return Decimal(str(value))
+
+    def user_state(self, address: str | None = None) -> dict[str, Any]:
+        info = self._info()
+        return info.user_state(address or self._account_address())
+
+    def user_fills(self, address: str | None = None) -> list[dict[str, Any]]:
+        info = self._info()
+        fills = info.user_fills(address or self._account_address())
+        return fills if isinstance(fills, list) else []
+
+    def submit_market_order(
+        self,
+        coin: str,
+        is_buy: bool,
+        size: Decimal,
+        max_slippage_pct: float,
+        expires_after_seconds: int,
+        cloid: str | None = None,
+    ) -> HyperliquidOrderResult:
+        exchange = self._exchange(expires_after_seconds)
+        kwargs: dict[str, Any] = {"slippage": max(0.0, max_slippage_pct) / 100}
+        cloid_obj = _build_cloid(cloid)
+        if cloid_obj is not None:
+            kwargs["cloid"] = cloid_obj
+        response = exchange.market_open(coin, is_buy, _size_to_float(size), **kwargs)
+        return parse_order_result(response)
+
+    def submit_market_close(
+        self,
+        coin: str,
+        is_buy: bool,
+        size: Decimal,
+        max_slippage_pct: float,
+        expires_after_seconds: int,
+    ) -> HyperliquidOrderResult:
+        exchange = self._exchange(expires_after_seconds)
+        response = exchange.order(
+            coin,
+            is_buy,
+            _size_to_float(size),
+            exchange._slippage_price(coin, is_buy, max(0.0, max_slippage_pct) / 100),
+            order_type={"limit": {"tif": "Ioc"}},
+            reduce_only=True,
+        )
+        return parse_order_result(response)
+
+    def submit_trigger_order(
+        self,
+        coin: str,
+        is_buy: bool,
+        size: Decimal,
+        trigger_price: Decimal,
+        tpsl: str,
+        expires_after_seconds: int,
+        cloid: str | None = None,
+    ) -> HyperliquidOrderResult:
+        exchange = self._exchange(expires_after_seconds)
+        rounded_price = _round_price(trigger_price)
+        order_kwargs: dict[str, Any] = {
+            "order_type": {
+                "trigger": {
+                    "isMarket": True,
+                    "triggerPx": rounded_price,
+                    "tpsl": tpsl,
+                }
+            },
+            "reduce_only": True,
+        }
+        cloid_obj = _build_cloid(cloid)
+        if cloid_obj is not None:
+            order_kwargs["cloid"] = cloid_obj
+        response = exchange.order(coin, is_buy, _size_to_float(size), rounded_price, **order_kwargs)
+        return parse_order_result(response)
+
+    def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> None:
+        exchange = self._exchange(0)
+        exchange.update_leverage(leverage, coin, is_cross)
+
+    def predicted_fundings(self) -> dict[str, float]:
+        return fetch_predicted_fundings(self.settings.info_url)
+
+    def cancel_order(
+        self,
+        coin: str,
+        oid: int,
+        expires_after_seconds: int,
+    ) -> dict[str, Any]:
+        exchange = self._exchange(expires_after_seconds)
+        response = exchange.cancel(coin, oid)
+        if not isinstance(response, dict):
+            raise HyperliquidError("Hyperliquid cancel returned an invalid response")
+        if response.get("status") == "err":
+            raise HyperliquidError(str(response))
+        return response
+
+    def _account_address(self) -> str:
+        if not self.settings.hyperliquid_account_address:
+            raise HyperliquidError("HYPERLIQUID_ACCOUNT_ADDRESS is required for live trading")
+        return self.settings.hyperliquid_account_address
+
+    def _private_key(self) -> str:
+        if not self.settings.hyperliquid_private_key:
+            raise HyperliquidError("HYPERLIQUID_PRIVATE_KEY is required for live trading")
+        return self.settings.hyperliquid_private_key
+
+    def _base_url(self) -> str:
+        try:
+            constants = import_module("hyperliquid.utils.constants")
+        except ImportError as exc:
+            raise HyperliquidError("Install hyperliquid-python-sdk to enable live trading") from exc
+        if self.settings.hyperliquid_network == "mainnet":
+            return constants.MAINNET_API_URL
+        return constants.TESTNET_API_URL
+
+    def _info(self):
+        try:
+            Info = import_module("hyperliquid.info").Info
+        except ImportError as exc:
+            raise HyperliquidError("Install hyperliquid-python-sdk to enable live trading") from exc
+        return Info(self._base_url(), skip_ws=True)
+
+    def _exchange(self, expires_after_seconds: int):
+        try:
+            eth_account = import_module("eth_account")
+            Exchange = import_module("hyperliquid.exchange").Exchange
+        except ImportError as exc:
+            raise HyperliquidError("Install hyperliquid-python-sdk to enable live trading") from exc
+        wallet = eth_account.Account.from_key(self._private_key())
+        exchange = Exchange(
+            wallet,
+            base_url=self._base_url(),
+            account_address=self._account_address(),
+        )
+        if expires_after_seconds > 0:
+            exchange.set_expires_after(int(time.time() * 1000) + (expires_after_seconds * 1000))
+        return exchange
+
+
+def _size_to_float(size: Decimal, max_decimals: int = 8) -> float:
+    """Quantize a Decimal size to a fixed number of decimals BEFORE converting
+    to float, so binary-fp drift cannot leak into the order payload sent to
+    Hyperliquid."""
+    if size <= 0:
+        return 0.0
+    quant = Decimal(1).scaleb(-max_decimals)
+    return float(size.quantize(quant))
+
+
+def _build_cloid(cloid: str | None) -> Any | None:
+    if not cloid:
+        return None
+    for module_path in (
+        "hyperliquid.utils.types",
+        "hyperliquid.utils.signing",
+    ):
+        try:
+            module = import_module(module_path)
+        except ImportError:
+            continue
+        Cloid = getattr(module, "Cloid", None)
+        if Cloid is None:
+            continue
+        for ctor in ("from_str", "from_int"):
+            factory = getattr(Cloid, ctor, None)
+            if factory is None:
+                continue
+            try:
+                return factory(cloid if ctor == "from_str" else int(cloid, 16))
+            except Exception:
+                continue
+        try:
+            return Cloid(cloid)
+        except Exception:
+            continue
+    return None
+
+
+def _round_price(price: Decimal, sig_figs: int = 5, max_decimals: int = 6) -> float:
+    f = float(price)
+    if f == 0.0:
+        return 0.0
+    # Mirror HL SDK _slippage_price: 5 significant figures then cap decimal places
+    return round(float(f"{f:.{sig_figs}g}"), max_decimals)
+
+
+def parse_order_result(response: dict[str, Any]) -> HyperliquidOrderResult:
+    status = str(response.get("status", "unknown"))
+    oid: str | None = None
+    avg_price: Decimal | None = None
+    filled_size: Decimal | None = None
+    statuses = (
+        response.get("response", {})
+        .get("data", {})
+        .get("statuses", [])
+    )
+    if statuses:
+        first = statuses[0]
+        if "filled" in first:
+            filled = first["filled"]
+            oid = str(filled.get("oid")) if filled.get("oid") is not None else None
+            avg_price = _decimal(filled.get("avgPx"))
+            filled_size = _decimal(filled.get("totalSz"))
+        elif "resting" in first:
+            resting = first["resting"]
+            oid = str(resting.get("oid")) if resting.get("oid") is not None else None
+        elif "error" in first:
+            status = "error"
+    return HyperliquidOrderResult(
+        status=status,
+        oid=oid,
+        avg_price=avg_price,
+        filled_size=filled_size,
+        raw_response=response,
+    )
+
+
+def _decimal(value: str | int | float | Decimal | None) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
 
 def parse_hl_candle(row: dict[str, Any]) -> dict[str, Any]:
     return {

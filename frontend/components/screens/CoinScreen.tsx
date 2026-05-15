@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Icon, ScoreChip, DirBadge, TfChip, MarketBadge, StratList, Kv, Seg, fmt, StatusBadge } from "@/components/atoms";
 import { Health, IndicatorSnapshot, Market, Position, Signal, apiGet } from "@/lib/api";
 import { ChartPanel, ChartOverlays, LiveChartUpdate } from "@/components/ChartPanel";
@@ -167,29 +167,64 @@ export function CoinScreen({ markets, signals, positions, health, chartMarkets, 
   const [candles, setCandles] = useState(initialCandles);
   const [indicators, setIndicators] = useState<IndicatorSnapshot[]>([]);
   const [loadingCandles, setLoadingCandles] = useState(false);
-  const [search, setSearch] = useState("");
   const [liveStats, setLiveStats] = useState<{ price: number | null; vol24: number | null; updatedAt: number | null }>({
     price: null,
     vol24: null,
     updatedAt: null
   });
   const [overlays, setOverlays] = useState<ChartOverlays>({
-    ema: false, bollinger: false, vwap: false, supertrend: false, levels: false, signals: false
+    ema: false,
+    bollinger: false,
+    vwap: false,
+    supertrend: false,
+    levels: false,
+    fibonacci: false,
+    signals: true,
+    rsi: false,
+    macd: false,
+    candlestick_patterns: false,
   });
+  const [showIndicatorsMenu, setShowIndicatorsMenu] = useState(false);
+  const indicatorsMenuRef = useRef<HTMLDivElement | null>(null);
+  const candleLoadSeqRef = useRef(0);
 
-  const allMarkets = chartMarkets.length > 0 ? chartMarkets : markets;
-  const selectedMarket = allMarkets.find(m => marketKey(m) === selectedKey) ?? allMarkets[0] ?? null;
+  useEffect(() => {
+    if (!showIndicatorsMenu) return;
+    function handleClickOutside(e: MouseEvent) {
+      if (indicatorsMenuRef.current && !indicatorsMenuRef.current.contains(e.target as Node)) {
+        setShowIndicatorsMenu(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showIndicatorsMenu]);
 
-  const visibleMarkets = allMarkets.filter(m =>
-    !search || m.symbol.toLowerCase().includes(search.toLowerCase())
+  const allMarkets = useMemo(
+    () => chartMarkets.length > 0 ? chartMarkets : markets,
+    [chartMarkets, markets]
+  );
+  const selectedMarket = useMemo(
+    () => allMarkets.find(m => marketKey(m) === selectedKey) ?? allMarkets[0] ?? null,
+    [allMarkets, selectedKey]
   );
 
   const selectedMarketKey = selectedMarket ? marketKey(selectedMarket) : selectedKey;
-  const marketSignals = signals.filter(s => s.market && marketKey(s.market) === selectedMarketKey);
-  const openMarketSignals = marketSignals.filter(s => isSignalOpen(s, positions));
+  const selectedSymbol = selectedMarket?.symbol ?? null;
+  const selectedMarketType = selectedMarket?.market_type ?? null;
+  const marketSignals = useMemo(
+    () => signals.filter(s => s.market && marketKey(s.market) === selectedMarketKey),
+    [signals, selectedMarketKey]
+  );
+  const openMarketSignals = useMemo(
+    () => marketSignals.filter(s => isSignalOpen(s, positions)),
+    [marketSignals, positions]
+  );
   const activeSignal = openMarketSignals[0] ?? null;
   const activePosition = activeSignal ? openPositionForSignal(activeSignal, positions) : null;
-  const timeframeOptions = Array.from(new Set([initialTf, ...signals.map(s => s.timeframe)].filter(Boolean)));
+  const timeframeOptions = useMemo(
+    () => Array.from(new Set([initialTf, ...signals.map(s => s.timeframe)].filter(Boolean))),
+    [initialTf, signals]
+  );
   const derivedStats = useMemo(() => candleStats(candles), [candles]);
   const meta = selectedMarket?.metadata_json ?? {};
   const metaPrice = asNumber(meta.last_price ?? meta.mark_price);
@@ -206,22 +241,27 @@ export function CoinScreen({ markets, signals, positions, health, chartMarkets, 
     }));
   }, []);
 
-  async function loadCandles(market: Market | null, timeframe: string) {
+  async function loadCandles(
+    market: Pick<Market, "symbol" | "market_type"> | null,
+    timeframe: string,
+    options: { silent?: boolean; keepOnError?: boolean } = {}
+  ) {
     if (!market) { setCandles([]); return; }
-    setLoadingCandles(true);
+    const seq = ++candleLoadSeqRef.current;
+    if (!options.silent) setLoadingCandles(true);
     try {
       const data = await apiGet<Candle[]>(
         `/api/candles?symbol=${encodeURIComponent(market.symbol)}&market_type=${encodeURIComponent(market.market_type)}&timeframe=${encodeURIComponent(timeframe)}`
       );
-      setCandles(data);
+      if (seq === candleLoadSeqRef.current) setCandles(data);
     } catch {
-      setCandles([]);
+      if (!options.keepOnError && seq === candleLoadSeqRef.current) setCandles([]);
     } finally {
-      setLoadingCandles(false);
+      if (!options.silent && seq === candleLoadSeqRef.current) setLoadingCandles(false);
     }
   }
 
-  async function loadIndicators(market: Market | null, timeframe: string) {
+  async function loadIndicators(market: Pick<Market, "symbol" | "market_type"> | null, timeframe: string) {
     if (!market) { setIndicators([]); return; }
     try {
       const data = await apiGet<IndicatorSnapshot[]>(
@@ -234,11 +274,15 @@ export function CoinScreen({ markets, signals, positions, health, chartMarkets, 
   }
 
   useEffect(() => {
-    if (selectedMarket) {
-      loadCandles(selectedMarket, tf);
-      loadIndicators(selectedMarket, tf);
-    }
-  }, [selectedKey, tf]);
+    if (!selectedSymbol || !selectedMarketType) return;
+    const market = { symbol: selectedSymbol, market_type: selectedMarketType };
+    loadCandles(market, tf);
+    loadIndicators(market, tf);
+    const timer = window.setInterval(() => {
+      loadCandles(market, tf, { silent: true, keepOnError: true });
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, [selectedSymbol, selectedMarketType, tf]);
 
   useEffect(() => {
     if (focusMarketKey) setSelectedKey(focusMarketKey);
@@ -280,26 +324,6 @@ export function CoinScreen({ markets, signals, positions, health, chartMarkets, 
             <div className="muted mono">—</div>
           )}
         </div>
-        <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
-          <input
-            type="text"
-            placeholder="Cerca symbol…"
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            className="filter"
-            style={{ height: 28, paddingLeft: 10, width: 140, fontSize: "var(--fz-sm)" }}
-          />
-          <select
-            value={selectedKey}
-            onChange={e => setSelectedKey(e.target.value)}
-            className="filter"
-            style={{ height: 28, paddingLeft: 10, paddingRight: 26, fontSize: "var(--fz-sm)" }}
-          >
-            {visibleMarkets.map(m => (
-              <option key={marketKey(m)} value={marketKey(m)}>{m.symbol} {m.market_type.toUpperCase()}</option>
-            ))}
-          </select>
-        </div>
       </div>
 
       {/* Stat strip */}
@@ -324,11 +348,13 @@ export function CoinScreen({ markets, signals, positions, health, chartMarkets, 
               options={timeframeOptions.map(t => [t, t] as [string, string])}
             />
             {loadingCandles && <span className="muted mono" style={{ fontSize: "var(--fz-xs)" }}>loading…</span>}
-            <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
-              {([ ["ema","EMA"],["bollinger","BB"],["vwap","VWAP"],["supertrend","ST"],["levels","Livelli"],["signals","Segnali"] ] as [keyof ChartOverlays, string][]).map(([key, label]) => (
-                <ChartToggle key={key} on={overlays[key]} label={label}
-                  onClick={() => setOverlays(o => ({ ...o, [key]: !o[key] }))} />
-              ))}
+            <div ref={indicatorsMenuRef} style={{ marginLeft: "auto", position: "relative" }}>
+              <IndicatorsButton
+                overlays={overlays}
+                open={showIndicatorsMenu}
+                onToggle={() => setShowIndicatorsMenu(v => !v)}
+                onOverlayChange={(key) => setOverlays(o => ({ ...o, [key]: !o[key] }))}
+              />
             </div>
           </div>
           <ChartPanel
@@ -441,23 +467,114 @@ export function CoinScreen({ markets, signals, positions, health, chartMarkets, 
 }
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
-function ChartToggle({ on, onClick, label }: { on: boolean; onClick: () => void; label: string }) {
+const INDICATOR_OPTIONS: [keyof ChartOverlays, string][] = [
+  ["signals", "Segnali"],
+  ["macd", "MACD"],
+  ["fibonacci", "Fibonacci"],
+  ["candlestick_patterns", "Candlestick patterns"],
+  ["ema", "EMA (9 · 21 · 200)"],
+  ["bollinger", "Bollinger Bands"],
+  ["vwap", "VWAP"],
+  ["supertrend", "Supertrend"],
+  ["levels", "Supporti / Resistenze"],
+  ["rsi", "RSI (14)"],
+];
+
+function IndicatorsButton({
+  overlays,
+  open,
+  onToggle,
+  onOverlayChange,
+}: {
+  overlays: ChartOverlays;
+  open: boolean;
+  onToggle: () => void;
+  onOverlayChange: (key: keyof ChartOverlays) => void;
+}) {
+  const activeCount = INDICATOR_OPTIONS.filter(([key]) => overlays[key]).length;
   return (
-    <button
-      className="btn ghost sm"
-      onClick={onClick}
-      style={{
-        borderColor: on ? "var(--accent-border)" : "transparent",
-        color: on ? "var(--accent)" : "var(--fg-3)",
-        background: on ? "var(--accent-soft)" : "transparent",
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 4,
-      }}
-    >
-      <Icon name={on ? "check" : "plus"} size={11} />
-      {label}
-    </button>
+    <>
+      <button
+        className="btn ghost sm"
+        onClick={onToggle}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 5,
+          borderColor: open || activeCount > 0 ? "var(--accent-border)" : "transparent",
+          color: open || activeCount > 0 ? "var(--accent)" : "var(--fg-3)",
+          background: open || activeCount > 0 ? "var(--accent-soft)" : "transparent",
+        }}
+      >
+        <Icon name="sliders-horizontal" size={12} />
+        Indicators
+        {activeCount > 0 && (
+          <span style={{
+            background: "var(--accent)",
+            color: "var(--bg-1)",
+            borderRadius: 99,
+            fontSize: 9,
+            fontWeight: 700,
+            lineHeight: 1,
+            padding: "2px 5px",
+            minWidth: 14,
+            textAlign: "center",
+          }}>
+            {activeCount}
+          </span>
+        )}
+        <Icon name={open ? "chevron-up" : "chevron-down"} size={10} />
+      </button>
+      {open && (
+        <div style={{
+          position: "absolute",
+          top: "calc(100% + 6px)",
+          right: 0,
+          zIndex: 100,
+          background: "var(--bg-2)",
+          border: "1px solid var(--border)",
+          borderRadius: "var(--radius)",
+          padding: "6px 0",
+          minWidth: 200,
+          boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+        }}>
+          {INDICATOR_OPTIONS.map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => onOverlayChange(key)}
+              style={{
+                width: "100%",
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "7px 14px",
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                color: overlays[key] ? "var(--fg)" : "var(--fg-3)",
+                fontSize: "var(--fz-sm)",
+                textAlign: "left",
+              }}
+            >
+              <span style={{
+                width: 14,
+                height: 14,
+                borderRadius: 3,
+                border: `1px solid ${overlays[key] ? "var(--accent)" : "var(--border)"}`,
+                background: overlays[key] ? "var(--accent)" : "transparent",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                flexShrink: 0,
+              }}>
+                {overlays[key] && <Icon name="check" size={9} />}
+              </span>
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 

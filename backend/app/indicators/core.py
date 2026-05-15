@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from math import sqrt
+from typing import cast, Any
 
 
 def ema(values: Sequence[float], period: int) -> list[float | None]:
@@ -88,6 +89,75 @@ def atr(highs: Sequence[float], lows: Sequence[float], closes: Sequence[float], 
             )
         )
     return ema(true_ranges, period)
+
+
+def adx(
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    period: int = 14,
+) -> list[float | None]:
+    if not (len(highs) == len(lows) == len(closes)):
+        raise ValueError("highs, lows, closes must have same length")
+    if period <= 0:
+        raise ValueError("period must be positive")
+    n = len(closes)
+    result: list[float | None] = [None] * n
+    if n < period * 2 + 1:
+        return result
+
+    plus_dm = [0.0] * n
+    minus_dm = [0.0] * n
+    true_range = [0.0] * n
+    for index in range(1, n):
+        up_move = highs[index] - highs[index - 1]
+        down_move = lows[index - 1] - lows[index]
+        plus_dm[index] = up_move if up_move > down_move and up_move > 0 else 0.0
+        minus_dm[index] = down_move if down_move > up_move and down_move > 0 else 0.0
+        true_range[index] = max(
+            highs[index] - lows[index],
+            abs(highs[index] - closes[index - 1]),
+            abs(lows[index] - closes[index - 1]),
+        )
+
+    smoothed_plus_dm: list[float | None] = [None] * n
+    smoothed_minus_dm: list[float | None] = [None] * n
+    smoothed_tr: list[float | None] = [None] * n
+    smoothed_plus_dm[period] = sum(plus_dm[1 : period + 1])
+    smoothed_minus_dm[period] = sum(minus_dm[1 : period + 1])
+    smoothed_tr[period] = sum(true_range[1 : period + 1])
+    for index in range(period + 1, n):
+        prev_p = cast(float, smoothed_plus_dm[index - 1])
+        prev_m = cast(float, smoothed_minus_dm[index - 1])
+        prev_t = cast(float, smoothed_tr[index - 1])
+        smoothed_plus_dm[index] = prev_p - (prev_p / period) + plus_dm[index]
+        smoothed_minus_dm[index] = prev_m - (prev_m / period) + minus_dm[index]
+        smoothed_tr[index] = prev_t - (prev_t / period) + true_range[index]
+
+    dx: list[float | None] = [None] * n
+    for index in range(period, n):
+        tr_value = smoothed_tr[index]
+        if tr_value is None or tr_value == 0:
+            continue
+        plus_di = 100 * cast(float, smoothed_plus_dm[index]) / tr_value
+        minus_di = 100 * cast(float, smoothed_minus_dm[index]) / tr_value
+        denominator = plus_di + minus_di
+        dx[index] = 0.0 if denominator == 0 else 100 * abs(plus_di - minus_di) / denominator
+
+    first_adx_index = period * 2
+    if first_adx_index >= n:
+        return result
+    window = [value for value in dx[period + 1 : first_adx_index + 1] if value is not None]
+    if len(window) < period:
+        return result
+    result[first_adx_index] = sum(window) / period
+    for index in range(first_adx_index + 1, n):
+        prev = result[index - 1]
+        current_dx = dx[index]
+        if prev is None or current_dx is None:
+            continue
+        result[index] = (prev * (period - 1) + current_dx) / period
+    return result
 
 
 def simple_moving_average(values: Sequence[float], period: int) -> list[float | None]:
@@ -190,8 +260,8 @@ def supertrend(
             trend[index] = basic_lower
             direction[index] = "up"
             continue
-        previous_upper = upper_band[index - 1]
-        previous_lower = lower_band[index - 1]
+        previous_upper = cast(float, upper_band[index - 1])
+        previous_lower = cast(float, lower_band[index - 1])
         previous_close = closes[index - 1]
         upper_band[index] = (
             basic_upper
@@ -205,14 +275,14 @@ def supertrend(
         )
         previous_direction = direction[index - 1]
         if previous_direction == "down":
-            if closes[index] > upper_band[index]:
+            if closes[index] > cast(float, upper_band[index]):
                 direction[index] = "up"
                 trend[index] = lower_band[index]
             else:
                 direction[index] = "down"
                 trend[index] = upper_band[index]
         else:
-            if closes[index] < lower_band[index]:
+            if closes[index] < cast(float, lower_band[index]):
                 direction[index] = "down"
                 trend[index] = upper_band[index]
             else:
@@ -223,7 +293,7 @@ def supertrend(
 
 def fibonacci_levels(
     highs: Sequence[float], lows: Sequence[float], lookback: int = 120
-) -> dict[str, float | str | None]:
+) -> dict[str, Any]:
     if not highs or not lows:
         return {"trend": None, "swing_high": None, "swing_low": None, "levels": {}}
     if len(highs) != len(lows):

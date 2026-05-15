@@ -2,6 +2,7 @@ import { AppShell } from "@/components/AppShell";
 import {
   AppSettings,
   Calibration,
+  CalibrationHistoryEntry,
   DecisionLog,
   Health,
   Market,
@@ -12,6 +13,7 @@ import {
   Strategy,
   apiGet
 } from "@/lib/api";
+import { hydrateOpenPositionSourceSignals } from "@/lib/signalHydration";
 
 export const dynamic = "force-dynamic";
 
@@ -36,6 +38,7 @@ async function loadDashboard() {
     strategies,
     logs,
     calibration,
+    calibrationHistory,
     marketIntelligence,
   ] = await Promise.all([
     apiGet<Health>("/api/health"),
@@ -48,12 +51,14 @@ async function loadDashboard() {
     apiGet<Strategy[]>("/api/strategies"),
     apiGet<DecisionLog[]>("/api/logs"),
     apiGet<Calibration>("/api/analytics/calibration"),
+    apiGet<CalibrationHistoryEntry[]>("/api/analytics/calibration/history"),
     apiGet<MarketIntelligence>("/api/market-intelligence").catch(() => ({
       fear_greed: null,
       altcoin_season: null,
     }))
   ]);
-  const latestSignal = signals[0];
+  const hydratedSignals = await hydrateOpenPositionSourceSignals(signals, positions);
+  const latestSignal = hydratedSignals[0];
   const configuredTimeframes = Array.isArray(settings.timeframes?.enabled)
     ? settings.timeframes.enabled.filter((value): value is string => typeof value === "string")
     : [];
@@ -70,8 +75,8 @@ async function loadDashboard() {
     health,
     markets,
     chartMarkets,
-    signals,
-    chartSignals: signals,
+    signals: hydratedSignals,
+    chartSignals: hydratedSignals,
     candles,
     chartMarket,
     chartTimeframe,
@@ -81,6 +86,7 @@ async function loadDashboard() {
     strategies,
     logs,
     calibration,
+    calibrationHistory,
     marketIntelligence
   };
 }

@@ -70,6 +70,10 @@ class Indicator(Base):
     indicator_name: Mapped[str] = mapped_column(String(64), index=True)
     values: Mapped[dict] = mapped_column(JSONB, default=dict)
 
+    __table_args__ = (
+        Index("ix_indicators_market_tf_time", "market_id", "timeframe", "timestamp"),
+    )
+
 
 class Signal(Base):
     __tablename__ = "signals"
@@ -89,12 +93,22 @@ class Signal(Base):
     reason: Mapped[str] = mapped_column(Text)
     strategy_breakdown: Mapped[dict] = mapped_column(JSONB, default=dict)
     status: Mapped[str] = mapped_column(String(32), default="new", index=True)
+    source_candle_open_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
     market: Mapped[Market] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "market_id", "timeframe", "source_candle_open_time", name="uq_signal_market_tf_candle"
+        ),
+        Index("ix_signals_market_tf_created", "market_id", "timeframe", "created_at"),
+    )
 
 
 class Position(Base):
@@ -116,6 +130,9 @@ class Position(Base):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     realized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
     unrealized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    pnl_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
 
     market: Mapped[Market] = relationship()
@@ -128,6 +145,7 @@ class Order(Base):
     position_id: Mapped[int | None] = mapped_column(ForeignKey("positions.id"), nullable=True, index=True)
     signal_id: Mapped[int | None] = mapped_column(ForeignKey("signals.id"), nullable=True, index=True)
     hyperliquid_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    cloid: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
     mode: Mapped[str] = mapped_column(String(16), index=True)
     order_type: Mapped[str] = mapped_column(String(32))
     side: Mapped[str] = mapped_column(String(16))

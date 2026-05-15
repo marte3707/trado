@@ -60,6 +60,19 @@ def seed_defaults(db: Session) -> None:
         db.add(AppSetting(key="kill_switch", value={"enabled": settings.kill_switch_enabled}))
     if db.get(AppSetting, "paper") is None:
         db.add(AppSetting(key="paper", value={"equity": settings.paper_equity}))
+    if db.get(AppSetting, "live_execution") is None:
+        db.add(
+            AppSetting(
+                key="live_execution",
+                value={
+                    "min_account_value_usd": settings.live_min_account_value_usd,
+                    "order_notional_cap_usd": settings.live_order_notional_cap_usd,
+                    "max_slippage_pct": settings.live_max_slippage_pct,
+                    "order_expires_after_seconds": settings.live_order_expires_after_seconds,
+                    "enable_mainnet_live_trading": settings.enable_mainnet_live_trading,
+                },
+            )
+        )
     if db.get(AppSetting, "risk") is None:
         db.add(
             AppSetting(
@@ -117,28 +130,32 @@ def seed_defaults(db: Session) -> None:
             )
         )
     for timeframe in settings.enabled_timeframes:
-        for strategy_name, params in DEFAULT_STRATEGIES.items():
-            exists = (
-                db.query(StrategyConfig)
-                .filter(
-                    StrategyConfig.strategy_name == strategy_name,
-                    StrategyConfig.timeframe == timeframe,
-                )
-                .first()
-            )
-            if exists is None:
-                db.add(
-                    StrategyConfig(
-                        strategy_name=strategy_name,
-                        timeframe=timeframe,
-                        enabled=True,
-                        params=params,
-                        weight=DEFAULT_STRATEGY_WEIGHTS[strategy_name],
-                    )
-                )
-            elif (
-                strategy_name in LEGACY_DEFAULT_STRATEGY_WEIGHTS
-                and exists.weight == LEGACY_DEFAULT_STRATEGY_WEIGHTS[strategy_name]
-            ):
-                exists.weight = DEFAULT_STRATEGY_WEIGHTS[strategy_name]
+        seed_timeframe(db, timeframe)
     db.commit()
+
+
+def seed_timeframe(db: Session, timeframe: str) -> None:
+    for strategy_name, params in DEFAULT_STRATEGIES.items():
+        exists = (
+            db.query(StrategyConfig)
+            .filter(
+                StrategyConfig.strategy_name == strategy_name,
+                StrategyConfig.timeframe == timeframe,
+            )
+            .first()
+        )
+        if exists is None:
+            db.add(
+                StrategyConfig(
+                    strategy_name=strategy_name,
+                    timeframe=timeframe,
+                    enabled=True,
+                    params=params,
+                    weight=DEFAULT_STRATEGY_WEIGHTS[strategy_name],
+                )
+            )
+        elif (
+            strategy_name in LEGACY_DEFAULT_STRATEGY_WEIGHTS
+            and exists.weight == LEGACY_DEFAULT_STRATEGY_WEIGHTS[strategy_name]
+        ):
+            exists.weight = DEFAULT_STRATEGY_WEIGHTS[strategy_name]

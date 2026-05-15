@@ -1,4 +1,5 @@
 from app.indicators.core import (
+    adx,
     atr,
     bollinger_bands,
     ema,
@@ -96,3 +97,37 @@ def test_latest_candlestick_pattern_detects_engulfing() -> None:
     )
     assert result["pattern"] == "bullish_engulfing"
     assert result["direction"] == "LONG"
+
+
+def test_adx_returns_none_when_history_is_too_short() -> None:
+    highs = [10.0 + i for i in range(10)]
+    lows = [9.0 + i for i in range(10)]
+    closes = [9.5 + i for i in range(10)]
+
+    result = adx(highs, lows, closes, 14)
+
+    assert all(value is None for value in result)
+
+
+def test_adx_high_in_trending_market() -> None:
+    closes = [100.0 + i * 0.5 for i in range(80)]
+    highs = [close + 0.3 for close in closes]
+    lows = [close - 0.3 for close in closes]
+
+    result = adx(highs, lows, closes, 14)
+    last = result[-1]
+
+    assert last is not None
+    assert last > 25
+
+
+def test_adx_low_in_choppy_market() -> None:
+    closes = [100.0 + ((-1) ** i) * 0.2 for i in range(80)]
+    highs = [close + 0.4 for close in closes]
+    lows = [close - 0.4 for close in closes]
+
+    result = adx(highs, lows, closes, 14)
+    last = result[-1]
+
+    assert last is not None
+    assert last < 30

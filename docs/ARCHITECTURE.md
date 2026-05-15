@@ -12,7 +12,7 @@
 Il client in `backend/app/services/hyperliquid.py` usa gli endpoint ufficiali:
 
 - `POST /info` per `meta`, `spotMeta`, `allMids`, `candleSnapshot`, account state e ordini aperti.
-- `POST /exchange` e' incapsulato in `OrderExecutionEngine`, ma il live e' disabilitato finche' non sono presenti tutte le protezioni esplicite.
+- `POST /exchange` e' incapsulato in `OrderExecutionEngine` tramite SDK ufficiale Hyperliquid. Il live resta bloccato finche' non sono presenti modalita' `AUTO_TRADE`, flag live, credenziali, kill switch spento e validazioni rischio.
 
 Regole asset:
 
@@ -28,7 +28,7 @@ Regole asset:
 4. `SignalScoringEngine` combina i risultati e applica soglie/penalita'.
 5. `RiskManager` calcola SL/TP con ATR e risk/reward.
 6. Il segnale viene salvato e notificato.
-7. `OrderExecutionEngine` puo' aprire paper trade; live trading richiede `AUTO_TRADE`, flag live, kill switch spento e validazione rischio.
+7. `OrderExecutionEngine` puo' aprire paper trade o live trade. Il live trading calcola size da account value e rischio, invia market IOC, registra posizione/ordine e piazza stop loss + take profit reduce-only.
 
 ## Estensioni previste
 
@@ -38,6 +38,5 @@ Regole asset:
 - Bollinger Bands
 - VWAP
 - Pattern candlestick
-- Live execution completa tramite SDK ufficiale Hyperliquid
+- Fill/reconciliation live piu' granulare tramite stream ordini/fill Hyperliquid
 - Performance analytics sui segnali
-

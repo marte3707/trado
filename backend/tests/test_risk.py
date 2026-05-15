@@ -54,3 +54,34 @@ def test_risk_plan_uses_score_for_more_ambitious_targets() -> None:
     assert baseline is not None
     assert strong is not None
     assert strong.risk_reward > baseline.risk_reward
+
+
+def test_higher_min_atr_multiplier_widens_stop_loss() -> None:
+    candles = build_market_candles(Direction.LONG)
+    baseline = RiskManager().build_plan(
+        candles, Direction.LONG, signal_score=95, min_risk_reward=2, min_atr_multiplier=1.5
+    )
+    wider = RiskManager().build_plan(
+        candles, Direction.LONG, signal_score=95, min_risk_reward=2, min_atr_multiplier=3.5
+    )
+    assert baseline is not None
+    assert wider is not None
+    # Stop più largo => prezzo dello stop più lontano dall'entry verso il basso
+    assert wider.stop_loss < baseline.stop_loss
+
+
+def test_default_min_atr_multiplier_preserves_legacy_behavior() -> None:
+    candles = build_market_candles(Direction.LONG)
+    legacy = RiskManager().build_plan(candles, Direction.LONG, signal_score=78, min_risk_reward=2)
+    explicit_default = RiskManager().build_plan(
+        candles,
+        Direction.LONG,
+        signal_score=78,
+        min_risk_reward=2,
+        min_atr_multiplier=1.5,
+        min_stop_distance_pct=0.020,
+    )
+    assert legacy is not None
+    assert explicit_default is not None
+    assert legacy.stop_loss == explicit_default.stop_loss
+    assert legacy.take_profit_2 == explicit_default.take_profit_2

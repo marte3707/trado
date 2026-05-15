@@ -2,6 +2,10 @@
 
 import {
   Activity,
+  AlertTriangle,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   Ban,
   BarChart3,
   Bell,
@@ -10,6 +14,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Database,
+  Info,
   LayoutDashboard,
   ListChecks,
   Play,
@@ -17,6 +22,7 @@ import {
   RotateCcw,
   Shield,
   Square,
+  Target,
   Trash2,
   X,
   XCircle
@@ -26,6 +32,7 @@ import { ChartPanel } from "@/components/ChartPanel";
 import {
   AppSettings,
   Calibration,
+  CalibrationHistoryEntry,
   DecisionLog,
   Health,
   Market,
@@ -60,7 +67,11 @@ type Filters = {
 type DashboardView = "overview" | "trading" | "performance" | "system";
 type TableKey = "signals" | "positions" | "orders" | "closedPositions";
 type TablePageState = Record<TableKey, { page: number; pageSize: number }>;
-type SignalToast = { id: number; title: string; body: string; createdAt: number };
+type ToastTone = "signal" | "strong" | "risk" | "info";
+type DashboardToast = { id: string; tone: ToastTone; title: string; body: string; createdAt: number };
+type SignalSortKey = "id" | "symbol" | "timeframe" | "direction" | "score" | "entry" | "riskReward" | "status" | "createdAt";
+type SortDirection = "asc" | "desc";
+type SignalSort = { key: SignalSortKey; direction: SortDirection } | null;
 
 export type DashboardData = {
   health: Health;
@@ -77,6 +88,7 @@ export type DashboardData = {
   strategies: Strategy[];
   logs: DecisionLog[];
   calibration: Calibration;
+  calibrationHistory: CalibrationHistoryEntry[];
   marketIntelligence: MarketIntelligence;
 };
 
@@ -234,6 +246,126 @@ function asNumber(value: unknown): number | null {
   if (value === null || value === undefined) return null;
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isWorkerCycleCompleted(log: DecisionLog) {
+  return log.message === "Worker cycle completed";
+}
+
+function decisionLogAlertLevel(log: DecisionLog): "strong" | "good" | "info" | "warn" | "risk" {
+  const eventType = log.event_type.toLowerCase();
+  const score = asNumber(log.data?.score);
+  if (eventType.includes("error") || eventType.includes("fail")) return "risk";
+  if (eventType.includes("strong") || (score !== null && score >= 90)) return "strong";
+  if (eventType.includes("signal")) return "good";
+  if (eventType.includes("warn") || eventType.includes("kill")) return "warn";
+  return "info";
+}
+
+function exitTriggerLabel(log: DecisionLog): string | null {
+  const text = `${log.event_type} ${log.message}`.toLowerCase();
+  if (text.includes("stop_loss") || text.includes("stop loss")) return "SL raggiunto";
+  if (text.includes("tp1")) return "TP1 raggiunto";
+  if (text.includes("tp2")) return "TP2 raggiunto";
+  if (text.includes("tp3")) return "TP3 raggiunto";
+  if (text.includes("take_profit") || text.includes("take profit")) return "TP raggiunto";
+  return null;
+}
+
+function marketLabelById(markets: Market[], marketId: number | null | undefined) {
+  if (marketId === null || marketId === undefined) return null;
+  const market = markets.find((item) => item.id === marketId);
+  return market ? marketLabel(market) : null;
+}
+
+function buildLogToast(log: DecisionLog, markets: Market[]): Omit<DashboardToast, "id" | "createdAt"> | null {
+  if (isWorkerCycleCompleted(log)) return null;
+
+  const triggerLabel = exitTriggerLabel(log);
+  const market = marketLabelById(markets, log.market_id);
+  const context = [
+    market,
+    log.position_id ? `posizione #${log.position_id}` : null,
+    log.signal_id ? `segnale #${log.signal_id}` : null,
+    typeof log.data?.exit_price === "string" ? `prezzo ${formatCompactNumber(log.data.exit_price, 8)}` : null
+  ].filter(Boolean).join(" · ");
+
+  if (triggerLabel) {
+    return {
+      tone: triggerLabel.startsWith("SL") ? "risk" : "strong",
+      title: triggerLabel,
+      body: context || log.message
+    };
+  }
+
+  const level = decisionLogAlertLevel(log);
+  if (level !== "strong" && level !== "risk" && level !== "info") return null;
+  return {
+    tone: level,
+    title: level === "strong" ? "Alert Strong" : level === "risk" ? "Alert Risk" : "Alert Info",
+    body: context ? `${context} · ${log.message}` : log.message
+  };
+}
+
+const SIGNAL_SORT_DEFAULTS: Record<SignalSortKey, SortDirection> = {
+  id: "desc",
+  symbol: "asc",
+  timeframe: "asc",
+  direction: "asc",
+  score: "desc",
+  entry: "desc",
+  riskReward: "desc",
+  status: "asc",
+  createdAt: "desc"
+};
+
+function signalSearchText(signal: Signal) {
+  const strategyNames = Object.keys(signal.strategy_breakdown ?? {});
+  return [
+    String(signal.id),
+    signal.market?.symbol,
+    signal.market?.base,
+    signal.market?.quote,
+    signal.market ? marketLabel(signal.market) : null,
+    signal.market?.market_type,
+    signal.timeframe,
+    signal.direction,
+    signal.score,
+    signal.confidence_label,
+    signal.status,
+    signal.reason,
+    ...strategyNames
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+function signalSortValue(signal: Signal, key: SignalSortKey): string | number | null {
+  if (key === "id") return signal.id;
+  if (key === "symbol") return signal.market?.symbol ?? null;
+  if (key === "timeframe") return signal.timeframe;
+  if (key === "direction") return signal.direction;
+  if (key === "score") return signal.score;
+  if (key === "entry") return asNumber(signal.entry_price);
+  if (key === "riskReward") return asNumber(signal.risk_reward);
+  if (key === "createdAt") return new Date(signal.created_at).getTime();
+  return signal.status;
+}
+
+function compareSignals(a: Signal, b: Signal, sort: Exclude<SignalSort, null>) {
+  const aValue = signalSortValue(a, sort.key);
+  const bValue = signalSortValue(b, sort.key);
+  const aEmpty = aValue === null || aValue === "";
+  const bEmpty = bValue === null || bValue === "";
+
+  if (aEmpty && bEmpty) return b.id - a.id;
+  if (aEmpty) return 1;
+  if (bEmpty) return -1;
+
+  const result = typeof aValue === "number" && typeof bValue === "number"
+    ? aValue - bValue
+    : String(aValue).localeCompare(String(bValue), undefined, { numeric: true, sensitivity: "base" });
+
+  if (result === 0) return b.id - a.id;
+  return sort.direction === "asc" ? result : -result;
 }
 
 function formatCompactNumber(value: string | number | null | undefined, maximumFractionDigits = 2): string {
@@ -415,6 +547,8 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [chartSearch, setChartSearch] = useState("");
+  const [signalSearch, setSignalSearch] = useState("");
+  const [signalSort, setSignalSort] = useState<SignalSort>(null);
   const [activeView, setActiveView] = useState<DashboardView>("overview");
   const [tablePages, setTablePages] = useState<TablePageState>({
     signals: { page: 1, pageSize: 10 },
@@ -422,11 +556,14 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
     orders: { page: 1, pageSize: 10 },
     closedPositions: { page: 1, pageSize: 10 }
   });
-  const [signalToasts, setSignalToasts] = useState<SignalToast[]>([]);
+  const [dashboardToasts, setDashboardToasts] = useState<DashboardToast[]>([]);
   const [collapsedTfs, setCollapsedTfs] = useState<Record<string, boolean>>({});
   const [tooltip, setTooltip] = useState<{ text: string; x: number; y: number } | null>(null);
   const tooltipHideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const seenSignalIds = useRef<Set<number>>(new Set(initialData.signals.map((signal) => signal.id)));
+  const seenSignalIds = useRef<Set<number>>(
+    new Set([...initialData.signals, ...initialData.chartSignals].map((signal) => signal.id))
+  );
+  const seenLogIds = useRef<Set<number>>(new Set(initialData.logs.map((log) => log.id)));
 
   function showTooltip(e: React.MouseEvent, text: string) {
     if (tooltipHideTimer.current) clearTimeout(tooltipHideTimer.current);
@@ -494,14 +631,19 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
     );
   const averageHoldHours = averageHoldMs.count > 0 ? averageHoldMs.total / averageHoldMs.count / 3600000 : null;
 
-  const filteredSignals = useMemo(
-    () =>
-      signals.filter((s) => {
+  const filteredSignals = useMemo(() => {
+    const query = signalSearch.trim().toLowerCase();
+    return signals.filter((s) => {
         if (isClosedSignal(s) || closedSignalIds.has(s.id)) return false;
+        if (query && !signalSearchText(s).includes(query)) return false;
         if (filters.marketType === "all") return true;
         return s.market?.market_type === filters.marketType;
-      }),
-    [signals, filters.marketType, closedSignalIds]
+      });
+  }, [signals, filters.marketType, closedSignalIds, signalSearch]);
+
+  const sortedSignals = useMemo(
+    () => signalSort ? [...filteredSignals].sort((a, b) => compareSignals(a, b, signalSort)) : filteredSignals,
+    [filteredSignals, signalSort]
   );
 
   const strategiesByTf = useMemo(() => {
@@ -535,7 +677,7 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
     tablePages.closedPositions.page,
     Math.max(1, Math.ceil(closedPositions.length / tablePages.closedPositions.pageSize))
   );
-  const paginatedSignals = filteredSignals.slice(
+  const paginatedSignals = sortedSignals.slice(
     (signalPage - 1) * tablePages.signals.pageSize,
     signalPage * tablePages.signals.pageSize
   );
@@ -559,12 +701,12 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
   }, [notice]);
 
   useEffect(() => {
-    if (signalToasts.length === 0) return;
+    if (dashboardToasts.length === 0) return;
     const timer = setTimeout(() => {
-      setSignalToasts((current) => current.filter((toast) => Date.now() - toast.createdAt < 7000));
+      setDashboardToasts((current) => current.filter((toast) => Date.now() - toast.createdAt < 7000));
     }, 1000);
     return () => clearTimeout(timer);
-  }, [signalToasts]);
+  }, [dashboardToasts]);
 
   async function loadCandles(market: Market | null, timeframe: string) {
     if (!market) { setCandles([]); return; }
@@ -586,18 +728,31 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
   function registerNewSignals(nextSignals: Signal[]) {
     const incoming = nextSignals.filter((signal) => !seenSignalIds.current.has(signal.id));
     for (const signal of nextSignals) seenSignalIds.current.add(signal.id);
-    const visibleIncoming = incoming.filter((signal) => signal.status === "new");
-    if (visibleIncoming.length === 0) return false;
-    setSignalToasts((current) => [
-      ...visibleIncoming.slice(0, 4).map((signal) => ({
-        id: signal.id,
-        title: `${signal.market?.symbol ?? "Mercato"} ${signal.timeframe}`,
-        body: `${signal.direction.replace("_", " ")} · score ${signal.score}`,
+    if (incoming.length === 0) return false;
+    setDashboardToasts((current) => [
+      ...incoming.map((signal) => ({
+        id: `signal-${signal.id}`,
+        tone: signal.direction.includes("STRONG") || signal.score >= 90 ? "strong" as const : "signal" as const,
+        title: `Nuovo segnale ${signal.market?.symbol ?? "Mercato"} ${signal.timeframe}`,
+        body: `${signal.direction.replaceAll("_", " ")} · score ${signal.score} · stato ${signal.status}`,
         createdAt: Date.now()
       })),
       ...current
-    ].slice(0, 5));
+    ].slice(0, 8));
     return true;
+  }
+
+  function registerAlertLogs(nextLogs: DecisionLog[], nextMarkets: Market[]) {
+    const incoming = nextLogs.filter((log) => !seenLogIds.current.has(log.id));
+    for (const log of nextLogs) seenLogIds.current.add(log.id);
+    const toasts = incoming
+      .map((log) => {
+        const toast = buildLogToast(log, nextMarkets);
+        return toast ? { id: `log-${log.id}`, ...toast, createdAt: Date.now() } : null;
+      })
+      .filter((toast): toast is DashboardToast => toast !== null);
+    if (toasts.length === 0) return;
+    setDashboardToasts((current) => [...toasts, ...current].slice(0, 8));
   }
 
   async function refresh(nextFilters = filters, options: { silent?: boolean } = {}) {
@@ -630,11 +785,12 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
           apiGet<Strategy[]>("/api/strategies"),
           apiGet<DecisionLog[]>("/api/logs"),
           apiGet<Calibration>("/api/analytics/calibration")
-        ]);
+      ]);
       setHealth(nextHealth);
       setMarkets(nextMarkets);
       setChartMarkets(nextChartMarkets);
-      const hasNewSignals = registerNewSignals(nextSignals);
+      const hasNewSignals = registerNewSignals(nextChartSignals);
+      registerAlertLogs(nextLogs, nextMarkets);
       setSignals(nextSignals);
       setChartSignals(nextChartSignals);
       setPositions(nextPositions);
@@ -676,6 +832,37 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
     setFilters(nextFilters);
     updateTablePage("signals", { page: 1 });
     await refresh(nextFilters);
+  }
+
+  function updateSignalSearch(value: string) {
+    setSignalSearch(value);
+    updateTablePage("signals", { page: 1 });
+  }
+
+  function toggleSignalSort(key: SignalSortKey) {
+    setSignalSort((current) => {
+      if (current?.key !== key) return { key, direction: SIGNAL_SORT_DEFAULTS[key] };
+      return { key, direction: current.direction === "asc" ? "desc" : "asc" };
+    });
+  }
+
+  function signalSortIcon(key: SignalSortKey) {
+    if (signalSort?.key !== key) return <ArrowUpDown size={12} className="opacity-40" />;
+    return signalSort.direction === "asc" ? <ArrowUp size={12} /> : <ArrowDown size={12} />;
+  }
+
+  function signalHeader(key: SignalSortKey, label: string) {
+    return (
+      <button
+        type="button"
+        onClick={() => toggleSignalSort(key)}
+        className={`flex items-center gap-1 uppercase tracking-wider ${signalSort?.key === key ? "text-text" : "text-muted/70"}`}
+        title={`Ordina per ${label}`}
+      >
+        <span>{label}</span>
+        {signalSortIcon(key)}
+      </button>
+    );
   }
 
   async function updateChart(nextMarketKey: string, nextTimeframe = chartTimeframe) {
@@ -899,7 +1086,11 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
             vwap: false,
             supertrend: false,
             levels: false,
-            signals: false
+            fibonacci: false,
+            signals: false,
+            rsi: false,
+            macd: false,
+            candlestick_patterns: false
           }}
         />
       </section>
@@ -916,6 +1107,13 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
             )}
           </div>
           <div className="flex items-center gap-2 flex-wrap">
+            <input
+              type="text"
+              value={signalSearch}
+              onChange={(e) => updateSignalSearch(e.target.value)}
+              placeholder="Cerca segnale..."
+              className={`${INPUT_CLS} w-44`}
+            />
             {/* Status pill-tabs */}
             <PillFilter
               value={filters.status}
@@ -982,9 +1180,17 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
           <table className="w-full border-collapse min-w-240">
             <thead>
               <tr>
-                {["#", "Coppia", "TF", "Direzione", "Score", "Entry", "SL / TP", "R/R", "Stato", "Ora", ""].map((h, i) => (
-                  <th key={i} className={TH}>{h}</th>
-                ))}
+                <th className={TH}>{signalHeader("id", "#")}</th>
+                <th className={TH}>{signalHeader("symbol", "Coppia")}</th>
+                <th className={TH}>{signalHeader("timeframe", "TF")}</th>
+                <th className={TH}>{signalHeader("direction", "Direzione")}</th>
+                <th className={TH}>{signalHeader("score", "Score")}</th>
+                <th className={TH}>{signalHeader("entry", "Entry")}</th>
+                <th className={TH}>SL / TP</th>
+                <th className={TH}>{signalHeader("riskReward", "R/R")}</th>
+                <th className={TH}>{signalHeader("status", "Stato")}</th>
+                <th className={TH}>{signalHeader("createdAt", "Ora")}</th>
+                <th className={TH} />
               </tr>
             </thead>
             <tbody>
@@ -1646,16 +1852,23 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
       </>
       )}
 
-      {signalToasts.length > 0 && (
+      {dashboardToasts.length > 0 && (
         <div className="fixed right-4 top-4 z-50 grid w-80 max-w-[calc(100vw-2rem)] gap-2">
-          {signalToasts.map((toast) => (
+          {dashboardToasts.map((toast) => {
+            const Icon = toast.tone === "risk" ? AlertTriangle : toast.tone === "info" ? Info : toast.tone === "strong" ? Target : Bell;
+            const toneClass = toast.tone === "risk"
+              ? "border-red/25 bg-red/15 text-red"
+              : toast.tone === "strong"
+                ? "border-green/25 bg-green/15 text-green"
+                : "border-blue/25 bg-blue/15 text-blue";
+            return (
             <div
               key={toast.id}
-              className="rounded-xl border border-blue/25 bg-surface shadow-deep p-3"
+              className="rounded-xl border border-divider bg-surface shadow-deep p-3"
             >
               <div className="flex items-start gap-2">
-                <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-blue/15 text-blue">
-                  <Bell size={14} />
+                <span className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${toneClass}`}>
+                  <Icon size={14} />
                 </span>
                 <div className="min-w-0 flex-1">
                   <strong className="block truncate text-sm font-semibold text-text">{toast.title}</strong>
@@ -1663,14 +1876,15 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
                 </div>
                 <button
                   className="text-muted hover:text-text"
-                  onClick={() => setSignalToasts((current) => current.filter((item) => item.id !== toast.id))}
+                  onClick={() => setDashboardToasts((current) => current.filter((item) => item.id !== toast.id))}
                   title="Chiudi notifica"
                 >
                   <X size={13} />
                 </button>
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
 

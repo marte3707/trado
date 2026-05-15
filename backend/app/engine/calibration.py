@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.models import AppSetting, DecisionLog, StrategyConfig
+from app.engine.diagnostics import equity_slope
 from app.engine.performance import PerformanceStats, SignalPerformanceAnalyzer, serialize_stats
 
 
@@ -43,8 +44,28 @@ class AutoCalibrationEngine:
         )
         overall = self.analyzer.summarize_positions(positions)
         if not settings["enabled"] and not force:
+            if commit:
+                self._record_run(
+                    db,
+                    force=force,
+                    overall=overall,
+                    changes=[],
+                    event_type="auto_calibration_skipped",
+                    reason="auto calibration disabled",
+                    status="skipped",
+                )
             return self._result(False, False, "auto calibration disabled", overall, [], {}, settings)
         if overall.trades < int(settings["min_closed_trades"]):
+            if commit:
+                self._record_run(
+                    db,
+                    force=force,
+                    overall=overall,
+                    changes=[],
+                    event_type="auto_calibration_skipped",
+                    reason="not enough closed trades",
+                    status="skipped",
+                )
             return self._result(
                 False,
                 False,
@@ -58,7 +79,12 @@ class AutoCalibrationEngine:
         changes: list[CalibrationChange] = []
         changes.extend(self._calibrate_strategy_weights(db, settings))
         changes.extend(self._calibrate_strategy_params(db, settings))
-        changes.extend(self._calibrate_risk_settings(db, overall, settings))
+        slope_value = equity_slope(positions)
+        changes.extend(
+            self._calibrate_risk_settings(
+                db, overall, settings, equity_slope_value=slope_value
+            )
+        )
         strategy_changes = {
             change.key: {
                 "target": change.target,
@@ -71,29 +97,15 @@ class AutoCalibrationEngine:
         }
 
         if commit:
-            state = db.get(AppSetting, "auto_calibration_state") or AppSetting(
-                key="auto_calibration_state",
-                value={},
+            self._record_run(
+                db,
+                force=force,
+                overall=overall,
+                changes=changes,
+                event_type="auto_calibration_applied" if changes else "auto_calibration_checked",
+                reason="calibration completed",
+                status="applied" if changes else "checked",
             )
-            state.value = {
-                "last_run_at": datetime.now(timezone.utc).isoformat(),
-                "last_trade_count": overall.trades,
-                "last_summary": serialize_stats(overall),
-                "last_changes": [change.__dict__ for change in changes],
-            }
-            db.add(state)
-            db.add(
-                DecisionLog(
-                    event_type="auto_calibration_applied" if changes else "auto_calibration_checked",
-                    message="Auto calibration completed",
-                    data={
-                        "force": force,
-                        "overall": serialize_stats(overall),
-                        "changes": [change.__dict__ for change in changes],
-                    },
-                )
-            )
-            db.commit()
         return self._result(bool(changes), True, "calibration completed", overall, changes, strategy_changes, settings)
 
     def preview(self, db: Session) -> CalibrationResult:
@@ -114,6 +126,10 @@ class AutoCalibrationEngine:
             "min_risk_reward_floor": 2.0,
             "min_risk_reward_ceiling": 3.0,
             "min_risk_per_trade_pct": 0.25,
+            "auto_disable_enabled": True,
+            "auto_disable_min_trades": 25,
+            "auto_disable_win_rate": 0.30,
+            "deep_defensive_slope_threshold": -2.0,
         }
         return {**defaults, **value}
 
@@ -144,6 +160,7 @@ class AutoCalibrationEngine:
             },
         }
         db.add(AppSetting(key="auto_calibration_baseline", value=baseline))
+        db.flush()
         return baseline
 
     def _baseline_strategy_params(self, db: Session) -> dict[str, dict[str, Any]]:
@@ -169,8 +186,17 @@ class AutoCalibrationEngine:
         min_trades = int(settings["min_strategy_trades"])
         min_weight = int(settings["min_weight"])
         max_weight = int(settings["max_weight"])
+        auto_disable_enabled = bool(settings.get("auto_disable_enabled", True))
+        auto_disable_min_trades = int(settings.get("auto_disable_min_trades", 25))
+        auto_disable_win_rate = float(settings.get("auto_disable_win_rate", 0.30))
         changes: list[CalibrationChange] = []
         strategies = db.query(StrategyConfig).all()
+        active_per_timeframe: dict[str, int] = {}
+        for strategy in strategies:
+            if strategy.enabled:
+                active_per_timeframe[strategy.timeframe] = (
+                    active_per_timeframe.get(strategy.timeframe, 0) + 1
+                )
         stats_by_timeframe: dict[str, dict[str, PerformanceStats]] = {}
 
         for strategy in strategies:
@@ -185,6 +211,28 @@ class AutoCalibrationEngine:
             if stats is None or stats.trades < min_trades:
                 continue
             key = f"{strategy.timeframe}:{strategy.strategy_name}"
+            if (
+                auto_disable_enabled
+                and strategy.enabled
+                and stats.trades >= auto_disable_min_trades
+                and stats.win_rate < auto_disable_win_rate
+                and active_per_timeframe.get(strategy.timeframe, 0) > 1
+            ):
+                strategy.enabled = False
+                active_per_timeframe[strategy.timeframe] -= 1
+                changes.append(
+                    CalibrationChange(
+                        target="strategy_enabled",
+                        key=key,
+                        before=True,
+                        after=False,
+                        reason=(
+                            f"auto-disabled: win_rate {stats.win_rate:.2f} < "
+                            f"{auto_disable_win_rate:.2f} over {stats.trades} trades"
+                        ),
+                    )
+                )
+                continue
             baseline_weight = int(baseline_weights.get(key, strategy.weight))
             factor, reason = self._strategy_factor(stats)
             calibrated = max(min_weight, min(max_weight, round(baseline_weight * factor)))
@@ -243,6 +291,8 @@ class AutoCalibrationEngine:
         db: Session,
         overall: PerformanceStats,
         settings: dict[str, Any],
+        *,
+        equity_slope_value: float = 0.0,
     ) -> list[CalibrationChange]:
         baseline = self._baseline_state(db).get("risk", {})
         app_settings = get_settings()
@@ -253,11 +303,41 @@ class AutoCalibrationEngine:
         base_rr = float(baseline.get("min_risk_reward", max(app_settings.min_risk_reward, 2.0)))
         base_risk = float(baseline.get("max_risk_per_trade_pct", app_settings.max_risk_per_trade_pct))
 
+        state_setting = db.get(AppSetting, "auto_calibration_state")
+        state_value = dict(
+            state_setting.value
+            if state_setting is not None and isinstance(state_setting.value, dict)
+            else {}
+        )
+        prev_streak = int(state_value.get("deep_defensive_positive_streak", 0))
+        prev_in_deep = bool(state_value.get("deep_defensive_active", False))
+        deep_threshold = float(settings.get("deep_defensive_slope_threshold", -2.0))
+
+        in_deep_defensive = False
+        new_streak = 0
+        if equity_slope_value < deep_threshold:
+            in_deep_defensive = True
+            new_streak = 0
+        elif equity_slope_value >= 0:
+            new_streak = prev_streak + 1
+            in_deep_defensive = prev_in_deep and new_streak < 2
+        else:
+            new_streak = 0
+            in_deep_defensive = prev_in_deep
+
         score_delta = 0
         rr_delta = 0.0
         risk_pct = base_risk
         reason = "historical performance near baseline"
-        if overall.realized_pnl < 0 or overall.win_rate < 0.4 or (
+        if in_deep_defensive:
+            score_delta = 12
+            rr_delta = 0.4
+            risk_pct = max(float(settings["min_risk_per_trade_pct"]), base_risk * 0.5)
+            reason = (
+                f"deep defensive mode: equity slope {equity_slope_value:.4f} "
+                f"below threshold {deep_threshold}"
+            )
+        elif overall.realized_pnl < 0 or overall.win_rate < 0.4 or (
             overall.profit_factor is not None and overall.profit_factor < 0.9
         ):
             score_delta = 8
@@ -271,6 +351,15 @@ class AutoCalibrationEngine:
             rr_delta = 0.0
             risk_pct = base_risk
             reason = "restore baseline after strong historical results"
+
+        state_value["deep_defensive_active"] = in_deep_defensive
+        state_value["deep_defensive_positive_streak"] = new_streak
+        state_value["last_equity_slope"] = equity_slope_value
+        state_setting_to_persist = state_setting or AppSetting(
+            key="auto_calibration_state", value={}
+        )
+        state_setting_to_persist.value = state_value
+        db.add(state_setting_to_persist)
 
         next_score = int(
             max(
@@ -445,6 +534,47 @@ class AutoCalibrationEngine:
             strategy_adjustments=strategy_adjustments,
             settings=settings,
         )
+
+    def _record_run(
+        self,
+        db: Session,
+        *,
+        force: bool,
+        overall: PerformanceStats,
+        changes: list[CalibrationChange],
+        event_type: str,
+        reason: str,
+        status: str,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        serialized_changes = [change.__dict__ for change in changes]
+        state = db.get(AppSetting, "auto_calibration_state") or AppSetting(
+            key="auto_calibration_state",
+            value={},
+        )
+        state.value = {
+            "last_run_at": now,
+            "last_trade_count": overall.trades,
+            "last_summary": serialize_stats(overall),
+            "last_changes": serialized_changes,
+            "last_reason": reason,
+            "last_status": status,
+        }
+        db.add(state)
+        db.add(
+            DecisionLog(
+                event_type=event_type,
+                message="Auto calibration completed" if event_type != "auto_calibration_skipped" else "Auto calibration skipped",
+                data={
+                    "force": force,
+                    "status": status,
+                    "reason": reason,
+                    "overall": serialize_stats(overall),
+                    "changes": serialized_changes,
+                },
+            )
+        )
+        db.commit()
 
 
 def serialize_calibration(result: CalibrationResult) -> dict[str, Any]:

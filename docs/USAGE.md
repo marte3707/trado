@@ -4,9 +4,11 @@
 
 - `SIGNAL_ONLY`: genera e salva segnali, non apre posizioni.
 - `PAPER_TRADING`: permette posizioni simulate.
-- `AUTO_TRADE`: riservata alla fase successiva; richiede anche `ENABLE_LIVE_TRADING=true`.
+- `AUTO_TRADE`: abilita l'esecuzione live su Hyperliquid se passano tutti i guardrail.
 
-Non salvare private key nel database. Se serve live trading, impostare `HYPERLIQUID_PRIVATE_KEY` solo come variabile ambiente del backend/worker.
+Il live trading richiede `ENABLE_LIVE_TRADING=true`, account/key Hyperliquid in ambiente, kill switch spento e validazioni rischio. Su mainnet richiede anche `ENABLE_MAINNET_LIVE_TRADING=true` o il corrispondente toggle runtime `enable_mainnet_live_trading`.
+
+Non salvare private key nel database. Impostare `HYPERLIQUID_PRIVATE_KEY` solo come variabile ambiente del backend/worker.
 
 ## Avvio locale passo per passo
 
@@ -42,9 +44,10 @@ Per la prima esecuzione lascia questi valori sicuri:
 OPERATION_MODE=SIGNAL_ONLY
 HYPERLIQUID_NETWORK=testnet
 ENABLE_LIVE_TRADING=false
+ENABLE_MAINNET_LIVE_TRADING=false
 ```
 
-Non inserire private key per l'MVP. Il live trading non e' implementato nella prima versione.
+Per preparare testnet live, configurare anche `HYPERLIQUID_ACCOUNT_ADDRESS` e `HYPERLIQUID_PRIVATE_KEY`. Usare una API wallet autorizzata dal wallet principale Hyperliquid.
 
 ### 3. Avvia PostgreSQL
 
@@ -177,7 +180,42 @@ Il worker resta attivo e ogni ciclo:
 - calcola strategie;
 - genera segnali sopra soglia;
 - invia alert Telegram se configurato;
-- apre paper trade solo se `OPERATION_MODE=PAPER_TRADING`.
+- apre paper trade se `OPERATION_MODE=PAPER_TRADING`;
+- in `AUTO_TRADE`, riconcilia posizioni live e invia ordini live solo se i guardrail passano.
+
+## Checklist AUTO_TRADE
+
+Prima di abilitare live:
+
+1. Passare da paper a testnet:
+
+```env
+HYPERLIQUID_NETWORK=testnet
+OPERATION_MODE=AUTO_TRADE
+ENABLE_LIVE_TRADING=true
+ENABLE_MAINNET_LIVE_TRADING=false
+```
+
+2. Configurare `HYPERLIQUID_ACCOUNT_ADDRESS` e `HYPERLIQUID_PRIVATE_KEY` nel backend e nel worker.
+3. Tenere `KILL_SWITCH_ENABLED=false` solo quando si vuole davvero consentire invio ordini.
+4. Verificare in Settings:
+   - `Max posizioni live`
+   - `Max daily loss`
+   - `Max esposizione live`
+   - `Risk per trade`
+   - `Order cap`
+   - `Max slippage`
+5. Controllare `GET /api/health`: `live_trading_allowed` deve essere `true` e `live_readiness.checks` vuoto.
+6. Provare `POST /api/signals/{id}/execute-live` su un singolo segnale testnet prima di lasciare il worker in `AUTO_TRADE`.
+
+Mainnet:
+
+```env
+HYPERLIQUID_NETWORK=mainnet
+ENABLE_MAINNET_LIVE_TRADING=true
+```
+
+Mainnet resta bloccato se `enable_mainnet_live_trading` non e' esplicitamente attivo anche nelle impostazioni runtime.
 
 ### 8. Installa e avvia frontend
 

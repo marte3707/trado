@@ -18,20 +18,99 @@ interface Props {
   onOpenChart: (signal: Signal) => void;
 }
 
+type SortKey = "symbol" | "timeframe" | "direction" | "score" | "entry" | "stopLoss" | "takeProfit" | "riskReward" | "strategies" | "createdAt" | "status";
+type SortDirection = "asc" | "desc";
+type SortConfig = { key: SortKey; direction: SortDirection } | null;
+
+const SORT_DEFAULT_DIRECTION: Record<SortKey, SortDirection> = {
+  symbol: "asc",
+  timeframe: "asc",
+  direction: "asc",
+  score: "desc",
+  entry: "desc",
+  stopLoss: "desc",
+  takeProfit: "desc",
+  riskReward: "desc",
+  strategies: "asc",
+  createdAt: "desc",
+  status: "asc",
+};
+
+function sortableNumber(value: string | number | null | undefined): number | null {
+  if (value == null || value === "") return null;
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function sortableValue(signal: Signal, key: SortKey): string | number | null {
+  if (key === "symbol") return signal.market?.symbol ?? null;
+  if (key === "timeframe") return signal.timeframe;
+  if (key === "direction") return signal.direction;
+  if (key === "score") return signal.score;
+  if (key === "entry") return sortableNumber(signal.entry_price);
+  if (key === "stopLoss") return sortableNumber(signal.stop_loss);
+  if (key === "takeProfit") return sortableNumber(signal.take_profit_1);
+  if (key === "riskReward") return sortableNumber(signal.risk_reward);
+  if (key === "strategies") return Object.keys(signal.strategy_breakdown ?? {}).join(" ");
+  if (key === "createdAt") return new Date(signal.created_at).getTime();
+  return signal.status;
+}
+
+function compareSignals(a: Signal, b: Signal, sort: Exclude<SortConfig, null>) {
+  const aValue = sortableValue(a, sort.key);
+  const bValue = sortableValue(b, sort.key);
+  const aEmpty = aValue == null || aValue === "";
+  const bEmpty = bValue == null || bValue === "";
+
+  if (aEmpty && bEmpty) return b.id - a.id;
+  if (aEmpty) return 1;
+  if (bEmpty) return -1;
+
+  const result = typeof aValue === "number" && typeof bValue === "number"
+    ? aValue - bValue
+    : String(aValue).localeCompare(String(bValue), undefined, { numeric: true, sensitivity: "base" });
+
+  if (result === 0) return b.id - a.id;
+  return sort.direction === "asc" ? result : -result;
+}
+
 export function SignalsScreen({ signals, strategies, health, threshold, onRefresh, onOpenChart }: Props) {
+  const [search, setSearch] = useState("");
   const [market, setMarket] = useState("all");
   const [dir, setDir] = useState("all");
   const [tf, setTf] = useState("all");
   const [stratFilter, setStratFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState("open");
+  const [minScore, setMinScore] = useState(0);
+  const [sort, setSort] = useState<SortConfig>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const OPEN_STATUSES = ["new", "active", "executed"];
   const CLOSED_STATUSES = ["closed", "ignored", "invalidated"];
 
+  const query = search.trim().toLowerCase();
+
   const filtered = signals.filter(s => {
-    if (s.score < threshold) return false;
+    if (query) {
+      const strategyNames = Object.keys(s.strategy_breakdown ?? {});
+      const haystack = [
+        String(s.id),
+        s.market?.symbol,
+        s.market?.base,
+        s.market?.quote,
+        s.market?.market_type,
+        s.timeframe,
+        s.direction,
+        s.status,
+        s.confidence_label,
+        s.reason,
+        ...strategyNames,
+      ].filter(Boolean).join(" ").toLowerCase();
+
+      if (!haystack.includes(query)) return false;
+    }
+    if (s.score < minScore) return false;
     if (statusFilter === "open" && !OPEN_STATUSES.includes(s.status)) return false;
     if (statusFilter === "closed" && !CLOSED_STATUSES.includes(s.status)) return false;
     if (market !== "all" && s.market?.market_type !== market) return false;
@@ -46,10 +125,45 @@ export function SignalsScreen({ signals, strategies, health, threshold, onRefres
   });
 
   const strong = filtered.filter(s => s.score >= threshold).slice(0, 3);
-  const rest = filtered.filter(s => !strong.includes(s));
+  const sortedSignals = sort ? [...filtered].sort((a, b) => compareSignals(a, b, sort)) : filtered;
 
   const allTfs = Array.from(new Set([...strategies.map(s => s.timeframe), ...signals.map(s => s.timeframe)])).sort();
   const allStrats = Array.from(new Set(strategies.map(s => s.strategy_name)));
+
+  function toggleSort(key: SortKey) {
+    setSort(current => {
+      if (current?.key !== key) return { key, direction: SORT_DEFAULT_DIRECTION[key] };
+      return { key, direction: current.direction === "asc" ? "desc" : "asc" };
+    });
+  }
+
+  function sortIcon(key: SortKey) {
+    if (sort?.key !== key) return <span style={{ width: 12, opacity: 0.35 }}>↕</span>;
+    return <Icon name={sort.direction === "asc" ? "up" : "down"} size={12} />;
+  }
+
+  function sortHeader(key: SortKey, label: string, align: "left" | "right" = "left") {
+    return (
+      <button
+        type="button"
+        onClick={() => toggleSort(key)}
+        aria-label={`Ordina per ${label}`}
+        style={{
+          all: "unset",
+          cursor: "pointer",
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: align === "right" ? "flex-end" : "flex-start",
+          gap: 4,
+          width: "100%",
+          color: sort?.key === key ? "var(--fg)" : "inherit",
+        }}
+      >
+        <span>{label}</span>
+        {sortIcon(key)}
+      </button>
+    );
+  }
 
   async function action(id: number, label: string, path: string) {
     setBusy(`${label}-${id}`);
@@ -83,7 +197,7 @@ export function SignalsScreen({ signals, strategies, health, threshold, onRefres
       <div className="page-head">
         <div>
           <h1 className="page-title">Segnali live</h1>
-          <div className="page-sub">{filtered.length} segnali · soglia score ≥ {threshold} · {strong.length} strong</div>
+          <div className="page-sub">{filtered.length} segnali · score ≥ {minScore} · {strong.length} strong</div>
         </div>
         <div className="page-actions">
           <button className="btn ghost" onClick={onRefresh}><Icon name="refresh" size={12} /></button>
@@ -98,6 +212,14 @@ export function SignalsScreen({ signals, strategies, health, threshold, onRefres
 
       {/* Filter bar */}
       <div className="card" style={{ marginBottom: "var(--gap)", padding: "10px 14px", display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+        <input
+          type="text"
+          placeholder="Cerca symbol, strategia..."
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          className="filter"
+          style={{ width: 190 }}
+        />
         <Seg value={statusFilter} onChange={setStatusFilter} options={[["all","Tutti"],["open","Aperti"],["closed","Chiusi"]]} />
         <Seg value={market} onChange={setMarket} options={[["all","All"],["spot","Spot"],["perp","Perp"]]} />
         <Seg value={dir} onChange={setDir} options={[["all","All"],["LONG","Long"],["SHORT","Short"],["NEUTRAL","Neutral"]]} />
@@ -111,6 +233,18 @@ export function SignalsScreen({ signals, strategies, health, threshold, onRefres
           <option value="all">Strategia: tutte</option>
           {allStrats.map(s => <option key={s} value={s}>{s}</option>)}
         </select>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: "var(--fz-sm)", color: "var(--fg-3)", whiteSpace: "nowrap" }}>Score ≥ <span className="mono" style={{ color: "var(--fg)" }}>{minScore}</span></span>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={5}
+            value={minScore}
+            onChange={e => setMinScore(Number(e.target.value))}
+            style={{ width: 120, accentColor: "var(--accent)" }}
+          />
+        </div>
         <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center", color: "var(--fg-3)", fontSize: "var(--fz-sm)" }}>
           <span className="dot green" /> {filtered.length} matches
         </div>
@@ -138,34 +272,34 @@ export function SignalsScreen({ signals, strategies, health, threshold, onRefres
         </>
       )}
 
-      {/* Rest table */}
-      <SectionLabel>{rest.length} altri segnali</SectionLabel>
+      {/* Filtered results table */}
+      <SectionLabel>{filtered.length} segnali filtrati</SectionLabel>
       <div className="card">
         <table className="tbl">
           <thead>
             <tr>
               <th style={{ width: 20 }} />
-              <th>Symbol</th>
-              <th>TF</th>
-              <th>Dir</th>
-              <th>Score</th>
-              <th style={{ textAlign: "right" }}>Entry</th>
-              <th style={{ textAlign: "right" }}>SL</th>
-              <th style={{ textAlign: "right" }}>TP1 · TP2 · TP3</th>
-              <th style={{ textAlign: "right" }}>R/R</th>
-              <th>Strats</th>
-              <th>Età</th>
-              <th>Status</th>
+              <th>{sortHeader("symbol", "Symbol")}</th>
+              <th>{sortHeader("timeframe", "TF")}</th>
+              <th>{sortHeader("direction", "Dir")}</th>
+              <th>{sortHeader("score", "Score")}</th>
+              <th style={{ textAlign: "right" }}>{sortHeader("entry", "Entry", "right")}</th>
+              <th style={{ textAlign: "right" }}>{sortHeader("stopLoss", "SL", "right")}</th>
+              <th style={{ textAlign: "right" }}>{sortHeader("takeProfit", "TP1 · TP2 · TP3", "right")}</th>
+              <th style={{ textAlign: "right" }}>{sortHeader("riskReward", "R/R", "right")}</th>
+              <th>{sortHeader("strategies", "Strats")}</th>
+              <th>{sortHeader("createdAt", "Età")}</th>
+              <th>{sortHeader("status", "Status")}</th>
               <th style={{ textAlign: "right" }} />
             </tr>
           </thead>
           <tbody>
-            {rest.length === 0 && (
+            {sortedSignals.length === 0 && (
               <tr><td colSpan={13} style={{ textAlign: "center", padding: "32px 0", color: "var(--fg-3)" }}>
-                {filtered.length === 0 ? "Nessun segnale corrisponde ai filtri" : "Tutti i segnali sono strong"}
+                Nessun segnale corrisponde ai filtri
               </td></tr>
             )}
-            {rest.map(s => (
+            {sortedSignals.map(s => (
               <tr
                 key={s.id}
                 onClick={() => onOpenChart(s)}
@@ -205,7 +339,7 @@ export function SignalsScreen({ signals, strategies, health, threshold, onRefres
                       }}
                       title="Paper trade"
                     >Paper</button>
-                    <button
+                 {/*    <button
                       className="btn ghost sm"
                       disabled={s.status !== "new" || busy !== null}
                       onClick={(event) => {
@@ -215,7 +349,7 @@ export function SignalsScreen({ signals, strategies, health, threshold, onRefres
                       title="Ignora"
                     >
                       <Icon name="x" size={11} />
-                    </button>
+                    </button> */}
                     {health.live_trading_allowed && (
                       <button
                         className="btn sm"

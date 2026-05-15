@@ -28,6 +28,8 @@ class RiskManager:
         direction: Direction,
         signal_score: int = 60,
         min_risk_reward: float = MIN_RISK_REWARD,
+        min_atr_multiplier: float = 1.5,
+        min_stop_distance_pct: float = MIN_STOP_DISTANCE_PCT,
     ) -> RiskPlan | None:
         if len(candles) < 30 or direction == Direction.NEUTRAL:
             return None
@@ -41,9 +43,9 @@ class RiskManager:
         risk_reward_floor = max(MIN_RISK_REWARD, min_risk_reward)
         score_strength = _clamp((signal_score - 60) / 40, 0.0, 1.0)
         target_rr = risk_reward_floor + 0.5 + (0.75 * score_strength)
-        stop_atr_multiplier = 2.1 - (0.25 * score_strength)
+        stop_atr_multiplier = max(2.1 - (0.25 * score_strength), min_atr_multiplier)
         buffer = latest_atr * 0.30
-        min_stop_distance = max(latest_atr * stop_atr_multiplier, entry * MIN_STOP_DISTANCE_PCT)
+        min_stop_distance = max(latest_atr * stop_atr_multiplier, entry * min_stop_distance_pct)
         max_stop_distance = max(entry * MAX_STOP_DISTANCE_PCT, latest_atr * 4.0)
         support_levels, resistance_levels = _structure_levels(candles[-STRUCTURE_LOOKBACK:])
         if direction in {Direction.LONG, Direction.STRONG_LONG}:

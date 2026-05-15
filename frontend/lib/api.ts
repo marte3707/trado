@@ -6,6 +6,33 @@ export type Health = {
   network: string;
   enable_live_trading: boolean;
   live_trading_allowed: boolean;
+  live_readiness?: {
+    account_address_configured: boolean;
+    private_key_configured: boolean;
+    mainnet_live_enabled: boolean;
+    checks: string[];
+  };
+  worker?: {
+    last_run_at: string | null;
+    seconds_since_last_run: number | null;
+    healthy: boolean;
+    phase: string | null;
+    last_cycle_at: string | null;
+    last_cycle: {
+      markets?: number;
+      timeframes?: string[] | number;
+      active_timeframes?: string[] | number;
+      synced?: number;
+      skipped?: number;
+      generated?: number;
+      closed?: number;
+      pnl_updated?: number;
+      live_reconciled?: number;
+      calibrated?: number;
+    } | null;
+    last_error_at: string | null;
+    last_error_message: string | null;
+  };
 };
 
 export type MarketIntelligence = {
@@ -25,6 +52,134 @@ export type MarketIntelligence = {
     yearly_low_date: string | null;
     source: string;
   } | null;
+  global_metrics: {
+    btc_price_usd: number | null;
+    total_market_cap_usd: number | null;
+    total_market_cap_ex_top10_usd: number | null;
+    total_volume_24h_usd: number | null;
+    volume_trend: "up" | "down" | null;
+    btc_dominance_pct: number | null;
+    market_cap_change_24h_pct: number | null;
+    last_updated: string | null;
+    source: string;
+  } | null;
+};
+
+export type CoinMarketCapUsage = {
+  enabled: boolean;
+  available: boolean;
+  checked_at: string | null;
+  disabled_until: string | null;
+  disabled_reason: string | null;
+  plan: Record<string, unknown>;
+  usage: Record<string, unknown>;
+  source: string;
+};
+
+export type CoinGeckoUsage = {
+  enabled: boolean;
+  checked_at: string | null;
+  data: Record<string, unknown>;
+  source: string;
+};
+
+export type AccountMonitor = {
+  status: string;
+  network: string;
+  checked_at: string;
+  api: {
+    status: string;
+    latency_ms: number | null;
+    info_url: string;
+    ws_url: string;
+    universe_count: number;
+    mids_count: number;
+    error: string | null;
+  };
+  account: {
+    configured: boolean;
+    address: string | null;
+    account_value: string | null;
+    withdrawable: string | null;
+    total_margin_used: string | null;
+    total_notional_position: string | null;
+    cross_account_value: string | null;
+    cross_margin_used: string | null;
+    cross_maintenance_margin_used: string | null;
+    open_positions: number;
+    open_orders: number;
+    error: string | null;
+  };
+  positions: AccountPosition[];
+  spot_balances: AccountSpotBalance[];
+  open_orders: AccountOpenOrder[];
+  funding: {
+    status: string;
+    predicted: AccountFunding[];
+    user_last_24h: Record<string, unknown>[];
+    error: string | null;
+  };
+  last_snapshot: {
+    timestamp: string;
+    total_equity: string | null;
+    available_balance: string | null;
+    margin_used: string | null;
+    unrealized_pnl: string | null;
+  } | null;
+};
+
+export type AccountPosition = {
+  coin: string | null;
+  side: string | null;
+  size: string | null;
+  entry_price: string | null;
+  position_value: string | null;
+  unrealized_pnl: string | null;
+  return_on_equity: string | null;
+  liquidation_price: string | null;
+  margin_used: string | null;
+  leverage: Record<string, unknown> | null;
+  cum_funding: Record<string, unknown> | null;
+};
+
+export type AccountSpotBalance = {
+  coin: string | null;
+  total: string | null;
+  hold: string | null;
+  entry_ntl: string | null;
+};
+
+export type AccountOpenOrder = {
+  coin?: string | null;
+  side?: string | null;
+  sz?: string | number | null;
+  origSz?: string | number | null;
+  limitPx?: string | number | null;
+  triggerPx?: string | number | null;
+  triggerCondition?: string | null;
+  oid?: string | number | null;
+  timestamp?: number | null;
+  reduceOnly?: boolean | null;
+  orderType?: unknown;
+  tif?: string | null;
+  cloid?: string | null;
+  [key: string]: unknown;
+};
+
+export type AccountFunding = {
+  coin: string;
+  hyperliquid: {
+    exchange: string;
+    funding_rate: string | null;
+    next_funding_time: number | null;
+    funding_interval_hours: number | null;
+  } | null;
+  exchanges: {
+    exchange: string;
+    funding_rate: string | null;
+    next_funding_time: number | null;
+    funding_interval_hours: number | null;
+  }[];
 };
 
 export type Market = {
@@ -72,6 +227,7 @@ export type Position = {
   side: string;
   entry_price: string;
   size: string;
+  leverage: string | null;
   stop_loss: string | null;
   take_profit: string | null;
   status: string;
@@ -79,6 +235,14 @@ export type Position = {
   closed_at: string | null;
   realized_pnl: string | null;
   unrealized_pnl: string | null;
+  initial_size: string | null;
+  notional: string | null;
+  initial_risk: string | null;
+  total_pnl: string | null;
+  return_pct: string | null;
+  realized_return_pct: string | null;
+  r_multiple: string | null;
+  realized_r_multiple: string | null;
   metadata_json: Record<string, unknown>;
 };
 
@@ -109,6 +273,9 @@ export type DecisionLog = {
   id: number;
   timestamp: string;
   event_type: string;
+  market_id?: number | null;
+  signal_id?: number | null;
+  position_id?: number | null;
   message: string;
   data: Record<string, unknown>;
 };
@@ -144,6 +311,19 @@ export type Calibration = {
   settings: Record<string, unknown>;
   state?: Record<string, unknown>;
   baseline?: Record<string, unknown>;
+};
+
+export type CalibrationHistoryEntry = {
+  id: number;
+  timestamp: string;
+  event_type: string;
+  message: string;
+  status: string | null;
+  reason: string | null;
+  overall: CalibrationStats | null;
+  changes: CalibrationChange[];
+  error: string | null;
+  force: boolean | null;
 };
 
 export async function apiGet<T>(path: string): Promise<T> {

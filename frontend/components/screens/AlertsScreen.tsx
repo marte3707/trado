@@ -2,11 +2,12 @@
 
 import React, { useEffect, useState } from "react";
 import { Icon, ScoreChip, DirBadge, TfChip, fmt } from "@/components/atoms";
-import { AppSettings, DecisionLog, apiPatch } from "@/lib/api";
+import { AppSettings, DecisionLog, Market, apiPatch } from "@/lib/api";
 import { isPushSupported, subscribePush, unsubscribePush } from "@/lib/push";
 
 interface Props {
   logs: DecisionLog[];
+  markets: Market[];
   settings: AppSettings;
   onRefresh: () => void;
 }
@@ -22,27 +23,104 @@ interface AlertItem {
   dir?: string;
   score?: number;
   msg: string;
+  detail?: string;
   channels: string[];
 }
 
-function logsToAlerts(logs: DecisionLog[]): AlertItem[] {
+const EVENT_LABELS: Record<string, string> = {
+  live_order_rejected:                   "Ordine live rifiutato",
+  live_order_rejected_by_exchange:       "Ordine live rifiutato dall'exchange",
+  live_order_submitted:                  "Ordine live inviato",
+  live_protection_orders_submitted:      "Ordini di protezione inviati",
+  live_protection_orders_partial_failure:"Protezioni parzialmente fallite",
+  paper_order_executed:                  "Posizione paper aperta",
+  paper_order_skipped_duplicate_ticker:  "Paper saltato (duplicato)",
+  paper_position_auto_closed:            "Posizione paper chiusa (auto)",
+  paper_position_partial_closed:         "Posizione paper chiusa parzialmente",
+  position_closed:                       "Posizione chiusa",
+  position_partially_closed:             "Posizione chiusa parzialmente",
+  live_close_rejected_by_exchange:       "Chiusura live rifiutata",
+};
+
+function fmtPrice(v: unknown): string {
+  const n = Number(v);
+  return isNaN(n) ? String(v) : `$${n.toLocaleString("en-US", { maximumFractionDigits: 4 })}`;
+}
+
+function fmtPnl(v: unknown): string {
+  const n = Number(v);
+  return isNaN(n) ? String(v) : `${n >= 0 ? "+" : ""}${n.toFixed(2)} USDC`;
+}
+
+function extractDetail(event_type: string, data: Record<string, unknown>): string | undefined {
+  switch (event_type) {
+    case "live_order_rejected": {
+      const reasons = data.reasons as string[] | undefined;
+      return reasons?.length ? reasons.map(r => `• ${r}`).join("  ") : undefined;
+    }
+    case "live_order_rejected_by_exchange": {
+      const resp = data.response as Record<string, unknown> | undefined;
+      if (resp?.error) return String(resp.error);
+      return undefined;
+    }
+    case "live_order_submitted": {
+      const side = data.side as string | undefined;
+      const size = data.size as string | undefined;
+      const price = data.entry_price as string | undefined;
+      if (!side || !size) return undefined;
+      return [side.toUpperCase(), size, price ? `@ ${fmtPrice(price)}` : undefined].filter(Boolean).join(" ");
+    }
+    case "paper_order_executed": {
+      const side = data.side as string | undefined;
+      const size = data.size as string | undefined;
+      if (!side || !size) return undefined;
+      return `${side.toUpperCase()} · size ${size}`;
+    }
+    case "position_closed":
+    case "paper_position_auto_closed": {
+      const parts: string[] = [];
+      if (data.exit_price) parts.push(`@ ${fmtPrice(data.exit_price)}`);
+      if (data.realized_pnl) parts.push(`PnL ${fmtPnl(data.realized_pnl)}`);
+      if (data.last_exit_reason) parts.push(String(data.last_exit_reason));
+      return parts.length ? parts.join(" · ") : undefined;
+    }
+    case "position_partially_closed":
+    case "paper_position_partial_closed": {
+      const parts: string[] = [];
+      if (data.exit_price) parts.push(`@ ${fmtPrice(data.exit_price)}`);
+      if (data.realized_pnl) parts.push(`PnL parziale ${fmtPnl(data.realized_pnl)}`);
+      if (data.remaining_size) parts.push(`rimanente ${data.remaining_size}`);
+      return parts.length ? parts.join(" · ") : undefined;
+    }
+    case "live_protection_orders_partial_failure": {
+      const errors = data.errors as string[] | undefined;
+      return errors?.length ? errors.join("; ") : undefined;
+    }
+  }
+  return undefined;
+}
+
+function logsToAlerts(logs: DecisionLog[], marketIndex: Map<number, string>): AlertItem[] {
   return logs.slice(0, 20).map(log => {
     const t = log.event_type.toLowerCase();
     let level: AlertLevel = "info";
-    if (t.includes("error") || t.includes("fail")) level = "risk";
-    else if (t.includes("strong") || ((log.data as Record<string, unknown>).score as number) >= 90) level = "strong";
-    else if (t.includes("signal")) level = "good";
-    else if (t.includes("warn") || t.includes("kill")) level = "warn";
+    if (t.includes("error") || t.includes("fail") || t === "live_order_rejected") level = "risk";
+    else if (t.includes("strong") || (log.data.score as number) >= 90) level = "strong";
+    else if (t.includes("signal") || t === "live_order_submitted" || t === "paper_order_executed") level = "good";
+    else if (t.includes("warn") || t.includes("kill") || t.includes("partial")) level = "warn";
     return {
       ts: fmt.relTime(log.timestamp),
       level,
-      msg: log.message,
+      sym: log.market_id != null ? marketIndex.get(log.market_id) : undefined,
+      msg: EVENT_LABELS[log.event_type] ?? log.message,
+      detail: extractDetail(log.event_type, log.data),
       channels: ["dash"],
     };
   });
 }
 
-export function AlertsScreen({ logs, settings, onRefresh }: Props) {
+export function AlertsScreen({ logs, markets, settings, onRefresh }: Props) {
+  const marketIndex = new Map(markets.map(m => [m.id, m.base]));
   const alertSettings = settings.alerts ?? {};
   const [tgEnabled, setTgEnabled] = useState(Boolean(alertSettings.telegram_enabled));
   const [pushEnabled, setPushEnabled] = useState(Boolean(alertSettings.browser_push_enabled));
@@ -122,7 +200,7 @@ export function AlertsScreen({ logs, settings, onRefresh }: Props) {
     }
   }
 
-  const alerts = logsToAlerts(logs);
+  const alerts = logsToAlerts(logs, marketIndex);
   const filtered: AlertItem[] = feedFilter === "all" ? alerts :
     feedFilter === "strong" ? alerts.filter(a => a.level === "strong" || a.level === "good") :
     alerts.filter(a => a.level === "risk" || a.level === "warn");
@@ -302,13 +380,16 @@ function AlertRow({ a, isLast }: { a: AlertItem; isLast: boolean }) {
         <Icon name={lvl.icon} size={10} /> {lvl.label}
       </span>
       <div>
-        <div style={{ fontSize: "var(--fz-sm)", display: "flex", alignItems: "center", gap: 6, marginBottom: a.msg ? 2 : 0 }}>
+        <div style={{ fontSize: "var(--fz-sm)", display: "flex", alignItems: "center", gap: 6, marginBottom: (a.detail || a.msg) ? 2 : 0 }}>
           {a.sym && <strong>{a.sym}</strong>}
           {a.tf && <TfChip tf={a.tf} />}
           {a.dir && <DirBadge dir={a.dir} />}
           {a.score != null && <ScoreChip score={a.score} dir={a.dir ?? "NEUTRAL"} />}
+          <span style={{ fontWeight: 500, color: "var(--fg-2)" }}>{a.msg}</span>
         </div>
-        <div className="muted" style={{ fontSize: "var(--fz-sm)" }}>{a.msg}</div>
+        {a.detail && (
+          <div className="muted mono" style={{ fontSize: 11, lineHeight: 1.5, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{a.detail}</div>
+        )}
       </div>
       <div style={{ display: "flex", gap: 4 }}>
         {a.channels.includes("dash") && <span style={{ color: "var(--fg-3)" }} title="Dashboard"><Icon name="dash" size={11} /></span>}

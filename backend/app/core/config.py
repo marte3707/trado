@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     app_env: str = "development"
     operation_mode: OperationMode = OperationMode.SIGNAL_ONLY
     database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/trado"
+    api_key: str | None = None
+    cors_allowed_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["http://localhost:3000"]
+    )
     enabled_timeframes: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: ["5m", "15m", "1h", "4h"]
     )
@@ -23,11 +27,44 @@ class Settings(BaseSettings):
     hyperliquid_network: Literal["mainnet", "testnet"] = "testnet"
     hyperliquid_account_address: str | None = None
     hyperliquid_private_key: str | None = None
+    # Master kill-switch on live trading. Must be `true` AND operation_mode must
+    # be AUTO_TRADE for live orders to leave the engine.
     enable_live_trading: bool = False
+    # Separate explicit opt-in required to run live trades on mainnet. Testnet
+    # is allowed when only `enable_live_trading` is true.
+    enable_mainnet_live_trading: bool = False
+    # Hyperliquid account equity must be at least this many USD before
+    # OrderValidator will authorize any live order. Acts as a basic floor so a
+    # near-empty account cannot trigger fills.
+    live_min_account_value_usd: float = 100.0
+    # Maximum notional (price × size, USD) per single live order. Hard cap that
+    # overrides any sizing computed from risk_pct/leverage.
+    live_order_notional_cap_usd: float = 250.0
+    # Hyperliquid rejects any order whose notional is below this floor (the
+    # exchange-side minimum is $10). Used by validator + sizing logic.
+    live_min_order_notional_usd: float = 10.0
+    # When the risk-based size produces a notional below the min floor, either
+    # reject the order (false, default) or bump the size up to the floor
+    # — knowingly violating risk_pct to satisfy the exchange minimum.
+    live_bump_to_min_notional: bool = False
+    # Max slippage tolerated on market_open / market_close, expressed in
+    # percent (0.5 means 0.5%). Forwarded to the Hyperliquid SDK.
+    live_max_slippage_pct: float = 0.5
+    # TTL of the signed order request submitted to Hyperliquid. If the order
+    # is not picked up within this window the exchange rejects it.
+    live_order_expires_after_seconds: int = 30
 
     coinmarketcap_api_key: str | None = None
+    coinmarketcap_enabled: bool = True
     coinmarketcap_base_url: str = "https://pro-api.coinmarketcap.com"
-    external_market_data_cache_ttl_seconds: int = 300
+    coinmarketcap_quota_cooldown_seconds: int = 86_400
+    coinmarketcap_usage_cache_ttl_seconds: int = 300
+    coinmarketcap_min_credits_left: int = 1
+    external_quote_enrichment_enabled: bool = False
+    external_market_data_cache_ttl_seconds: int = 21_600
+    coingecko_enabled: bool = True
+    coingecko_api_key: str | None = None
+    coingecko_base_url: str = "https://api.coingecko.com/api/v3"
     fear_greed_weight: int = 4
     altcoin_season_weight: int = 4
 
@@ -40,6 +77,9 @@ class Settings(BaseSettings):
     whale_alert_lookback_minutes: int = 60
     whale_flow_weight: int = 6
     whale_contra_block_confidence: int = 70
+
+    funding_rate_weight: int = 5
+    max_long_funding_rate_pct: float = 0.05  # 0.05%/8h → blocca long oltre questa soglia
 
     kill_switch_enabled: bool = False
     max_risk_per_trade_pct: float = 1.0
@@ -59,6 +99,13 @@ class Settings(BaseSettings):
     @field_validator("enabled_timeframes", mode="before")
     @classmethod
     def parse_timeframes(cls, value: str | list[str]) -> list[str]:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("cors_allowed_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value

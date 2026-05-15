@@ -92,9 +92,12 @@ class SignalPerformanceAnalyzer:
         by_strategy: dict[str, list[Position]] = {}
         for position in positions:
             metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
-            signal_id = metadata.get("source_signal_id")
+            signal_id_raw = metadata.get("source_signal_id")
+            if signal_id_raw is None:
+                continue
             try:
-                signal = signals.get(int(signal_id))
+                signal_id = int(signal_id_raw)
+                signal = signals.get(signal_id)
             except (TypeError, ValueError):
                 signal = None
             if signal is None:

@@ -4,7 +4,7 @@ import React from "react";
 import { Icon } from "@/components/atoms";
 import { Health } from "@/lib/api";
 
-export type Route = "dash" | "signals" | "coin" | "strategies" | "history" | "alerts" | "settings";
+export type Route = "dash" | "signals" | "coin" | "account" | "strategies" | "calibration" | "history" | "alerts" | "settings";
 export type TradingMode = "signal" | "paper" | "live";
 
 interface SidebarProps {
@@ -21,9 +21,11 @@ export const Sidebar = ({ route, setRoute, counts, wsLive, health, collapsed, on
   const topItems: { id: Route; label: string; icon: string; badge?: number }[] = [
     { id: "dash",    label: "Dashboard", icon: "dash"    },
     { id: "signals", label: "Segnali",   icon: "signal", badge: counts.signals > 0 ? counts.signals : undefined },
+    { id: "account", label: "Account",   icon: "wallet"  },
   ];
   const bottomItems: { id: Route; label: string; icon: string; badge?: number }[] = [
     { id: "strategies", label: "Strategie", icon: "sliders"  },
+    { id: "calibration", label: "Calibration", icon: "refresh" },
     { id: "history",    label: "Storico",   icon: "history"  },
     { id: "alerts",     label: "Alert",     icon: "bell", badge: counts.alerts > 0 ? counts.alerts : undefined },
     { id: "settings",   label: "Settings",  icon: "settings" },
@@ -86,7 +88,9 @@ const ROUTE_LABELS: Record<Route, string> = {
   dash:       "Dashboard",
   signals:    "Segnali live",
   coin:       "Mercati",
+  account:    "Account monitor",
   strategies: "Strategie",
+  calibration: "Calibration",
   history:    "Storico segnali",
   alerts:     "Alert",
   settings:   "Settings",
@@ -108,12 +112,6 @@ export const Topbar = ({ route, mode, kill, setKill, onToggleTweaks }: TopbarPro
       <span className="here">{ROUTE_LABELS[route]}</span>
     </div>
     <div className="topbar-spacer" />
-
-    <div className="topbar-search">
-      <Icon name="search" size={13} />
-      <input placeholder="Cerca symbol, segnale, strategia…" />
-      <kbd>⌘K</kbd>
-    </div>
 
     <div className="mode-selector" aria-label="Trading mode" title="Modalità definita in .env">
       <span

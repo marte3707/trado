@@ -2,9 +2,9 @@
 
 Web app personale per generare segnali crypto spot e perpetual su Hyperliquid.
 
-Stato attuale: scaffold MVP con backend FastAPI, worker Python, PostgreSQL via SQLAlchemy, client Hyperliquid REST, dashboard Next.js e moduli per indicatori, strategie, scoring, risk management, paper trading e alert Telegram.
+Stato attuale: scaffold MVP con backend FastAPI, worker Python, PostgreSQL via SQLAlchemy, client Hyperliquid REST/SDK, dashboard Next.js e moduli per indicatori, strategie, scoring, risk management, paper trading, live trading Hyperliquid e alert Telegram.
 
-Il default e' sempre non-live: `SIGNAL_ONLY`. Il live trading richiede sia `OPERATION_MODE=AUTO_TRADE` sia `ENABLE_LIVE_TRADING=true`.
+Il default e' sempre non-live: `SIGNAL_ONLY`. Il live trading richiede `OPERATION_MODE=AUTO_TRADE`, `ENABLE_LIVE_TRADING=true`, account/key Hyperliquid configurati e, su mainnet, anche `ENABLE_MAINNET_LIVE_TRADING=true`.
 
 ## Avvio locale
 
@@ -38,4 +38,3 @@ Documentazione:
 
 - [Architettura](docs/ARCHITECTURE.md)
 - [Guida utilizzo](docs/USAGE.md)
-

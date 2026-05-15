@@ -27,11 +27,11 @@ type LinePoint = {
   value: number;
 };
 
-type WsTrade = {
-  coin: string;
-  px: string;
-  sz: string;
-  time: number;
+type CandlestickPattern = {
+  time: Time;
+  pattern: string;
+  direction: "LONG" | "SHORT";
+  confidence: number;
 };
 
 type WsCandle = {
@@ -48,7 +48,6 @@ type WsCandle = {
 };
 
 type WsMessage =
-  | { channel: "trades"; data: WsTrade[] }
   | { channel: "candle"; data: WsCandle | WsCandle[] }
   | { channel: "subscriptionResponse"; data: unknown }
   | { channel: string; data: unknown };
@@ -60,21 +59,6 @@ export type LiveChartUpdate = {
   candleTime: number;
   candle?: Candle;
 };
-
-const INTERVAL_SECONDS: Record<string, number> = {
-  "1m": 60,
-  "3m": 180,
-  "5m": 300,
-  "15m": 900,
-  "30m": 1800,
-  "1h": 3600,
-  "2h": 7200,
-  "4h": 14400,
-  "8h": 28800,
-  "12h": 43200,
-  "1d": 86400
-};
-
 
 function wsUrl(network: Health["network"]) {
   return network === "mainnet" ? "wss://api.hyperliquid.xyz/ws" : "wss://api.hyperliquid-testnet.xyz/ws";
@@ -128,6 +112,25 @@ function normalizeCandles(candles: Candle[]): ChartCandle[] {
   return [...byTime.values()].sort((a, b) => Number(a.time) - Number(b.time));
 }
 
+function mergeRestCandlesWithLive(restCandles: ChartCandle[], existingCandles: ChartCandle[]) {
+  if (restCandles.length === 0 || existingCandles.length === 0) return restCandles;
+  const byTime = new Map<number, ChartCandle>();
+  for (const candle of restCandles) byTime.set(Number(candle.time), candle);
+  const latestRestTime = Number(restCandles.at(-1)!.time);
+
+  for (const candle of existingCandles) {
+    const time = Number(candle.time);
+    const restCandle = byTime.get(time);
+    if (time > latestRestTime) {
+      byTime.set(time, candle);
+    } else if (restCandle && candle.volume > restCandle.volume) {
+      byTime.set(time, candle);
+    }
+  }
+
+  return [...byTime.values()].sort((a, b) => Number(a.time) - Number(b.time));
+}
+
 function lastNumber(values: (number | null)[]) {
   for (let index = values.length - 1; index >= 0; index -= 1) {
     if (values[index] !== null) return values[index];
@@ -152,6 +155,20 @@ function volumeData(candles: ChartCandle[], longColor: string, shortColor: strin
   }));
 }
 
+function macdHistogramData(candles: ChartCandle[], values: (number | null)[], longColor: string, shortColor: string): HistogramData[] {
+  const points: HistogramData[] = [];
+  candles.forEach((candle, index) => {
+    const value = values[index];
+    if (value === null) return;
+    points.push({
+      time: candle.time,
+      value,
+      color: value >= 0 ? `${longColor}88` : `${shortColor}88`
+    });
+  });
+  return points;
+}
+
 function formatLegendValue(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "—";
   if (Math.abs(value) >= 1000) return value.toLocaleString("en-US", { maximumFractionDigits: 2 });
@@ -170,6 +187,29 @@ function ema(values: number[], period: number): (number | null)[] {
     result[index] = previous;
   }
   return result;
+}
+
+function macdCalc(closes: number[], fast = 12, slow = 26, signalPeriod = 9) {
+  const fastEma = ema(closes, fast);
+  const slowEma = ema(closes, slow);
+  const line = closes.map((_, index) => (
+    fastEma[index] !== null && slowEma[index] !== null
+      ? (fastEma[index] as number) - (slowEma[index] as number)
+      : null
+  ));
+  const compactLine = line.filter((value): value is number => value !== null);
+  const compactSignal = ema(compactLine, signalPeriod);
+  const signal: (number | null)[] = Array(closes.length).fill(null);
+  let compactIndex = 0;
+  for (let index = 0; index < line.length; index += 1) {
+    if (line[index] === null) continue;
+    signal[index] = compactSignal[compactIndex] ?? null;
+    compactIndex += 1;
+  }
+  const histogram = line.map((value, index) => (
+    value !== null && signal[index] !== null ? value - (signal[index] as number) : null
+  ));
+  return { line, signal, histogram };
 }
 
 function sma(values: number[], period: number): (number | null)[] {
@@ -262,6 +302,28 @@ function supertrend(candles: ChartCandle[], period = 10, multiplier = 3): (numbe
   return trend;
 }
 
+function rsiCalc(closes: number[], period = 14): (number | null)[] {
+  const result: (number | null)[] = Array(closes.length).fill(null);
+  if (closes.length < period + 1) return result;
+  let avgGain = 0, avgLoss = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) avgGain += diff; else avgLoss -= diff;
+  }
+  avgGain /= period;
+  avgLoss /= period;
+  result[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    result[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  }
+  return result;
+}
+
 function fibonacciLevels(candles: ChartCandle[], lookback = 120) {
   const window = candles.slice(Math.max(0, candles.length - lookback));
   if (window.length === 0) return [];
@@ -276,6 +338,79 @@ function fibonacciLevels(candles: ChartCandle[], lookback = 120) {
     title: `Fib ${(ratio * 100).toFixed(1)}%`,
     price: lowIndex < highIndex ? high - diff * ratio : low + diff * ratio
   }));
+}
+
+function latestPatternForWindow(candles: ChartCandle[]): CandlestickPattern | null {
+  if (candles.length < 2) return null;
+  const index = candles.length - 1;
+  const current = candles[index];
+  const previous = candles[index - 1];
+  const body = Math.abs(current.close - current.open);
+  const candleRange = current.high - current.low;
+  const upperWick = current.high - Math.max(current.open, current.close);
+  const lowerWick = Math.min(current.open, current.close) - current.low;
+  const previousBearish = previous.close < previous.open;
+  const previousBullish = previous.close > previous.open;
+  const currentBullish = current.close > current.open;
+  const currentBearish = current.close < current.open;
+
+  if (previousBearish && currentBullish && current.open <= previous.close && current.close >= previous.open) {
+    return { time: current.time, pattern: "bullish_engulfing", direction: "LONG", confidence: 72 };
+  }
+  if (previousBullish && currentBearish && current.open >= previous.close && current.close <= previous.open) {
+    return { time: current.time, pattern: "bearish_engulfing", direction: "SHORT", confidence: 72 };
+  }
+  if (candleRange > 0 && lowerWick >= body * 2 && upperWick <= body && currentBullish) {
+    return { time: current.time, pattern: "hammer", direction: "LONG", confidence: 62 };
+  }
+  if (candleRange > 0 && upperWick >= body * 2 && lowerWick <= body && currentBearish) {
+    return { time: current.time, pattern: "shooting_star", direction: "SHORT", confidence: 62 };
+  }
+  if (candles.length >= 3) {
+    const first = candles[index - 2];
+    const firstBody = Math.abs(first.close - first.open);
+    const middleBody = Math.abs(previous.close - previous.open);
+    if (
+      first.close < first.open &&
+      middleBody < firstBody * 0.6 &&
+      currentBullish &&
+      current.close > (first.open + first.close) / 2
+    ) {
+      return { time: current.time, pattern: "morning_star", direction: "LONG", confidence: 78 };
+    }
+    if (
+      first.close > first.open &&
+      middleBody < firstBody * 0.6 &&
+      currentBearish &&
+      current.close < (first.open + first.close) / 2
+    ) {
+      return { time: current.time, pattern: "evening_star", direction: "SHORT", confidence: 78 };
+    }
+  }
+  return null;
+}
+
+function candlestickPatterns(candles: ChartCandle[], lookback = 160) {
+  const start = Math.max(0, candles.length - lookback);
+  const patterns: CandlestickPattern[] = [];
+  for (let index = Math.max(start + 1, 1); index < candles.length; index += 1) {
+    const pattern = latestPatternForWindow(candles.slice(0, index + 1));
+    if (pattern) patterns.push(pattern);
+  }
+  return patterns;
+}
+
+function candlestickPatternMarkers(candles: ChartCandle[], longColor: string, shortColor: string): SeriesMarker<Time>[] {
+  return candlestickPatterns(candles).map((pattern) => {
+    const isLong = pattern.direction === "LONG";
+    return {
+      time: pattern.time,
+      position: isLong ? "belowBar" : "aboveBar",
+      color: isLong ? longColor : shortColor,
+      shape: "circle",
+      text: `${pattern.pattern.replaceAll("_", " ")} ${pattern.confidence}`
+    } satisfies SeriesMarker<Time>;
+  });
 }
 
 function supportResistance(candles: ChartCandle[], lookback = 120, pivotWindow = 3, tolerancePct = 0.0025) {
@@ -339,25 +474,20 @@ function signalMarkers(signals: Signal[], candles: ChartCandle[], market: Market
     .sort((a, b) => Number(a.time) - Number(b.time));
 }
 
-function applyTrade(candle: ChartCandle | null, trade: WsTrade, timeframe: string): ChartCandle {
-  const interval = INTERVAL_SECONDS[timeframe] ?? 300;
-  const tradeSeconds = Math.floor(trade.time / 1000);
-  const bucket = Math.floor(tradeSeconds / interval) * interval;
-  const price = Number(trade.px);
-  const size = Number(trade.sz);
-  const volumeDelta = Number.isFinite(size) ? size : 0;
-
-  if (!candle || Number(candle.time) < bucket) {
-    return { time: bucket as Time, open: price, high: price, low: price, close: price, volume: volumeDelta };
-  }
-
-  return {
-    ...candle,
-    high: Math.max(candle.high, price),
-    low: Math.min(candle.low, price),
-    close: price,
-    volume: candle.volume + volumeDelta
-  };
+function chartMarkers(
+  signals: Signal[],
+  candles: ChartCandle[],
+  market: Market | null,
+  timeframe: string,
+  includeSignals: boolean,
+  includeCandlestickPatterns: boolean,
+  longColor: string,
+  shortColor: string
+): SeriesMarker<Time>[] {
+  return [
+    ...(includeSignals ? signalMarkers(signals, candles, market, timeframe) : []),
+    ...(includeCandlestickPatterns ? candlestickPatternMarkers(candles, longColor, shortColor) : []),
+  ].sort((a, b) => Number(a.time) - Number(b.time));
 }
 
 export type ChartOverlays = {
@@ -366,7 +496,11 @@ export type ChartOverlays = {
   vwap: boolean;
   supertrend: boolean;
   levels: boolean;
+  fibonacci: boolean;
   signals: boolean;
+  rsi: boolean;
+  macd: boolean;
+  candlestick_patterns: boolean;
 };
 
 export function ChartPanel({
@@ -401,6 +535,14 @@ export function ChartPanel({
   const candlesRef = useRef(candles);
   const marketRef = useRef(market);
   const signalsRef = useRef(signals);
+  const rsiRef = useRef<HTMLDivElement | null>(null);
+  const rsiChartRef = useRef<IChartApi | null>(null);
+  const rsiSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const macdRef = useRef<HTMLDivElement | null>(null);
+  const macdChartRef = useRef<IChartApi | null>(null);
+  const macdLineSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const macdSignalSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const macdHistogramSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const [status, setStatus] = useState<"idle" | "connecting" | "live" | "closed" | "error">("idle");
   const [lastPrice, setLastPrice] = useState<number | null>(null);
   const coin = useMemo(() => marketCoin(market), [market]);
@@ -431,8 +573,17 @@ export function ChartPanel({
       items.push({ label: "Supertrend", value: formatLegendValue(lastNumber(supertrend(data))), color: "var(--accent)", dashed: true });
     }
     items.push({ label: "Volume", value: formatLegendValue(data.at(-1)?.volume), color: "var(--fg-3)" });
-    if (overlays.levels) items.push({ label: "S/R + Fib", value: "", color: "var(--warn)", dashed: true });
+    if (overlays.levels) items.push({ label: "S/R", value: "", color: "var(--fg-3)", dashed: true });
+    if (overlays.fibonacci) items.push({ label: "Fibonacci", value: "", color: "var(--warn)", dashed: true });
     if (overlays.signals) items.push({ label: "Segnali", value: String(signals.filter((signal) => signal.timeframe === timeframe).length), color: "var(--long)" });
+    if (overlays.rsi) items.push({ label: "RSI 14", value: formatLegendValue(lastNumber(rsiCalc(closes))), color: "var(--info)" });
+    if (overlays.macd) {
+      const macdValues = macdCalc(closes);
+      items.push({ label: "MACD", value: formatLegendValue(lastNumber(macdValues.histogram)), color: "var(--accent)" });
+    }
+    if (overlays.candlestick_patterns) {
+      items.push({ label: "Pattern", value: String(candlestickPatterns(data).length), color: "var(--warn)" });
+    }
     return items;
   }, [candles, lastPrice, overlays, signals, timeframe]);
 
@@ -469,14 +620,22 @@ export function ChartPanel({
     const visibleLogicalRange = chart?.timeScale().getVisibleLogicalRange() ?? null;
     const shouldPreserveRange = (chart?.timeScale().scrollPosition() ?? 0) > 1;
     const { long, short } = colorsRef.current;
+    const nextTime = Number(nextCandle.time);
+    const latestTime = Number(chartDataRef.current.at(-1)?.time ?? nextTime);
+    const updatesHistoricalCandle = nextTime < latestTime;
 
     liveCandleRef.current = nextCandle;
-    series?.update(nextCandle);
-    volumeSeries?.update({
-      time: nextCandle.time,
-      value: nextCandle.volume,
-      color: nextCandle.close >= nextCandle.open ? `${long}55` : `${short}55`
-    });
+    if (updatesHistoricalCandle) {
+      series?.setData(chartDataRef.current);
+      volumeSeries?.setData(volumeData(chartDataRef.current, long, short));
+    } else {
+      series?.update(nextCandle);
+      volumeSeries?.update({
+        time: nextCandle.time,
+        value: nextCandle.volume,
+        color: nextCandle.close >= nextCandle.open ? `${long}55` : `${short}55`
+      });
+    }
     setLastPrice(nextCandle.close);
 
     if (shouldPreserveRange && visibleLogicalRange) {
@@ -555,9 +714,16 @@ export function ChartPanel({
       scaleMargins: { top: 0.78, bottom: 0 }
     });
     volumeSeries.setData(volumeData(initialData, longClr, shortClr));
-    if (overlays.signals) {
-      series.setMarkers(signalMarkers(signalsRef.current, initialData, marketRef.current, timeframe));
-    }
+    series.setMarkers(chartMarkers(
+      signalsRef.current,
+      initialData,
+      marketRef.current,
+      timeframe,
+      overlays.signals,
+      overlays.candlestick_patterns,
+      longClr,
+      shortClr
+    ));
 
     if (overlays.ema) {
       const ema9 = chart.addLineSeries({ color: infoClr, lineWidth: 1, title: "", priceLineVisible: false, lastValueVisible: false });
@@ -624,7 +790,7 @@ export function ChartPanel({
       });
       supertrendSeries.setData(lineData(initialData, supertrend(initialData)));
     }
-    if (overlays.levels) {
+    if (overlays.fibonacci) {
       for (const level of fibonacciLevels(initialData)) {
         series.createPriceLine({
           price: level.price,
@@ -635,6 +801,8 @@ export function ChartPanel({
           title: ""
         });
       }
+    }
+    if (overlays.levels) {
       const levels = supportResistance(initialData);
       for (const price of levels.supports) {
         series.createPriceLine({
@@ -685,7 +853,9 @@ export function ChartPanel({
     dataKey,
     hasCandles,
     overlays.bollinger,
+    overlays.candlestick_patterns,
     overlays.ema,
+    overlays.fibonacci,
     overlays.levels,
     overlays.signals,
     overlays.supertrend,
@@ -703,7 +873,10 @@ export function ChartPanel({
 
     const previousKey = latestDataKeyRef.current;
     const shouldResetRange = previousKey !== dataKey || chartDataRef.current.length === 0;
-    const nextData = normalizeCandles(candles);
+    const normalizedData = normalizeCandles(candles);
+    const nextData = previousKey === dataKey
+      ? mergeRestCandlesWithLive(normalizedData, chartDataRef.current)
+      : normalizedData;
     chartDataRef.current = nextData;
     liveCandleRef.current = nextData.at(-1) ?? null;
     latestDataKeyRef.current = dataKey;
@@ -713,6 +886,15 @@ export function ChartPanel({
     const { long, short } = colorsRef.current;
     seriesRef.current?.setData(nextData);
     volumeSeriesRef.current?.setData(volumeData(nextData, long, short));
+    if (rsiSeriesRef.current && nextData.length > 0) {
+      rsiSeriesRef.current.setData(lineData(nextData, rsiCalc(nextData.map((c) => c.close))));
+    }
+    if (macdLineSeriesRef.current && macdSignalSeriesRef.current && macdHistogramSeriesRef.current && nextData.length > 0) {
+      const macdValues = macdCalc(nextData.map((c) => c.close));
+      macdLineSeriesRef.current.setData(lineData(nextData, macdValues.line));
+      macdSignalSeriesRef.current.setData(lineData(nextData, macdValues.signal));
+      macdHistogramSeriesRef.current.setData(macdHistogramData(nextData, macdValues.histogram, long, short));
+    }
 
     if (shouldResetRange && nextData.length > 0) {
       const lastIndex = nextData.length - 1;
@@ -724,9 +906,154 @@ export function ChartPanel({
   }, [candles, dataKey, hasCandles]);
 
   useEffect(() => {
-    if (!seriesRef.current || !overlays.signals) return;
-    seriesRef.current.setMarkers(signalMarkers(signals, chartDataRef.current, market, timeframe));
-  }, [market, overlays.signals, signals, timeframe]);
+    if (!seriesRef.current) return;
+    const { long, short } = colorsRef.current;
+    seriesRef.current.setMarkers(chartMarkers(
+      signals,
+      chartDataRef.current,
+      market,
+      timeframe,
+      overlays.signals,
+      overlays.candlestick_patterns,
+      long,
+      short
+    ));
+  }, [market, overlays.candlestick_patterns, overlays.signals, signals, timeframe]);
+
+  useEffect(() => {
+    const container = rsiRef.current;
+    if (!container || !overlays.rsi) {
+      if (rsiChartRef.current) {
+        rsiChartRef.current.remove();
+        rsiChartRef.current = null;
+        rsiSeriesRef.current = null;
+      }
+      return;
+    }
+    const data = chartDataRef.current.length > 0 ? chartDataRef.current : normalizeCandles(candlesRef.current);
+    if (data.length === 0) return;
+
+    const cv = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const bgColor  = cv("--bg-1")   || "#0d0d10";
+    const gridClr  = cv("--border") || "#1c1c22";
+    const textClr  = cv("--fg-3")   || "#6a6a72";
+    const infoClr  = cv("--info")   || "#5b8def";
+    const longClr  = cv("--long")   || "#1edb88";
+    const shortClr = cv("--short")  || "#ff5a4d";
+
+    const chart = createChart(container, {
+      height: 100,
+      layout: { background: { type: ColorType.Solid, color: bgColor }, textColor: textClr },
+      grid: { vertLines: { color: `${gridClr}33` }, horzLines: { color: `${gridClr}33` } },
+      rightPriceScale: { borderColor: gridClr, scaleMargins: { top: 0.1, bottom: 0.1 } },
+      timeScale: { borderColor: gridClr, visible: false },
+      crosshair: { horzLine: { visible: true, labelVisible: false } },
+      handleScroll: false,
+      handleScale: false,
+    });
+    rsiChartRef.current = chart;
+
+    const series = chart.addLineSeries({ color: infoClr, lineWidth: 1, priceLineVisible: false, lastValueVisible: true });
+    rsiSeriesRef.current = series;
+    series.setData(lineData(data, rsiCalc(data.map((c) => c.close))));
+    series.createPriceLine({ price: 70, color: `${shortClr}99`, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: "" });
+    series.createPriceLine({ price: 50, color: `${textClr}55`, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: "" });
+    series.createPriceLine({ price: 30, color: `${longClr}99`,  lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: "" });
+
+    const syncRange = (range: LogicalRange | null) => { if (range) chart.timeScale().setVisibleLogicalRange(range); };
+    chartRef.current?.timeScale().subscribeVisibleLogicalRangeChange(syncRange);
+    const current = chartRef.current?.timeScale().getVisibleLogicalRange();
+    if (current) chart.timeScale().setVisibleLogicalRange(current);
+
+    const handleResize = () => chart.applyOptions({ width: container.clientWidth });
+    handleResize();
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(handleResize) : null;
+    ro?.observe(container);
+    window.addEventListener("resize", handleResize);
+
+    return () => {
+      chartRef.current?.timeScale().unsubscribeVisibleLogicalRangeChange(syncRange);
+      ro?.disconnect();
+      window.removeEventListener("resize", handleResize);
+      chart.remove();
+      rsiChartRef.current = null;
+      rsiSeriesRef.current = null;
+    };
+  }, [overlays.rsi, coin, dataKey, hasCandles]);
+
+  useEffect(() => {
+    const container = macdRef.current;
+    if (!container || !overlays.macd) {
+      if (macdChartRef.current) {
+        macdChartRef.current.remove();
+        macdChartRef.current = null;
+        macdLineSeriesRef.current = null;
+        macdSignalSeriesRef.current = null;
+        macdHistogramSeriesRef.current = null;
+      }
+      return;
+    }
+    const data = chartDataRef.current.length > 0 ? chartDataRef.current : normalizeCandles(candlesRef.current);
+    if (data.length === 0) return;
+
+    const cv = (name: string) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    const bgColor   = cv("--bg-1")   || "#0d0d10";
+    const gridClr   = cv("--border") || "#1c1c22";
+    const textClr   = cv("--fg-3")   || "#6a6a72";
+    const infoClr   = cv("--info")   || "#5b8def";
+    const warnClr   = cv("--warn")   || "#f0b341";
+    const longClr   = cv("--long")   || "#1edb88";
+    const shortClr  = cv("--short")  || "#ff5a4d";
+    const macdData = macdCalc(data.map((c) => c.close));
+
+    const chart = createChart(container, {
+      height: 120,
+      layout: { background: { type: ColorType.Solid, color: bgColor }, textColor: textClr },
+      grid: { vertLines: { color: `${gridClr}33` }, horzLines: { color: `${gridClr}33` } },
+      rightPriceScale: { borderColor: gridClr, scaleMargins: { top: 0.16, bottom: 0.16 } },
+      timeScale: { borderColor: gridClr, visible: false },
+      crosshair: { horzLine: { visible: true, labelVisible: false } },
+      handleScroll: false,
+      handleScale: false,
+    });
+    macdChartRef.current = chart;
+
+    const histogramSeries = chart.addHistogramSeries({ priceLineVisible: false, lastValueVisible: false });
+    macdHistogramSeriesRef.current = histogramSeries;
+    histogramSeries.setData(macdHistogramData(data, macdData.histogram, longClr, shortClr));
+
+    const lineSeries = chart.addLineSeries({ color: infoClr, lineWidth: 1, priceLineVisible: false, lastValueVisible: true });
+    macdLineSeriesRef.current = lineSeries;
+    lineSeries.setData(lineData(data, macdData.line));
+
+    const signalSeries = chart.addLineSeries({ color: warnClr, lineWidth: 1, priceLineVisible: false, lastValueVisible: false });
+    macdSignalSeriesRef.current = signalSeries;
+    signalSeries.setData(lineData(data, macdData.signal));
+
+    lineSeries.createPriceLine({ price: 0, color: `${textClr}55`, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: "" });
+
+    const syncRange = (range: LogicalRange | null) => { if (range) chart.timeScale().setVisibleLogicalRange(range); };
+    chartRef.current?.timeScale().subscribeVisibleLogicalRangeChange(syncRange);
+    const current = chartRef.current?.timeScale().getVisibleLogicalRange();
+    if (current) chart.timeScale().setVisibleLogicalRange(current);
+
+    const handleResize = () => chart.applyOptions({ width: container.clientWidth });
+    handleResize();
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(handleResize) : null;
+    ro?.observe(container);
+    window.addEventListener("resize", handleResize);
+
+    return () => {
+      chartRef.current?.timeScale().unsubscribeVisibleLogicalRangeChange(syncRange);
+      ro?.disconnect();
+      window.removeEventListener("resize", handleResize);
+      chart.remove();
+      macdChartRef.current = null;
+      macdLineSeriesRef.current = null;
+      macdSignalSeriesRef.current = null;
+      macdHistogramSeriesRef.current = null;
+    };
+  }, [overlays.macd, coin, dataKey, hasCandles]);
 
   useEffect(() => {
     if (!coin || !hasCandles) {
@@ -737,13 +1064,11 @@ export function ChartPanel({
     setStatus("connecting");
     const socket = new WebSocket(wsUrl(network));
     const candleSubscription = { type: "candle", coin, interval: timeframe };
-    const tradesSubscription = { type: "trades", coin };
     let active = true;
 
     socket.addEventListener("open", () => {
       if (!active) return;
       socket.send(JSON.stringify({ method: "subscribe", subscription: candleSubscription }));
-      socket.send(JSON.stringify({ method: "subscribe", subscription: tradesSubscription }));
       setStatus("live");
     });
 
@@ -768,19 +1093,6 @@ export function ChartPanel({
         }
         return;
       }
-
-      if (message.channel !== "trades" || !Array.isArray(message.data)) return;
-      for (const trade of message.data) {
-        const price = Number(trade.px);
-        const baseVolumeDelta = Number(trade.sz);
-        if (Number.isFinite(price)) setLastPrice(price);
-
-        if (!candleFeedSeenRef.current) {
-          const nextCandle = applyTrade(liveCandleRef.current, trade, timeframe);
-          mergeLiveCandle(nextCandle);
-          updateLiveCandle(nextCandle, Number.isFinite(baseVolumeDelta) ? baseVolumeDelta : 0);
-        }
-      }
     });
 
     socket.addEventListener("close", () => {
@@ -794,7 +1106,6 @@ export function ChartPanel({
       active = false;
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ method: "unsubscribe", subscription: candleSubscription }));
-        socket.send(JSON.stringify({ method: "unsubscribe", subscription: tradesSubscription }));
       }
       socket.close();
     };
@@ -805,7 +1116,7 @@ export function ChartPanel({
       <div className="w-full min-h-95 flex flex-col items-center justify-center gap-3 p-8 text-center">
         <strong className="text-lg font-semibold text-text">Nessuna candela disponibile</strong>
         <span className="text-sm text-muted max-w-xs">
-          Avvia il worker e attendi almeno un ciclo di sincronizzazione.
+          Snapshot Hyperliquid non disponibile per questo mercato/timeframe.
         </span>
       </div>
     );
@@ -848,6 +1159,18 @@ export function ChartPanel({
         ))}
       </div>
       <div className="w-full min-h-95" ref={ref} />
+      {overlays.macd && (
+        <div style={{ borderTop: "1px solid var(--border)" }}>
+          <div style={{ padding: "2px 10px", fontSize: 9, fontFamily: "monospace", color: "var(--fg-3)", letterSpacing: "0.06em" }}>MACD 12 26 9</div>
+          <div ref={macdRef} className="w-full" />
+        </div>
+      )}
+      {overlays.rsi && (
+        <div style={{ borderTop: "1px solid var(--border)" }}>
+          <div style={{ padding: "2px 10px", fontSize: 9, fontFamily: "monospace", color: "var(--fg-3)", letterSpacing: "0.06em" }}>RSI 14</div>
+          <div ref={rsiRef} className="w-full" />
+        </div>
+      )}
     </div>
   );
 }

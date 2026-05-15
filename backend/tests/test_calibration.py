@@ -158,3 +158,132 @@ def test_calibrate_strategy_params_updates_strategy_config_params() -> None:
     assert strategy.params == {"period": 22, "multiplier": 1.7}
     assert len(changes) == 1
     assert changes[0].target == "strategy_params"
+
+
+def _weights_settings() -> dict:
+    return {
+        "min_strategy_trades": 8,
+        "lookback_trades": 500,
+        "min_weight": 1,
+        "max_weight": 30,
+        "auto_disable_enabled": True,
+        "auto_disable_min_trades": 25,
+        "auto_disable_win_rate": 0.30,
+    }
+
+
+def test_auto_disable_chronic_underperformer_with_safety_floor() -> None:
+    losing = StrategyConfig(
+        strategy_name="rsi",
+        timeframe="15m",
+        enabled=True,
+        params={"period": 14, "oversold": 30, "overbought": 70},
+        weight=9,
+    )
+    keeper = StrategyConfig(
+        strategy_name="macd",
+        timeframe="15m",
+        enabled=True,
+        params={"fast": 12, "slow": 26, "signal": 9},
+        weight=12,
+    )
+    db = FakeStrategyDb([losing, keeper])
+
+    analyzer = FakeAnalyzer(  # type: ignore[arg-type]
+        {
+            "rsi": stats(win_rate=0.25, pnl=-200, profit_factor=0.6),
+            "macd": stats(win_rate=0.55, pnl=120, profit_factor=1.4),
+        }
+    )
+    changes = AutoCalibrationEngine(analyzer=analyzer)._calibrate_strategy_weights(
+        db,  # type: ignore[arg-type]
+        _weights_settings(),
+    )
+
+    assert losing.enabled is False
+    assert keeper.enabled is True
+    disable_changes = [c for c in changes if c.target == "strategy_enabled"]
+    assert len(disable_changes) == 1
+    assert disable_changes[0].key == "15m:rsi"
+    assert "auto-disabled" in disable_changes[0].reason
+
+
+def test_auto_disable_keeps_at_least_one_strategy_per_timeframe() -> None:
+    only_losing = StrategyConfig(
+        strategy_name="rsi",
+        timeframe="15m",
+        enabled=True,
+        params={"period": 14, "oversold": 30, "overbought": 70},
+        weight=9,
+    )
+    db = FakeStrategyDb([only_losing])
+
+    analyzer = FakeAnalyzer(  # type: ignore[arg-type]
+        {"rsi": stats(win_rate=0.20, pnl=-300, profit_factor=0.5)}
+    )
+    changes = AutoCalibrationEngine(analyzer=analyzer)._calibrate_strategy_weights(
+        db,  # type: ignore[arg-type]
+        _weights_settings(),
+    )
+
+    assert only_losing.enabled is True
+    assert all(c.target != "strategy_enabled" for c in changes)
+
+
+def _risk_settings() -> dict:
+    return {
+        "min_signal_score_floor": 55,
+        "min_signal_score_ceiling": 80,
+        "min_risk_reward_floor": 2.0,
+        "min_risk_reward_ceiling": 3.0,
+        "min_risk_per_trade_pct": 0.25,
+        "deep_defensive_slope_threshold": -2.0,
+    }
+
+
+def test_deep_defensive_activates_on_strongly_negative_equity_slope() -> None:
+    db = FakeDb({"min_signal_score": 60, "min_risk_reward": 2.0, "max_risk_per_trade_pct": 1.0})
+
+    AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        stats(win_rate=0.45, pnl=-50, profit_factor=0.95),
+        _risk_settings(),
+        equity_slope_value=-5.0,
+    )
+
+    risk = db.rows["risk"].value
+    state = db.rows["auto_calibration_state"].value
+    assert risk["min_signal_score"] == 72  # 60 + 12
+    assert risk["min_risk_reward"] == 2.4
+    assert risk["max_risk_per_trade_pct"] == 0.5
+    assert state["deep_defensive_active"] is True
+
+
+def test_deep_defensive_requires_two_positive_runs_to_exit() -> None:
+    db = FakeDb({"min_signal_score": 72, "min_risk_reward": 2.4, "max_risk_per_trade_pct": 0.5})
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={"deep_defensive_active": True, "deep_defensive_positive_streak": 0},
+    )
+
+    AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        stats(win_rate=0.50, pnl=50, profit_factor=1.1),
+        _risk_settings(),
+        equity_slope_value=0.5,
+    )
+
+    state_after_first = db.rows["auto_calibration_state"].value
+    assert state_after_first["deep_defensive_active"] is True
+    assert state_after_first["deep_defensive_positive_streak"] == 1
+
+    AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        stats(win_rate=0.55, pnl=80, profit_factor=1.3),
+        _risk_settings(),
+        equity_slope_value=0.5,
+    )
+
+    state_after_second = db.rows["auto_calibration_state"].value
+    assert state_after_second["deep_defensive_active"] is False
+    assert state_after_second["deep_defensive_positive_streak"] == 2
