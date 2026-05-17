@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import time
 from datetime import datetime, timezone
 
@@ -26,6 +27,20 @@ from app.services.position_pnl import refresh_open_position_pnls
 logger = structlog.get_logger()
 _LAST_TIMEFRAME_RUN_MS: dict[str, int] = {}
 _TICK_LOCK = asyncio.Lock()
+
+_RECAP_INTERVAL_SECONDS = 3600  # ogni ora
+_ERROR_NOTIFY_COOLDOWN_SECONDS = 1800  # max 1 notifica errore ogni 30 min
+_next_recap_at: float = 0.0
+_last_error_notify_at: float = 0.0
+
+
+@dataclasses.dataclass
+class _WorkerStats:
+    cycles: int = 0
+    signals_generated: int = 0
+    candle_errors: int = 0
+    cycle_failures: int = 0
+    period_start: float = dataclasses.field(default_factory=time.time)
 
 
 def should_run_timeframe(timeframe: str, now_ms: int) -> bool:
@@ -154,7 +169,7 @@ async def run_once(
     calibration_engine: AutoCalibrationEngine,
     notifier: TelegramNotifier,
     executor: OrderExecutionEngine,
-) -> None:
+) -> tuple[int, int]:
     settings = get_settings()
     db = SessionLocal()
     # Catturato una volta: usa time.time() per POSIX corretto indipendente dal timezone
@@ -183,7 +198,7 @@ async def run_once(
     if should_run_calibration(db, closed):
         calibrated = run_calibration(db, calibration_engine)
         calibration_attempted = True
-        run_auto_tuner(db)
+    run_auto_tuner(db)
     if not active_timeframes:
         try:
             db.add(DecisionLog(
@@ -198,6 +213,7 @@ async def run_once(
                     "closed": closed,
                     "pnl_updated": pnl_updated,
                     "live_reconciled": live_reconciled,
+                    "live_stop_updates": 0,
                     "calibrated": calibrated,
                     "active_timeframes": [],
                 },
@@ -205,7 +221,7 @@ async def run_once(
             db.commit()
         finally:
             db.close()
-        return
+        return 0, 0
     try:
         markets = await asyncio.to_thread(
             lambda: (
@@ -221,6 +237,7 @@ async def run_once(
         synced = 0
         skipped = 0
         generated = 0
+        live_stop_updates = 0
         last_heartbeat = time.monotonic()
         for market in markets:
             # Keep heartbeat fresh during long ticks (many markets × timeframes)
@@ -258,6 +275,13 @@ async def run_once(
                 closed += await asyncio.to_thread(
                     executor.close_paper_positions_for_timeframe, db, market, timeframe
                 )
+                if operation_mode == OperationMode.AUTO_TRADE:
+                    live_stop_updates += await asyncio.to_thread(
+                        executor.position_manager.manage_live_positions_for_timeframe,
+                        db,
+                        market,
+                        timeframe,
+                    )
                 signal = await asyncio.to_thread(signal_engine.generate, db, market, timeframe)
                 if signal is None:
                     await asyncio.sleep(0.05)
@@ -337,11 +361,13 @@ async def run_once(
                     "closed": closed,
                     "pnl_updated": pnl_updated,
                     "live_reconciled": live_reconciled,
+                    "live_stop_updates": live_stop_updates,
                     "calibrated": calibrated,
                 },
             )
         )
         db.commit()
+        return generated, skipped
     finally:
         db.close()
 
@@ -374,6 +400,20 @@ async def main() -> None:
     notifier = TelegramNotifier(settings)
     executor = OrderExecutionEngine(settings)
     _record_heartbeat("starting")
+
+    global _next_recap_at, _last_error_notify_at
+    _next_recap_at = time.time() + _RECAP_INTERVAL_SECONDS
+    _last_error_notify_at = 0.0
+    stats = _WorkerStats()
+
+    startup_db = SessionLocal()
+    try:
+        await notifier.send_worker_online(startup_db)
+    except Exception:
+        logger.exception("telegram_worker_online_failed")
+    finally:
+        startup_db.close()
+
     while True:
         if _TICK_LOCK.locked():
             logger.warning("worker_tick_skipped_overlap")
@@ -381,10 +421,43 @@ async def main() -> None:
             async with _TICK_LOCK:
                 _record_heartbeat("tick")
                 try:
-                    await run_once(signal_engine, candle_sync, calibration_engine, notifier, executor)
+                    generated, candle_errors = await run_once(
+                        signal_engine, candle_sync, calibration_engine, notifier, executor
+                    )
+                    stats.cycles += 1
+                    stats.signals_generated += generated
+                    stats.candle_errors += candle_errors
                 except Exception as exc:
                     logger.exception("worker_cycle_failed", error=str(exc))
                     _record_worker_failure(exc)
+                    stats.cycle_failures += 1
+                    now = time.time()
+                    if now - _last_error_notify_at >= _ERROR_NOTIFY_COOLDOWN_SECONDS:
+                        _last_error_notify_at = now
+                        try:
+                            await notifier.send_worker_error("worker_cycle", exc)
+                        except Exception:
+                            logger.exception("telegram_error_notify_failed")
+
+        now = time.time()
+        if now >= _next_recap_at:
+            _next_recap_at = now + _RECAP_INTERVAL_SECONDS
+            period_min = round((now - stats.period_start) / 60)
+            recap_db = SessionLocal()
+            try:
+                await notifier.send_hourly_recap(recap_db, {
+                    "cycles": stats.cycles,
+                    "signals_generated": stats.signals_generated,
+                    "candle_errors": stats.candle_errors,
+                    "cycle_failures": stats.cycle_failures,
+                    "period_minutes": period_min,
+                })
+            except Exception:
+                logger.exception("telegram_recap_failed")
+            finally:
+                recap_db.close()
+            stats = _WorkerStats()
+
         await asyncio.sleep(60)
 
 

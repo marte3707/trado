@@ -29,6 +29,15 @@ Regole asset:
 5. `RiskManager` calcola SL/TP con ATR e risk/reward.
 6. Il segnale viene salvato e notificato.
 7. `OrderExecutionEngine` puo' aprire paper trade o live trade. Il live trading calcola size da account value e rischio, invia market IOC, registra posizione/ordine e piazza stop loss + take profit reduce-only.
+8. `PositionManagementEngine` gestisce le posizioni aperte dopo l'ingresso: R-multiple, TP parziali configurabili, breakeven, lock-profit e trailing stop su candle close. Ogni modifica dello stop viene salvata in `position_stop_updates` e sintetizzata nei `decision_logs`.
+
+## Gestione dinamica SL/TP
+
+- La configurazione vive in `app_settings.position_management` e viene inizializzata da `seed_defaults`.
+- In paper trading il worker applica prima i trigger gia' validi della candela e poi aggiorna lo stop per le candele successive.
+- In live trading gli update sono operativi solo quando la modalita' effettiva e' `AUTO_TRADE`, live trading e' abilitato e il kill switch e' spento.
+- Per aggiornare uno stop live il sistema invia prima il nuovo trigger reduce-only, poi prova a cancellare il vecchio ordine. Se la submit fallisce, il vecchio stop resta invariato; se la cancel fallisce, il nuovo stop rimane registrato e l'evento viene loggato.
+- I TP dinamici chiudono TP1/TP2 e lasciano la quota runner senza TP fisso, gestita dal trailing stop. Le posizioni legacy continuano a usare il piano TP salvato in metadata.
 
 ## Estensioni previste
 

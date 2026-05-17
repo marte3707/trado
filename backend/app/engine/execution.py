@@ -11,6 +11,7 @@ from app.core.enums import Direction, OrderMode, SignalStatus
 from app.core.runtime_settings import effective_live_execution_settings, effective_paper_equity
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, Signal
 from app.engine.order_validation import LiveOrderPlan, OrderValidator
+from app.engine.position_management import PositionManagementEngine
 from app.engine.risk import calculate_position_size
 from app.services.hyperliquid import HyperliquidError, HyperliquidTradingClient
 
@@ -61,6 +62,7 @@ class OrderExecutionEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.validator = OrderValidator()
+        self.position_manager = PositionManagementEngine(settings)
 
     def execute_paper(self, db: Session, signal: Signal) -> Position | None:
         existing = (
@@ -107,6 +109,20 @@ class OrderExecutionEngine:
         )
         notional = Decimal(str(size)) * signal.entry_price
         leverage = notional / Decimal(str(equity)) if equity > 0 else Decimal("0")
+        metadata = self.position_manager.initial_metadata(
+            db,
+            signal,
+            size=Decimal(str(size)),
+            planned_notional=notional,
+            base={
+                "source_signal_id": signal.id,
+                "source_timeframe": signal.timeframe,
+                "initial_size": str(size),
+                "remaining_size": str(size),
+                "account_value_at_entry": str(equity),
+                "take_profit_plan": self._build_take_profit_plan(db, signal),
+            },
+        )
         position = Position(
             market_id=signal.market_id,
             mode=OrderMode.PAPER.value,
@@ -118,15 +134,7 @@ class OrderExecutionEngine:
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit_3 or signal.take_profit_2 or signal.take_profit_1,
             status="open",
-            metadata_json={
-                "source_signal_id": signal.id,
-                "source_timeframe": signal.timeframe,
-                "initial_size": str(size),
-                "remaining_size": str(size),
-                "account_value_at_entry": str(equity),
-                "planned_notional": str(notional),
-                "take_profit_plan": self._build_take_profit_plan(signal),
-            },
+            metadata_json=metadata,
         )
         db.add(position)
         db.flush()
@@ -272,6 +280,23 @@ class OrderExecutionEngine:
     ) -> Position:
         filled_size = entry_result.filled_size or requested_size
         entry_price = entry_result.avg_price or signal.entry_price
+        metadata = self.position_manager.initial_metadata(
+            db,
+            signal,
+            size=filled_size,
+            planned_notional=plan.notional,
+            base={
+                "source_signal_id": signal.id,
+                "source_timeframe": signal.timeframe,
+                "initial_size": str(filled_size),
+                "remaining_size": str(filled_size),
+                "account_value_at_entry": str(account_value),
+                "contract_leverage": plan.max_leverage,
+                "entry_response": entry_result.raw_response,
+                "take_profit_plan": self._build_take_profit_plan(db, signal),
+                "funding_rate": (signal.strategy_breakdown or {}).get("_funding_rate"),
+            },
+        )
         position = Position(
             market_id=signal.market_id,
             hyperliquid_position_id=entry_result.oid,
@@ -284,18 +309,7 @@ class OrderExecutionEngine:
             stop_loss=signal.stop_loss,
             take_profit=signal.take_profit_3 or signal.take_profit_2 or signal.take_profit_1,
             status="open",
-            metadata_json={
-                "source_signal_id": signal.id,
-                "source_timeframe": signal.timeframe,
-                "initial_size": str(filled_size),
-                "remaining_size": str(filled_size),
-                "account_value_at_entry": str(account_value),
-                "planned_notional": str(plan.notional),
-                "contract_leverage": plan.max_leverage,
-                "entry_response": entry_result.raw_response,
-                "take_profit_plan": self._build_take_profit_plan(signal),
-                "funding_rate": (signal.strategy_breakdown or {}).get("_funding_rate"),
-            },
+            metadata_json=metadata,
         )
         db.add(position)
         db.flush()
@@ -453,9 +467,14 @@ class OrderExecutionEngine:
 
         initial_size = position.size
         skipped_tp_levels: list[dict[str, Any]] = []
-        for level, column, allocation in TAKE_PROFIT_ALLOCATIONS:
-            price = getattr(signal, column)
-            if price is None:
+        for item in self._take_profit_plan(position):
+            if item.get("filled") or item.get("runner"):
+                continue
+            try:
+                level = str(item.get("level", "take_profit"))
+                price = Decimal(str(item["price"]))
+                allocation = Decimal(str(item["allocation"]))
+            except (KeyError, TypeError, ValueError):
                 continue
             tp_size = _round_size(initial_size * allocation, sz_decimals)
             if tp_size <= 0:
@@ -756,6 +775,11 @@ class OrderExecutionEngine:
             exit_count, closed_count = self._apply_paper_triggers_for_candle(db, position, candle)
             exits += exit_count
             closed += closed_count
+            if position.status == "open":
+                updated = self.position_manager.manage_paper_position_for_candle(
+                    db, market, position, [candle], candle
+                )
+                exits += 1 if updated else 0
         if exits:
             db.commit()
         return closed
@@ -796,6 +820,11 @@ class OrderExecutionEngine:
                 exit_count, closed_count = self._apply_paper_triggers_for_candle(db, position, candle)
                 exits += exit_count
                 closed += closed_count
+                if position.status == "open":
+                    updated = self.position_manager.manage_paper_position_for_candle(
+                        db, market, position, candles, candle
+                    )
+                    exits += 1 if updated else 0
         if exits:
             db.commit()
         return closed
@@ -844,7 +873,7 @@ class OrderExecutionEngine:
             try:
                 price = Decimal(str(item["price"]))
                 allocation = Decimal(str(item["allocation"]))
-            except (KeyError, TypeError, ValueError):
+            except Exception:
                 continue
             take_hit = candle.high >= price if side == "long" else candle.low <= price
             if take_hit:
@@ -894,7 +923,10 @@ class OrderExecutionEngine:
         except Exception:
             return position.size
 
-    def _build_take_profit_plan(self, signal: Signal) -> list[dict[str, str | bool]]:
+    def _build_take_profit_plan(self, db: Session, signal: Signal) -> list[dict[str, str | bool]]:
+        dynamic_plan = self.position_manager.build_take_profit_plan(db, signal)
+        if dynamic_plan:
+            return dynamic_plan
         plan: list[dict[str, str | bool]] = []
         for level, field_name, allocation in TAKE_PROFIT_ALLOCATIONS:
             price = getattr(signal, field_name)
@@ -921,7 +953,7 @@ class OrderExecutionEngine:
             return
         signal = self._source_signal(db, metadata)
         if signal is not None:
-            metadata["take_profit_plan"] = self._build_take_profit_plan(signal)
+            metadata["take_profit_plan"] = self._build_take_profit_plan(db, signal)
         elif position.take_profit is not None:
             metadata["take_profit_plan"] = [
                 {
@@ -965,6 +997,12 @@ class OrderExecutionEngine:
         for item in plan:
             if isinstance(item, dict) and item.get("level") == reason:
                 item["filled"] = True
+                metadata["partial_exit_count"] = int(metadata.get("partial_exit_count") or 0) + 1
+                if reason == "tp1":
+                    metadata["tp1_hit"] = True
+                elif reason == "tp2":
+                    metadata["tp2_hit"] = True
+                    metadata["runner_active"] = True
 
 
 def _sz_decimals(market: Market) -> int:

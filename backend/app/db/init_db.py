@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.runtime_settings import DEFAULT_POSITION_MANAGEMENT_SETTINGS
 from app.db.models import AppSetting, Base, StrategyConfig
 from app.db.session import engine
 
@@ -87,6 +88,13 @@ def seed_defaults(db: Session) -> None:
                     "max_total_exposure_pct": settings.max_total_exposure_pct,
                     "max_leverage": settings.max_leverage,
                 },
+            )
+        )
+    if db.get(AppSetting, "position_management") is None:
+        db.add(
+            AppSetting(
+                key="position_management",
+                value=DEFAULT_POSITION_MANAGEMENT_SETTINGS,
             )
         )
     if db.get(AppSetting, "timeframes") is None:

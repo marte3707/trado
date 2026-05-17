@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from typing import Any
 
 import pytest

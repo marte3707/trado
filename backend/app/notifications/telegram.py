@@ -2,10 +2,14 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import httpx
+import structlog
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.db.models import Alert, Signal
+from app.db.models import Alert, AppSetting, Position, Signal
+
+logger = structlog.get_logger()
 
 _DIRECTION_ICON = {"LONG": "📈", "SHORT": "📉"}
 _SCORE_FILLED = "●"
@@ -63,6 +67,138 @@ def _build_message(signal: Signal) -> str:
 class TelegramNotifier:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+
+    async def _send_text(self, text: str) -> bool:
+        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+            return False
+        url = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/sendMessage"
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    url,
+                    json={
+                        "chat_id": self.settings.telegram_chat_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                    },
+                )
+            return response.is_success
+        except Exception as exc:
+            logger.warning("telegram_send_failed", error=str(exc))
+            return False
+
+    async def send_worker_online(self, db: Session) -> None:
+        now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+        mode = "—"
+        score = "—"
+        defensive = False
+        try:
+            mode_setting = db.get(AppSetting, "operation_mode")
+            if mode_setting:
+                mode = mode_setting.value.get("mode", "—")
+            risk_setting = db.get(AppSetting, "risk")
+            if risk_setting:
+                score = risk_setting.value.get("min_signal_score", "—")
+            cal_state = db.get(AppSetting, "auto_calibration_state")
+            if cal_state:
+                defensive = bool(cal_state.value.get("deep_defensive_active", False))
+        except Exception:
+            pass
+        defensive_line = "\n⚠️ <b>Modalità difensiva attiva</b>" if defensive else ""
+        await self._send_text(
+            f"✅ <b>Trado Worker ONLINE</b>\n"
+            f"<code>{now}</code>\n"
+            f"\n⚙️ Config: modalità <b>{mode}</b> · score min <b>{score}</b>"
+            f"{defensive_line}"
+        )
+
+    async def send_worker_error(self, context: str, exc: Exception) -> None:
+        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        error_type = type(exc).__name__
+        error_msg = str(exc)[:300]
+        await self._send_text(
+            f"🔴 <b>Trado Worker — Errore</b>\n"
+            f"<code>{now}</code>\n\n"
+            f"Contesto: <code>{context}</code>\n"
+            f"<code>{error_type}: {error_msg}</code>"
+        )
+
+    async def send_hourly_recap(self, db: Session, stats: dict) -> None:
+        now = datetime.now(timezone.utc)
+        now_str = now.strftime("%H:%M UTC")
+
+        # posizioni aperte
+        try:
+            paper_count = (
+                db.query(func.count(Position.id))
+                .filter(Position.mode == "paper", Position.status == "open")
+                .scalar() or 0
+            )
+            paper_pnl = (
+                db.query(func.sum(Position.unrealized_pnl))
+                .filter(Position.mode == "paper", Position.status == "open")
+                .scalar()
+            )
+            live_count = (
+                db.query(func.count(Position.id))
+                .filter(Position.mode == "live", Position.status == "open")
+                .scalar() or 0
+            )
+            live_pnl = (
+                db.query(func.sum(Position.unrealized_pnl))
+                .filter(Position.mode == "live", Position.status == "open")
+                .scalar()
+            )
+        except Exception:
+            paper_count = live_count = 0
+            paper_pnl = live_pnl = None
+
+        # impostazioni correnti
+        mode = "—"
+        score = "—"
+        defensive = False
+        try:
+            mode_setting = db.get(AppSetting, "operation_mode")
+            if mode_setting:
+                mode = mode_setting.value.get("mode", "—")
+            risk_setting = db.get(AppSetting, "risk")
+            if risk_setting:
+                score = risk_setting.value.get("min_signal_score", "—")
+            cal_state = db.get(AppSetting, "auto_calibration_state")
+            if cal_state:
+                defensive = bool(cal_state.value.get("deep_defensive_active", False))
+        except Exception:
+            pass
+
+        def _pnl(v) -> str:
+            if v is None:
+                return "n/d"
+            sign = "+" if float(v) >= 0 else ""
+            return f"{sign}{float(v):.2f} $"
+
+        cycles = stats.get("cycles", 0)
+        signals = stats.get("signals_generated", 0)
+        candle_errors = stats.get("candle_errors", 0)
+        cycle_failures = stats.get("cycle_failures", 0)
+        period_min = stats.get("period_minutes", 60)
+
+        defensive_line = "\n⚠️ <b>Modalità difensiva attiva</b>" if defensive else ""
+        positions_block = (
+            f"\n\n📌 <b>Posizioni aperte</b>\n"
+            f"  Paper: {paper_count} | PnL: <code>{_pnl(paper_pnl)}</code>\n"
+            f"  Live:  {live_count} | PnL: <code>{_pnl(live_pnl)}</code>"
+        )
+
+        await self._send_text(
+            f"📊 <b>Trado — Recap {period_min} min</b>\n"
+            f"<code>{now_str}</code>\n\n"
+            f"📡 Cicli: {cycles} | Errori ciclo: {cycle_failures}\n"
+            f"📈 Segnali generati: {signals}\n"
+            f"⚠️ Errori candle sync: {candle_errors}"
+            f"{positions_block}\n\n"
+            f"⚙️ Modalità: <b>{mode}</b> · Score min: <b>{score}</b>"
+            f"{defensive_line}"
+        )
 
     async def send_signal(self, db: Session, signal: Signal) -> None:
         payload: dict[str, str | int | None] = {

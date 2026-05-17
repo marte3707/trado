@@ -7,7 +7,7 @@ import pytest
 from app.core.config import Settings
 from app.db.models import AppSetting, DecisionLog, Market, Order, Position, Signal
 from app.engine.execution import OrderExecutionEngine
-from app.engine.order_validation import LiveOrderPlan, ValidationResult
+from app.engine.order_validation import ValidationResult
 from app.services.hyperliquid import HyperliquidError, HyperliquidOrderResult
 
 
@@ -267,7 +267,7 @@ def _force_validator_ok(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(OrderValidator, "validate_live_execution", fake_validate)
 
 
-def test_execute_live_long_submits_market_plus_three_triggers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_live_long_submits_market_plus_dynamic_triggers(monkeypatch: pytest.MonkeyPatch) -> None:
     _force_validator_ok(monkeypatch)
     settings = _build_settings()
     signal = _build_signal()
@@ -281,13 +281,13 @@ def test_execute_live_long_submits_market_plus_three_triggers(monkeypatch: pytes
     assert len(trading.market_orders) == 1
     assert trading.market_orders[0]["coin"] == "BTC"
     assert trading.market_orders[0]["is_buy"] is True
-    assert len(trading.trigger_orders) == 4  # 1 SL + 3 TP
+    assert len(trading.trigger_orders) == 3  # 1 SL + TP1/TP2; runner has no fixed TP
     tpsl_values = sorted(c["tpsl"] for c in trading.trigger_orders)
-    assert tpsl_values == ["sl", "tp", "tp", "tp"]
+    assert tpsl_values == ["sl", "tp", "tp"]
     assert signal.status == "executed"
     orders = db.added_of(Order)
-    # entry + SL + 3 TP
-    assert len(orders) == 5
+    # entry + SL + TP1/TP2
+    assert len(orders) == 4
 
 
 def test_execute_live_short_uses_sell_market_and_buy_triggers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -382,7 +382,6 @@ def test_execute_live_propagates_cloids_to_trading_client(monkeypatch: pytest.Mo
     OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
 
     assert trading.market_orders[0]["cloid"] == make_cloid(signal.id, "mkt")
-    trigger_by_tpsl = {t["tpsl"] + ":" + str(t["trigger_price"]): t["cloid"] for t in trading.trigger_orders}
     # all triggers got a non-empty cloid distinct from the market one
     cloids = [trig["cloid"] for trig in trading.trigger_orders]
     assert all(cloid is not None for cloid in cloids)

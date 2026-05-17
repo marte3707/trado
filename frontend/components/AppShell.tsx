@@ -15,7 +15,8 @@ import { AlertsScreen } from "@/components/screens/AlertsScreen";
 import { SettingsScreen } from "@/components/screens/SettingsScreen";
 import {
   apiGet, apiPatch, apiPost,
-  Health, Market, Signal, Position, Order, AppSettings, Strategy, DecisionLog, MarketIntelligence, Calibration, CalibrationHistoryEntry
+  Health, Market, Signal, Position, Order, AppSettings, Strategy, DecisionLog, MarketIntelligence,
+  Calibration, CalibrationHistoryEntry, AutoTunerStatus, WorkerCycle, SignalRejections
 } from "@/lib/api";
 import { hydrateOpenPositionSourceSignals } from "@/lib/signalHydration";
 
@@ -76,6 +77,9 @@ export function AppShell({ initialData }: AppShellProps) {
   const [logs, setLogs] = useState(initialData.logs);
   const [calibration, setCalibration] = useState<Calibration>(initialData.calibration);
   const [calibrationHistory, setCalibrationHistory] = useState<CalibrationHistoryEntry[]>(initialData.calibrationHistory);
+  const [tunerStatus, setTunerStatus] = useState<AutoTunerStatus | null>(initialData.tunerStatus ?? null);
+  const [workerCycles, setWorkerCycles] = useState<WorkerCycle[]>(initialData.workerCycles ?? []);
+  const [signalRejections, setSignalRejections] = useState<SignalRejections>(initialData.signalRejections ?? { total: 0, by_reason: {}, recent: [] });
   const [marketIntelligence, setMarketIntelligence] = useState<MarketIntelligence>(
     initialData.marketIntelligence
   );
@@ -105,7 +109,7 @@ export function AppShell({ initialData }: AppShellProps) {
   /* ── refresh ─────────────────────────────────────────────────────────── */
   const refresh = useCallback(async () => {
     try {
-      const [h, m, cm, s, p, o, st, str, l, cal, calHistory, mi] = await Promise.all([
+      const [h, m, cm, s, p, o, st, str, l, cal, calHistory, tuner, cycles, rejections, mi] = await Promise.all([
         apiGet<Health>("/api/health"),
         apiGet<Market[]>("/api/markets"),
         apiGet<Market[]>("/api/markets?active=true&has_candles=true"),
@@ -117,6 +121,9 @@ export function AppShell({ initialData }: AppShellProps) {
         apiGet<DecisionLog[]>("/api/logs"),
         apiGet<Calibration>("/api/analytics/calibration"),
         apiGet<CalibrationHistoryEntry[]>("/api/analytics/calibration/history"),
+        apiGet<AutoTunerStatus>("/api/auto-tuner/status").catch(() => null),
+        apiGet<WorkerCycle[]>("/api/analytics/worker-cycles?limit=20").catch(() => []),
+        apiGet<SignalRejections>("/api/analytics/signal-rejections?limit=50").catch(() => ({ total: 0, by_reason: {}, recent: [] })),
         apiGet<MarketIntelligence>("/api/market-intelligence").catch(() => marketIntelligence),
       ]);
       const hydratedSignals = await hydrateOpenPositionSourceSignals(s, p);
@@ -131,6 +138,9 @@ export function AppShell({ initialData }: AppShellProps) {
       setLogs(l);
       setCalibration(cal);
       setCalibrationHistory(calHistory);
+      setTunerStatus(tuner);
+      setWorkerCycles(cycles);
+      setSignalRejections(rejections);
       setMarketIntelligence(mi);
     } catch (e) {
       console.error("refresh failed", e);
@@ -266,6 +276,9 @@ export function AppShell({ initialData }: AppShellProps) {
               calibration={calibration}
               history={calibrationHistory}
               settings={settings}
+              tunerStatus={tunerStatus}
+              workerCycles={workerCycles}
+              signalRejections={signalRejections}
               onRefresh={refresh}
             />
           )}

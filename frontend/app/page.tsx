@@ -1,6 +1,7 @@
 import { AppShell } from "@/components/AppShell";
 import {
   AppSettings,
+  AutoTunerStatus,
   Calibration,
   CalibrationHistoryEntry,
   DecisionLog,
@@ -10,7 +11,9 @@ import {
   Order,
   Position,
   Signal,
+  SignalRejections,
   Strategy,
+  WorkerCycle,
   apiGet
 } from "@/lib/api";
 import { hydrateOpenPositionSourceSignals } from "@/lib/signalHydration";
@@ -39,6 +42,9 @@ async function loadDashboard() {
     logs,
     calibration,
     calibrationHistory,
+    tunerStatus,
+    workerCycles,
+    signalRejections,
     marketIntelligence,
   ] = await Promise.all([
     apiGet<Health>("/api/health"),
@@ -52,10 +58,14 @@ async function loadDashboard() {
     apiGet<DecisionLog[]>("/api/logs"),
     apiGet<Calibration>("/api/analytics/calibration"),
     apiGet<CalibrationHistoryEntry[]>("/api/analytics/calibration/history"),
+    apiGet<AutoTunerStatus>("/api/auto-tuner/status").catch(() => null),
+    apiGet<WorkerCycle[]>("/api/analytics/worker-cycles?limit=20").catch(() => []),
+    apiGet<SignalRejections>("/api/analytics/signal-rejections?limit=50").catch(() => ({ total: 0, by_reason: {}, recent: [] })),
     apiGet<MarketIntelligence>("/api/market-intelligence").catch(() => ({
       fear_greed: null,
       altcoin_season: null,
-    }))
+      global_metrics: null,
+    } as MarketIntelligence))
   ]);
   const hydratedSignals = await hydrateOpenPositionSourceSignals(signals, positions);
   const latestSignal = hydratedSignals[0];
@@ -87,6 +97,9 @@ async function loadDashboard() {
     logs,
     calibration,
     calibrationHistory,
+    tunerStatus,
+    workerCycles,
+    signalRejections,
     marketIntelligence
   };
 }

@@ -254,9 +254,11 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
   const [periodFilter, setPeriodFilter] = useState("7d");
   const [historyQuery, setHistoryQuery] = useState("");
   const [expandedPositionId, setExpandedPositionId] = useState<number | null>(null);
+  const [statusFilter, setStatusFilter] = useState<"all" | "closed" | "partial">("all");
   const [historyPage, setHistoryPage] = useState(1);
   const [historyPageSize, setHistoryPageSize] = useState(10);
   const [perfExpanded, setPerfExpanded] = useState(false);
+  const [stratExpanded, setStratExpanded] = useState(false);
 
   const trackedPositions = useMemo(() => positions.filter(p => hasExitActivity(p, orders)), [positions, orders]);
 
@@ -287,15 +289,27 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
     () => marketTypeFiltered.filter(p => modeFilter === "all" || p.mode === modeFilter),
     [marketTypeFiltered, modeFilter]
   );
+
+  const closedCount = useMemo(() => modeRows.filter(p => positionStatusLabel(p, exitOrdersFor(p, orders)) !== "partial").length, [modeRows, orders]);
+  const partialCount = useMemo(() => modeRows.filter(p => positionStatusLabel(p, exitOrdersFor(p, orders)) === "partial").length, [modeRows, orders]);
+
+  const statusRows = useMemo(() => {
+    if (statusFilter === "all") return modeRows;
+    return modeRows.filter(p => {
+      const label = positionStatusLabel(p, exitOrdersFor(p, orders));
+      return statusFilter === "partial" ? label === "partial" : label !== "partial";
+    });
+  }, [modeRows, statusFilter, orders]);
+
   const historySearchTokens = historyQuery.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const rows = useMemo(
     () => historySearchTokens.length === 0
-      ? modeRows
-      : modeRows.filter((position) => {
+      ? statusRows
+      : statusRows.filter((position) => {
         const text = positionSearchText(position, exitOrdersFor(position, orders));
         return historySearchTokens.every((token) => text.includes(token));
       }),
-    [historySearchTokens, modeRows, orders]
+    [historySearchTokens, statusRows, orders]
   );
   const historyTotalPages = Math.max(1, Math.ceil(rows.length / historyPageSize));
   const historySafePage = Math.min(historyPage, historyTotalPages);
@@ -461,6 +475,12 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
     setExpandedPositionId(null);
   }
 
+  function changeStatusFilter(next: "all" | "closed" | "partial") {
+    setStatusFilter(next);
+    setHistoryPage(1);
+    setExpandedPositionId(null);
+  }
+
   function changeHistoryQuery(next: string) {
     setHistoryQuery(next);
     setHistoryPage(1);
@@ -496,6 +516,13 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
           value={marketTypeFilter}
           onChange={changeMarketTypeFilter}
           counts={{ all: periodFiltered.length, perp: perpCount, spot: spotCount }}
+        />
+        <span style={{ width: 1, height: 20, background: "var(--border)", display: "inline-block" }} />
+        <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>Status</span>
+        <StatusSeg
+          value={statusFilter}
+          onChange={changeStatusFilter}
+          counts={{ all: modeRows.length, closed: closedCount, partial: partialCount }}
         />
         <div style={{ flex: 1 }} />
         <LiveEdgePill liveSt={modeLiveSt} papSt={modePaperSt} />
@@ -598,7 +625,7 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
                 <div className="card-head">
                   <span className="title">Equity curve</span>
                   <div className="right" style={{ display: "flex", gap: 10, fontSize: "var(--fz-xs)" }}>
-                    <span className="mono"><span className="dot green" /> Live</span>
+                    <span className="mono"><span className="dot red" /> Live</span>
                     <span className="mono"><span className="dot amber" /> Paper</span>
                   </div>
                 </div>
@@ -608,11 +635,19 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
 
             {/* Performance per strategia */}
             <div className="card" style={{ marginBottom: "var(--gap)" }}>
-              <div className="card-head">
-                <span className="title">Performance per strategia</span>
+              <div className="card-head" style={{ cursor: "pointer" }} onClick={() => setStratExpanded(v => !v)}>
+                <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ display: "inline-flex", transition: "transform 0.15s", transform: stratExpanded ? "rotate(90deg)" : "none", color: "var(--fg-2)" }}>
+                    <Icon name="chevron" size={12} />
+                  </span>
+                  <span className="title">Performance per strategia</span>
+                  {!stratExpanded && strategyStats.length > 0 && (
+                    <span className="muted mono" style={{ fontSize: "var(--fz-xs)" }}>{strategyStats.length} indicatori</span>
+                  )}
+                </span>
                 <div className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>tutti i mode · periodo selezionato</div>
               </div>
-              <StrategyPerformanceRows rows={strategyStats} />
+              {stratExpanded && <StrategyPerformanceRows rows={strategyStats} />}
             </div>
           </>
         )}
@@ -798,6 +833,29 @@ function MarketTypeSeg({ value, onChange, counts }: {
     { v: "all",  label: "Tutti" },
     { v: "perp", label: "Perp" },
     { v: "spot", label: "Spot" },
+  ];
+  return (
+    <div className="seg">
+      {opts.map(o => (
+        <button key={o.v} className={"seg-opt " + (value === o.v ? "active" : "")} onClick={() => onChange(o.v)}
+          style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+          <span>{o.label}</span>
+          <span className="mono" style={{ fontSize: 9, color: "var(--fg-3)" }}>{counts[o.v]}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function StatusSeg({ value, onChange, counts }: {
+  value: "all" | "closed" | "partial";
+  onChange: (v: "all" | "closed" | "partial") => void;
+  counts: Record<string, number>;
+}) {
+  const opts: { v: "all" | "closed" | "partial"; label: string }[] = [
+    { v: "all",     label: "Tutti" },
+    { v: "closed",  label: "Closed" },
+    { v: "partial", label: "Partial" },
   ];
   return (
     <div className="seg">

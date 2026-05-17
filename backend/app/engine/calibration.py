@@ -130,6 +130,8 @@ class AutoCalibrationEngine:
             "auto_disable_min_trades": 25,
             "auto_disable_win_rate": 0.30,
             "deep_defensive_slope_threshold": -2.0,
+            "starvation_soft_cycles": 10,
+            "starvation_hard_cycles": 15,
         }
         return {**defaults, **value}
 
@@ -286,6 +288,24 @@ class AutoCalibrationEngine:
             strategy.params = next_params
         return changes
 
+    def _consecutive_zero_signal_cycles(self, db: Session) -> int:
+        if not hasattr(db, "query"):
+            return 0
+        recent = (
+            db.query(DecisionLog)
+            .filter(DecisionLog.event_type == "worker_cycle")
+            .order_by(DecisionLog.timestamp.desc())
+            .limit(120)
+            .all()
+        )
+        streak = 0
+        for entry in recent:
+            if isinstance(entry.data, dict) and int(entry.data.get("generated", 0)) == 0:
+                streak += 1
+            else:
+                break
+        return streak
+
     def _calibrate_risk_settings(
         self,
         db: Session,
@@ -325,11 +345,40 @@ class AutoCalibrationEngine:
             new_streak = 0
             in_deep_defensive = prev_in_deep
 
+        # Starvation recovery: se troppi cicli consecutivi senza segnali il deep
+        # defensive non sta proteggendo nulla — allentare progressivamente.
+        zero_cycles = self._consecutive_zero_signal_cycles(db)
+        starvation_soft = int(settings.get("starvation_soft_cycles", 30))
+        starvation_hard = int(settings.get("starvation_hard_cycles", 60))
+        starvation_override = False
+        if in_deep_defensive and zero_cycles >= starvation_hard:
+            in_deep_defensive = False
+            new_streak = 0
+            starvation_override = True
+        state_value["consecutive_zero_signal_cycles"] = zero_cycles
+        state_value["starvation_override_active"] = starvation_override
+
         score_delta = 0
         rr_delta = 0.0
         risk_pct = base_risk
         reason = "historical performance near baseline"
-        if in_deep_defensive:
+        if starvation_override:
+            score_delta = 0
+            rr_delta = 0.0
+            risk_pct = base_risk
+            reason = (
+                f"starvation recovery: {zero_cycles} cicli consecutivi senza segnali, "
+                "parametri ripristinati al baseline"
+            )
+        elif in_deep_defensive and zero_cycles >= starvation_soft:
+            score_delta = 6
+            rr_delta = 0.2
+            risk_pct = max(float(settings["min_risk_per_trade_pct"]), base_risk * 0.75)
+            reason = (
+                f"deep defensive attenuato: {zero_cycles} cicli senza segnali, "
+                f"equity slope {equity_slope_value:.4f}"
+            )
+        elif in_deep_defensive:
             score_delta = 12
             rr_delta = 0.4
             risk_pct = max(float(settings["min_risk_per_trade_pct"]), base_risk * 0.5)

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,7 +12,7 @@ import httpx
 
 from app.core.config import Settings
 from app.core.enums import MarketType
-from app.services._circuit import CircuitBreakerOpen, hyperliquid_info_breaker
+from app.services._circuit import hyperliquid_info_breaker
 
 
 @dataclass(frozen=True)
@@ -48,8 +47,14 @@ def fetch_l2_book(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapsho
             raw_levels = data.get("levels", [])
             if len(raw_levels) < 2:
                 return None
-            bids = [OrderBookLevel(price=float(l["px"]), size=float(l["sz"])) for l in raw_levels[0]]
-            asks = [OrderBookLevel(price=float(l["px"]), size=float(l["sz"])) for l in raw_levels[1]]
+            bids = [
+                OrderBookLevel(price=float(level["px"]), size=float(level["sz"]))
+                for level in raw_levels[0]
+            ]
+            asks = [
+                OrderBookLevel(price=float(level["px"]), size=float(level["sz"]))
+                for level in raw_levels[1]
+            ]
             return L2BookSnapshot(bids=bids, asks=asks)
     except Exception:
         return None
@@ -229,7 +234,37 @@ class HyperliquidTradingClient:
         value = margin.get("accountValue")
         if value is None:
             raise HyperliquidError("Hyperliquid user_state did not include accountValue")
-        return Decimal(str(value))
+        account_val = Decimal(str(value))
+        # Unified account: add free USDC from spot wallet (total − hold).
+        # The held portion is already reflected in marginSummary.accountValue.
+        try:
+            spot_state = self.spot_user_state(address)
+            for balance in spot_state.get("balances", []):
+                if balance.get("coin") == "USDC":
+                    total = Decimal(str(balance.get("total", "0")))
+                    hold = Decimal(str(balance.get("hold", "0")))
+                    free_usdc = total - hold
+                    if free_usdc > 0:
+                        account_val += free_usdc
+                    break
+        except Exception:
+            pass
+        return account_val
+
+    def spot_user_state(self, address: str | None = None) -> dict[str, Any]:
+        info = self._info()
+        addr = address or self._account_address()
+        spot_method = getattr(info, "spot_user_state", None)
+        if callable(spot_method):
+            return spot_method(addr)
+        import httpx
+        response = httpx.post(
+            self.settings.info_url,
+            json={"type": "spotClearinghouseState", "user": addr},
+            timeout=20,
+        )
+        response.raise_for_status()
+        return response.json()
 
     def user_state(self, address: str | None = None) -> dict[str, Any]:
         info = self._info()

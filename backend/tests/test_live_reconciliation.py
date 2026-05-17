@@ -324,6 +324,32 @@ def test_reconciliation_tp_fill_suppresses_size_mismatch_warning() -> None:
     assert "live_reconciliation_size_mismatch" not in events
 
 
+def test_reconciliation_aligns_local_stop_size_after_partial_fill() -> None:
+    position = _make_position(size="1.0")
+    tp1_order = _make_tp_order()
+    stop_order = _make_sl_order()
+    db = FakeDb(positions=[position], orders=[tp1_order, stop_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "0.5", "entryPx": "100"}],
+        fills=[
+            {
+                "coin": "BTC",
+                "oid": 9999,
+                "cloid": "0xabc123",
+                "px": "110",
+                "sz": "0.5",
+                "closedPnl": "5",
+            }
+        ],
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert stop_order.size == Decimal("0.5")
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_stop_order_size_reconciled" in events
+
+
 def test_reconciliation_matches_fill_by_oid_when_cloid_missing() -> None:
     position = _make_position(size="1.0")
     tp1_order = _make_tp_order(cloid=None)  # no cloid stored

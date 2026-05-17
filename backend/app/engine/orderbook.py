@@ -41,8 +41,8 @@ def analyze_order_book(
     bids = snapshot.bids[:n_levels]
     asks = snapshot.asks[:n_levels]
 
-    bid_volume = sum(l.size for l in bids)
-    ask_volume = sum(l.size for l in asks)
+    bid_volume = sum(level.size for level in bids)
+    ask_volume = sum(level.size for level in asks)
     total = bid_volume + ask_volume
     obi = (bid_volume - ask_volume) / total if total > 0 else 0.0
 
@@ -57,18 +57,18 @@ def analyze_order_book(
     all_bids = snapshot.bids
     all_asks = snapshot.asks
 
-    avg_bid = sum(l.size for l in all_bids) / len(all_bids) if all_bids else 0.0
-    avg_ask = sum(l.size for l in all_asks) / len(all_asks) if all_asks else 0.0
+    avg_bid = sum(level.size for level in all_bids) / len(all_bids) if all_bids else 0.0
+    avg_ask = sum(level.size for level in all_asks) / len(all_asks) if all_asks else 0.0
 
     bid_walls = [
-        WallLevel(price=l.price, size=l.size, side="bid")
-        for l in all_bids
-        if l.size >= avg_bid * wall_multiplier and lower_bound <= l.price < entry
+        WallLevel(price=level.price, size=level.size, side="bid")
+        for level in all_bids
+        if level.size >= avg_bid * wall_multiplier and lower_bound <= level.price < entry
     ]
     ask_walls = [
-        WallLevel(price=l.price, size=l.size, side="ask")
-        for l in all_asks
-        if l.size >= avg_ask * wall_multiplier and entry < l.price <= upper_bound
+        WallLevel(price=level.price, size=level.size, side="ask")
+        for level in all_asks
+        if level.size >= avg_ask * wall_multiplier and entry < level.price <= upper_bound
     ]
 
     return OrderBookAnalysis(

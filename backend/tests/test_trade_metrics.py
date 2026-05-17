@@ -120,3 +120,18 @@ def test_open_partial_position_total_pnl_includes_realized_and_unrealized() -> N
     assert metrics.total_pnl == Decimal("40")
     assert metrics.return_pct == Decimal("4")
     assert metrics.realized_return_pct == Decimal("2.5")
+
+
+def test_initial_risk_uses_original_stop_from_metadata_after_trailing() -> None:
+    position = make_position(
+        "long",
+        "100",
+        "5",
+        stop="105",
+        metadata={"initial_size": "10", "initial_stop_loss": "90"},
+        status="open",
+    )
+
+    metrics = build_trade_metrics(position)
+
+    assert metrics.initial_risk == Decimal("100")

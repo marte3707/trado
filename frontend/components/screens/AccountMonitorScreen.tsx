@@ -285,13 +285,6 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
     () => summarizeTrading(snapshot?.positions ?? [], snapshot?.open_orders ?? []),
     [snapshot]
   );
-  const marginRatio = useMemo(() => {
-    const marginUsed = asNumber(snapshot?.account.total_margin_used);
-    const accountValue = asNumber(snapshot?.account.account_value);
-    if (marginUsed == null || accountValue == null || accountValue <= 0) return tradingSummary.marginRatio;
-    return (marginUsed / accountValue) * 100;
-  }, [snapshot, tradingSummary.marginRatio]);
-
   return (
     <div className="page">
       <div className="page-head">
@@ -326,7 +319,7 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
             <span className={"badge " + statusClass(snapshot?.status ?? "loading")}>{snapshot?.status ?? "loading"}</span>
           </div>
           <div className="card-body" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
-            <Metric label="Equity" value={fmtUsd(snapshot?.account.account_value)} />
+            <Metric label="Equity" value={fmtUsd(snapshot?.account.effective_account_value ?? snapshot?.account.account_value)} />
             <Metric label="Withdrawable" value={fmtUsd(snapshot?.account.withdrawable)} />
             <Metric label="Margin used" value={fmtUsd(snapshot?.account.total_margin_used)} />
             <Metric label="Notional" value={fmtUsd(snapshot?.account.total_notional_position)} />
@@ -430,7 +423,7 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
 }
 
 function UnifiedAccountCard({ account }: { account: AccountMonitor["account"] | null }) {
-  const accountValue = asNumber(account?.account_value);
+  const accountValue = asNumber(account?.effective_account_value ?? account?.account_value);
   const crossAccountValue = asNumber(account?.cross_account_value);
   const totalNtl = asNumber(account?.total_notional_position);
   const maintMargin = asNumber(account?.cross_maintenance_margin_used);
@@ -451,7 +444,7 @@ function UnifiedAccountCard({ account }: { account: AccountMonitor["account"] | 
         <span className="title">Unified Account</span>
       </div>
       <div className="card-body" style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
-        <Metric label="Portfolio Value" value={fmtUsd(account?.account_value)} />
+        <Metric label="Portfolio Value" value={fmtUsd(account?.effective_account_value ?? account?.account_value)} />
         <Metric
           label="Unified Account Leverage"
           value={leverage != null ? `${leverage.toFixed(2)}x` : "-"}

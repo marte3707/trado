@@ -327,6 +327,48 @@ def _resubmit_missing_protection_orders(
             )
 
 
+def _resize_local_stop_orders(
+    db: Session,
+    position: Position,
+    remote_size: Decimal,
+) -> None:
+    pending_stops = (
+        db.query(Order)
+        .filter(
+            Order.position_id == position.id,
+            Order.mode == OrderMode.LIVE.value,
+            Order.order_type == "stop_loss",
+            Order.status.notin_(_TERMINAL_ORDER_STATUSES),
+        )
+        .all()
+    )
+    for order in pending_stops:
+        if order.size == remote_size:
+            continue
+        previous_size = order.size
+        order.size = remote_size
+        raw = dict(order.raw_response or {})
+        raw["local_size_adjusted_after_reconciliation"] = {
+            "old_size": str(previous_size),
+            "new_size": str(remote_size),
+        }
+        order.raw_response = raw
+        db.add(order)
+        db.add(
+            DecisionLog(
+                event_type="live_stop_order_size_reconciled",
+                market_id=position.market_id,
+                position_id=position.id,
+                message="Local live stop order size aligned to reconciled position size",
+                data={
+                    "order_id": order.id,
+                    "old_size": str(previous_size),
+                    "new_size": str(remote_size),
+                },
+            )
+        )
+
+
 def reconcile_live_positions(
     db: Session,
     trading_client: HyperliquidTradingClient | None = None,
@@ -458,6 +500,7 @@ def reconcile_live_positions(
                 updated += 1
                 continue
             position.size = remote_abs
+            _resize_local_stop_orders(db, position, remote_abs)
             position.side = "long" if remote_size > 0 else "short"
             metadata.pop("size_mismatch_at", None)
             metadata.pop("size_mismatch_local", None)

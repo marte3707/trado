@@ -100,6 +100,8 @@ export type AccountMonitor = {
     configured: boolean;
     address: string | null;
     account_value: string | null;
+    effective_account_value: string | null;
+    free_spot_usdc: string | null;
     withdrawable: string | null;
     total_margin_used: string | null;
     total_notional_position: string | null;
@@ -324,6 +326,68 @@ export type CalibrationHistoryEntry = {
   changes: CalibrationChange[];
   error: string | null;
   force: boolean | null;
+};
+
+export type TunerStepMetrics = {
+  trades: number;
+  win_rate: number;
+  realized_pnl?: number;
+  profit_factor?: number;
+  equity_slope: number;
+};
+
+export type TunerStepHistory = {
+  key: string;
+  label: string;
+  status: "success" | "reverted" | "skipped";
+  metrics_before: TunerStepMetrics | null;
+  metrics_after: TunerStepMetrics | null;
+  trades_evaluated: number;
+  evaluated_at: string;
+  manual?: boolean;
+};
+
+export type TunerProgress = {
+  trades_done: number;
+  trades_required: number;
+};
+
+export type AutoTunerStatus = {
+  enabled: boolean;
+  current_step_key: string | null;
+  current_step_index: number | null;
+  activated_at: string | null;
+  metrics_before: TunerStepMetrics | null;
+  next_step_key: string | null;
+  trades_now: number;
+  progress: TunerProgress | null;
+  step_history: TunerStepHistory[];
+  config: {
+    min_trades_per_step: number;
+    improvement_threshold: number;
+  };
+};
+
+export type WorkerCycle = {
+  id: number;
+  timestamp: string;
+  event_type: string;
+  data: {
+    markets?: number;
+    synced?: number;
+    skipped?: number;
+    generated?: number;
+    closed?: number;
+    calibrated?: boolean;
+    active_timeframes?: string[];
+    error?: string;
+  };
+};
+
+export type SignalRejections = {
+  total: number;
+  by_reason: Record<string, number>;
+  recent: { id: number; timestamp: string; reasons: string[] }[];
 };
 
 export async function apiGet<T>(path: string): Promise<T> {

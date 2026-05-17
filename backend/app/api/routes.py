@@ -8,17 +8,6 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from sqlalchemy.orm import Session, joinedload
-
-_logger = structlog.get_logger()
-
-
-def _log_and_redact(event: str, exc: Exception) -> str:
-    """Log the full exception server-side and return a safe error_id to embed
-    in the API response. Callers never echo exception messages anymore."""
-    error_id = uuid.uuid4().hex[:12]
-    _logger.exception(event, error_id=error_id, error=str(exc))
-    return error_id
-
 from app.core.config import get_settings
 from app.core.runtime_settings import (
     effective_live_execution_settings,
@@ -58,6 +47,15 @@ from app.strategies.registry import strategy_registry
 
 router = APIRouter(prefix="/api")
 _market_data_client: CoinMarketCapClient | None = None
+_logger = structlog.get_logger()
+
+
+def _log_and_redact(event: str, exc: Exception) -> str:
+    """Log the full exception server-side and return a safe error_id to embed
+    in the API response. Callers never echo exception messages anymore."""
+    error_id = uuid.uuid4().hex[:12]
+    _logger.exception(event, error_id=error_id, error=str(exc))
+    return error_id
 
 # Beyond this age, Position.unrealized_pnl is considered stale and the API
 # recomputes it on the fly from the latest candle, instead of trusting the
@@ -843,6 +841,50 @@ def calibration_history(db: Session = Depends(get_db), limit: int = Query(100, g
     ]
 
 
+@router.get("/analytics/worker-cycles")
+def worker_cycles(db: Session = Depends(get_db), limit: int = Query(20, ge=1, le=100)) -> list[dict]:
+    rows = (
+        db.query(DecisionLog)
+        .filter(DecisionLog.event_type.in_(["worker_cycle", "worker_cycle_failed"]))
+        .order_by(DecisionLog.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": row.id,
+            "timestamp": row.timestamp,
+            "event_type": row.event_type,
+            "data": row.data or {},
+        }
+        for row in rows
+    ]
+
+
+@router.get("/analytics/signal-rejections")
+def signal_rejections(db: Session = Depends(get_db), limit: int = Query(50, ge=1, le=200)) -> dict:
+    rows = (
+        db.query(DecisionLog)
+        .filter(DecisionLog.event_type == "live_order_rejected")
+        .order_by(DecisionLog.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    reason_counts: dict[str, int] = {}
+    recent: list[dict] = []
+    for row in rows:
+        reasons = (row.data or {}).get("reasons", [])
+        if isinstance(reasons, list):
+            for r in reasons:
+                reason_counts[r] = reason_counts.get(r, 0) + 1
+        recent.append({
+            "id": row.id,
+            "timestamp": row.timestamp,
+            "reasons": reasons,
+        })
+    return {"total": len(rows), "by_reason": reason_counts, "recent": recent[:10]}
+
+
 @router.get("/settings")
 def settings(db: Session = Depends(get_db)) -> dict:
     return {row.key: row.value for row in db.query(AppSetting).all()}
@@ -1093,6 +1135,14 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
         (_decimal(position.get("unrealized_pnl")) or Decimal("0") for position in positions),
         Decimal("0"),
     )
+    free_spot_usdc = Decimal("0")
+    for bal in spot_balances:
+        if bal.get("coin") == "USDC":
+            total_usdc = _decimal(bal.get("total")) or Decimal("0")
+            hold_usdc = _decimal(bal.get("hold")) or Decimal("0")
+            free_spot_usdc = max(Decimal("0"), total_usdc - hold_usdc)
+            break
+    effective_account_value = (total_equity or Decimal("0")) + free_spot_usdc
     if user_state is not None:
         db.add(
             AccountSnapshot(
@@ -1128,6 +1178,8 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
             "configured": bool(address),
             "address": _redact_address(address),
             "account_value": _string_decimal(margin.get("accountValue")),
+            "effective_account_value": str(effective_account_value.quantize(Decimal("0.000001"))),
+            "free_spot_usdc": str(free_spot_usdc.quantize(Decimal("0.000001"))),
             "withdrawable": _string_decimal(withdrawable),
             "total_margin_used": _string_decimal(margin.get("totalMarginUsed")),
             "total_notional_position": _string_decimal(margin.get("totalNtlPos")),

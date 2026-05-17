@@ -138,6 +138,28 @@ class Position(Base):
     market: Mapped[Market] = relationship()
 
 
+class PositionStopUpdate(Base):
+    __tablename__ = "position_stop_updates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    position_id: Mapped[int] = mapped_column(
+        ForeignKey("positions.id", ondelete="CASCADE"), index=True
+    )
+    old_stop_loss: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    new_stop_loss: Mapped[Decimal] = mapped_column(Numeric(28, 10))
+    current_price: Mapped[Decimal] = mapped_column(Numeric(28, 10))
+    r_multiple: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    reason: Mapped[str] = mapped_column(String(64), index=True)
+    indicators: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    position: Mapped[Position] = relationship()
+
+    __table_args__ = (
+        Index("ix_position_stop_updates_position_created", "position_id", "created_at"),
+    )
+
+
 class Order(Base):
     __tablename__ = "orders"
 
@@ -230,4 +252,3 @@ class DecisionLog(Base):
     position_id: Mapped[int | None] = mapped_column(ForeignKey("positions.id"), nullable=True, index=True)
     message: Mapped[str] = mapped_column(Text)
     data: Mapped[dict] = mapped_column(JSONB, default=dict)
-

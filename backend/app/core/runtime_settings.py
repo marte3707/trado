@@ -6,6 +6,39 @@ from app.core.config import Settings
 from app.core.enums import OperationMode
 from app.db.models import AppSetting
 
+DEFAULT_POSITION_MANAGEMENT_SETTINGS: dict[str, Any] = {
+    "trailingStop": {
+        "enabled": True,
+        "activationR": 1.0,
+        "mode": "hybrid",
+        "atrPeriod": 14,
+        "atrMultiplierInitial": 3.0,
+        "atrMultiplierAfterTp1": 2.5,
+        "atrMultiplierAfterTp2": 2.0,
+        "useChandelierExit": True,
+        "useSwingTrailing": True,
+        "useEmaTrailing": True,
+        "emaPeriod": 21,
+        "swingLookback": 20,
+        "swingBufferAtr": 0.5,
+        "emaBufferAtr": 0.5,
+        "minStopUpdateDistancePct": 0.15,
+        "updateOnlyOnCandleClose": True,
+        "moveToBreakevenAtR": 1.0,
+        "lockProfitAtR": 2.0,
+        "lockProfitStopR": 1.0,
+    },
+    "takeProfit": {
+        "enabled": True,
+        "tp1R": 1.0,
+        "tp1ClosePct": 30,
+        "tp2R": 2.0,
+        "tp2ClosePct": 30,
+        "runnerPct": 40,
+        "runnerMode": "trailing_stop",
+    },
+}
+
 
 def setting_value(db: Session, key: str) -> dict:
     row = db.get(AppSetting, key)
@@ -80,6 +113,11 @@ def effective_live_execution_settings(db: Session, settings: Settings) -> dict:
     }
 
 
+def effective_position_management_settings(db: Session) -> dict[str, Any]:
+    value = setting_value(db, "position_management")
+    return _deep_merge(DEFAULT_POSITION_MANAGEMENT_SETTINGS, value)
+
+
 def effective_alert_min_score(db: Session, settings: Settings) -> int:
     value = setting_value(db, "alerts").get("min_score")
     if value is None:
@@ -88,6 +126,22 @@ def effective_alert_min_score(db: Session, settings: Settings) -> int:
         return int(value)
     except (TypeError, ValueError):
         return settings.min_signal_score
+
+
+def _deep_merge(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, default_value in defaults.items():
+        override_value = overrides.get(key)
+        if isinstance(default_value, dict) and isinstance(override_value, dict):
+            result[key] = _deep_merge(default_value, override_value)
+        elif override_value is not None:
+            result[key] = override_value
+        else:
+            result[key] = default_value.copy() if isinstance(default_value, dict) else default_value
+    for key, override_value in overrides.items():
+        if key not in result:
+            result[key] = override_value
+    return result
 
 
 def _float(value: object | None, default: float) -> float:

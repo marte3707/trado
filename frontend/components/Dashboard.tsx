@@ -31,6 +31,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChartPanel } from "@/components/ChartPanel";
 import {
   AppSettings,
+  AutoTunerStatus,
   Calibration,
   CalibrationHistoryEntry,
   DecisionLog,
@@ -40,7 +41,9 @@ import {
   Order,
   Position,
   Signal,
+  SignalRejections,
   Strategy,
+  WorkerCycle,
   apiDelete,
   apiGet,
   apiPatch,
@@ -89,6 +92,9 @@ export type DashboardData = {
   logs: DecisionLog[];
   calibration: Calibration;
   calibrationHistory: CalibrationHistoryEntry[];
+  tunerStatus: AutoTunerStatus | null;
+  workerCycles: WorkerCycle[];
+  signalRejections: SignalRejections;
   marketIntelligence: MarketIntelligence;
 };
 

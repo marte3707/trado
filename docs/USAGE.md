@@ -10,6 +10,48 @@ Il live trading richiede `ENABLE_LIVE_TRADING=true`, account/key Hyperliquid in 
 
 Non salvare private key nel database. Impostare `HYPERLIQUID_PRIVATE_KEY` solo come variabile ambiente del backend/worker.
 
+## Gestione dinamica Stop Loss / Take Profit
+
+La configurazione runtime e' in `/api/settings`, chiave `position_management`.
+Default iniziale:
+
+```json
+{
+  "trailingStop": {
+    "enabled": true,
+    "activationR": 1.0,
+    "mode": "hybrid",
+    "atrPeriod": 14,
+    "atrMultiplierInitial": 3.0,
+    "atrMultiplierAfterTp1": 2.5,
+    "atrMultiplierAfterTp2": 2.0,
+    "useChandelierExit": true,
+    "useSwingTrailing": true,
+    "useEmaTrailing": true,
+    "emaPeriod": 21,
+    "swingLookback": 20,
+    "swingBufferAtr": 0.5,
+    "emaBufferAtr": 0.5,
+    "minStopUpdateDistancePct": 0.15,
+    "updateOnlyOnCandleClose": true,
+    "moveToBreakevenAtR": 1.0,
+    "lockProfitAtR": 2.0,
+    "lockProfitStopR": 1.0
+  },
+  "takeProfit": {
+    "enabled": true,
+    "tp1R": 1.0,
+    "tp1ClosePct": 30,
+    "tp2R": 2.0,
+    "tp2ClosePct": 30,
+    "runnerPct": 40,
+    "runnerMode": "trailing_stop"
+  }
+}
+```
+
+In paper trading il worker simula TP parziali e aggiornamenti SL. In live trading gli aggiornamenti SL sono inviati solo quando la modalita' effettiva e' `AUTO_TRADE`, `enable_live_trading` e' true, le credenziali sono configurate e il kill switch e' spento. Ogni modifica dello stop e' registrata in `position_stop_updates` e nei `decision_logs`.
+
 ## Avvio locale passo per passo
 
 ### 1. Prerequisiti

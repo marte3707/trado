@@ -52,8 +52,6 @@ class FakeDb:
 def _monkeypatch_filter(monkeypatch) -> None:
     # FakeQuery.filter usa l'oggetto BinaryExpression come chiave;
     # gli iniettiamo un comportamento che riconosce confronti su AppSetting.key.
-    real_filter = FakeQuery.filter
-
     def fake_filter(self, condition):
         # Per i nostri test la condition è sempre AppSetting.key == 'auto_calibration_baseline'.
         self._filter_key = "auto_calibration_baseline"
