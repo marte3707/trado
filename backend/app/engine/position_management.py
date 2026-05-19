@@ -63,6 +63,8 @@ class PositionManagementEngine:
             if r_multiple is None or r_multiple <= 0 or allocation <= 0:
                 continue
             price = signal.entry_price + (risk * r_multiple if long else -(risk * r_multiple))
+            if price <= 0:
+                continue
             plan.append(
                 {
                     "level": level,
@@ -391,12 +393,14 @@ class PositionManagementEngine:
                 indicators=candidate.indicators,
             )
         )
+        old_stop_str = str(old_stop) if old_stop is not None else "none"
+        new_stop_str = str(candidate.price)
         db.add(
             DecisionLog(
                 event_type="position_stop_updated",
                 market_id=position.market_id,
                 position_id=position.id,
-                message="Position stop loss updated",
+                message=f"Position stop loss updated - from {old_stop_str} to {new_stop_str}",
                 data={
                     "mode": mode,
                     "old_stop_loss": str(old_stop) if old_stop is not None else None,

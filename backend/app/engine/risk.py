@@ -63,15 +63,18 @@ class RiskManager:
             risk = entry - stop
             if stop <= 0 or risk <= 0 or risk > max_stop_distance:
                 return None
-            tp1 = _target_before_resistance(resistance_levels, entry + risk, buffer)
-            tp2 = _target_before_resistance(resistance_levels, entry + (risk * target_rr), buffer)
-            tp3 = _target_before_resistance(resistance_levels, entry + risk * (target_rr + 1), buffer)
+            tp1_target = entry + risk
+            tp2_target = entry + (risk * target_rr)
+            tp3_target = entry + risk * (target_rr + 1)
+            tp1 = _target_before_resistance(resistance_levels, tp1_target, buffer)
+            tp2 = _target_before_resistance(resistance_levels, tp2_target, buffer)
+            tp3 = _target_before_resistance(resistance_levels, tp3_target, buffer)
             tp1 = max(tp1, entry + risk)
             tp2 = max(tp2, entry + risk * risk_reward_floor)
             if tp2 <= tp1:
                 tp2 = entry + risk * max(risk_reward_floor, 2.0)
             if tp3 <= tp2:
-                tp3 = entry + risk * (target_rr + 1)
+                tp3 = None
             if ob_analysis is not None:
                 wall_buf = latest_atr * 0.15
                 tp1 = _adjust_tp_for_walls(direction, entry, tp1, ob_analysis.ask_walls, wall_buf)
@@ -86,21 +89,44 @@ class RiskManager:
             risk = stop - entry
             if risk <= 0 or risk > max_stop_distance:
                 return None
-            tp1 = _target_before_support(support_levels, entry - risk, buffer)
-            tp2 = _target_before_support(support_levels, entry - (risk * target_rr), buffer)
-            tp3 = _target_before_support(support_levels, entry - risk * (target_rr + 1), buffer)
+            tp1_target = entry - risk
+            tp2_target = entry - (risk * target_rr)
+            tp3_target = entry - risk * (target_rr + 1)
+            floor_target = entry - risk * risk_reward_floor
+            if floor_target <= 0:
+                return None
+            if tp2_target <= 0:
+                tp2_target = floor_target
+            if tp3_target <= 0:
+                tp3_target = None
+            tp1 = _target_before_support(support_levels, tp1_target, buffer)
+            tp2 = _target_before_support(support_levels, tp2_target, buffer)
+            tp3 = (
+                _target_before_support(support_levels, tp3_target, buffer)
+                if tp3_target is not None
+                else None
+            )
             tp1 = min(tp1, entry - risk)
             tp2 = min(tp2, entry - risk * risk_reward_floor)
             if tp2 >= tp1:
                 tp2 = entry - risk * max(risk_reward_floor, 2.0)
-            if tp3 >= tp2:
-                tp3 = entry - risk * (target_rr + 1)
+            if tp2 <= 0:
+                return None
+            if tp3 is not None and (tp3 >= tp2 or tp3 <= 0):
+                tp3 = None
             if ob_analysis is not None:
                 wall_buf = latest_atr * 0.15
                 tp1 = _adjust_tp_for_walls(direction, entry, tp1, ob_analysis.bid_walls, wall_buf)
                 tp2 = _adjust_tp_for_walls(direction, entry, tp2, ob_analysis.bid_walls, wall_buf)
                 if tp3 is not None:
                     tp3 = _adjust_tp_for_walls(direction, entry, tp3, ob_analysis.bid_walls, wall_buf)
+        if direction in {Direction.LONG, Direction.STRONG_LONG}:
+            if tp3 is not None and tp3 <= tp2:
+                tp3 = None
+        elif tp3 is not None and (tp3 >= tp2 or tp3 <= 0):
+            tp3 = None
+        if not _levels_are_valid(direction, entry, stop, tp1, tp2, tp3):
+            return None
         actual_risk_reward = abs(tp2 - entry) / risk
         if actual_risk_reward < risk_reward_floor:
             return None
@@ -205,3 +231,16 @@ def _adjust_tp_for_walls(
     return tp
 
 
+def _levels_are_valid(
+    direction: Direction,
+    entry: float,
+    stop: float,
+    tp1: float,
+    tp2: float,
+    tp3: float | None,
+) -> bool:
+    if min(entry, stop, tp1, tp2) <= 0:
+        return False
+    if direction in {Direction.LONG, Direction.STRONG_LONG}:
+        return stop < entry < tp1 < tp2 and (tp3 is None or tp2 < tp3)
+    return tp2 < tp1 < entry < stop and (tp3 is None or tp3 < tp2)

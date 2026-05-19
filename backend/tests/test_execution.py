@@ -3,8 +3,19 @@ from decimal import Decimal
 
 from app.api.routes import _calculate_unrealized_pnl
 from app.core.config import Settings
-from app.db.models import Candle, Order, Position, Signal
+from app.db.models import AppSetting, Candle, DecisionLog, Order, Position, Signal
 from app.engine.execution import OrderExecutionEngine
+
+
+class FakeQuery:
+    def __init__(self, rows: list[object]) -> None:
+        self.rows = rows
+
+    def filter(self, *_args, **_kwargs) -> "FakeQuery":
+        return self
+
+    def first(self) -> object | None:
+        return self.rows[0] if self.rows else None
 
 
 class FakeDb:
@@ -23,6 +34,74 @@ class FakeDb:
 
     def commit(self) -> None:
         self.committed = True
+
+
+class FakePaperDb:
+    def __init__(
+        self,
+        *,
+        existing_order: Order | None = None,
+        existing_position: Position | None = None,
+    ) -> None:
+        self.existing_order = existing_order
+        self.existing_position = existing_position
+        self.added: list[object] = []
+        self.committed = 0
+        self.next_position_id = 1
+
+    def get(self, model: type[object], row_id: object) -> object | None:
+        if model is Position and self.existing_position is not None:
+            if self.existing_position.id == row_id:
+                return self.existing_position
+        if model is AppSetting:
+            return None
+        return None
+
+    def query(self, model: type[object], *_args, **_kwargs) -> FakeQuery:
+        if model is Order and self.existing_order is not None:
+            return FakeQuery([self.existing_order])
+        return FakeQuery([])
+
+    def add(self, row: object) -> None:
+        self.added.append(row)
+        if isinstance(row, Position) and row.id is None:
+            row.id = self.next_position_id
+            self.next_position_id += 1
+
+    def flush(self) -> None:
+        for row in self.added:
+            if isinstance(row, Position) and row.id is None:
+                row.id = self.next_position_id
+                self.next_position_id += 1
+
+    def commit(self) -> None:
+        self.committed += 1
+
+    def refresh(self, _row: object) -> None:
+        return None
+
+    def added_of(self, model: type[object]) -> list[object]:
+        return [row for row in self.added if isinstance(row, model)]
+
+
+def _paper_signal(signal_id: int = 42) -> Signal:
+    return Signal(
+        id=signal_id,
+        market_id=1,
+        timeframe="5m",
+        direction="LONG",
+        score=80,
+        confidence_label="high",
+        entry_price=Decimal("100"),
+        stop_loss=Decimal("95"),
+        take_profit_1=Decimal("105"),
+        take_profit_2=Decimal("110"),
+        take_profit_3=Decimal("115"),
+        risk_reward=Decimal("2"),
+        reason="test",
+        strategy_breakdown={},
+        status="new",
+    )
 
 
 def test_candle_containing_position_open_can_trigger_exit() -> None:
@@ -141,6 +220,103 @@ def test_closing_position_marks_source_signal_closed() -> None:
     assert position.status == "closed"
     assert signal.status == "closed"
     assert db.committed
+
+
+def test_execute_paper_opens_position_even_if_same_market_already_has_open_paper() -> None:
+    engine = OrderExecutionEngine(Settings())
+    signal = _paper_signal()
+    db = FakePaperDb(
+        existing_position=Position(
+            id=99,
+            market_id=1,
+            mode="paper",
+            side="long",
+            entry_price=Decimal("100"),
+            size=Decimal("1"),
+            status="open",
+            metadata_json={"source_signal_id": "1"},
+        )
+    )
+
+    position = engine.execute_paper(db, signal)  # type: ignore[arg-type]
+
+    assert position is not None
+    assert position.id != 99
+    assert position.metadata_json["source_signal_id"] == signal.id
+    assert len(db.added_of(Position)) == 1
+    assert len(db.added_of(Order)) == 1
+    events = [log.event_type for log in db.added_of(DecisionLog)]
+    assert events == ["paper_order_executed"]
+
+
+def test_execute_paper_is_idempotent_for_same_signal() -> None:
+    engine = OrderExecutionEngine(Settings())
+    signal = _paper_signal()
+    existing_position = Position(
+        id=99,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        metadata_json={"source_signal_id": str(signal.id)},
+    )
+    existing_order = Order(
+        id=123,
+        position_id=existing_position.id,
+        signal_id=signal.id,
+        mode="paper",
+        order_type="market",
+        side="long",
+        price=Decimal("100"),
+        size=Decimal("1"),
+        status="filled",
+        reduce_only=False,
+        raw_response={},
+    )
+    db = FakePaperDb(existing_order=existing_order, existing_position=existing_position)
+
+    position = engine.execute_paper(db, signal)  # type: ignore[arg-type]
+
+    assert position is existing_position
+    assert db.added == []
+    assert db.committed == 0
+
+
+def test_take_profit_plan_omits_non_positive_signal_targets() -> None:
+    engine = OrderExecutionEngine(Settings())
+    engine.position_manager.build_take_profit_plan = lambda db, signal: []  # type: ignore[method-assign]
+    signal = _paper_signal()
+    signal.take_profit_3 = Decimal("-0.01")
+
+    plan = engine._build_take_profit_plan(FakePaperDb(), signal)  # type: ignore[arg-type]
+
+    assert [item["level"] for item in plan] == ["tp1", "tp2"]
+
+
+def test_existing_take_profit_plan_ignores_non_positive_short_target() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=10,
+        market_id=1,
+        mode="paper",
+        side="short",
+        entry_price=Decimal("0.50"),
+        size=Decimal("1"),
+        status="open",
+        metadata_json={
+            "take_profit_plan": [
+                {"level": "tp1", "price": "0.40", "allocation": "0.50", "filled": False},
+                {"level": "tp2", "price": "-0.05", "allocation": "0.30", "filled": False},
+                {"level": "runner", "price": "", "allocation": "0.20", "filled": False, "runner": True},
+            ]
+        },
+    )
+
+    plan = engine._take_profit_plan(position)
+
+    assert [item["level"] for item in plan] == ["tp1", "runner"]
 
 
 def test_take_profit_plan_closes_half_at_tp1() -> None:

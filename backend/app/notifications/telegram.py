@@ -16,6 +16,18 @@ _SCORE_FILLED = "●"
 _SCORE_EMPTY = "○"
 _SCORE_STEPS = 10
 
+_REASON_LABELS: dict[str, str] = {
+    "tp1": "TP1",
+    "tp2": "TP2",
+    "tp3": "TP3",
+    "take_profit": "Take Profit",
+    "stop_loss": "Stop Loss",
+    "manual": "Manuale",
+    "btc_macro_protection_loss_exit": "BTC Macro Stop",
+    "btc_macro_protection_breakeven": "BTC Macro Breakeven",
+    "reconciliazione hl": "Riconciliata HL",
+}
+
 
 def _fmt_price(value: Decimal | None) -> str:
     if value is None:
@@ -30,6 +42,59 @@ def _fmt_price(value: Decimal | None) -> str:
 def _score_bar(score: int) -> str:
     filled = round(score / 100 * _SCORE_STEPS)
     return _SCORE_FILLED * filled + _SCORE_EMPTY * (_SCORE_STEPS - filled)
+
+
+def _fmt_reason(reason: str) -> str:
+    return _REASON_LABELS.get(reason.lower(), reason.upper())
+
+
+def _build_live_close_message(
+    *,
+    symbol: str,
+    side: str,
+    reason: str,
+    entry_price: Decimal,
+    exit_price: Decimal | None,
+    remaining_size: Decimal | None,
+    step_pnl: Decimal | None,
+    total_pnl: Decimal | None,
+    is_partial: bool,
+) -> str:
+    direction = side.upper()
+    side_icon = _DIRECTION_ICON.get(direction, "🔔")
+    sep = "━━━━━━━━━━━━━━━━━━━━"
+
+    if is_partial:
+        header_icon = "🟡"
+        header = f"{header_icon} <b>LIVE · Chiusura parziale</b>"
+        pnl_label = "PnL"
+        pnl_value = step_pnl
+    else:
+        pnl_value = total_pnl
+        if pnl_value is not None and float(pnl_value) >= 0:
+            header_icon = "✅"
+        else:
+            header_icon = "🔴"
+        header = f"{header_icon} <b>LIVE · Posizione chiusa</b>"
+        pnl_label = "PnL tot"
+
+    lines = [
+        header,
+        f"{side_icon} {symbol} · {direction}",
+        sep,
+        f"📊 Motivo:  <code>{_fmt_reason(reason)}</code>",
+        f"💰 Entry:   <code>{_fmt_price(entry_price)}</code>",
+    ]
+    if exit_price is not None:
+        lines.append(f"📤 Exit:    <code>{_fmt_price(exit_price)}</code>")
+    if is_partial and remaining_size is not None:
+        lines.append(f"📦 Rimasto: <code>{remaining_size.normalize():f}</code>")
+    if pnl_value is not None:
+        sign = "+" if float(pnl_value) >= 0 else ""
+        pnl_icon = "📈" if float(pnl_value) >= 0 else "📉"
+        lines.append(f"{pnl_icon} {pnl_label}: <code>{sign}{float(pnl_value):.2f} $</code>")
+    lines += [sep, "🤖 <i>Trado · Hyperliquid</i>"]
+    return "\n".join(lines)
 
 
 def _build_message(signal: Signal) -> str:
@@ -199,6 +264,32 @@ class TelegramNotifier:
             f"⚙️ Modalità: <b>{mode}</b> · Score min: <b>{score}</b>"
             f"{defensive_line}"
         )
+
+    async def send_live_position_closed(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        reason: str,
+        entry_price: Decimal,
+        exit_price: Decimal | None,
+        remaining_size: Decimal | None,
+        step_pnl: Decimal | None,
+        total_pnl: Decimal | None,
+        is_partial: bool,
+    ) -> None:
+        text = _build_live_close_message(
+            symbol=symbol,
+            side=side,
+            reason=reason,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            remaining_size=remaining_size,
+            step_pnl=step_pnl,
+            total_pnl=total_pnl,
+            is_partial=is_partial,
+        )
+        await self._send_text(text)
 
     async def send_signal(self, db: Session, signal: Signal) -> None:
         payload: dict[str, str | int | None] = {

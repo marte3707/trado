@@ -33,6 +33,10 @@ _TPSL_BY_ORDER_TYPE: dict[str, str] = {
     "stop_loss": "sl",
 }
 
+# After this many consecutive failed re-submissions we stop retrying to avoid
+# infinite resubmit loops when HL persistently rejects the order.
+_MAX_RESUBMIT_ATTEMPTS = 3
+
 
 def _decimal(value: str | int | float | Decimal | None) -> Decimal | None:
     if value is None:
@@ -166,6 +170,12 @@ def _reconcile_exit_fills(
                     if avg_px is not None:
                         entry["filled_price"] = str(avg_px)
                     entry["filled_size"] = str(total_sz)
+            metadata["partial_exit_count"] = int(metadata.get("partial_exit_count") or 0) + 1
+            if order.order_type == "tp1":
+                metadata["tp1_hit"] = True
+            elif order.order_type == "tp2":
+                metadata["tp2_hit"] = True
+                metadata["runner_active"] = True
 
         realized_delta += total_pnl
         db.add(
@@ -173,7 +183,7 @@ def _reconcile_exit_fills(
                 event_type=f"live_reconciliation_{order.order_type}_filled",
                 market_id=position.market_id,
                 position_id=position.id,
-                message=f"Reconciled live {order.order_type} fill from Hyperliquid",
+                message=f"Reconciled live {order.order_type} fill: {total_sz} @ {avg_px}",
                 data={
                     "coin": coin,
                     "order_id": order.id,
@@ -202,6 +212,20 @@ def _round_size(size: Decimal, decimals: int) -> Decimal:
     return size.quantize(Decimal(10) ** -decimals)
 
 
+def _tp_allocation_map(position: Position) -> dict[str, Decimal]:
+    """Return {level: allocation} from the position's take_profit_plan metadata."""
+    plan = (position.metadata_json or {}).get("take_profit_plan") or []
+    result: dict[str, Decimal] = {}
+    for entry in plan:
+        if not isinstance(entry, dict):
+            continue
+        level = entry.get("level")
+        alloc = _decimal(entry.get("allocation"))
+        if level and alloc is not None and alloc > 0:
+            result[str(level)] = alloc
+    return result
+
+
 def _index_open_orders(open_orders: list[dict]) -> tuple[set[int], set[str]]:
     """Return (oids, normalised_cloids) for quick membership tests."""
     oids: set[int] = set()
@@ -227,12 +251,22 @@ def _resubmit_missing_protection_orders(
     trading: HyperliquidTradingClient,
     expires_after_seconds: int,
     sz_decimals: int,
+    remote_size: Decimal | None = None,
 ) -> None:
     """Detect protection orders that have disappeared from HL and re-submit them.
 
     An order is considered missing when its recorded oid (and cloid) are absent
     from the live HL open-orders list AND the order is still in a non-terminal
     state in our DB (i.e. we haven't already processed a fill for it).
+
+    For TP orders the resubmitted size is derived from the actual HL position
+    size (remote_size) multiplied by the allocation recorded in the TP plan,
+    rather than the potentially stale order.size stored in the DB.  The SL is
+    always resubmitted with the full remote_size.
+
+    To avoid infinite resubmit loops when HL persistently rejects an order
+    (e.g. trigger price already passed), we stop retrying after
+    _MAX_RESUBMIT_ATTEMPTS consecutive failed submissions.
     """
     pending_orders = (
         db.query(Order)
@@ -248,10 +282,18 @@ def _resubmit_missing_protection_orders(
         return
 
     close_is_buy = position.side.lower() == "short"
+    allocation_map = _tp_allocation_map(position)
 
     for order in pending_orders:
         if order.status in _TERMINAL_ORDER_STATUSES:
             continue
+
+        raw = dict(order.raw_response or {})
+        resubmits: list[dict] = raw.get("resubmits") or []
+        failed_attempts = sum(1 for r in resubmits if r.get("status") != "ok")
+        if failed_attempts >= _MAX_RESUBMIT_ATTEMPTS:
+            continue
+
         oid_int: int | None = None
         if order.hyperliquid_order_id:
             try:
@@ -273,6 +315,32 @@ def _resubmit_missing_protection_orders(
         if tpsl is None:
             continue
 
+        # Compute the correct submission size:
+        # - TP: remote_size * allocation (keeps the sum of all TPs = position size)
+        # - SL: remote_size (always covers the full remaining position)
+        # Fall back to the stored order.size only when remote_size is unavailable.
+        if remote_size is not None and remote_size > 0:
+            if order.order_type in ("tp1", "tp2", "tp3"):
+                alloc = allocation_map.get(order.order_type)
+                if alloc is not None and alloc > 0:
+                    submit_size = _round_size(remote_size * alloc, sz_decimals)
+                else:
+                    submit_size = _round_size(order.size, sz_decimals)
+            else:
+                submit_size = _round_size(remote_size, sz_decimals)
+        else:
+            submit_size = _round_size(order.size, sz_decimals)
+
+        if submit_size <= 0:
+            logger.warning(
+                "live_protection_order_resubmit_skip_zero_size",
+                position_id=position.id,
+                order_id=order.id,
+                order_type=order.order_type,
+                remote_size=str(remote_size),
+            )
+            continue
+
         logger.warning(
             "live_protection_order_missing_from_hl",
             position_id=position.id,
@@ -280,44 +348,109 @@ def _resubmit_missing_protection_orders(
             order_type=order.order_type,
             coin=coin,
             old_oid=oid_int,
+            submit_size=str(submit_size),
         )
 
         try:
             result = trading.submit_trigger_order(
                 coin=coin,
                 is_buy=close_is_buy,
-                size=_round_size(order.size, sz_decimals),
+                size=submit_size,
                 trigger_price=order.price,
                 tpsl=tpsl,
                 expires_after_seconds=expires_after_seconds,
                 cloid=None,  # no cloid: avoids HL duplicate-cloid rejection
             )
             old_oid = order.hyperliquid_order_id
+            resubmit_entry: dict = {
+                "old_oid": old_oid,
+                "new_oid": result.oid,
+                "status": result.status,
+                "size": str(submit_size),
+                "response": result.raw_response,
+            }
+            resubmits.append(resubmit_entry)
+            raw["resubmits"] = resubmits
+
+            if result.status != "ok":
+                order.raw_response = raw
+                db.add(order)
+                db.add(
+                    DecisionLog(
+                        event_type="live_protection_order_resubmit_rejected",
+                        market_id=position.market_id,
+                        position_id=position.id,
+                        message=f"Protection order {order.order_type} re-submission rejected by HL",
+                        data={
+                            "coin": coin,
+                            "order_id": order.id,
+                            "order_type": order.order_type,
+                            "old_oid": old_oid,
+                            "status": result.status,
+                            "size": str(submit_size),
+                            "response": result.raw_response,
+                        },
+                    )
+                )
+                logger.warning(
+                    "live_protection_order_resubmit_rejected",
+                    position_id=position.id,
+                    order_id=order.id,
+                    order_type=order.order_type,
+                    status=result.status,
+                )
+                continue
+
+            immediately_filled = result.filled_size is not None
             order.hyperliquid_order_id = result.oid
-            order.status = result.status
-            raw = dict(order.raw_response or {})
-            raw.setdefault("resubmits", []).append(
-                {"old_oid": old_oid, "new_oid": result.oid, "response": result.raw_response}
-            )
+            order.status = "filled" if immediately_filled else "open"
+            order.size = submit_size
             order.raw_response = raw
             db.add(order)
-            db.add(
-                DecisionLog(
-                    event_type="live_protection_order_resubmitted",
-                    market_id=position.market_id,
-                    position_id=position.id,
-                    message=f"Protection order {order.order_type} re-submitted: missing from HL",
-                    data={
-                        "coin": coin,
-                        "order_id": order.id,
-                        "order_type": order.order_type,
-                        "old_oid": old_oid,
-                        "new_oid": result.oid,
-                        "status": result.status,
-                    },
+            if immediately_filled:
+                db.add(
+                    DecisionLog(
+                        event_type="live_protection_order_resubmit_filled_immediately",
+                        market_id=position.market_id,
+                        position_id=position.id,
+                        message=f"Protection order {order.order_type} re-submitted and immediately filled: price {order.price}, size {submit_size}",
+                        data={
+                            "coin": coin,
+                            "order_id": order.id,
+                            "order_type": order.order_type,
+                            "old_oid": old_oid,
+                            "new_oid": result.oid,
+                            "avg_price": str(result.avg_price),
+                            "filled_size": str(result.filled_size),
+                            "size": str(submit_size),
+                        },
+                    )
                 )
-            )
+            else:
+                db.add(
+                    DecisionLog(
+                        event_type="live_protection_order_resubmitted",
+                        market_id=position.market_id,
+                        position_id=position.id,
+                        message=f"Protection order {order.order_type} re-submitted: price {order.price}, size {submit_size}",
+                        data={
+                            "coin": coin,
+                            "order_id": order.id,
+                            "order_type": order.order_type,
+                            "old_oid": old_oid,
+                            "new_oid": result.oid,
+                            "status": result.status,
+                            "size": str(submit_size),
+                        },
+                    )
+                )
         except Exception as exc:
+            resubmits.append(
+                {"old_oid": order.hyperliquid_order_id, "status": "error", "error": str(exc)}
+            )
+            raw["resubmits"] = resubmits
+            order.raw_response = raw
+            db.add(order)
             logger.warning(
                 "live_protection_order_resubmit_failed",
                 position_id=position.id,
@@ -359,7 +492,7 @@ def _resize_local_stop_orders(
                 event_type="live_stop_order_size_reconciled",
                 market_id=position.market_id,
                 position_id=position.id,
-                message="Local live stop order size aligned to reconciled position size",
+                message=f"Stop order size aligned to HL position - from {previous_size} to {remote_size}",
                 data={
                     "order_id": order.id,
                     "old_size": str(previous_size),
@@ -444,6 +577,11 @@ def reconcile_live_positions(
             updated += 1
             continue
 
+        # Compute remote_abs early so _resubmit_missing_protection_orders can
+        # use the actual HL position size to derive correct TP/SL sizes.
+        remote_size_raw = _decimal(remote.get("szi"))
+        remote_abs: Decimal | None = abs(remote_size_raw) if remote_size_raw is not None else None
+
         if open_orders_available:
             _resubmit_missing_protection_orders(
                 db,
@@ -454,9 +592,10 @@ def reconcile_live_positions(
                 trading,
                 expires_after_seconds,
                 _sz_decimals(position.market),
+                remote_size=remote_abs,
             )
 
-        remote_size = _decimal(remote.get("szi"))
+        remote_size = remote_size_raw
         if remote_size is not None:
             remote_abs = abs(remote_size)
             local_size = position.size or Decimal("0")

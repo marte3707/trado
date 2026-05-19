@@ -44,13 +44,6 @@ function num(value: number | null | undefined, decimals = 2) {
   return value.toFixed(decimals);
 }
 
-function slopeArrow(val: number | null | undefined) {
-  if (val == null) return null;
-  if (val > 0) return <span style={{ color: "var(--long)" }}>▲ {val.toFixed(2)}</span>;
-  if (val < 0) return <span style={{ color: "var(--short)" }}>▼ {val.toFixed(2)}</span>;
-  return <span className="muted">— {val.toFixed(2)}</span>;
-}
-
 function changeLabel(change: CalibrationChange) {
   if (change.target === "risk_setting") {
     if (change.key === "min_signal_score") return "Score minimo";
@@ -122,6 +115,9 @@ function TunerStatusBanner({ tuner, onAction }: {
 
   const currentStep = tuner.current_step_key;
   const progress = tuner.progress;
+  const progressPct = progress && progress.trades_required > 0
+    ? Math.min(100, Math.round((progress.trades_done / progress.trades_required) * 100))
+    : 0;
 
   return (
     <div style={{
@@ -130,58 +126,83 @@ function TunerStatusBanner({ tuner, onAction }: {
       background: tuner.enabled ? "var(--long-soft)" : "var(--card-bg)",
       border: `1px solid ${tuner.enabled ? "var(--long-border)" : "var(--border)"}`,
       display: "flex",
-      alignItems: "center",
-      gap: 16,
-      flexWrap: "wrap",
+      flexDirection: "column",
+      gap: 8,
     }}>
-      <span className={`badge ${tuner.enabled ? "long" : "muted"}`}>
-        {tuner.enabled ? "attivo" : "in pausa"}
-      </span>
-
-      {currentStep ? (
-        <span style={{ color: "var(--fg)", fontSize: "var(--fz-sm)" }}>
-          Testando: <strong>{currentStep}</strong>
-          {progress && (
-            <span className="muted"> · {progress.trades_done}/{progress.trades_required} trade</span>
-          )}
+      <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+        <span className={`badge ${tuner.enabled ? "long" : "muted"}`}>
+          {tuner.enabled ? "attivo" : "in pausa"}
         </span>
-      ) : tuner.next_step_key ? (
-        <span style={{ color: "var(--fg-2)", fontSize: "var(--fz-sm)" }}>
-          Prossimo step: <strong>{tuner.next_step_key}</strong>
-        </span>
-      ) : (
-        <span className="muted" style={{ fontSize: "var(--fz-sm)" }}>
-          {tuner.step_history.length > 0 ? "Sequenza completata" : "In attesa di dati sufficienti"}
-        </span>
-      )}
 
-      <span className="muted" style={{ fontSize: "var(--fz-sm)" }}>
-        {tuner.trades_now} trade chiusi · min {tuner.config.min_trades_per_step}/step
-      </span>
-
-      <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-        {tuner.enabled ? (
-          <button className="btn ghost" style={{ fontSize: "var(--fz-xs)" }}
-            disabled={busy !== null} onClick={() => act("pause")}>
-            {busy === "pause" ? "…" : "Pausa"}
-          </button>
+        {currentStep ? (
+          <span style={{ color: "var(--fg)", fontSize: "var(--fz-sm)" }}>
+            Testando: <strong>{currentStep}</strong>
+            {progress && (
+              <span className="muted"> · {progress.trades_done}/{progress.trades_required} trade</span>
+            )}
+          </span>
+        ) : tuner.next_step_key ? (
+          <span style={{ color: "var(--fg-2)", fontSize: "var(--fz-sm)" }}>
+            Prossimo step: <strong>{tuner.next_step_key}</strong>
+          </span>
         ) : (
-          <button className="btn ghost" style={{ fontSize: "var(--fz-xs)" }}
-            disabled={busy !== null} onClick={() => act("resume")}>
-            {busy === "resume" ? "…" : "Riprendi"}
-          </button>
+          <span className="muted" style={{ fontSize: "var(--fz-sm)" }}>
+            {tuner.step_history.length > 0 ? "Sequenza completata" : "In attesa di dati sufficienti"}
+          </span>
         )}
-        {currentStep && (
-          <button className="btn ghost" style={{ fontSize: "var(--fz-xs)", color: "var(--short)" }}
-            disabled={busy !== null} onClick={() => act("rollback")}>
-            {busy === "rollback" ? "…" : "Rollback"}
+
+        <span className="muted" style={{ fontSize: "var(--fz-sm)" }}>
+          {tuner.trades_now} trade chiusi · min {tuner.config.min_trades_per_step}/step
+        </span>
+
+        <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          {tuner.enabled ? (
+            <button className="btn ghost" style={{ fontSize: "var(--fz-xs)" }}
+              disabled={busy !== null} onClick={() => act("pause")}>
+              {busy === "pause" ? "…" : "Pausa"}
+            </button>
+          ) : (
+            <button className="btn ghost" style={{ fontSize: "var(--fz-xs)" }}
+              disabled={busy !== null} onClick={() => act("resume")}>
+              {busy === "resume" ? "…" : "Riprendi"}
+            </button>
+          )}
+          {currentStep && (
+            <button className="btn ghost" style={{ fontSize: "var(--fz-xs)", color: "var(--short)" }}
+              disabled={busy !== null} onClick={() => act("rollback")}>
+              {busy === "rollback" ? "…" : "Rollback"}
+            </button>
+          )}
+          <button
+            className="btn ghost"
+            style={{ fontSize: "var(--fz-xs)", color: "var(--short)", borderColor: "var(--short-border)" }}
+            disabled={busy !== null}
+            onClick={() => {
+              if (!window.confirm("Reset del tuner: tutti gli step verranno cancellati. Continuare?")) return;
+              act("reset");
+            }}
+          >
+            {busy === "reset" ? "…" : "Reset"}
           </button>
-        )}
-        <button className="btn ghost" style={{ fontSize: "var(--fz-xs)", color: "var(--short)" }}
-          disabled={busy !== null} onClick={() => act("reset")}>
-          {busy === "reset" ? "…" : "Reset"}
-        </button>
+        </div>
       </div>
+
+      {currentStep && progress && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{ flex: 1, height: 4, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
+            <div style={{
+              width: `${progressPct}%`,
+              height: "100%",
+              background: "var(--long)",
+              borderRadius: 3,
+              transition: "width 0.4s ease",
+            }} />
+          </div>
+          <span style={{ fontSize: "var(--fz-xs)", color: "var(--fg-3)", minWidth: 32, textAlign: "right" }}>
+            {progressPct}%
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -200,11 +221,9 @@ function TunerStepHistoryTable({ history }: { history: TunerStepHistory[] }) {
         <tr>
           <th>Step</th>
           <th>Esito</th>
-          <th>Trade val.</th>
-          <th>WR prima</th>
-          <th>WR dopo</th>
-          <th>Slope prima</th>
-          <th>Slope dopo</th>
+          <th style={{ textAlign: "right" }}>Trade val.</th>
+          <th style={{ textAlign: "right" }}>WR prima</th>
+          <th style={{ textAlign: "right" }}>WR dopo</th>
           <th>Valutato</th>
         </tr>
       </thead>
@@ -222,8 +241,6 @@ function TunerStepHistoryTable({ history }: { history: TunerStepHistory[] }) {
             <td className="num">{step.trades_evaluated}</td>
             <td className="num">{pct(step.metrics_before?.win_rate)}</td>
             <td className="num">{pct(step.metrics_after?.win_rate)}</td>
-            <td className="num">{slopeArrow(step.metrics_before?.equity_slope)}</td>
-            <td className="num">{slopeArrow(step.metrics_after?.equity_slope)}</td>
             <td className="mono" style={{ fontSize: "var(--fz-xs)" }}>{fmt.relTime(step.evaluated_at)}</td>
           </tr>
         ))}
@@ -252,7 +269,7 @@ function ActiveStrategyCard({ calibration, tuner, settings }: { calibration: Cal
         <span className="title">Strategia attuale</span>
         {deepDefensive && <span className="badge short">difensiva profonda</span>}
       </div>
-      <div className="card-body" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
+      <div className="card-body" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 20 }}>
         <div>
           <div className="stat-label" style={{ marginBottom: 8 }}>Parametri di rischio attivi</div>
           <div className="mono" style={{ color: "var(--fg-2)", fontSize: "var(--fz-sm)", lineHeight: 2 }}>
@@ -328,11 +345,11 @@ function WorkerCyclesCard({ cycles }: { cycles: WorkerCycle[] }) {
           <tr>
             <th>Quando</th>
             <th>Timeframe attivi</th>
-            <th>Mercati</th>
-            <th>Synced</th>
-            <th>Skip sync</th>
-            <th>Segnali</th>
-            <th>Chiusi</th>
+            <th style={{ textAlign: "right" }}>Mercati</th>
+            <th style={{ textAlign: "right" }}>Synced</th>
+            <th style={{ textAlign: "right" }}>Sync saltati</th>
+            <th style={{ textAlign: "right" }}>Segnali</th>
+            <th style={{ textAlign: "right" }}>Chiusi</th>
           </tr>
         </thead>
         <tbody>
@@ -341,8 +358,8 @@ function WorkerCyclesCard({ cycles }: { cycles: WorkerCycle[] }) {
             const generated = d.generated ?? 0;
             return (
               <tr key={c.id}>
-                <td className="mono" style={{ fontSize: "var(--fz-xs)" }}>{fmt.relTime(c.timestamp)}</td>
-                <td style={{ fontSize: "var(--fz-xs)" }}>
+                <td className="mono" style={{ fontSize: "var(--fz-xs)", whiteSpace: "nowrap" }}>{fmt.relTime(c.timestamp)}</td>
+                <td style={{ fontSize: "var(--fz-xs)", whiteSpace: "nowrap" }}>
                   {(d.active_timeframes ?? []).join(" · ") || <span className="muted">—</span>}
                 </td>
                 <td className="num">{d.markets ?? "—"}</td>
@@ -366,9 +383,10 @@ function WorkerCyclesCard({ cycles }: { cycles: WorkerCycle[] }) {
   );
 }
 
-function SignalRejectionCard({ rejections, calibration }: {
+function SignalRejectionCard({ rejections, calibration, settings }: {
   rejections: SignalRejections;
   calibration: Calibration;
+  settings: AppSettings;
 }) {
   const deepDefensive = calibration.state?.deep_defensive_active === true;
   const sorted = Object.entries(rejections.by_reason).sort((a, b) => b[1] - a[1]);
@@ -391,39 +409,20 @@ function SignalRejectionCard({ rejections, calibration }: {
             color: "var(--short)",
           }}>
             <strong>Modalità difensiva profonda attiva.</strong>{" "}
-            Il motore genera 0 segnali perché <code>min_signal_score</code> ({String(calibration.settings?.min_signal_score ?? "—")}) è troppo alto per il mercato attuale. La calibrazione automatica ha irrigidito i parametri in risposta a performance scarsa (win rate {pct(calibration.overall?.win_rate)}, PF {num(calibration.overall?.profit_factor)}).
+            Il motore genera 0 segnali perché <code>min_signal_score</code> ({String(settings.risk?.min_signal_score ?? calibration.settings?.min_signal_score ?? "—")}) è troppo alto per il mercato attuale. La calibrazione automatica ha irrigidito i parametri in risposta a performance scarsa (win rate {pct(calibration.overall?.win_rate)}, PF {num(calibration.overall?.profit_factor)}).
           </div>
         )}
 
         {sorted.length > 0 ? (
           <div>
             <div className="stat-label" style={{ marginBottom: 8 }}>Motivi rifiuto ordini live (ultimi 50)</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              {sorted.map(([reason, count]) => {
-                const maxCount = sorted[0][1];
-                const pctBar = Math.round((count / maxCount) * 100);
-                return (
-                  <div key={reason} style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                    <div style={{
-                      flex: 1,
-                      background: "var(--card-border)",
-                      borderRadius: 3,
-                      height: 6,
-                      overflow: "hidden",
-                    }}>
-                      <div style={{
-                        width: `${pctBar}%`,
-                        height: "100%",
-                        background: "var(--short)",
-                        borderRadius: 3,
-                      }} />
-                    </div>
-                    <span style={{ fontSize: "var(--fz-sm)", minWidth: 24, textAlign: "right" }}
-                      className="num">{count}</span>
-                    <span style={{ fontSize: "var(--fz-sm)", color: "var(--fg-2)", minWidth: 260 }}>{reason}</span>
-                  </div>
-                );
-              })}
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {sorted.map(([reason, count]) => (
+                <div key={reason} style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+                  <span className="num" style={{ fontSize: "var(--fz-sm)", color: "var(--short)", minWidth: 28, textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{count}</span>
+                  <span style={{ fontSize: "var(--fz-sm)", color: "var(--fg-2)" }}>{reason}</span>
+                </div>
+              ))}
             </div>
           </div>
         ) : (
@@ -475,6 +474,7 @@ export function CalibrationScreen({
   const [error, setError] = useState<string | null>(null);
   const enabled = settings.auto_calibration?.enabled !== false;
   const lastStatus = String(localCalibration.state?.last_status ?? "nessun run");
+  const deepDefensive = localCalibration.state?.deep_defensive_active === true;
 
   useEffect(() => setLocalCalibration(calibration), [calibration]);
   useEffect(() => setLocalHistory(history), [history]);
@@ -492,6 +492,7 @@ export function CalibrationScreen({
   );
 
   async function runNow() {
+    if (!window.confirm("Avviare la calibrazione ora? I parametri di rischio attivi potrebbero essere modificati.")) return;
     setBusy(true);
     setError(null);
     try {
@@ -531,21 +532,39 @@ export function CalibrationScreen({
   const proposedChanges = localCalibration.changes;
 
   return (
-    <div className="page">
+    <div className="page" style={{ opacity: busy ? 0.7 : 1, pointerEvents: busy ? "none" : "auto", transition: "opacity 0.2s" }}>
       <div className="page-head">
         <div>
-          <h1 className="page-title">Calibration</h1>
+          <h1 className="page-title">Calibrazione</h1>
           <div className="page-sub">
             {enabled ? "attiva" : "disattivata"} · ultimo stato {lastStatus} · ultimo run {lastRunText(localCalibration)}
           </div>
         </div>
         <div className="page-actions">
-          <button className="btn ghost" onClick={onRefresh}><Icon name="refresh" size={12} /></button>
+          <button className="btn ghost" aria-label="Aggiorna" onClick={onRefresh}><Icon name="refresh" size={12} /></button>
           <button className="btn primary" disabled={busy} onClick={runNow}>
             <Icon name="refresh" size={12} /> {busy ? "Calibrazione..." : "Calibra ora"}
           </button>
         </div>
       </div>
+
+      {deepDefensive && (
+        <div style={{
+          padding: "12px 16px",
+          marginBottom: "var(--gap)",
+          borderRadius: "var(--radius)",
+          background: "var(--short-soft)",
+          border: "1px solid var(--short-border)",
+          color: "var(--short)",
+          fontSize: "var(--fz-sm)",
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+        }}>
+          <strong>⚠ Modalità difensiva profonda attiva</strong>
+          {" — "}Il motore non emette segnali. Win rate: {pct(localCalibration.overall?.win_rate)} · PF: {num(localCalibration.overall?.profit_factor)} · score minimo: {String(settings.risk?.min_signal_score ?? localCalibration.settings?.min_signal_score ?? "—")}.
+        </div>
+      )}
 
       {error && (
         <div style={{ padding: "8px 14px", marginBottom: "var(--gap)", background: "var(--short-soft)", border: "1px solid var(--short-border)", borderRadius: "var(--radius)", color: "var(--short)", fontSize: "var(--fz-sm)" }}>
@@ -601,27 +620,17 @@ export function CalibrationScreen({
         )}
       </div>
 
-      {/* ── strategia attuale + cicli worker ─────────────────────────────── */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
+      {/* ── strategia attuale + motivo ultimo run ────────────────────────── */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
         <ActiveStrategyCard calibration={localCalibration} tuner={localTuner} settings={settings} />
         <div className="card">
           <div className="card-head">
             <span className="title">Motivo ultimo run</span>
           </div>
-          <div className="card-body" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-            <div>
-              <div className="stat-label">Reason</div>
-              <div style={{ color: "var(--fg)", fontSize: "var(--fz-md)" }}>
-                {String(localCalibration.state?.last_reason ?? localCalibration.reason)}
-              </div>
-            </div>
-            <div>
-              <div className="stat-label">Policy attuale</div>
-              <div className="mono" style={{ color: "var(--fg-2)", fontSize: "var(--fz-sm)", lineHeight: 1.8 }}>
-                score ≥ {String(settings.risk?.min_signal_score ?? "—")}<br />
-                RR ≥ {String(settings.risk?.min_risk_reward ?? "—")}<br />
-                risk/trade {String(settings.risk?.max_risk_per_trade_pct ?? "—")}%
-              </div>
+          <div className="card-body">
+            <div className="stat-label">Motivo</div>
+            <div style={{ color: "var(--fg)", fontSize: "var(--fz-md)", marginTop: 4 }}>
+              {String(localCalibration.state?.last_reason ?? localCalibration.reason)}
             </div>
           </div>
         </div>
@@ -629,7 +638,7 @@ export function CalibrationScreen({
 
       {/* ── segnali skippati ─────────────────────────────────────────────── */}
       <div style={{ marginBottom: "var(--gap)" }}>
-        <SignalRejectionCard rejections={localRejections} calibration={localCalibration} />
+        <SignalRejectionCard rejections={localRejections} calibration={localCalibration} settings={settings} />
       </div>
 
       {/* ── worker cycles ─────────────────────────────────────────────────── */}
@@ -638,7 +647,7 @@ export function CalibrationScreen({
       </div>
 
       {/* ── calibration changes ──────────────────────────────────────────── */}
-      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 380px", gap: "var(--gap)" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: "var(--gap)" }}>
         <div className="card">
           <div className="card-head">
             <span className="title">Modifiche applicate nell&apos;ultimo run</span>
@@ -763,10 +772,10 @@ function CalibrationLogTable({ history }: { history: CalibrationHistoryEntry[] }
           <tr>
             <th>Quando</th>
             <th>Stato</th>
-            <th>Trade</th>
-            <th>Win rate</th>
-            <th>PnL</th>
-            <th>Modifiche</th>
+            <th style={{ textAlign: "right" }}>Trade</th>
+            <th style={{ textAlign: "right" }}>Win rate</th>
+            <th style={{ textAlign: "right" }}>PnL</th>
+            <th style={{ textAlign: "right" }}>Modifiche</th>
             <th>Motivo / errore</th>
           </tr>
         </thead>

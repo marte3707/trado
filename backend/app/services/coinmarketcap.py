@@ -292,7 +292,7 @@ class CoinGeckoClient:
                     "per_page": 100,
                     "page": 1,
                     "sparkline": "false",
-                    "price_change_percentage": "90d",
+                    "price_change_percentage": "200d",
                 },
                 timeout=15,
             )
@@ -309,8 +309,8 @@ class CoinGeckoClient:
             (c for c in coins if isinstance(c, dict) and str(c.get("symbol", "")).upper() == "BTC"),
             None,
         )
-        btc_90d = _as_float(btc.get("price_change_percentage_90d_in_currency")) if btc else None
-        if btc_90d is None:
+        btc_200d = _as_float(btc.get("price_change_percentage_200d_in_currency")) if btc else None
+        if btc_200d is None:
             return None
 
         valid_coins = [
@@ -318,14 +318,14 @@ class CoinGeckoClient:
             if isinstance(c, dict)
             and str(c.get("symbol", "")).upper() not in _STABLECOIN_SYMBOLS
             and str(c.get("symbol", "")).upper() != "BTC"
-            and c.get("price_change_percentage_90d_in_currency") is not None
+            and c.get("price_change_percentage_200d_in_currency") is not None
         ]
         if not valid_coins:
             return None
 
         outperformed = sum(
             1 for c in valid_coins
-            if (_as_float(c.get("price_change_percentage_90d_in_currency")) or 0) > btc_90d
+            if (_as_float(c.get("price_change_percentage_200d_in_currency")) or 0) > btc_200d
         )
         altcoin_index = max(0, min(100, int(round((outperformed / len(valid_coins)) * 100))))
         return AltcoinSeasonIndex(
@@ -479,8 +479,6 @@ class CoinMarketCapClient:
         return self._coingecko.key_usage(force=force)
 
     def latest_fear_greed(self) -> FearGreedIndex | None:
-        if not self.settings.coinmarketcap_enabled:
-            return None
         if self._cmc_available():
             now = time.time()
             if (

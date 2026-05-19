@@ -55,7 +55,7 @@ async function loadDashboard() {
     apiGet<Order[]>("/api/orders"),
     apiGet<AppSettings>("/api/settings"),
     apiGet<Strategy[]>("/api/strategies"),
-    apiGet<DecisionLog[]>("/api/logs"),
+    apiGet<DecisionLog[]>("/api/logs").catch(() => []),
     apiGet<Calibration>("/api/analytics/calibration"),
     apiGet<CalibrationHistoryEntry[]>("/api/analytics/calibration/history"),
     apiGet<AutoTunerStatus>("/api/auto-tuner/status").catch(() => null),

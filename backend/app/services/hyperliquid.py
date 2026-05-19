@@ -346,7 +346,9 @@ class HyperliquidTradingClient:
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> None:
         exchange = self._exchange(0)
-        exchange.update_leverage(leverage, coin, is_cross)
+        response = exchange.update_leverage(leverage, coin, is_cross)
+        if isinstance(response, dict) and response.get("status") == "err":
+            raise HyperliquidError(f"set_leverage failed: {response}")
 
     def predicted_fundings(self) -> dict[str, float]:
         return fetch_predicted_fundings(self.settings.info_url)

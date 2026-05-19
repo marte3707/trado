@@ -137,6 +137,23 @@ def seed_defaults(db: Session) -> None:
                 },
             )
         )
+    if db.get(AppSetting, "btc_macro_protection") is None:
+        db.add(
+            AppSetting(
+                key="btc_macro_protection",
+                value={
+                    "enabled": False,
+                    "timeframe": "5m",
+                    "lookback_candles": 6,
+                    "reversal_pct_threshold": 1.5,
+                    "volume_multiplier": 1.2,
+                    "breakeven_buffer_pct": 0.3,
+                    "loss_exit_enabled": True,
+                    "_last_btc_trend": "NEUTRAL",
+                    "_last_reversal_at": None,
+                },
+            )
+        )
     for timeframe in settings.enabled_timeframes:
         seed_timeframe(db, timeframe)
     db.commit()

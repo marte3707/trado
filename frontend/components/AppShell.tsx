@@ -118,7 +118,7 @@ export function AppShell({ initialData }: AppShellProps) {
         apiGet<Order[]>("/api/orders"),
         apiGet<AppSettings>("/api/settings"),
         apiGet<Strategy[]>("/api/strategies"),
-        apiGet<DecisionLog[]>("/api/logs"),
+        apiGet<DecisionLog[]>("/api/logs").catch(() => logs),
         apiGet<Calibration>("/api/analytics/calibration"),
         apiGet<CalibrationHistoryEntry[]>("/api/analytics/calibration/history"),
         apiGet<AutoTunerStatus>("/api/auto-tuner/status").catch(() => null),
@@ -145,7 +145,7 @@ export function AppShell({ initialData }: AppShellProps) {
     } catch (e) {
       console.error("refresh failed", e);
     }
-  }, [marketIntelligence]);
+  }, [logs, marketIntelligence]);
 
   /* ── auto-poll every 30s ─────────────────────────────────────────────── */
   useEffect(() => {

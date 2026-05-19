@@ -85,3 +85,54 @@ def test_default_min_atr_multiplier_preserves_legacy_behavior() -> None:
     assert explicit_default is not None
     assert legacy.stop_loss == explicit_default.stop_loss
     assert legacy.take_profit_2 == explicit_default.take_profit_2
+
+
+def test_short_plan_clips_ambitious_target_before_it_turns_negative() -> None:
+    pattern = [0, 0.8, 0.2, 1.1, 0.4, 0.9]
+    candles = []
+    for index in range(80):
+        close = 0.6 - (index * 0.002) - (pattern[index % len(pattern)] * 0.02)
+        candles.append(
+            CandleInput(
+                datetime.now(timezone.utc),
+                close - 0.002,
+                close + 0.04,
+                max(0.001, close - 0.04),
+                close,
+                1000,
+            )
+        )
+
+    plan = RiskManager().build_plan(
+        candles, Direction.STRONG_SHORT, signal_score=79, min_risk_reward=2
+    )
+
+    assert plan is not None
+    assert plan.take_profit_2 > 0
+    assert plan.take_profit_3 is None
+    assert plan.take_profit_2 < plan.take_profit_1 < plan.entry < plan.stop_loss
+    assert plan.risk_reward >= 2
+
+
+def test_short_plan_is_rejected_when_minimum_target_would_be_negative() -> None:
+    pattern = [0, 0.8, 0.2, 1.1, 0.4, 0.9]
+    candles = []
+    for index in range(80):
+        close = 0.3 - (index * 0.001) - (pattern[index % len(pattern)] * 0.025)
+        candles.append(
+            CandleInput(
+                datetime.now(timezone.utc),
+                close - 0.002,
+                close + 0.05,
+                max(0.001, close - 0.05),
+                close,
+                1000,
+            )
+        )
+
+    assert (
+        RiskManager().build_plan(
+            candles, Direction.STRONG_SHORT, signal_score=79, min_risk_reward=2
+        )
+        is None
+    )

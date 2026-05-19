@@ -65,26 +65,34 @@ class OrderExecutionEngine:
         self.position_manager = PositionManagementEngine(settings)
 
     def execute_paper(self, db: Session, signal: Signal) -> Position | None:
-        existing = (
-            db.query(Position)
+        existing_order = (
+            db.query(Order)
             .filter(
-                Position.market_id == signal.market_id,
-                Position.mode == OrderMode.PAPER.value,
-                Position.status == "open",
+                Order.signal_id == signal.id,
+                Order.mode == OrderMode.PAPER.value,
+                Order.order_type == "market",
+                Order.position_id.is_not(None),
             )
             .first()
         )
-        if existing is not None:
+        if existing_order is not None and existing_order.position_id is not None:
+            existing_position = db.get(Position, existing_order.position_id)
+            if existing_position is not None:
+                logger.warning(
+                    "execute_paper_idempotent_skip",
+                    signal_id=signal.id,
+                    position_id=existing_position.id,
+                )
+                return existing_position
             db.add(
                 DecisionLog(
-                    event_type="paper_order_skipped_duplicate_ticker",
+                    event_type="paper_order_skipped_duplicate_signal",
                     market_id=signal.market_id,
                     signal_id=signal.id,
-                    message="Paper position skipped: already open for this ticker",
+                    message="Paper position skipped: signal already has a paper order",
                     data={
-                        "existing_position_id": existing.id,
-                        "existing_timeframe": (existing.metadata_json or {}).get("source_timeframe"),
-                        "signal_timeframe": signal.timeframe,
+                        "existing_order_id": existing_order.id,
+                        "existing_position_id": existing_order.position_id,
                     },
                 )
             )
@@ -195,7 +203,20 @@ class OrderExecutionEngine:
         existing_position = self._find_idempotent_position(db, signal, market_cloid)
         if existing_position is not None:
             return existing_position
-        trading.set_leverage(coin, plan.max_leverage, is_cross=False)
+        try:
+            trading.set_leverage(coin, plan.max_leverage, is_cross=False)
+        except Exception as exc:
+            db.add(
+                DecisionLog(
+                    event_type="live_set_leverage_failed",
+                    market_id=signal.market_id,
+                    signal_id=signal.id,
+                    message="set_leverage failed before order submission",
+                    data={"coin": coin, "leverage": plan.max_leverage, "is_cross": False, "error": str(exc)},
+                )
+            )
+            db.commit()
+            raise
         entry_result = trading.submit_market_order(
             coin=coin,
             is_buy=plan.side == "long",
@@ -420,6 +441,7 @@ class OrderExecutionEngine:
         expires_after_seconds = int(live_settings["order_expires_after_seconds"])
         close_is_buy = position.side.lower() == "short"
         protection_errors: list[str] = []
+        submitted_parts: list[str] = []
 
         if signal.stop_loss is not None:
             sl_cloid = make_cloid(signal.id, "sl")
@@ -437,10 +459,11 @@ class OrderExecutionEngine:
                 )
             else:
                 try:
+                    sl_size = _round_size(position.size, sz_decimals)
                     stop_result = trading.submit_trigger_order(
                         coin=coin,
                         is_buy=close_is_buy,
-                        size=_round_size(position.size, sz_decimals),
+                        size=sl_size,
                         trigger_price=signal.stop_loss,
                         tpsl="sl",
                         expires_after_seconds=expires_after_seconds,
@@ -462,6 +485,7 @@ class OrderExecutionEngine:
                             raw_response=stop_result.raw_response,
                         )
                     )
+                    submitted_parts.append(f"SL @ {signal.stop_loss} (size {sl_size})")
                 except Exception as exc:
                     protection_errors.append(f"stop_loss: {exc}")
 
@@ -537,23 +561,25 @@ class OrderExecutionEngine:
                         raw_response=tp_result.raw_response,
                     )
                 )
+                submitted_parts.append(f"{level} @ {price} (size {tp_size})")
             except Exception as exc:
                 protection_errors.append(f"{level}: {exc}")
 
+        orders_summary = " | ".join(submitted_parts) if submitted_parts else "none"
         metadata = dict(position.metadata_json or {})
         if skipped_tp_levels:
             metadata["protection_orders_skipped"] = skipped_tp_levels
         if protection_errors:
             metadata["protection_order_errors"] = protection_errors
             event_type = "live_protection_orders_partial_failure"
-            message = "One or more live protection orders failed"
+            message = f"Protection orders partial failure: {orders_summary}"
         elif skipped_tp_levels:
             event_type = "live_protection_orders_partial_skipped"
-            message = "Some TP levels rounded to zero and were skipped"
+            message = f"Some TP levels skipped (rounded to zero): {orders_summary}"
         else:
             metadata["protection_orders_submitted"] = True
             event_type = "live_protection_orders_submitted"
-            message = "Live stop loss and take profit orders submitted"
+            message = f"Protection orders submitted: {orders_summary}"
         position.metadata_json = metadata
         db.add(position)
         db.add(
@@ -743,6 +769,7 @@ class OrderExecutionEngine:
                     "exit_price": str(exit_price),
                     "realized_pnl": str(realized_pnl),
                     "cumulative_realized_pnl": str(cumulative_realized),
+                    "reason": reason,
                 },
             )
         )
@@ -932,6 +959,8 @@ class OrderExecutionEngine:
             price = getattr(signal, field_name)
             if price is None:
                 continue
+            if price <= 0:
+                continue
             plan.append(
                 {
                     "level": level,
@@ -949,6 +978,7 @@ class OrderExecutionEngine:
         if not metadata.get("remaining_size"):
             metadata["remaining_size"] = str(position.size)
         if metadata.get("take_profit_plan"):
+            metadata["take_profit_plan"] = self._sanitize_take_profit_plan(position, metadata["take_profit_plan"])
             position.metadata_json = metadata
             return
         signal = self._source_signal(db, metadata)
@@ -978,8 +1008,14 @@ class OrderExecutionEngine:
     def _take_profit_plan(self, position: Position) -> list[dict[str, Any]]:
         plan = (position.metadata_json or {}).get("take_profit_plan")
         if isinstance(plan, list) and plan:
-            return plan
+            return self._sanitize_take_profit_plan(position, plan)
         if position.take_profit is None:
+            return []
+        if position.take_profit <= 0:
+            return []
+        if position.side.lower() == "long" and position.take_profit <= position.entry_price:
+            return []
+        if position.side.lower() == "short" and position.take_profit >= position.entry_price:
             return []
         return [
             {
@@ -989,6 +1025,31 @@ class OrderExecutionEngine:
                 "filled": False,
             }
         ]
+
+    def _sanitize_take_profit_plan(
+        self, position: Position, plan: list[Any]
+    ) -> list[dict[str, Any]]:
+        sanitized: list[dict[str, Any]] = []
+        side = position.side.lower()
+        for item in plan:
+            if not isinstance(item, dict):
+                continue
+            if item.get("runner"):
+                sanitized.append(dict(item))
+                continue
+            try:
+                price = Decimal(str(item["price"]))
+                allocation = Decimal(str(item["allocation"]))
+            except Exception:
+                continue
+            if price <= 0 or allocation <= 0:
+                continue
+            if side == "long" and price <= position.entry_price:
+                continue
+            if side == "short" and price >= position.entry_price:
+                continue
+            sanitized.append(dict(item))
+        return sanitized
 
     def _mark_take_profit_filled(self, metadata: dict[str, Any], reason: str) -> None:
         plan = metadata.get("take_profit_plan")

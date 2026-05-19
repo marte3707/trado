@@ -789,7 +789,7 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
           apiGet<Order[]>("/api/orders"),
           apiGet<AppSettings>("/api/settings"),
           apiGet<Strategy[]>("/api/strategies"),
-          apiGet<DecisionLog[]>("/api/logs"),
+          apiGet<DecisionLog[]>("/api/logs").catch(() => logs),
           apiGet<Calibration>("/api/analytics/calibration")
       ]);
       setHealth(nextHealth);

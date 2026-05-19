@@ -61,12 +61,14 @@ class FakeTrading:
         fills: list[dict[str, Any]] | None = None,
         open_order_oids: list[int] | None = None,
         resubmit_oid: str = "88888",
+        resubmit_immediately_filled: bool = False,
     ) -> None:
         self._remote = remote_positions
         self._fills = fills or []
         # oids of orders currently open on HL (for protection-order detection tests)
         self._open_order_oids: list[int] | None = open_order_oids
         self._resubmit_oid = resubmit_oid
+        self._resubmit_immediately_filled = resubmit_immediately_filled
         self.resubmitted: list[dict[str, Any]] = []
 
     def user_state(self, _address: str) -> dict[str, Any]:
@@ -94,6 +96,13 @@ class FakeTrading:
         self.resubmitted.append(
             {"coin": coin, "is_buy": is_buy, "size": size, "tpsl": tpsl}
         )
+        if self._resubmit_immediately_filled:
+            return _FakeOrderResult(
+                oid=self._resubmit_oid,
+                status="ok",
+                avg_price=Decimal("54.20"),
+                filled_size=size,
+            )
         return _FakeOrderResult(oid=self._resubmit_oid, status="ok")
 
 
@@ -285,11 +294,82 @@ def test_reconciliation_marks_tp1_filled_from_hl_fills() -> None:
     assert plan[0]["filled"] is True
     assert plan[0]["filled_price"] == "110"
     assert plan[1]["filled"] is False
+    # Trailing-stop metadata flags set
+    assert position.metadata_json.get("tp1_hit") is True
+    assert position.metadata_json.get("tp2_hit") is not True
+    assert position.metadata_json.get("runner_active") is not True
+    assert position.metadata_json.get("partial_exit_count") == 1
     # Local size aligned to remote
     assert position.size == Decimal("0.5")
     # DecisionLog event recorded
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_reconciliation_tp1_filled" in events
+
+
+def test_reconciliation_sets_runner_active_when_tp2_fills() -> None:
+    """Quando tp2 si filla, tp2_hit e runner_active devono essere impostati
+    in modo che il trailing stop attivi la modalità runner al ciclo successivo."""
+    position = _make_position(size="1.0")
+    position.metadata_json = {
+        "tp1_hit": True,
+        "partial_exit_count": 1,
+        "take_profit_plan": [
+            {"level": "tp1", "price": "110", "allocation": "0.3", "filled": True},
+            {"level": "tp2", "price": "120", "allocation": "0.3", "filled": False},
+            {"level": "runner", "price": "", "allocation": "0.4", "filled": False, "runner": True},
+        ],
+    }
+    tp2_order = _make_tp_order(cloid="tp2cloid", level="tp2", size="0.3", price="120", oid_str="9998")
+    db = FakeDb(positions=[position], orders=[tp2_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "0.4", "entryPx": "100"}],
+        fills=[
+            {
+                "coin": "BTC",
+                "oid": 9998,
+                "cloid": "0xtp2cloid",
+                "px": "120",
+                "sz": "0.3",
+                "closedPnl": "6",
+            }
+        ],
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert tp2_order.status == "filled"
+    assert position.realized_pnl == Decimal("6")
+    plan = position.metadata_json["take_profit_plan"]
+    assert plan[1]["filled"] is True
+    # Flag runner attivo impostati
+    assert position.metadata_json.get("tp2_hit") is True
+    assert position.metadata_json.get("runner_active") is True
+    assert position.metadata_json.get("partial_exit_count") == 2
+    # tp1_hit non deve essere sovrascritto
+    assert position.metadata_json.get("tp1_hit") is True
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_reconciliation_tp2_filled" in events
+
+
+def test_reconciliation_increments_partial_exit_count_per_tp_fill() -> None:
+    """partial_exit_count deve incrementare di 1 per ogni TP fillato."""
+    position = _make_position(size="1.0")
+    position.metadata_json = {
+        "partial_exit_count": 0,
+        "take_profit_plan": [
+            {"level": "tp1", "price": "110", "allocation": "0.5", "filled": False},
+        ],
+    }
+    tp1_order = _make_tp_order()
+    db = FakeDb(positions=[position], orders=[tp1_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "0.5", "entryPx": "100"}],
+        fills=[{"coin": "BTC", "oid": 9999, "cloid": "0xabc123", "px": "110", "sz": "0.5", "closedPnl": "5"}],
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert position.metadata_json["partial_exit_count"] == 1
 
 
 def test_reconciliation_tp_fill_suppresses_size_mismatch_warning() -> None:
@@ -513,3 +593,44 @@ def test_resubmit_sl_order_with_correct_tpsl_flag() -> None:
     assert len(trading.resubmitted) == 1
     assert trading.resubmitted[0]["tpsl"] == "sl"
     assert sl_order.hyperliquid_order_id == "66666"
+
+
+def test_resubmit_tp1_status_open_when_resting() -> None:
+    """After re-submit that lands as resting, order.status must be 'open' (not 'ok')."""
+    position = _make_position(size="1.0")
+    tp1_order = _make_tp_order(oid_str="9999")
+    db = FakeDb(positions=[position], orders=[tp1_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        open_order_oids=[],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert tp1_order.status == "open"
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_resubmitted" in events
+    assert "live_protection_order_resubmit_filled_immediately" not in events
+
+
+def test_resubmit_tp1_immediately_filled_by_hl() -> None:
+    """When HL fills the re-submitted trigger order immediately, order.status must be
+    'filled' and the correct event logged — NOT 'live_protection_order_resubmitted'."""
+    position = _make_position(size="1.0")
+    tp1_order = _make_tp_order(oid_str="9999")
+    db = FakeDb(positions=[position], orders=[tp1_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        open_order_oids=[],
+        resubmit_oid="77777",
+        resubmit_immediately_filled=True,
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert tp1_order.status == "filled"
+    assert tp1_order.hyperliquid_order_id == "77777"
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_resubmit_filled_immediately" in events
+    assert "live_protection_order_resubmitted" not in events

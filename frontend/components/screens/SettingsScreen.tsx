@@ -19,6 +19,7 @@ const MODE_OPTIONS: [string, string][] = [
 ];
 
 const TF_OPTIONS = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d"];
+const BTC_PROT_TF_OPTIONS = ["1m", "3m", "5m", "15m", "30m"];
 
 function toNum(value: unknown, fallback: number): number {
   const next = Number(value);
@@ -165,6 +166,17 @@ function Toggle({ label, checked, onChange, danger = false, tooltip }: {
   );
 }
 
+/* ─── Helpers for nested position_management settings ──────────────────── */
+function pmTp(settings: AppSettings, key: string, def: number) {
+  return toNum((settings.position_management?.takeProfit as Record<string, unknown> | undefined)?.[key], def);
+}
+function pmTs(settings: AppSettings, key: string, def: number) {
+  return toNum((settings.position_management?.trailingStop as Record<string, unknown> | undefined)?.[key], def);
+}
+function pmTsBool(settings: AppSettings, key: string, def: boolean) {
+  return toBool((settings.position_management?.trailingStop as Record<string, unknown> | undefined)?.[key], def);
+}
+
 /* ─── Main component ───────────────────────────────────────────────────── */
 export function SettingsScreen({ settings, health, onRefresh }: Props) {
   const [mode, setMode] = useState(String(settings.operation_mode?.mode ?? health.mode ?? "SIGNAL_ONLY"));
@@ -188,6 +200,29 @@ export function SettingsScreen({ settings, health, onRefresh }: Props) {
   const [mainnetLiveEnabled, setMainnetLiveEnabled] = useState(toBool(settings.live_execution?.enable_mainnet_live_trading, false));
   const [timeframes, setTimeframes] = useState<string[]>(() => enabledTimeframes(settings));
   const [autoCalibration, setAutoCalibration] = useState(toBool(settings.auto_calibration?.enabled, true));
+  // Position management — take profit
+  const [tpEnabled, setTpEnabled] = useState(() => toBool((settings.position_management?.takeProfit as Record<string, unknown> | undefined)?.enabled, true));
+  const [tp1R, setTp1R] = useState(() => pmTp(settings, "tp1R", 1.0));
+  const [tp1ClosePct, setTp1ClosePct] = useState(() => pmTp(settings, "tp1ClosePct", 30));
+  const [tp2R, setTp2R] = useState(() => pmTp(settings, "tp2R", 2.0));
+  const [tp2ClosePct, setTp2ClosePct] = useState(() => pmTp(settings, "tp2ClosePct", 30));
+  const [runnerPct, setRunnerPct] = useState(() => pmTp(settings, "runnerPct", 40));
+  // Position management — trailing stop
+  const [trailingEnabled, setTrailingEnabled] = useState(() => pmTsBool(settings, "enabled", true));
+  const [activationR, setActivationR] = useState(() => pmTs(settings, "activationR", 1.0));
+  const [atrMultInit, setAtrMultInit] = useState(() => pmTs(settings, "atrMultiplierInitial", 3.0));
+  const [atrMultTp1, setAtrMultTp1] = useState(() => pmTs(settings, "atrMultiplierAfterTp1", 2.5));
+  const [atrMultTp2, setAtrMultTp2] = useState(() => pmTs(settings, "atrMultiplierAfterTp2", 2.0));
+  const [moveBeR, setMoveBeR] = useState(() => pmTs(settings, "moveToBreakevenAtR", 1.0));
+  const [lockProfitR, setLockProfitR] = useState(() => pmTs(settings, "lockProfitAtR", 2.0));
+  const [lockProfitStopR, setLockProfitStopR] = useState(() => pmTs(settings, "lockProfitStopR", 1.0));
+  const [btcProtEnabled, setBtcProtEnabled] = useState(toBool(settings.btc_macro_protection?.enabled, false));
+  const [btcProtTimeframe, setBtcProtTimeframe] = useState(String(settings.btc_macro_protection?.timeframe ?? "5m"));
+  const [btcProtLookback, setBtcProtLookback] = useState(toNum(settings.btc_macro_protection?.lookback_candles, 6));
+  const [btcProtPctThreshold, setBtcProtPctThreshold] = useState(toNum(settings.btc_macro_protection?.reversal_pct_threshold, 1.5));
+  const [btcProtVolMultiplier, setBtcProtVolMultiplier] = useState(toNum(settings.btc_macro_protection?.volume_multiplier, 1.2));
+  const [btcProtBufferPct, setBtcProtBufferPct] = useState(toNum(settings.btc_macro_protection?.breakeven_buffer_pct, 0.3));
+  const [btcProtLossExit, setBtcProtLossExit] = useState(toBool(settings.btc_macro_protection?.loss_exit_enabled, true));
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
   const [cmcUsage, setCmcUsage] = useState<CoinMarketCapUsage | null>(null);
@@ -218,6 +253,27 @@ export function SettingsScreen({ settings, health, onRefresh }: Props) {
     setMainnetLiveEnabled(toBool(settings.live_execution?.enable_mainnet_live_trading, false));
     setTimeframes(enabledTimeframes(settings));
     setAutoCalibration(toBool(settings.auto_calibration?.enabled, true));
+    setTpEnabled(toBool((settings.position_management?.takeProfit as Record<string, unknown> | undefined)?.enabled, true));
+    setTp1R(pmTp(settings, "tp1R", 1.0));
+    setTp1ClosePct(pmTp(settings, "tp1ClosePct", 30));
+    setTp2R(pmTp(settings, "tp2R", 2.0));
+    setTp2ClosePct(pmTp(settings, "tp2ClosePct", 30));
+    setRunnerPct(pmTp(settings, "runnerPct", 40));
+    setTrailingEnabled(pmTsBool(settings, "enabled", true));
+    setActivationR(pmTs(settings, "activationR", 1.0));
+    setAtrMultInit(pmTs(settings, "atrMultiplierInitial", 3.0));
+    setAtrMultTp1(pmTs(settings, "atrMultiplierAfterTp1", 2.5));
+    setAtrMultTp2(pmTs(settings, "atrMultiplierAfterTp2", 2.0));
+    setMoveBeR(pmTs(settings, "moveToBreakevenAtR", 1.0));
+    setLockProfitR(pmTs(settings, "lockProfitAtR", 2.0));
+    setLockProfitStopR(pmTs(settings, "lockProfitStopR", 1.0));
+    setBtcProtEnabled(toBool(settings.btc_macro_protection?.enabled, false));
+    setBtcProtTimeframe(String(settings.btc_macro_protection?.timeframe ?? "5m"));
+    setBtcProtLookback(toNum(settings.btc_macro_protection?.lookback_candles, 6));
+    setBtcProtPctThreshold(toNum(settings.btc_macro_protection?.reversal_pct_threshold, 1.5));
+    setBtcProtVolMultiplier(toNum(settings.btc_macro_protection?.volume_multiplier, 1.2));
+    setBtcProtBufferPct(toNum(settings.btc_macro_protection?.breakeven_buffer_pct, 0.3));
+    setBtcProtLossExit(toBool(settings.btc_macro_protection?.loss_exit_enabled, true));
   }, [health, settings]);
 
   useEffect(() => {
@@ -301,6 +357,38 @@ export function SettingsScreen({ settings, health, onRefresh }: Props) {
         },
         auto_calibration: {
           value: mergePatch(settings.auto_calibration, { enabled: autoCalibration }),
+        },
+        position_management: {
+          value: {
+            ...((settings.position_management as Record<string, unknown>) ?? {}),
+            takeProfit: {
+              ...(((settings.position_management?.takeProfit) as Record<string, unknown>) ?? {}),
+              enabled: tpEnabled,
+              tp1R, tp1ClosePct, tp2R, tp2ClosePct, runnerPct,
+            },
+            trailingStop: {
+              ...(((settings.position_management?.trailingStop) as Record<string, unknown>) ?? {}),
+              enabled: trailingEnabled,
+              activationR,
+              atrMultiplierInitial: atrMultInit,
+              atrMultiplierAfterTp1: atrMultTp1,
+              atrMultiplierAfterTp2: atrMultTp2,
+              moveToBreakevenAtR: moveBeR,
+              lockProfitAtR: lockProfitR,
+              lockProfitStopR,
+            },
+          },
+        },
+        btc_macro_protection: {
+          value: mergePatch(settings.btc_macro_protection, {
+            enabled: btcProtEnabled,
+            timeframe: btcProtTimeframe,
+            lookback_candles: btcProtLookback,
+            reversal_pct_threshold: btcProtPctThreshold,
+            volume_multiplier: btcProtVolMultiplier,
+            breakeven_buffer_pct: btcProtBufferPct,
+            loss_exit_enabled: btcProtLossExit,
+          }),
         },
       });
       setToast({ tone: "success", message: "Impostazioni salvate" });
@@ -658,6 +746,106 @@ export function SettingsScreen({ settings, health, onRefresh }: Props) {
         </div>
       </div>
 
+      {/* ── Gestione posizioni ── */}
+      <SectionDivider label="Gestione posizioni · paper e live" />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)", marginTop: "var(--gap)", marginBottom: "var(--gap)" }}>
+
+        {/* Take profit plan */}
+        <div className="card">
+          <div className="card-head">
+            <span className="title">Take profit plan</span>
+            <span className={"badge " + (tpEnabled ? "long" : "muted")}>{tpEnabled ? "attivo" : "disabilitato"}</span>
+          </div>
+          <div className="card-body" style={{ display: "grid", gap: 16 }}>
+            <Toggle
+              label="Abilitato"
+              checked={tpEnabled}
+              onChange={setTpEnabled}
+              tooltip="Se disabilitato, non vengono piazzati ordini TP e la posizione viene gestita interamente dallo stop."
+            />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
+              <NumberField label="TP1 R-multiplo" value={tp1R} onChange={setTp1R} min={0.1} step={0.1} suffix="R"
+                tooltip="Distanza del primo take profit in multipli del rischio iniziale. Es: 1R su entry 100 con SL a 95 → TP1 a 105." />
+              <NumberField label="TP1 close %" value={tp1ClosePct} onChange={setTp1ClosePct} min={1} max={99} step={1} suffix="%"
+                tooltip="Percentuale della posizione da chiudere quando TP1 viene raggiunto." />
+              <div />
+              <NumberField label="TP2 R-multiplo" value={tp2R} onChange={setTp2R} min={0.1} step={0.1} suffix="R"
+                tooltip="Distanza del secondo take profit. Deve essere maggiore di TP1." />
+              <NumberField label="TP2 close %" value={tp2ClosePct} onChange={setTp2ClosePct} min={1} max={99} step={1} suffix="%"
+                tooltip="Percentuale della posizione da chiudere quando TP2 viene raggiunto." />
+              <NumberField label="Runner %" value={runnerPct} onChange={setRunnerPct} min={0} max={99} step={1} suffix="%"
+                tooltip="Quota residua lasciata aperta dopo TP1 e TP2. Non ha un ordine TP fisso: viene chiusa solo dallo stop in trailing." />
+            </div>
+            <div style={{ padding: "6px 10px", background: "var(--bg-2)", borderRadius: "var(--radius-sm)", fontSize: "var(--fz-xs)", color: "var(--fg-3)" }}>
+              TP1 + TP2 + Runner = {tp1ClosePct + tp2ClosePct + runnerPct}%
+              {tp1ClosePct + tp2ClosePct + runnerPct !== 100 && (
+                <span style={{ color: "var(--short)", marginLeft: 8 }}>· deve essere 100%</span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Trailing stop */}
+        <div className="card">
+          <div className="card-head">
+            <span className="title">Trailing stop</span>
+            <span className={"badge " + (trailingEnabled ? "long" : "muted")}>{trailingEnabled ? "attivo" : "disabilitato"}</span>
+          </div>
+          <div className="card-body" style={{ display: "grid", gap: 16 }}>
+            <Toggle
+              label="Abilitato"
+              checked={trailingEnabled}
+              onChange={setTrailingEnabled}
+              tooltip="Gestisce il runner spostando lo stop in favore della posizione man mano che il prezzo avanza."
+            />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+              <NumberField label="Attivazione" value={activationR} onChange={setActivationR} min={0} step={0.1} suffix="R"
+                tooltip="Il trailing stop inizia a seguire il prezzo solo quando il guadagno raggiunge questo multiplo del rischio iniziale." />
+              <NumberField label="Breakeven a" value={moveBeR} onChange={setMoveBeR} min={0} step={0.1} suffix="R"
+                tooltip="Quando il guadagno raggiunge questo R, lo stop viene spostato al prezzo di entry (breakeven)." />
+              <NumberField label="Lock profit a" value={lockProfitR} onChange={setLockProfitR} min={0} step={0.1} suffix="R"
+                tooltip="Quando il guadagno raggiunge questo R, lo stop viene bloccato a lockProfitStopR dal rischio." />
+              <NumberField label="Lock profit stop" value={lockProfitStopR} onChange={setLockProfitStopR} min={0} step={0.1} suffix="R"
+                tooltip="Posizione dello stop bloccato, in R dal entry. Es: 1R → stop a entry + 1× rischio." />
+            </div>
+            <div>
+              <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", display: "block", marginBottom: 8 }}>
+                ATR multiplier (ampiezza trailing)
+              </span>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 14 }}>
+                <NumberField label="Iniziale" value={atrMultInit} onChange={setAtrMultInit} min={0.1} step={0.1} suffix="×"
+                  tooltip="Moltiplicatore ATR per calcolare lo stop iniziale. Più alto = stop più lontano = meno falsi trigger." />
+                <NumberField label="Dopo TP1" value={atrMultTp1} onChange={setAtrMultTp1} min={0.1} step={0.1} suffix="×"
+                  tooltip="Moltiplicatore più stretto dopo che TP1 è stato raggiunto." />
+                <NumberField label="Runner" value={atrMultTp2} onChange={setAtrMultTp2} min={0.1} step={0.1} suffix="×"
+                  tooltip="Moltiplicatore più stretto quando il runner è attivo (dopo TP2)." />
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── BTC Macro Protection ── */}
+      <SectionDivider label="BTC Macro Protection · solo AUTO_TRADE" />
+      <BtcMacroProtectionCard
+        isLiveMode={isLiveMode}
+        settings={settings}
+        enabled={btcProtEnabled}
+        onEnabled={setBtcProtEnabled}
+        timeframe={btcProtTimeframe}
+        onTimeframe={setBtcProtTimeframe}
+        lookback={btcProtLookback}
+        onLookback={setBtcProtLookback}
+        pctThreshold={btcProtPctThreshold}
+        onPctThreshold={setBtcProtPctThreshold}
+        volMultiplier={btcProtVolMultiplier}
+        onVolMultiplier={setBtcProtVolMultiplier}
+        bufferPct={btcProtBufferPct}
+        onBufferPct={setBtcProtBufferPct}
+        lossExit={btcProtLossExit}
+        onLossExit={setBtcProtLossExit}
+      />
+
       {/* ── Monitoraggio ── */}
       <SectionDivider label="Monitoraggio" />
       <div style={{ marginTop: "var(--gap)" }}>
@@ -665,6 +853,157 @@ export function SettingsScreen({ settings, health, onRefresh }: Props) {
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)" }}>
           <CoinMarketCapUsagePanel usage={cmcUsage} error={cmcUsageError} />
           <CoinGeckoUsagePanel usage={cgUsage} error={cgUsageError} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─── BTC Macro Protection card ────────────────────────────────────────── */
+function BtcMacroProtectionCard({
+  isLiveMode, settings,
+  enabled, onEnabled,
+  timeframe, onTimeframe,
+  lookback, onLookback,
+  pctThreshold, onPctThreshold,
+  volMultiplier, onVolMultiplier,
+  bufferPct, onBufferPct,
+  lossExit, onLossExit,
+}: {
+  isLiveMode: boolean;
+  settings: AppSettings;
+  enabled: boolean; onEnabled: (v: boolean) => void;
+  timeframe: string; onTimeframe: (v: string) => void;
+  lookback: number; onLookback: (v: number) => void;
+  pctThreshold: number; onPctThreshold: (v: number) => void;
+  volMultiplier: number; onVolMultiplier: (v: number) => void;
+  bufferPct: number; onBufferPct: (v: number) => void;
+  lossExit: boolean; onLossExit: (v: boolean) => void;
+}) {
+  const lastTrend = String(settings.btc_macro_protection?._last_btc_trend ?? "NEUTRAL");
+  const lastDelta = settings.btc_macro_protection?._last_delta_pct;
+  const lastChecked = typeof settings.btc_macro_protection?._last_checked_at === "string"
+    ? settings.btc_macro_protection._last_checked_at as string
+    : null;
+  const trendColor = lastTrend === "BULLISH" ? "var(--long)" : lastTrend === "BEARISH" ? "var(--short)" : "var(--fg-4)";
+  const badgeClass = enabled && isLiveMode ? "long" : enabled ? "warn" : "muted";
+  const badgeLabel = enabled && isLiveMode ? "attiva" : enabled ? "abilitata · non in live" : "disabilitata";
+
+  return (
+    <div className="card" style={{ marginTop: "var(--gap)", marginBottom: "var(--gap)", ...(!isLiveMode ? { opacity: 0.65 } : {}) }}>
+      <div className="card-head">
+        <span className="title">Protezione macro BTC</span>
+        <span className={"badge " + badgeClass}>{badgeLabel}</span>
+      </div>
+      <div className="card-body" style={{ display: "grid", gap: 18 }}>
+
+        {/* Riga 1 – toggle abilitazione + stato rilevato */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, alignItems: "center" }}>
+          <Toggle
+            label="Abilitata"
+            checked={enabled}
+            onChange={onEnabled}
+            tooltip="Attiva il monitoraggio del trend BTC. Quando BTC subisce un cambio repentino di trend, le posizioni altcoin esposte vengono protette automaticamente."
+          />
+          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 10px", background: "var(--bg-2)", borderRadius: "var(--radius-sm)" }}>
+            <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", whiteSpace: "nowrap" }}>Ultimo trend BTC</span>
+            <span style={{ fontSize: "var(--fz-sm)", fontWeight: 600, color: trendColor }}>{lastTrend}</span>
+            {typeof lastDelta === "number" && (
+              <span className="mono muted" style={{ fontSize: "var(--fz-xs)" }}>
+                {lastDelta > 0 ? "+" : ""}{Number(lastDelta).toFixed(2)}%
+              </span>
+            )}
+            {lastChecked && (
+              <span className="muted" style={{ fontSize: "var(--fz-xs)", marginLeft: "auto" }}>
+                {new Date(String(lastChecked)).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Riga 2 – parametri di detection */}
+        <div>
+          <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", display: "block", marginBottom: 10 }}>
+            Rilevamento reversal
+          </span>
+          <div style={{ display: "grid", gridTemplateColumns: "auto 1fr 1fr 1fr", gap: 14, alignItems: "end" }}>
+            <div style={{ display: "grid", gap: 6 }}>
+              <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+                Timeframe BTC <InfoTooltip content="Timeframe delle candele BTC usate per calcolare il delta di prezzo. Timeframe più corti = reazione più rapida ma più falsi positivi." />
+              </span>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                {BTC_PROT_TF_OPTIONS.map((tf) => (
+                  <button
+                    key={tf}
+                    type="button"
+                    className={"btn sm " + (timeframe === tf ? "primary" : "ghost")}
+                    onClick={() => onTimeframe(tf)}
+                  >
+                    {tf}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <NumberField
+              label="Finestra candele"
+              value={lookback}
+              onChange={onLookback}
+              min={2}
+              max={50}
+              step={1}
+              tooltip="Numero di candele su cui calcolare il delta di prezzo. Es: 6 candele × 5m = 30 minuti di finestra temporale."
+            />
+            <NumberField
+              label="Soglia delta prezzo"
+              value={pctThreshold}
+              onChange={onPctThreshold}
+              min={0.1}
+              step={0.1}
+              suffix="%"
+              tooltip="Variazione percentuale minima del prezzo BTC nella finestra per considerare il segnale valido. Valori più alti = meno segnali ma più affidabili."
+            />
+            <NumberField
+              label="Moltiplicatore volume"
+              value={volMultiplier}
+              onChange={onVolMultiplier}
+              min={0.1}
+              step={0.1}
+              suffix="×"
+              tooltip="Il volume dell'ultima candela deve essere almeno questo multiplo del volume medio della finestra. Filtra i falsi positivi da basso volume."
+            />
+          </div>
+        </div>
+
+        {/* Riga 3 – reazione alle posizioni */}
+        <div>
+          <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", display: "block", marginBottom: 10 }}>
+            Reazione alle posizioni
+          </span>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+            <NumberField
+              label="Buffer breakeven SL"
+              value={bufferPct}
+              onChange={onBufferPct}
+              min={0}
+              step={0.05}
+              suffix="%"
+              tooltip="Offset percentuale rispetto all'entry per il nuovo stop loss di protezione. Es: 0.3% su SHORT a 100$ → nuovo SL a 100.30$. Applicato solo se migliora lo stop esistente."
+            />
+            <Toggle
+              label="Chiudi se in perdita"
+              checked={lossExit}
+              onChange={onLossExit}
+              danger
+              tooltip="Se la posizione è in perdita al momento del reversal BTC, la chiude immediatamente invece di spostare lo stop. Prioritizza la protezione del capitale."
+            />
+          </div>
+        </div>
+
+        {/* Nota esplicativa */}
+        <div style={{ padding: "8px 12px", background: "var(--bg-2)", borderRadius: "var(--radius-sm)", fontSize: "var(--fz-xs)", color: "var(--fg-3)", lineHeight: 1.6 }}>
+          Il reversal si attiva solo al cambio <span style={{ color: "var(--long)" }}>BULLISH</span> ↔ <span style={{ color: "var(--short)" }}>BEARISH</span> (non da/verso NEUTRAL).
+          Le posizioni SHORT sono protette sui reversal bullish, le LONG sui reversal bearish.
+          Il timeframe BTC deve essere tra i timeframe worker attivi.
         </div>
       </div>
     </div>

@@ -259,6 +259,7 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
   const [historyPageSize, setHistoryPageSize] = useState(10);
   const [perfExpanded, setPerfExpanded] = useState(false);
   const [stratExpanded, setStratExpanded] = useState(false);
+  const [timeframeExpanded, setTimeframeExpanded] = useState(false);
 
   const trackedPositions = useMemo(() => positions.filter(p => hasExitActivity(p, orders)), [positions, orders]);
 
@@ -457,6 +458,34 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
       .sort((a, b) => b.trades - a.trades);
   }, [marketTypeFiltered, signals, orders]);
 
+  const timeframeStats = useMemo(() => {
+    type Acc = { count: number; wins: number; losses: number; totalPnl: number; totalR: number; rCount: number };
+    const map = new Map<string, Acc>();
+    for (const p of marketTypeFiltered) {
+      const tf = p.metadata_json?.source_timeframe;
+      if (!tf || typeof tf !== "string") continue;
+      const exitOrds = exitOrdersFor(p, orders);
+      const pnl = realizedPnl(p, exitOrds);
+      const r = positionRMultiple(p, exitOrds);
+      const acc = map.get(tf) ?? { count: 0, wins: 0, losses: 0, totalPnl: 0, totalR: 0, rCount: 0 };
+      acc.count++;
+      if (pnl !== null) { if (pnl > 0) acc.wins++; else acc.losses++; acc.totalPnl += pnl; }
+      if (r !== null) { acc.totalR += r; acc.rCount++; }
+      map.set(tf, acc);
+    }
+    return Array.from(map.entries())
+      .map(([timeframe, st]) => ({
+        timeframe,
+        trades: st.count,
+        wins: st.wins,
+        losses: st.losses,
+        wr: st.wins + st.losses > 0 ? (st.wins / (st.wins + st.losses)) * 100 : 0,
+        avgR: st.rCount > 0 ? st.totalR / st.rCount : null,
+        totalPnl: st.totalPnl,
+      }))
+      .sort((a, b) => b.trades - a.trades);
+  }, [marketTypeFiltered, orders]);
+
   function changeModeFilter(next: ModeFilter) {
     setModeFilter(next);
     setHistoryPage(1);
@@ -648,6 +677,23 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
                 <div className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>tutti i mode · periodo selezionato</div>
               </div>
               {stratExpanded && <StrategyPerformanceRows rows={strategyStats} />}
+            </div>
+
+            {/* Performance per timeframe */}
+            <div className="card" style={{ marginBottom: "var(--gap)" }}>
+              <div className="card-head" style={{ cursor: "pointer" }} onClick={() => setTimeframeExpanded(v => !v)}>
+                <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ display: "inline-flex", transition: "transform 0.15s", transform: timeframeExpanded ? "rotate(90deg)" : "none", color: "var(--fg-2)" }}>
+                    <Icon name="chevron" size={12} />
+                  </span>
+                  <span className="title">Performance per timeframe</span>
+                  {!timeframeExpanded && timeframeStats.length > 0 && (
+                    <span className="muted mono" style={{ fontSize: "var(--fz-xs)" }}>{timeframeStats.length} timeframe</span>
+                  )}
+                </span>
+                <div className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>tutti i mode · periodo selezionato</div>
+              </div>
+              {timeframeExpanded && <TimeframePerformanceRows rows={timeframeStats} />}
             </div>
           </>
         )}
@@ -1145,6 +1191,55 @@ function DetailMetric({ label, value, tone }: { label: string; value: string; to
     <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", padding: "8px 10px", background: "var(--bg-1)" }}>
       <div className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 3 }}>{label}</div>
       <div className={"mono " + (tone ?? "fg")}>{value}</div>
+    </div>
+  );
+}
+
+type TimeframeRow = {
+  timeframe: string;
+  trades: number;
+  wins: number;
+  losses: number;
+  wr: number;
+  avgR: number | null;
+  totalPnl: number;
+};
+
+function TimeframePerformanceRows({ rows }: { rows: TimeframeRow[] }) {
+  if (rows.length === 0) {
+    return (
+      <div className="muted mono" style={{ padding: "18px 18px", fontSize: "var(--fz-sm)" }}>
+        Nessun segnale con timeframe nel periodo
+      </div>
+    );
+  }
+  return (
+    <div style={{ padding: "4px 18px 14px", overflowX: "auto" }}>
+      <div className="muted mono" style={{ display: "grid", gridTemplateColumns: "1fr 58px 64px 1fr 82px 96px", minWidth: 560, alignItems: "center", gap: 12, padding: "7px 0", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", borderBottom: "1px solid var(--border)" }}>
+        <span>Timeframe</span>
+        <span>Trade</span>
+        <span>W/L</span>
+        <span>WR</span>
+        <span style={{ textAlign: "right" }}>Avg R</span>
+        <span style={{ textAlign: "right" }}>P&L</span>
+      </div>
+      {rows.map((r) => {
+        const tone = pnlTone(r.totalPnl);
+        return (
+          <div key={r.timeframe} style={{ display: "grid", gridTemplateColumns: "1fr 58px 64px 1fr 82px 96px", minWidth: 560, alignItems: "center", gap: 12, padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
+            <span className="mono fg" style={{ fontSize: "var(--fz-sm)" }}>{r.timeframe}</span>
+            <span className="mono muted" style={{ fontSize: "var(--fz-sm)" }}>{r.trades}t</span>
+            <span className="mono muted" style={{ fontSize: "var(--fz-sm)" }}>{r.wins}W/{r.losses}L</span>
+            <WrBar wr={r.wr} />
+            <span className="mono muted" style={{ fontSize: "var(--fz-sm)", textAlign: "right" }}>
+              {r.avgR !== null ? `${r.avgR >= 0 ? "+" : ""}${r.avgR.toFixed(1)}R` : "—"}
+            </span>
+            <span className={"mono " + tone} style={{ fontSize: "var(--fz-sm)", textAlign: "right" }}>
+              {fmt.pnl(r.totalPnl)}
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }

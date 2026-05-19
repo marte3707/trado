@@ -362,7 +362,10 @@ tail -f ~/Library/Logs/trado-worker.err.log
 ## Stop/start temporaneo (es. per dev con --reload)
 
 launchctl bootout gui/$(id -u)/com.trado.backend
+launchctl bootout gui/$(id -u)/com.trado.worker
+
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trado.backend.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trado.worker.plist
 
 ## Disinstallare tutto
 

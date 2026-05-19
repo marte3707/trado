@@ -2,8 +2,10 @@ import asyncio
 import dataclasses
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import structlog
+from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.enums import OperationMode, OrderMode, SignalStatus
@@ -14,6 +16,7 @@ from app.db.migrations import apply_migrations
 from app.db.models import AppSetting, DecisionLog, Market, Position
 from app.db.session import SessionLocal
 from app.engine.auto_tuner import AutoTuner
+from app.engine.btc_macro_protection import BtcMacroProtectionEngine
 from app.engine.calibration import AutoCalibrationEngine
 from app.engine.execution import OrderExecutionEngine
 from app.engine.signal_engine import SignalEngine
@@ -163,13 +166,176 @@ def run_auto_tuner(db) -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+def execute_signal_for_mode(
+    db,
+    executor: OrderExecutionEngine,
+    signal,
+    operation_mode: OperationMode,
+    market: Market,
+    timeframe: str,
+) -> None:
+    if operation_mode == OperationMode.PAPER_TRADING:
+        executor.execute_paper(db, signal)
+    elif operation_mode == OperationMode.AUTO_TRADE:
+        paper_position = executor.execute_paper(db, signal)
+        try:
+            executor.execute_live(db, signal)
+        except PermissionError as exc:
+            if paper_position is None:
+                signal.status = SignalStatus.IGNORED.value
+                db.add(signal)
+                db.commit()
+            logger.warning(
+                "live_order_rejected",
+                market=market.symbol,
+                timeframe=timeframe,
+                signal_id=signal.id,
+                error=str(exc),
+            )
+        except Exception as exc:
+            logger.exception(
+                "live_order_failed",
+                market=market.symbol,
+                timeframe=timeframe,
+                signal_id=signal.id,
+                error=str(exc),
+            )
+
+
+_FILL_EVENT_TYPES = frozenset(
+    {
+        "live_reconciliation_tp1_filled",
+        "live_reconciliation_tp2_filled",
+        "live_reconciliation_tp3_filled",
+        "live_reconciliation_stop_loss_filled",
+    }
+)
+
+
+async def _notify_live_position_closes(
+    db: Session,
+    notifier: TelegramNotifier,
+    since: datetime,
+) -> None:
+    events = (
+        db.query(DecisionLog)
+        .filter(
+            DecisionLog.event_type.in_(
+                [
+                    *_FILL_EVENT_TYPES,
+                    "position_closed",
+                    "position_partially_closed",
+                    "live_position_reconciled_closed",
+                ]
+            ),
+            DecisionLog.timestamp >= since,
+            DecisionLog.position_id.isnot(None),
+        )
+        .order_by(DecisionLog.timestamp)
+        .all()
+    )
+    if not events:
+        return
+
+    positions_with_fills: set[int] = {
+        e.position_id
+        for e in events
+        if e.event_type in _FILL_EVENT_TYPES and e.position_id is not None
+    }
+
+    for event in events:
+        if event.position_id is None:
+            continue
+        position = db.get(Position, event.position_id)
+        if position is None:
+            continue
+        market = position.market
+        if market is None:
+            continue
+
+        try:
+            if event.event_type in _FILL_EVENT_TYPES:
+                order_type = (
+                    event.event_type.replace("live_reconciliation_", "").replace("_filled", "")
+                )
+                exit_price_str = event.data.get("avg_price")
+                exit_price = Decimal(exit_price_str) if exit_price_str else None
+                step_pnl_str = event.data.get("closed_pnl")
+                step_pnl = Decimal(step_pnl_str) if step_pnl_str else None
+                is_partial = position.status == "open"
+                remaining_size = position.size if is_partial else None
+                total_pnl = (
+                    Decimal(str(position.realized_pnl or 0)) if not is_partial else None
+                )
+                await notifier.send_live_position_closed(
+                    symbol=market.symbol,
+                    side=position.side,
+                    reason=order_type,
+                    entry_price=position.entry_price,
+                    exit_price=exit_price,
+                    remaining_size=remaining_size,
+                    step_pnl=step_pnl,
+                    total_pnl=total_pnl,
+                    is_partial=is_partial,
+                )
+
+            elif event.event_type in ("position_closed", "position_partially_closed"):
+                if event.data.get("mode") != "live":
+                    continue
+                exit_price_str = event.data.get("exit_price")
+                exit_price = Decimal(exit_price_str) if exit_price_str else None
+                step_pnl_str = event.data.get("realized_pnl")
+                step_pnl = Decimal(step_pnl_str) if step_pnl_str else None
+                remaining_str = event.data.get("remaining_size")
+                remaining_size = Decimal(remaining_str) if remaining_str else None
+                is_partial = event.event_type == "position_partially_closed"
+                cum_str = event.data.get("cumulative_realized_pnl")
+                total_pnl = Decimal(cum_str) if cum_str and not is_partial else None
+                reason = event.data.get("reason") or "manual"
+                await notifier.send_live_position_closed(
+                    symbol=market.symbol,
+                    side=event.data.get("side") or position.side,
+                    reason=reason,
+                    entry_price=position.entry_price,
+                    exit_price=exit_price,
+                    remaining_size=remaining_size if is_partial else None,
+                    step_pnl=step_pnl if is_partial else None,
+                    total_pnl=total_pnl,
+                    is_partial=is_partial,
+                )
+
+            elif event.event_type == "live_position_reconciled_closed":
+                if event.position_id in positions_with_fills:
+                    continue
+                await notifier.send_live_position_closed(
+                    symbol=market.symbol,
+                    side=position.side,
+                    reason="reconciliazione hl",
+                    entry_price=position.entry_price,
+                    exit_price=None,
+                    remaining_size=None,
+                    step_pnl=None,
+                    total_pnl=Decimal(str(position.realized_pnl or 0)),
+                    is_partial=False,
+                )
+
+        except Exception:
+            logger.warning(
+                "telegram_live_close_notify_failed",
+                event_type=event.event_type,
+                position_id=event.position_id,
+            )
+
+
 async def run_once(
     signal_engine: SignalEngine,
     candle_sync: CandleSyncService,
     calibration_engine: AutoCalibrationEngine,
     notifier: TelegramNotifier,
     executor: OrderExecutionEngine,
+    btc_protection: BtcMacroProtectionEngine | None = None,
 ) -> tuple[int, int]:
+    tick_start = datetime.now(timezone.utc)
     settings = get_settings()
     db = SessionLocal()
     # Catturato una volta: usa time.time() per POSIX corretto indipendente dal timezone
@@ -199,6 +365,13 @@ async def run_once(
         calibrated = run_calibration(db, calibration_engine)
         calibration_attempted = True
     run_auto_tuner(db)
+    btc_protection_updates = 0
+    if operation_mode == OperationMode.AUTO_TRADE and btc_protection is not None:
+        try:
+            btc_protection_updates = await asyncio.to_thread(btc_protection.run, db, executor)
+        except Exception as exc:
+            logger.exception("btc_macro_protection_failed", error=str(exc))
+            db.rollback()
     if not active_timeframes:
         try:
             db.add(DecisionLog(
@@ -214,11 +387,13 @@ async def run_once(
                     "pnl_updated": pnl_updated,
                     "live_reconciled": live_reconciled,
                     "live_stop_updates": 0,
+                    "btc_protection_updates": btc_protection_updates,
                     "calibrated": calibrated,
                     "active_timeframes": [],
                 },
             ))
             db.commit()
+            await _notify_live_position_closes(db, notifier, tick_start)
         finally:
             db.close()
         return 0, 0
@@ -286,26 +461,6 @@ async def run_once(
                 if signal is None:
                     await asyncio.sleep(0.05)
                     continue
-                if operation_mode in (OperationMode.PAPER_TRADING, OperationMode.AUTO_TRADE):
-                    position_mode = (
-                        OrderMode.PAPER.value
-                        if operation_mode == OperationMode.PAPER_TRADING
-                        else OrderMode.LIVE.value
-                    )
-                    if (
-                        db.query(Position)
-                        .filter(
-                            Position.market_id == market.id,
-                            Position.mode == position_mode,
-                            Position.status == "open",
-                        )
-                        .first()
-                        is not None
-                    ):
-                        signal.status = SignalStatus.IGNORED.value
-                        db.commit()
-                        await asyncio.sleep(0.05)
-                        continue
                 generated += 1
                 logger.info(
                     "signal_generated",
@@ -318,30 +473,7 @@ async def run_once(
                 alert_min_score = effective_alert_min_score(db, settings)
                 if signal.score >= alert_min_score:
                     await notifier.send_signal(db, signal)
-                if operation_mode == OperationMode.PAPER_TRADING:
-                    executor.execute_paper(db, signal)
-                elif operation_mode == OperationMode.AUTO_TRADE:
-                    try:
-                        executor.execute_live(db, signal)
-                    except PermissionError as exc:
-                        signal.status = SignalStatus.IGNORED.value
-                        db.add(signal)
-                        db.commit()
-                        logger.warning(
-                            "live_order_rejected",
-                            market=market.symbol,
-                            timeframe=timeframe,
-                            signal_id=signal.id,
-                            error=str(exc),
-                        )
-                    except Exception as exc:
-                        logger.exception(
-                            "live_order_failed",
-                            market=market.symbol,
-                            timeframe=timeframe,
-                            signal_id=signal.id,
-                            error=str(exc),
-                        )
+                execute_signal_for_mode(db, executor, signal, operation_mode, market, timeframe)
                 await asyncio.sleep(0.05)
         if not calibration_attempted and should_run_calibration(db, closed):
             calibrated = run_calibration(db, calibration_engine)
@@ -362,11 +494,13 @@ async def run_once(
                     "pnl_updated": pnl_updated,
                     "live_reconciled": live_reconciled,
                     "live_stop_updates": live_stop_updates,
+                    "btc_protection_updates": btc_protection_updates,
                     "calibrated": calibrated,
                 },
             )
         )
         db.commit()
+        await _notify_live_position_closes(db, notifier, tick_start)
         return generated, skipped
     finally:
         db.close()
@@ -399,6 +533,7 @@ async def main() -> None:
     calibration_engine = AutoCalibrationEngine()
     notifier = TelegramNotifier(settings)
     executor = OrderExecutionEngine(settings)
+    btc_protection = BtcMacroProtectionEngine(settings)
     _record_heartbeat("starting")
 
     global _next_recap_at, _last_error_notify_at
@@ -422,7 +557,7 @@ async def main() -> None:
                 _record_heartbeat("tick")
                 try:
                     generated, candle_errors = await run_once(
-                        signal_engine, candle_sync, calibration_engine, notifier, executor
+                        signal_engine, candle_sync, calibration_engine, notifier, executor, btc_protection
                     )
                     stats.cycles += 1
                     stats.signals_generated += generated

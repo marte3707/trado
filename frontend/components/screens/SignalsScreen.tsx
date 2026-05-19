@@ -80,7 +80,7 @@ export function SignalsScreen({ signals, strategies, health, threshold, onRefres
   const [dir, setDir] = useState("all");
   const [tf, setTf] = useState("all");
   const [stratFilter, setStratFilter] = useState("all");
-  const [statusFilter, setStatusFilter] = useState("open");
+  const [statusFilter, setStatusFilter] = useState("all");
   const [minScore, setMinScore] = useState(0);
   const [sort, setSort] = useState<SortConfig>(null);
   const [busy, setBusy] = useState<string | null>(null);

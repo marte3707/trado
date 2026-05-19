@@ -151,6 +151,44 @@ def _position(side: str = "long", stop: str = "90", mode: str = "paper") -> Posi
     )
 
 
+def test_take_profit_plan_skips_non_positive_short_targets() -> None:
+    signal = Signal(
+        id=1,
+        market_id=1,
+        timeframe="5m",
+        direction="SHORT",
+        score=80,
+        confidence_label="high",
+        entry_price=Decimal("0.10"),
+        stop_loss=Decimal("0.18"),
+        reason="test",
+        strategy_breakdown={},
+        status="executed",
+    )
+    db = FakeDb(
+        settings={
+            "position_management": AppSetting(
+                key="position_management",
+                value={
+                    "takeProfit": {
+                        "enabled": True,
+                        "tp1R": 1.0,
+                        "tp1ClosePct": 30,
+                        "tp2R": 2.0,
+                        "tp2ClosePct": 30,
+                        "runnerPct": 40,
+                    }
+                },
+            )
+        }
+    )
+
+    plan = PositionManagementEngine(Settings()).build_take_profit_plan(db, signal)  # type: ignore[arg-type]
+
+    assert [item["level"] for item in plan] == ["tp1", "runner"]
+    assert Decimal(str(plan[0]["price"])) > 0
+
+
 def _candles(close: str = "112", count: int = 30) -> list[Candle]:
     start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
     rows: list[Candle] = []
