@@ -117,35 +117,98 @@ function preferredIndicatorValue(name: string, values: Record<string, unknown>) 
   return scalar ?? null;
 }
 
-function inferredIndicatorTone(name: string, values: Record<string, unknown>): "ok" | "warn" | "bad" {
-  const confidence = asNumber(values._confidence ?? values.confidence);
+function indicatorImpliedBias(name: string, values: Record<string, unknown>): "long" | "short" | "neutral" {
   const direction = String(values._direction ?? values.direction ?? values.trend ?? "").toLowerCase();
-  if (confidence !== null) {
-    if (direction.includes("short") || direction === "down") return confidence >= 65 ? "bad" : "warn";
-    if (direction.includes("long") || direction === "up") return confidence >= 55 ? "ok" : "warn";
-    return confidence >= 50 ? "warn" : "bad";
-  }
   if (name === "rsi") {
-    const rsi = asNumber(values.rsi);
-    if (rsi === null) return "warn";
-    if (rsi >= 35 && rsi <= 65) return "ok";
-    if ((rsi >= 30 && rsi < 35) || (rsi > 65 && rsi <= 70)) return "warn";
-    return "bad";
+    const rsiVal = asNumber(values.rsi);
+    if (rsiVal === null) return "neutral";
+    if (rsiVal < 40) return "long";
+    if (rsiVal > 60) return "short";
+    return "neutral";
   }
   if (name === "macd") {
     const hist = asNumber(values.histogram);
-    if (hist === null) return "warn";
-    return hist > 0 ? "ok" : hist < 0 ? "bad" : "warn";
+    if (hist === null) return "neutral";
+    return hist > 0 ? "long" : hist < 0 ? "short" : "neutral";
   }
-  if (direction === "up" || direction.includes("long")) return "ok";
-  if (direction === "down" || direction.includes("short")) return "bad";
+  if (name === "bollinger_bands") {
+    const pct = asNumber(values.percent_b);
+    if (pct !== null) {
+      if (pct < 0.2) return "long";
+      if (pct > 0.8) return "short";
+      return "neutral";
+    }
+  }
+  if (direction === "up" || direction.includes("long") || direction === "bullish") return "long";
+  if (direction === "down" || direction.includes("short") || direction === "bearish") return "short";
+  return "neutral";
+}
+
+function inferredIndicatorTone(name: string, values: Record<string, unknown>, signalDir?: string | null): "ok" | "warn" | "bad" {
+  const bias = indicatorImpliedBias(name, values);
+  const sigLong = typeof signalDir === "string" && signalDir.includes("LONG");
+  const sigShort = typeof signalDir === "string" && signalDir.includes("SHORT");
+  if (sigLong || sigShort) {
+    if (bias === "neutral") return "warn";
+    return (sigLong && bias === "long") || (sigShort && bias === "short") ? "ok" : "bad";
+  }
+  if (bias === "long") return "ok";
+  if (bias === "short") return "bad";
   return "warn";
 }
 
-function indicatorRow(row: IndicatorSnapshot) {
+function rsiDetail(values: Record<string, unknown>): string {
+  const v = asNumber(values.rsi);
+  if (v === null) return "soglie 30 / 70";
+  const zone = v > 70 ? "ipercomprato" : v < 30 ? "ipervenduto" : v >= 50 ? "neutro rialzista" : "neutro ribassista";
+  return `${zone} · soglie 30 / 70`;
+}
+
+function fibonacciDetail(values: Record<string, unknown>): { value: string; detail: string } {
+  const nearestLevel = asNumber(values.nearest_level);
+  const levels = typeof values.levels === "object" && values.levels !== null
+    ? (values.levels as Record<string, unknown>)
+    : {};
+  const trend = typeof values.trend === "string" ? values.trend : null;
+  let ratioLabel: string | null = null;
+  if (nearestLevel !== null) {
+    for (const [key, price] of Object.entries(levels)) {
+      if (Math.abs((asNumber(price) ?? Infinity) - nearestLevel) < 1e-6) { ratioLabel = key; break; }
+    }
+  }
+  const pct = ratioLabel ? `${(parseFloat(ratioLabel) * 100).toFixed(1)}%` : null;
+  const swingHigh = asNumber(values.swing_high);
+  const swingLow = asNumber(values.swing_low);
+  const range = swingHigh !== null && swingLow !== null
+    ? `swing ${fmt.price(swingLow)} – ${fmt.price(swingHigh)}`
+    : null;
+  return {
+    value: pct ?? (nearestLevel !== null ? fmt.price(nearestLevel) : "—"),
+    detail: [trend ? `trend ${trend}` : null, range].filter(Boolean).join(" · ") || "nessun livello attivo",
+  };
+}
+
+function indicatorRow(row: IndicatorSnapshot, signalDir?: string | null) {
   const values = row.values ?? {};
+  const name = row.indicator_name;
+
+  if (name === "rsi") {
+    const v = asNumber(values.rsi);
+    return {
+      name,
+      value: v !== null ? formatIndicatorScalar(v) : "—",
+      status: inferredIndicatorTone(name, values, signalDir),
+      detail: rsiDetail(values),
+    };
+  }
+
+  if (name === "fibonacci") {
+    const { value, detail } = fibonacciDetail(values);
+    return { name, value, status: inferredIndicatorTone(name, values, signalDir), detail };
+  }
+
   const entries = Object.entries(values).filter(([key]) => !key.startsWith("_"));
-  const scalar = preferredIndicatorValue(row.indicator_name, values);
+  const scalar = preferredIndicatorValue(name, values);
   const confidence = asNumber(values._confidence ?? values.confidence);
   const reason = typeof values._reason === "string" ? values._reason : "";
   const detail = entries
@@ -154,9 +217,9 @@ function indicatorRow(row: IndicatorSnapshot) {
     .map(([key, value]) => `${key}: ${formatIndicatorScalar(value)}`)
     .join(" · ");
   return {
-    name: row.indicator_name,
+    name,
     value: scalar ? formatIndicatorScalar(scalar[1]) : "—",
-    status: inferredIndicatorTone(row.indicator_name, values),
+    status: inferredIndicatorTone(name, values, signalDir),
     detail: reason || (confidence !== null ? `confidence ${confidence}` : detail) || new Intl.DateTimeFormat("it-IT", { dateStyle: "short", timeStyle: "short" }).format(new Date(row.timestamp)),
   };
 }
@@ -378,7 +441,7 @@ export function CoinScreen({ markets, signals, positions, health, chartMarkets, 
               Nessun indicatore salvato nel DB per questo mercato/timeframe
             </div>
           )}
-          {indicators.map(indicatorRow).map((row, i) => (
+          {indicators.map(row => indicatorRow(row, activeSignal?.direction ?? null)).map((row, i) => (
             <IndRow key={i} name={row.name} value={row.value} status={row.status} detail={row.detail} />
           ))}
         </div>

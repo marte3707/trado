@@ -35,17 +35,21 @@ export const Sidebar = ({ route, setRoute, counts, wsLive, health, collapsed, on
   return (
     <aside className="sidebar">
       <div className="brand">
-        <div className="brand-mark">T</div>
-        <div className="brand-name">Trado</div>
-        <div className="brand-net">{health.network}</div>
-        <button
-          className="sidebar-toggle"
-          onClick={onToggleCollapsed}
-          title={collapsed ? "Espandi menu" : "Comprimi menu"}
-          aria-label={collapsed ? "Espandi menu" : "Comprimi menu"}
-        >
-          <Icon name={collapsed ? "chevron" : "chevron_left"} size={13} />
-        </button>
+        <div className="brand-logo-wrap">
+          <img src="/csp.png" alt="Trado" className="brand-logo-img" />
+        </div>
+        <div className="brand-row">
+          <div className="brand-name">Trado</div>
+          <div className="brand-net">{health.network}</div>
+          <button
+            className="sidebar-toggle"
+            onClick={onToggleCollapsed}
+            title={collapsed ? "Espandi menu" : "Comprimi menu"}
+            aria-label={collapsed ? "Espandi menu" : "Comprimi menu"}
+          >
+            <Icon name={collapsed ? "chevron" : "chevron_left"} size={13} />
+          </button>
+        </div>
       </div>
 
       <nav className="nav">

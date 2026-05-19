@@ -7,6 +7,10 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Trado",
   description: "Personal Hyperliquid signal dashboard",
+  icons: {
+    icon: "/csp.png",
+    apple: "/csp.png",
+  },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

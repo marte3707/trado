@@ -153,6 +153,12 @@ export function AppShell({ initialData }: AppShellProps) {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  /* ── sync scoreThreshold when calibration changes min_signal_score ──── */
+  useEffect(() => {
+    const score = asNumber(settings.risk?.min_signal_score);
+    if (score != null) setTweaks(prev => ({ ...prev, scoreThreshold: score }));
+  }, [settings.risk?.min_signal_score]);
+
   /* ── apply tweaks to :root ───────────────────────────────────────────── */
   useEffect(() => {
     const root = document.documentElement;

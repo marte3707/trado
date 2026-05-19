@@ -360,10 +360,11 @@ function latestPatternForWindow(candles: ChartCandle[]): CandlestickPattern | nu
   if (previousBullish && currentBearish && current.open >= previous.close && current.close <= previous.open) {
     return { time: current.time, pattern: "bearish_engulfing", direction: "SHORT", confidence: 72 };
   }
-  if (candleRange > 0 && lowerWick >= body * 2 && upperWick <= body && currentBullish) {
+  const hasBody = body > candleRange * 0.05;
+  if (hasBody && lowerWick >= body * 2 && upperWick <= body * 0.4) {
     return { time: current.time, pattern: "hammer", direction: "LONG", confidence: 62 };
   }
-  if (candleRange > 0 && upperWick >= body * 2 && lowerWick <= body && currentBearish) {
+  if (hasBody && upperWick >= body * 2 && lowerWick <= body * 0.4) {
     return { time: current.time, pattern: "shooting_star", direction: "SHORT", confidence: 62 };
   }
   if (candles.length >= 3) {
@@ -484,10 +485,13 @@ function chartMarkers(
   longColor: string,
   shortColor: string
 ): SeriesMarker<Time>[] {
-  return [
-    ...(includeSignals ? signalMarkers(signals, candles, market, timeframe) : []),
-    ...(includeCandlestickPatterns ? candlestickPatternMarkers(candles, longColor, shortColor) : []),
-  ].sort((a, b) => Number(a.time) - Number(b.time));
+  const patternMkrs = includeCandlestickPatterns ? candlestickPatternMarkers(candles, longColor, shortColor) : [];
+  const sigMkrs = includeSignals ? signalMarkers(signals, candles, market, timeframe) : [];
+  // lightweight-charts requires unique times; signal markers take priority over pattern markers
+  const byTime = new Map<number, SeriesMarker<Time>>();
+  for (const m of patternMkrs) byTime.set(Number(m.time), m);
+  for (const m of sigMkrs) byTime.set(Number(m.time), m);
+  return [...byTime.values()].sort((a, b) => Number(a.time) - Number(b.time));
 }
 
 export type ChartOverlays = {

@@ -122,6 +122,32 @@ def last_calibration_trade_count(db) -> int | None:
         return None
 
 
+def _starvation_soft_threshold(db) -> int:
+    setting = db.get(AppSetting, "auto_calibration")
+    value = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+    try:
+        return int(value.get("starvation_soft_cycles", 10))
+    except (TypeError, ValueError):
+        return 10
+
+
+def _consecutive_zero_signal_cycles_from_log(db) -> int:
+    recent = (
+        db.query(DecisionLog)
+        .filter(DecisionLog.event_type == "worker_cycle")
+        .order_by(DecisionLog.timestamp.desc())
+        .limit(120)
+        .all()
+    )
+    streak = 0
+    for entry in recent:
+        if isinstance(entry.data, dict) and int(entry.data.get("generated", 0)) == 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
 def should_run_calibration(db, closed_this_cycle: int) -> bool:
     if closed_this_cycle > 0:
         return True
@@ -129,7 +155,11 @@ def should_run_calibration(db, closed_this_cycle: int) -> bool:
     if total_closed < calibration_min_closed_trades(db):
         return False
     last_count = last_calibration_trade_count(db)
-    return last_count is None or last_count != total_closed
+    if last_count is None or last_count != total_closed:
+        return True
+    # Trigger anche senza nuovi trade se la starvation è attiva: la calibrazione
+    # deve poter aggiornare consecutive_zero_signal_cycles e applicare l'attenuazione.
+    return _consecutive_zero_signal_cycles_from_log(db) >= _starvation_soft_threshold(db)
 
 
 def run_calibration(db, calibration_engine: AutoCalibrationEngine) -> bool:

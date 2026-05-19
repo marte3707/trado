@@ -98,6 +98,33 @@ class OrderExecutionEngine:
             )
             db.commit()
             return None
+        open_paper_position = (
+            db.query(Position)
+            .filter(
+                Position.market_id == signal.market_id,
+                Position.mode == OrderMode.PAPER.value,
+                Position.status == "open",
+            )
+            .first()
+        )
+        if open_paper_position is not None:
+            logger.warning(
+                "execute_paper_duplicate_market_skip",
+                signal_id=signal.id,
+                market_id=signal.market_id,
+                position_id=open_paper_position.id,
+            )
+            db.add(
+                DecisionLog(
+                    event_type="paper_order_skipped_duplicate_market",
+                    market_id=signal.market_id,
+                    signal_id=signal.id,
+                    message="Paper position skipped: market already has an open paper position",
+                    data={"existing_position_id": open_paper_position.id},
+                )
+            )
+            db.commit()
+            return open_paper_position
         side = "long" if signal.direction in {Direction.LONG, Direction.STRONG_LONG} else "short"
         risk_settings = db.get(AppSetting, "risk")
         max_risk_per_trade_pct = self.settings.max_risk_per_trade_pct
@@ -393,7 +420,7 @@ class OrderExecutionEngine:
         notional_floor = Decimal(str(live_settings["min_order_notional_usd"]))
         if signal.entry_price > 0 and size * signal.entry_price > notional_cap:
             size = notional_cap / signal.entry_price
-        notional = size * signal.entry_price
+        notional = min(size * signal.entry_price, notional_cap)
         if (
             live_settings["bump_to_min_notional"]
             and signal.entry_price > 0

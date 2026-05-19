@@ -161,22 +161,22 @@ input, select { font: inherit; color: inherit; }
 
 /* ─── Sidebar ─────────────────────────────────────────────────────────── */
 .brand {
-  display: flex; align-items: center; gap: 10px;
-  padding: 14px 18px;
+  display: flex; flex-direction: column; align-items: center;
   border-bottom: 1px solid var(--border);
-  height: var(--topbar-h);
   flex-shrink: 0;
   position: relative;
 }
-.brand-mark {
-  width: 22px; height: 22px;
-  border-radius: 5px;
-  background: var(--accent);
-  display: grid; place-items: center;
-  color: #08080a;
-  font-family: var(--font-mono);
-  font-weight: 700;
-  font-size: 13px;
+.brand-logo-wrap {
+  display: flex; justify-content: center; align-items: center;
+  width: 100%;
+}
+.brand-logo-img {
+  width: auto;
+  object-fit: contain;
+}
+.brand-row {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
 }
 .brand-name { font-weight: 600; font-size: 14px; letter-spacing: -0.01em; }
 .brand-net {
@@ -199,18 +199,20 @@ input, select { font: inherit; color: inherit; }
 }
 .sidebar-toggle:hover { background: var(--bg-2); color: var(--fg); }
 .sidebar-collapsed .brand {
-  justify-content: center;
-  padding: 14px 8px;
-  gap: 0;
+  padding: 12px 8px;
+  gap: 4px;
 }
-.sidebar-collapsed .brand-name,
-.sidebar-collapsed .brand-net {
+.sidebar-collapsed .brand-logo-img {
+  height: 32px;
+}
+.sidebar-collapsed .brand-row {
   display: none;
 }
 .sidebar-collapsed .sidebar-toggle {
   position: absolute;
-  top: 17px;
-  right: 6px;
+  bottom: 8px;
+  right: 50%;
+  transform: translateX(50%);
   width: 18px;
   height: 18px;
 }
