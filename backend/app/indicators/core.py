@@ -412,6 +412,106 @@ def latest_candlestick_pattern(
     return {"pattern": None, "direction": "NEUTRAL", "confidence": 0}
 
 
+def wyckoff_spring_upthrust(
+    highs: Sequence[float],
+    lows: Sequence[float],
+    closes: Sequence[float],
+    opens: Sequence[float],
+    volumes: Sequence[float],
+    lookback: int = 50,
+    pivot_window: int = 5,
+    tolerance_pct: float = 0.002,
+    volume_factor: float = 1.3,
+) -> dict[str, Any]:
+    """Rileva Spring (falso breakdown sotto supporto) e Upthrust (falso breakout sopra resistenza)."""
+    n = len(closes)
+    if n < lookback + pivot_window + 2:
+        return {"pattern": None, "direction": "NEUTRAL", "confidence": 0,
+                "support_level": None, "resistance_level": None}
+
+    end = n - 1
+    start = max(0, end - lookback)
+    pw = min(pivot_window, max(1, (end - start) // 4))
+
+    range_highs = list(highs[start:end])
+    range_lows = list(lows[start:end])
+    range_volumes = list(volumes[start:end])
+
+    avg_volume = sum(range_volumes) / len(range_volumes) if range_volumes else 0.0
+
+    pivot_lows: list[float] = []
+    pivot_highs: list[float] = []
+    for i in range(pw, len(range_lows) - pw):
+        if range_lows[i] == min(range_lows[i - pw: i + pw + 1]):
+            pivot_lows.append(range_lows[i])
+        if range_highs[i] == max(range_highs[i - pw: i + pw + 1]):
+            pivot_highs.append(range_highs[i])
+    if range_lows:
+        pivot_lows.append(min(range_lows))
+    if range_highs:
+        pivot_highs.append(max(range_highs))
+
+    current_close = closes[end]
+    current_high = highs[end]
+    current_low = lows[end]
+    current_open = opens[end]
+    current_volume = volumes[end]
+
+    supports_below = [pl for pl in pivot_lows if pl < current_close]
+    support: float | None = max(supports_below) if supports_below else None
+
+    resistances_above = [ph for ph in pivot_highs if ph > current_close]
+    resistance: float | None = min(resistances_above) if resistances_above else None
+
+    volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1.0
+    volume_confirms = volume_ratio >= volume_factor
+
+    if support is not None:
+        min_penetration = support * tolerance_pct
+        if current_low < support - min_penetration and current_close > support:
+            confidence = 65
+            if volume_confirms:
+                confidence += 10
+            if current_close > current_open:
+                confidence += 5
+            return {
+                "pattern": "spring",
+                "direction": "LONG",
+                "confidence": min(confidence, 85),
+                "support_level": round(support, 6),
+                "resistance_level": round(resistance, 6) if resistance is not None else None,
+                "penetration_pct": round((support - current_low) / support * 100, 3),
+                "volume_ratio": round(volume_ratio, 2),
+            }
+
+    if resistance is not None:
+        min_penetration = resistance * tolerance_pct
+        if current_high > resistance + min_penetration and current_close < resistance:
+            confidence = 65
+            if volume_confirms:
+                confidence += 10
+            if current_close < current_open:
+                confidence += 5
+            return {
+                "pattern": "upthrust",
+                "direction": "SHORT",
+                "confidence": min(confidence, 85),
+                "support_level": round(support, 6) if support is not None else None,
+                "resistance_level": round(resistance, 6),
+                "penetration_pct": round((current_high - resistance) / resistance * 100, 3),
+                "volume_ratio": round(volume_ratio, 2),
+            }
+
+    return {
+        "pattern": None,
+        "direction": "NEUTRAL",
+        "confidence": 0,
+        "support_level": round(support, 6) if support is not None else None,
+        "resistance_level": round(resistance, 6) if resistance is not None else None,
+        "volume_ratio": round(volume_ratio, 2),
+    }
+
+
 def _cluster_levels(levels: Sequence[float], tolerance_pct: float) -> list[float]:
     if not levels:
         return []

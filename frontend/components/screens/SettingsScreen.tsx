@@ -1034,43 +1034,124 @@ function WorkerStatusPanel({ worker }: { worker: Health["worker"] }) {
   }
 
   const lastRunMs = worker.last_run_at ? new Date(worker.last_run_at).getTime() : null;
-  const liveSeconds = lastRunMs != null ? Math.max(0, Math.round((now - lastRunMs) / 1000)) : null;
-  const healthy = liveSeconds != null && liveSeconds < 180;
+  const liveSeconds = lastRunMs != null
+    ? Math.max(0, Math.round((now - lastRunMs) / 1000))
+    : worker.seconds_since_last_run ?? null;
+  const healthy = worker.healthy;
   const cycle = worker.last_cycle ?? {};
   const timeframesCount = countTimeframes(cycle.timeframes);
   const activeCount = countTimeframes(cycle.active_timeframes);
   const errorAt = worker.last_error_at ? new Date(worker.last_error_at).getTime() : null;
   const errorIsRecent = errorAt != null && lastRunMs != null && errorAt > lastRunMs;
-  const phaseLabel = worker.phase ? ` · ${worker.phase}` : "";
+
+  // Heartbeat color: green < 30s, yellow 30–90s, red > 90s
+  const heartbeatColor = !healthy
+    ? "var(--short)"
+    : liveSeconds == null
+      ? "var(--fg-4)"
+      : liveSeconds < 30
+        ? "var(--long)"
+        : liveSeconds < 90
+          ? "var(--warn)"
+          : "var(--short)";
+
+  const heartbeatLabel = liveSeconds != null
+    ? liveSeconds < 60 ? `${liveSeconds}s fa` : `${Math.floor(liveSeconds / 60)}m ${liveSeconds % 60}s fa`
+    : "n/d";
+
+  const statusLabel = healthy
+    ? worker.phase ? worker.phase.toLowerCase() : "alive"
+    : liveSeconds == null ? "no heartbeat" : "stale";
 
   return (
     <div className="card" style={{ marginBottom: "var(--gap)" }}>
       <div className="card-head">
-        <span className="title">Worker</span>
-        <span className={"badge " + (healthy ? "long" : "short")}>
-          {healthy ? `alive${phaseLabel}` : liveSeconds == null ? "no heartbeat" : "stale"}
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span className="title">Worker</span>
+          {/* pulsing dot */}
+          <span style={{
+            width: 7, height: 7, borderRadius: "50%",
+            background: healthy ? "var(--long)" : "var(--short)",
+            boxShadow: healthy ? "0 0 0 2px var(--long-soft)" : "0 0 0 2px var(--short-soft)",
+            flexShrink: 0,
+          }} />
         </span>
+        <span className={"badge " + (healthy ? "long" : "short")}>{statusLabel}</span>
       </div>
-      <div className="card-body" style={{ display: "grid", gap: 14 }}>
+
+      <div className="card-body" style={{ display: "grid", gap: 16 }}>
+
+        {/* Status row */}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 12 }}>
-          <UsageMetric label="Heartbeat" value={liveSeconds != null ? `${liveSeconds}s fa` : "n/d"} />
-          <UsageMetric label="Ultimo ciclo" value={worker.last_cycle_at ? formatDateTime(worker.last_cycle_at) : "in corso"} />
+          <div style={{ display: "grid", gap: 4, minWidth: 0 }}>
+            <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>Heartbeat</span>
+            <span className="mono" style={{ fontSize: "var(--fz-sm)", color: heartbeatColor, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {heartbeatLabel}
+            </span>
+          </div>
+          <UsageMetric
+            label="Ultimo ciclo"
+            value={worker.last_cycle_at ? formatDateTime(worker.last_cycle_at) : "in corso"}
+          />
           <UsageMetric label="Timeframe" value={`${activeCount}/${timeframesCount}`} />
           <UsageMetric label="Mercati" value={formatCompact(readNumber(cycle.markets))} />
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 12 }}>
-          <UsageMetric label="Synced" value={formatCompact(readNumber(cycle.synced))} />
-          <UsageMetric label="Skipped" value={formatCompact(readNumber(cycle.skipped))} />
-          <UsageMetric label="Segnali" value={formatCompact(readNumber(cycle.generated))} />
-          <UsageMetric label="Chiuse" value={formatCompact(readNumber(cycle.closed))} />
-          <UsageMetric label="PnL upd." value={formatCompact(readNumber(cycle.pnl_updated))} />
-        </div>
+
+        {/* Cycle stats — inline */}
+        <WorkerCycleInline cycle={cycle} />
+
         {errorIsRecent && worker.last_error_message && (
-          <div style={{ padding: 10, background: "var(--short-soft)", borderRadius: "var(--radius-sm)", color: "var(--short)", fontSize: "var(--fz-sm)" }}>
-            Ultimo errore <span className="mono">{worker.last_error_at ? formatDateTime(worker.last_error_at) : ""}</span>: {worker.last_error_message}
+          <div style={{ padding: 10, background: "var(--short-soft)", borderRadius: "var(--radius-sm)", color: "var(--short)", fontSize: "var(--fz-sm)", lineHeight: 1.5 }}>
+            <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", display: "block", marginBottom: 4 }}>
+              Errore · {worker.last_error_at ? formatDateTime(worker.last_error_at) : ""}
+            </span>
+            {worker.last_error_message}
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/* ─── Worker cycle inline summary ──────────────────────────────────────── */
+type WorkerCycleData = NonNullable<NonNullable<Health["worker"]>["last_cycle"]>;
+
+function WorkerCycleInline({ cycle }: { cycle: WorkerCycleData }) {
+  const items: { label: string; value: number | null }[] = [
+    { label: "synced", value: readNumber(cycle.synced) },
+    { label: "skipped", value: readNumber(cycle.skipped) },
+    { label: "segnali", value: readNumber(cycle.generated) },
+    { label: "chiuse", value: readNumber(cycle.closed) },
+    { label: "pnl", value: readNumber(cycle.pnl_updated) },
+    { label: "recon.", value: readNumber(cycle.live_reconciled) },
+    { label: "calib.", value: readNumber(cycle.calibrated) },
+  ];
+
+  const hasAny = items.some((item) => item.value != null && item.value > 0);
+
+  return (
+    <div style={{ display: "flex", alignItems: "baseline", flexWrap: "wrap", gap: "0 6px", fontSize: "var(--fz-xs)", lineHeight: 1.8 }}>
+      <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", marginRight: 4, whiteSpace: "nowrap" }}>
+        Ciclo
+      </span>
+      {!hasAny ? (
+        <span className="muted">nessun dato</span>
+      ) : (
+        items.map((item, i) => {
+          if (item.value == null) return null;
+          const isZero = item.value === 0;
+          return (
+            <React.Fragment key={item.label}>
+              {i > 0 && <span className="muted" style={{ userSelect: "none" }}>·</span>}
+              <span style={{ color: isZero ? "var(--fg-4)" : "var(--fg-1)" }}>
+                <span className="mono" style={{ fontWeight: isZero ? 400 : 600 }}>{formatCompact(item.value)}</span>
+                {" "}
+                <span className="muted">{item.label}</span>
+              </span>
+            </React.Fragment>
+          );
+        })
+      )}
     </div>
   );
 }

@@ -17,6 +17,7 @@ DEFAULT_STRATEGIES = {
     "bollinger_bands": {"period": 20, "stddev": 2.0},
     "vwap": {"period": 48, "tolerance_pct": 0.002},
     "candlestick_patterns": {},
+    "wyckoff_spring_upthrust": {"lookback": 50, "pivot_window": 5, "tolerance_pct": 0.002, "volume_factor": 1.3},
 }
 
 DEFAULT_STRATEGY_WEIGHTS = {
@@ -30,6 +31,7 @@ DEFAULT_STRATEGY_WEIGHTS = {
     "bollinger_bands": 8,
     "vwap": 8,
     "candlestick_patterns": 5,
+    "wyckoff_spring_upthrust": 12,
 }
 
 LEGACY_DEFAULT_STRATEGY_WEIGHTS = {
