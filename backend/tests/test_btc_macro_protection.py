@@ -21,7 +21,19 @@ from app.engine.position_management import StopCandidate
 class _Query:
     rows: list[Any]
 
-    def filter(self, *_args: Any, **_kwargs: Any) -> "_Query":
+    def filter(self, *args: Any, **_kwargs: Any) -> "_Query":
+        # Riconosce filtri "Candle.market_id == X" e applica il filtraggio sui rows.
+        # Necessario perché `_is_position_in_profit` interroga le candele del
+        # market specifico della posizione, non un dataset globale.
+        for arg in args:
+            if hasattr(arg, "left") and hasattr(arg, "right"):
+                column_name = getattr(arg.left, "key", None)
+                target = getattr(arg.right, "value", None)
+                if column_name == "market_id" and target is not None:
+                    filtered = [
+                        row for row in self.rows if getattr(row, "market_id", None) == target
+                    ]
+                    return _Query(filtered)
         return self
 
     def order_by(self, *_args: Any, **_kwargs: Any) -> "_Query":
@@ -179,10 +191,13 @@ def _position(
     stop: str | None = "105",
     unrealized_pnl: float = 5.0,
     mode: str = "live",
+    market_id: int = 2,
 ) -> Position:
+    # Position su un market non-BTC (market_id=2) di default, così
+    # `_is_position_in_profit` non trova candele in cache e usa unrealized_pnl.
     return Position(
         id=10,
-        market_id=1,
+        market_id=market_id,
         mode=mode,
         side=side,
         entry_price=Decimal(entry),
@@ -192,6 +207,19 @@ def _position(
         unrealized_pnl=Decimal(str(unrealized_pnl)),
         opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         metadata_json={},
+    )
+
+
+def _alt_market(market_id: int = 2) -> Market:
+    return Market(
+        id=market_id,
+        exchange="hyperliquid",
+        symbol="ETH:USDC",
+        base="ETH",
+        quote="USDC",
+        market_type="perp",
+        active=True,
+        metadata_json={"hl_coin": "ETH", "raw": {"szDecimals": 4}},
     )
 
 
@@ -282,7 +310,7 @@ def test_reversal_bearish_to_bullish_short_in_profit() -> None:
         btc_market=market,
         candles=candles,
         positions=[pos],
-        markets_by_id={1: market},
+        markets_by_id={1: market, 2: _alt_market(2)},
     )
     executor = FakeExecutor()
 
@@ -312,7 +340,7 @@ def test_reversal_bearish_to_bullish_short_in_loss() -> None:
         btc_market=market,
         candles=candles,
         positions=[pos],
-        markets_by_id={1: market},
+        markets_by_id={1: market, 2: _alt_market(2)},
     )
     executor = FakeExecutor()
 
@@ -339,7 +367,7 @@ def test_reversal_bullish_to_bearish_long_in_profit() -> None:
         btc_market=market,
         candles=candles,
         positions=[pos],
-        markets_by_id={1: market},
+        markets_by_id={1: market, 2: _alt_market(2)},
     )
     executor = FakeExecutor()
 
@@ -368,7 +396,7 @@ def test_reversal_bullish_to_bearish_long_in_loss() -> None:
         btc_market=market,
         candles=candles,
         positions=[pos],
-        markets_by_id={1: market},
+        markets_by_id={1: market, 2: _alt_market(2)},
     )
     executor = FakeExecutor()
 
@@ -402,7 +430,7 @@ def test_no_degradation_if_trailing_already_better_short() -> None:
         btc_market=market,
         candles=candles,
         positions=[pos],
-        markets_by_id={1: market},
+        markets_by_id={1: market, 2: _alt_market(2)},
     )
     executor = FakeExecutor()
 
@@ -427,7 +455,7 @@ def test_no_action_for_longs_on_bullish_reversal() -> None:
         btc_market=market,
         candles=candles,
         positions=[pos],
-        markets_by_id={1: market},
+        markets_by_id={1: market, 2: _alt_market(2)},
     )
     executor = FakeExecutor()
 
@@ -452,7 +480,7 @@ def test_same_trend_no_reversal() -> None:
         btc_market=market,
         candles=candles,
         positions=[pos],
-        markets_by_id={1: market},
+        markets_by_id={1: market, 2: _alt_market(2)},
     )
     executor = FakeExecutor()
 
@@ -480,7 +508,7 @@ def test_loss_exit_disabled_does_not_close() -> None:
         btc_market=market,
         candles=candles,
         positions=[pos],
-        markets_by_id={1: market},
+        markets_by_id={1: market, 2: _alt_market(2)},
     )
     executor = FakeExecutor()
 
@@ -505,6 +533,56 @@ def test_state_updated_after_run() -> None:
     assert setting.value["_last_btc_trend"] == "BULLISH"
 
 
+def test_reversal_through_neutral_state_preserved() -> None:
+    """F-01: BULLISH → NEUTRAL → BEARISH deve essere rilevato come reversal.
+
+    Bug originale: `_last_btc_trend` veniva sovrascritto a NEUTRAL durante una
+    candela neutra, perdendo il directional precedente. Il fix introduce
+    `_last_directional_trend` che si aggiorna solo per trend non-NEUTRAL.
+    """
+    engine = BtcMacroProtectionEngine(_settings())
+
+    # Stato iniziale: _last_directional_trend = BULLISH
+    setting = _config_setting(last_trend="NEUTRAL", lookback=3)
+    setting.value["_last_directional_trend"] = "BULLISH"
+    market = _btc_market()
+
+    # Ciclo 1: candela con delta > soglia ma volume insufficiente → NEUTRAL
+    candles_neutral = _candles(10, base_close=100.0, last_close=102.0, last_volume=800.0)
+    db1 = FakeDb(
+        settings={"btc_macro_protection": setting},
+        btc_market=market,
+        candles=candles_neutral,
+        markets_by_id={1: market, 2: _alt_market(2)},
+    )
+    engine.run(db1, FakeExecutor())
+
+    # NEUTRAL osservato non deve sovrascrivere il directional
+    assert setting.value["_last_btc_trend"] == "NEUTRAL"
+    assert setting.value["_last_directional_trend"] == "BULLISH"
+
+    # Ciclo 2: trend BEARISH (delta -2%, volume sufficiente)
+    candles_bearish = _candles(10, base_close=100.0, last_close=98.0, last_volume=2000.0)
+    pos = _position(side="long", entry="100", stop="92", unrealized_pnl=4.0)
+    db2 = FakeDb(
+        settings={"btc_macro_protection": setting},
+        btc_market=market,
+        candles=candles_bearish,
+        positions=[pos],
+        markets_by_id={1: market, 2: _alt_market(2)},
+    )
+
+    with patch.object(
+        engine._position_manager, "replace_live_stop_order", return_value=True
+    ) as mock_replace:
+        result = engine.run(db2, FakeExecutor())
+
+    # Reversal BULLISH → BEARISH rilevato correttamente
+    assert result == 1
+    mock_replace.assert_called_once()
+    assert setting.value["_last_directional_trend"] == "BEARISH"
+
+
 def test_decision_log_emitted_on_reversal() -> None:
     # Verifica che venga emesso un DecisionLog btc_macro_reversal_detected
     engine = BtcMacroProtectionEngine(_settings())
@@ -516,7 +594,7 @@ def test_decision_log_emitted_on_reversal() -> None:
         btc_market=market,
         candles=candles,
         positions=[],
-        markets_by_id={1: market},
+        markets_by_id={1: market, 2: _alt_market(2)},
     )
     engine.run(db, FakeExecutor())
 

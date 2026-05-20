@@ -212,6 +212,7 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
   const [error, setError] = useState<string | null>(null);
   const [ws, setWs] = useState<WsState>(WS_INITIAL);
   const [action, setAction] = useState<ActionState>(ACTION_INITIAL);
+  const [selectedCoin, setSelectedCoin] = useState<string | null>(null);
 
   async function refresh() {
     setLoading(true);
@@ -234,6 +235,21 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
       await refresh();
     } catch (exc) {
       setAction({ key: null, message: null, error: exc instanceof Error ? exc.message : "Azione non riuscita" });
+    }
+  }
+
+  async function reconcileExitData() {
+    setAction({ key: "reconcile", message: null, error: null });
+    try {
+      const result = await apiPost<{ patched: number; positions: { position_id: number; coin: string; exit_price: string; realized_pnl: string | null; was_wrong_data: boolean }[] }>(
+        "/api/account/positions/patch-missing-exit-data"
+      );
+      const detail = result.positions.length > 0
+        ? result.positions.map(p => `${p.coin} exit=${p.exit_price}${p.was_wrong_data ? " (corretto)" : ""}`).join(", ")
+        : "nessuna posizione da riconciliare";
+      setAction({ key: null, message: `Riconciliazione completata: ${result.patched} posizioni — ${detail}`, error: null });
+    } catch (exc) {
+      setAction({ key: null, message: null, error: exc instanceof Error ? exc.message : "Riconciliazione non riuscita" });
     }
   }
 
@@ -295,6 +311,9 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
           </div>
         </div>
         <div className="page-actions">
+          <button className="btn ghost" onClick={reconcileExitData} disabled={action.key === "reconcile"} title="Riconcilia dati di uscita con lo storico HL">
+            <Icon name="refresh" size={12} /> {action.key === "reconcile" ? "Riconcilio..." : "Riconcilia storico"}
+          </button>
           <button className="btn ghost" onClick={refresh} disabled={loading} title="Aggiorna">
             <Icon name="refresh" size={12} /> {loading ? "Sync..." : "Refresh"}
           </button>
@@ -367,15 +386,15 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
         <SummaryWidget
           title="Leva account"
           value={(() => {
-            const ntl = asNumber(snapshot?.account.total_notional_position);
-            const val = asNumber(snapshot?.account.account_value);
+            const ntl = asNumber(snapshot?.account.cross_ntl_pos ?? snapshot?.account.total_notional_position);
+            const val = asNumber(snapshot?.account.effective_account_value ?? snapshot?.account.account_value);
             if (ntl == null || val == null || val <= 0) return "-";
             return `${(ntl / val).toFixed(2)}x`;
           })()}
-          detail={`${fmtUsd(snapshot?.account.total_notional_position)} notional`}
+          detail={`${fmtUsd(snapshot?.account.cross_ntl_pos ?? snapshot?.account.total_notional_position)} cross notional`}
           tone={(() => {
-            const ntl = asNumber(snapshot?.account.total_notional_position);
-            const val = asNumber(snapshot?.account.account_value);
+            const ntl = asNumber(snapshot?.account.cross_ntl_pos ?? snapshot?.account.total_notional_position);
+            const val = asNumber(snapshot?.account.effective_account_value ?? snapshot?.account.account_value);
             if (ntl == null || val == null || val <= 0) return undefined;
             const lev = ntl / val;
             return lev > 10 ? "short" : lev > 5 ? "warn" : undefined;
@@ -389,6 +408,8 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
         <PositionsTable
           rows={snapshot?.positions ?? []}
           actionKey={action.key}
+          selectedCoin={selectedCoin}
+          onSelectCoin={(coin) => setSelectedCoin((prev) => (prev === coin ? null : coin))}
           onClose={(coin) =>
             runAccountAction(
               `close-position-${coin}`,
@@ -405,6 +426,8 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
         <OpenOrders
           rows={snapshot?.open_orders ?? []}
           positions={snapshot?.positions ?? []}
+          filterCoin={selectedCoin}
+          onClearFilter={() => setSelectedCoin(null)}
           actionKey={action.key}
           onCancel={(order) => {
             const oid = orderId(order);
@@ -425,17 +448,21 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
 function UnifiedAccountCard({ account }: { account: AccountMonitor["account"] | null }) {
   const accountValue = asNumber(account?.effective_account_value ?? account?.account_value);
   const crossAccountValue = asNumber(account?.cross_account_value);
+  const crossNtlPos = asNumber(account?.cross_ntl_pos);
   const totalNtl = asNumber(account?.total_notional_position);
+  const freeSpotUsdc = asNumber(account?.free_spot_usdc);
   const maintMargin = asNumber(account?.cross_maintenance_margin_used);
 
-  // leverage: total notional / portfolio value (include spot + perps)
-  const leverage = accountValue != null && accountValue > 0 && totalNtl != null
-    ? totalNtl / accountValue
+  // leverage: cross notional (solo posizioni cross) / portfolio value totale, come HL
+  const leverage = accountValue != null && accountValue > 0
+    ? (crossNtlPos ?? totalNtl) != null ? (crossNtlPos ?? totalNtl)! / accountValue : null
     : null;
-  // unified ratio: maintenance margin / cross account value (solo cross, come fa HL)
-  const denominator = crossAccountValue ?? accountValue;
-  const unifiedRatio = maintMargin != null && denominator != null && denominator > 0
-    ? (maintMargin / denominator) * 100
+  // unified ratio: maintenance margin / (cross account value + free spot USDC), come HL
+  const uarDenominator = crossAccountValue != null
+    ? crossAccountValue + (freeSpotUsdc ?? 0)
+    : accountValue;
+  const unifiedRatio = maintMargin != null && uarDenominator != null && uarDenominator > 0
+    ? (maintMargin / uarDenominator) * 100
     : null;
 
   return (
@@ -522,20 +549,111 @@ function SideBadge({ side }: { side: string | null | undefined }) {
   return <span className="badge muted">-</span>;
 }
 
-function PositionsTable({ rows, actionKey, onClose }: { rows: AccountPosition[]; actionKey: string | null; onClose: (coin: string) => void }) {
+type PositionSortKey = "coin" | "side" | "leverage" | "size" | "entry" | "value" | "pnl" | "roe" | "liq";
+
+function positionSortValue(row: AccountPosition, key: PositionSortKey): string | number {
+  switch (key) {
+    case "coin": return row.coin ?? "";
+    case "side": return row.side ?? "";
+    case "leverage": return asNumber((row.leverage as Record<string, string | number | null> | null)?.value) ?? 0;
+    case "size": return Math.abs(asNumber(row.size) ?? 0);
+    case "entry": return asNumber(row.entry_price) ?? 0;
+    case "value": return asNumber(row.position_value) ?? 0;
+    case "pnl": return asNumber(row.unrealized_pnl) ?? 0;
+    case "roe": return asNumber(row.return_on_equity) ?? 0;
+    case "liq": return asNumber(row.liquidation_price) ?? 0;
+  }
+}
+
+function SortTh({ label, sortKey, current, dir, onSort }: {
+  label: string;
+  sortKey: PositionSortKey;
+  current: PositionSortKey;
+  dir: "asc" | "desc";
+  onSort: (key: PositionSortKey) => void;
+}) {
+  const active = current === sortKey;
+  return (
+    <th
+      style={{ cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}
+      onClick={() => onSort(sortKey)}
+    >
+      {label}{" "}
+      <span style={{ opacity: active ? 1 : 0.25, fontSize: 9 }}>
+        {active ? (dir === "asc" ? "▲" : "▼") : "▲"}
+      </span>
+    </th>
+  );
+}
+
+function PositionsTable({ rows, actionKey, selectedCoin, onSelectCoin, onClose }: {
+  rows: AccountPosition[];
+  actionKey: string | null;
+  selectedCoin: string | null;
+  onSelectCoin: (coin: string) => void;
+  onClose: (coin: string) => void;
+}) {
+  const [sortKey, setSortKey] = useState<PositionSortKey>("pnl");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  function handleSort(key: PositionSortKey) {
+    if (key === sortKey) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir("desc");
+    }
+  }
+
+  const sorted = useMemo(() => {
+    return [...rows].sort((a, b) => {
+      const av = positionSortValue(a, sortKey);
+      const bv = positionSortValue(b, sortKey);
+      const cmp = typeof av === "string" ? av.localeCompare(bv as string) : (av as number) - (bv as number);
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+  }, [rows, sortKey, sortDir]);
+
+  const thProps = { current: sortKey, dir: sortDir, onSort: handleSort };
+
   return (
     <div className="card">
-      <div className="card-head"><span className="title">Posizioni perp</span><span className="badge muted">{rows.length}</span></div>
+      <div className="card-head">
+        <span className="title">Posizioni perp</span>
+        <span className="badge muted">{rows.length}</span>
+      </div>
       <table className="tbl">
-        <thead><tr><th>Coin</th><th>Direzione</th><th>Leva</th><th>Size</th><th>Entry</th><th>Value</th><th>PnL</th><th>ROE</th><th>Liq</th><th /></tr></thead>
+        <thead>
+          <tr>
+            <SortTh label="Coin" sortKey="coin" {...thProps} />
+            <SortTh label="Dir" sortKey="side" {...thProps} />
+            <SortTh label="Leva" sortKey="leverage" {...thProps} />
+            <SortTh label="Size" sortKey="size" {...thProps} />
+            <SortTh label="Entry" sortKey="entry" {...thProps} />
+            <SortTh label="Value" sortKey="value" {...thProps} />
+            <SortTh label="PnL" sortKey="pnl" {...thProps} />
+            <SortTh label="ROE" sortKey="roe" {...thProps} />
+            <SortTh label="Liq" sortKey="liq" {...thProps} />
+            <th />
+          </tr>
+        </thead>
         <tbody>
-          {rows.map((row, index) => {
+          {sorted.map((row, index) => {
             const pnl = asNumber(row.unrealized_pnl);
             const coin = row.coin ?? "";
             const running = actionKey === `close-position-${coin}`;
+            const isSelected = selectedCoin === coin;
             return (
-              <tr key={`${row.coin}-${index}`}>
-                <td className="mono">{row.coin ?? "-"}</td>
+              <tr
+                key={`${row.coin}-${index}`}
+                onClick={() => { if (coin) onSelectCoin(coin); }}
+                style={{
+                  cursor: coin ? "pointer" : undefined,
+                  background: isSelected ? "var(--bg-2, rgba(255,255,255,0.05))" : undefined,
+                  outline: isSelected ? "1px solid var(--border)" : undefined,
+                }}
+              >
+                <td className="mono" style={{ fontWeight: isSelected ? 600 : undefined }}>{row.coin ?? "-"}</td>
                 <td><SideBadge side={row.side} /></td>
                 <td className="mono">{leverageLabel(row.leverage)}</td>
                 <td className="mono">{fmtNum(row.size)}</td>
@@ -546,7 +664,7 @@ function PositionsTable({ rows, actionKey, onClose }: { rows: AccountPosition[];
                   {fmtPct(asNumber(row.return_on_equity) != null ? (asNumber(row.return_on_equity)! * 100) : null)}
                 </td>
                 <td className="mono">{fmt.price(row.liquidation_price)}</td>
-                <td style={{ textAlign: "right" }}>
+                <td style={{ textAlign: "right" }} onClick={(e) => e.stopPropagation()}>
                   <button
                     className="btn ghost"
                     disabled={!coin || running}
@@ -615,25 +733,49 @@ const ORDERS_PAGE_SIZE = 12;
 function OpenOrders({
   rows,
   positions,
+  filterCoin,
+  onClearFilter,
   actionKey,
   onCancel,
 }: {
   rows: AccountOpenOrder[];
   positions: AccountPosition[];
+  filterCoin: string | null;
+  onClearFilter: () => void;
   actionKey: string | null;
   onCancel: (order: AccountOpenOrder) => void;
 }) {
   const [page, setPage] = useState(0);
   const positionsMap = useMemo(() => positionByCoin(positions), [positions]);
-  const totalPages = Math.max(1, Math.ceil(rows.length / ORDERS_PAGE_SIZE));
-  const pageRows = rows.slice(page * ORDERS_PAGE_SIZE, (page + 1) * ORDERS_PAGE_SIZE);
 
-  // Reset to first page when rows change (e.g. after refresh)
-  useEffect(() => { setPage(0); }, [rows.length]);
+  const filtered = useMemo(
+    () => filterCoin ? rows.filter((r) => String(r.coin ?? "") === filterCoin) : rows,
+    [rows, filterCoin]
+  );
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / ORDERS_PAGE_SIZE));
+  const pageRows = filtered.slice(page * ORDERS_PAGE_SIZE, (page + 1) * ORDERS_PAGE_SIZE);
+
+  useEffect(() => { setPage(0); }, [filtered.length, filterCoin]);
 
   return (
     <div className="card">
-      <div className="card-head"><span className="title">Open orders</span><span className="badge muted">{rows.length}</span></div>
+      <div className="card-head">
+        <span className="title">Open orders</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {filterCoin && (
+            <span className="badge warn" style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              {filterCoin}
+              <button
+                onClick={onClearFilter}
+                style={{ background: "none", border: "none", cursor: "pointer", padding: 0, lineHeight: 1, color: "inherit" }}
+                title="Rimuovi filtro"
+              >×</button>
+            </span>
+          )}
+          <span className="badge muted">{filterCoin ? `${filtered.length}/${rows.length}` : rows.length}</span>
+        </div>
+      </div>
       <div style={{ overflowX: "auto" }}>
         <table className="tbl" style={{ minWidth: 760 }}>
           <thead>
@@ -694,14 +836,20 @@ function OpenOrders({
                 </tr>
               );
             })}
-            {rows.length === 0 && <tr><td colSpan={9} className="muted">Nessun ordine aperto.</td></tr>}
+            {filtered.length === 0 && (
+              <tr>
+                <td colSpan={9} className="muted">
+                  {filterCoin ? `Nessun ordine aperto per ${filterCoin}.` : "Nessun ordine aperto."}
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       </div>
       {totalPages > 1 && (
         <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, padding: "8px 14px", borderTop: "1px solid var(--border)" }}>
           <span className="muted" style={{ fontSize: "var(--fz-xs)" }}>
-            {page * ORDERS_PAGE_SIZE + 1}–{Math.min((page + 1) * ORDERS_PAGE_SIZE, rows.length)} di {rows.length}
+            {page * ORDERS_PAGE_SIZE + 1}–{Math.min((page + 1) * ORDERS_PAGE_SIZE, filtered.length)} di {filtered.length}
           </span>
           <button className="btn ghost" disabled={page === 0} onClick={() => setPage((p) => p - 1)} style={{ minHeight: 26, padding: "0 8px" }}>
             ‹ Prec

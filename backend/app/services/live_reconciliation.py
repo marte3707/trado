@@ -502,6 +502,45 @@ def _resize_local_stop_orders(
         )
 
 
+def _index_fills_by_coin(raw_fills: list[dict]) -> dict[str, list[dict]]:
+    result: dict[str, list[dict]] = {}
+    for fill in raw_fills:
+        if not isinstance(fill, dict):
+            continue
+        coin = fill.get("coin")
+        if isinstance(coin, str) and coin:
+            result.setdefault(coin, []).append(fill)
+    return result
+
+
+def _find_close_fill(
+    coin: str,
+    opened_at: datetime,
+    fills_by_coin: dict[str, list[dict]],
+) -> dict | None:
+    """Return the most recent HL fill for this coin that carries a closedPnl
+    (i.e. it's a position-close fill) and happened after the position opened.
+
+    Using the real HL fill gives the exact avg price and the true P&L
+    (including funding adjustments), so this is more accurate than deriving
+    P&L from a trigger price stored in Trado's DB.
+    """
+    opened_ts = int(opened_at.timestamp() * 1000)
+    best: dict | None = None
+    best_time = -1
+    for fill in fills_by_coin.get(coin, []):
+        pnl = _decimal(fill.get("closedPnl"))
+        if pnl is None or pnl == 0:
+            continue
+        fill_time = fill.get("time")
+        if not isinstance(fill_time, int) or fill_time <= opened_ts:
+            continue
+        if fill_time > best_time:
+            best = fill
+            best_time = fill_time
+    return best
+
+
 def reconcile_live_positions(
     db: Session,
     trading_client: HyperliquidTradingClient | None = None,
@@ -528,6 +567,7 @@ def reconcile_live_positions(
         logger.warning("live_reconciliation_user_fills_failed", error=str(exc))
         raw_fills = []
     fills_by_cloid, fills_by_oid = _index_fills(raw_fills or [])
+    fills_by_coin = _index_fills_by_coin(raw_fills or [])
 
     open_orders_available = True
     try:
@@ -559,10 +599,96 @@ def reconcile_live_positions(
             )
             metadata["realized_pnl"] = str(position.realized_pnl)
         if remote is None:
+            original_size = position.size
             position.status = "closed"
             position.closed_at = now
             position.size = Decimal("0")
             metadata["reconciled_closed_at"] = now.isoformat()
+
+            if realized_delta == 0 and position.realized_pnl is None:
+                # Fill not matched via cloid/oid. Strategy (highest accuracy first):
+                # 1. Search the already-fetched HL fills for a close fill on this coin
+                #    — gives exact avg price + true P&L (includes funding/fees).
+                # 2. Fall back to the most recent pending SL/TP order's trigger price.
+                hl_fill = _find_close_fill(coin, position.opened_at, fills_by_coin)
+                if hl_fill is not None:
+                    hl_px = _decimal(hl_fill.get("px"))
+                    hl_pnl = _decimal(hl_fill.get("closedPnl"))
+                    if hl_px is not None and hl_pnl is not None:
+                        position.realized_pnl = hl_pnl
+                        metadata["realized_pnl"] = str(hl_pnl)
+                        metadata["exit_price"] = str(hl_px)
+                        metadata["exit_reason"] = "hl_fill"
+                        db.add(
+                            DecisionLog(
+                                event_type="live_reconciliation_hl_fill_fallback",
+                                market_id=position.market_id,
+                                position_id=position.id,
+                                message="Close fill found in HL fill history; P&L and exit price taken from HL",
+                                data={
+                                    "coin": coin,
+                                    "exit_price": str(hl_px),
+                                    "realized_pnl": str(hl_pnl),
+                                    "fill": hl_fill,
+                                },
+                            )
+                        )
+                else:
+                    # No HL fill found: fall back to pending SL/TP trigger price
+                    pending_exit = (
+                        db.query(Order)
+                        .filter(
+                            Order.position_id == position.id,
+                            Order.mode == OrderMode.LIVE.value,
+                            Order.order_type.in_(_RECONCILED_EXIT_TYPES),
+                            Order.status.notin_(_TERMINAL_ORDER_STATUSES),
+                        )
+                        .order_by(Order.created_at.desc())
+                        .first()
+                    )
+                    if pending_exit is not None and pending_exit.price is not None:
+                        exit_sz = pending_exit.size or original_size
+                        pnl_sign = Decimal("1") if position.side.lower() == "long" else Decimal("-1")
+                        est_pnl = (pending_exit.price - position.entry_price) * exit_sz * pnl_sign
+                        position.realized_pnl = est_pnl
+                        metadata["realized_pnl"] = str(est_pnl)
+                        metadata["exit_price"] = str(pending_exit.price)
+                        metadata["exit_reason"] = pending_exit.order_type
+                        pending_exit.status = "filled"
+                        db.add(pending_exit)
+                        db.add(
+                            DecisionLog(
+                                event_type="live_reconciliation_sl_fallback",
+                                market_id=position.market_id,
+                                position_id=position.id,
+                                message="SL/TP fill not in HL history; P&L estimated from trigger price",
+                                data={
+                                    "coin": coin,
+                                    "order_id": pending_exit.id,
+                                    "exit_price": str(pending_exit.price),
+                                    "exit_size": str(exit_sz),
+                                    "realized_pnl": str(est_pnl),
+                                },
+                            )
+                        )
+
+            if "exit_price" not in metadata:
+                # Fill was matched (realized_delta != 0) but exit_price not stored:
+                # derive it from the most recently filled exit order's avg price.
+                last_filled = (
+                    db.query(Order)
+                    .filter(
+                        Order.position_id == position.id,
+                        Order.mode == OrderMode.LIVE.value,
+                        Order.order_type.in_(_RECONCILED_EXIT_TYPES),
+                        Order.status == "filled",
+                    )
+                    .order_by(Order.created_at.desc())
+                    .first()
+                )
+                if last_filled is not None and last_filled.price is not None:
+                    metadata["exit_price"] = str(last_filled.price)
+
             position.metadata_json = metadata
             db.add(position)
             db.add(

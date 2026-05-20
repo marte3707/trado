@@ -324,3 +324,14 @@ def test_status_returns_progress_when_step_active() -> None:
     assert status["current_step_key"] == "regime_filter"
     assert status["progress"]["trades_done"] == 3
     assert status["progress"]["trades_required"] == 10
+
+
+def test_positions_after_returns_empty_when_state_corrupt() -> None:
+    """F-10: senza `activated_at` ritorniamo lista vuota, non l'intera collezione.
+    Altrimenti `metrics_after` includerebbe le posizioni pre-attivazione."""
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+    positions = _positions_with_slope(5, 1.0, datetime(2026, 1, 1, tzinfo=timezone.utc))
+    assert tuner._positions_after(positions, None) == []
+    assert tuner._positions_after(positions, "") == []
+    # Stringa malformata → lista vuota (non solleva)
+    assert tuner._positions_after(positions, "not-a-date") == []

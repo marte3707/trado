@@ -19,8 +19,14 @@ class _Query:
     def filter(self, *_args, **_kwargs) -> "_Query":
         return self
 
+    def order_by(self, *_args, **_kwargs) -> "_Query":
+        return self
+
     def all(self) -> list[Any]:
         return list(self.rows)
+
+    def first(self) -> Any | None:
+        return self.rows[0] if self.rows else None
 
 
 @dataclass

@@ -309,9 +309,34 @@ class SignalEngine:
                 risk_settings.value.get("min_stop_distance_pct", min_stop_distance_pct)
             )
         risk_value = risk_settings.value if risk_settings else {}
+        scoring_settings = db.get(AppSetting, "scoring")
+        scoring_value = (
+            scoring_settings.value
+            if scoring_settings and isinstance(scoring_settings.value, dict)
+            else {}
+        )
+        strong_threshold = int(scoring_value.get("strong_score_threshold", 75))
+        label_map = scoring_value.get("label_thresholds")
+        label_tuple: tuple[tuple[int, str], ...] | None = None
+        if isinstance(label_map, dict):
+            try:
+                label_tuple = tuple(
+                    sorted(
+                        ((int(v), str(k)) for k, v in label_map.items()),
+                        key=lambda item: item[0],
+                    )
+                )
+            except (TypeError, ValueError):
+                label_tuple = None
+        scoring_engine = SignalScoringEngine(
+            strong_score_threshold=strong_threshold,
+            **({"label_thresholds": label_tuple} if label_tuple else {}),
+        )
         regime_filter_enabled = bool(risk_value.get("regime_filter_enabled", False))
         regime_adx_trending = float(risk_value.get("regime_adx_trending", 25.0))
         regime_adx_ranging = float(risk_value.get("regime_adx_ranging", 18.0))
+        regime_confirm_candles = int(risk_value.get("regime_confirm_candles", 2))
+        regime_off_multiplier = float(risk_value.get("regime_off_weight_multiplier", 0.5))
         participation_ratio = float(risk_value.get("participation_ratio", 0.35))
         volatility_filter_enabled = bool(risk_value.get("volatility_filter_enabled", False))
         atr_pct_min = float(risk_value.get("atr_pct_min", 0.10))
@@ -434,6 +459,8 @@ class SignalEngine:
             enabled=regime_filter_enabled,
             adx_trending=regime_adx_trending,
             adx_ranging=regime_adx_ranging,
+            confirm_candles=regime_confirm_candles,
+            off_regime_weight_multiplier=regime_off_multiplier,
         )
         if regime_info is not None and regime_info["neutralized"]:
             logger.debug(
@@ -444,7 +471,7 @@ class SignalEngine:
                 adx=regime_info["adx"],
                 neutralized=regime_info["neutralized"],
             )
-        score = self.scoring.score(results, weights, participation_ratio=participation_ratio)
+        score = scoring_engine.score(results, weights, participation_ratio=participation_ratio)
         if performance_notes:
             score.breakdown["_performance_adjustments"] = performance_notes
         if regime_info is not None:
@@ -496,6 +523,36 @@ class SignalEngine:
             if altcoin_season
             else None,
         }
+        funding_block_threshold = risk_value.get("funding_block_threshold_pct")
+        if (
+            funding_block_threshold is not None
+            and funding_rate_value is not None
+            and score.direction != Direction.NEUTRAL
+        ):
+            try:
+                threshold_pct = float(funding_block_threshold)
+            except (TypeError, ValueError):
+                threshold_pct = None
+            else:
+                # threshold espresso in % per 8h (es. 0.05 = 0.05%/8h)
+                funding_pct = funding_rate_value * 100
+                if (
+                    funding_pct > threshold_pct
+                    and score.direction in {Direction.LONG, Direction.STRONG_LONG}
+                ) or (
+                    funding_pct < -threshold_pct
+                    and score.direction in {Direction.SHORT, Direction.STRONG_SHORT}
+                ):
+                    logger.debug(
+                        "signal_skipped_funding_block",
+                        market=market.symbol,
+                        timeframe=timeframe,
+                        funding_pct=round(funding_pct, 4),
+                        threshold_pct=threshold_pct,
+                        direction=score.direction.value,
+                    )
+                    db.commit()
+                    return None
         if (
             whale_flow is not None
             and whale_flow.confidence >= settings.whale_contra_block_confidence
@@ -563,7 +620,6 @@ class SignalEngine:
                     )
                     db.commit()
                     return None
-        min_risk_reward = max(min_risk_reward, 2.0)
         risk_plan = self.risk.build_plan(
             candles,
             score.direction,

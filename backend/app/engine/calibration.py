@@ -132,6 +132,7 @@ class AutoCalibrationEngine:
             "deep_defensive_slope_threshold": -2.0,
             "starvation_soft_cycles": 10,
             "starvation_hard_cycles": 15,
+            "min_trades_for_slope": 10,
         }
         return {**defaults, **value}
 
@@ -293,13 +294,16 @@ class AutoCalibrationEngine:
             return 0
         recent = (
             db.query(DecisionLog)
-            .filter(DecisionLog.event_type == "worker_cycle")
+            .filter(DecisionLog.event_type.in_(["worker_cycle", "worker_cycle_failed"]))
             .order_by(DecisionLog.timestamp.desc())
             .limit(120)
             .all()
         )
         streak = 0
         for entry in recent:
+            if entry.event_type == "worker_cycle_failed":
+                streak += 1
+                continue
             if isinstance(entry.data, dict) and int(entry.data.get("generated", 0)) == 0:
                 streak += 1
             else:
@@ -333,6 +337,8 @@ class AutoCalibrationEngine:
         prev_in_deep = bool(state_value.get("deep_defensive_active", False))
         deep_threshold = float(settings.get("deep_defensive_slope_threshold", -2.0))
 
+        min_risk_floor = float(settings.get("min_risk_per_trade_pct", 0.25))
+
         in_deep_defensive = False
         new_streak = 0
         if equity_slope_value < deep_threshold:
@@ -348,21 +354,41 @@ class AutoCalibrationEngine:
         # Starvation recovery: se troppi cicli consecutivi senza segnali il deep
         # defensive non sta proteggendo nulla — allentare progressivamente.
         zero_cycles = self._consecutive_zero_signal_cycles(db)
-        starvation_soft = int(settings.get("starvation_soft_cycles", 30))
-        starvation_hard = int(settings.get("starvation_hard_cycles", 60))
+        starvation_soft = int(settings.get("starvation_soft_cycles", 10))
+        starvation_hard = int(settings.get("starvation_hard_cycles", 15))
         starvation_override = False
         if in_deep_defensive and zero_cycles >= starvation_hard:
             in_deep_defensive = False
             new_streak = 0
             starvation_override = True
+
+        # Equity-slope "ambiguo": se la calibrazione è in deep defensive ma il numero
+        # di trade chiusi nella finestra è troppo basso per stimare lo slope in modo
+        # affidabile, il vincolo non sta proteggendo nulla — usciamo dal deep defensive
+        # per non bloccare i segnali artificialmente.
+        min_slope_trades = int(settings.get("min_trades_for_slope", 10))
+        ambiguous_slope = overall.trades < min_slope_trades
+        if in_deep_defensive and ambiguous_slope:
+            in_deep_defensive = False
+            new_streak = 0
+            starvation_override = True
         state_value["consecutive_zero_signal_cycles"] = zero_cycles
         state_value["starvation_override_active"] = starvation_override
+        state_value["ambiguous_slope_override"] = ambiguous_slope and starvation_override
 
         score_delta = 0
         rr_delta = 0.0
         risk_pct = base_risk
         reason = "historical performance near baseline"
-        if starvation_override:
+        if starvation_override and ambiguous_slope and overall.trades < min_slope_trades:
+            score_delta = 0
+            rr_delta = 0.0
+            risk_pct = base_risk
+            reason = (
+                f"ambiguous slope ({overall.trades} trade chiusi < {min_slope_trades}): "
+                "parametri al baseline finché non si raccolgono più dati"
+            )
+        elif starvation_override:
             score_delta = 0
             rr_delta = 0.0
             risk_pct = base_risk
@@ -373,7 +399,7 @@ class AutoCalibrationEngine:
         elif in_deep_defensive and zero_cycles >= starvation_soft:
             score_delta = 6
             rr_delta = 0.2
-            risk_pct = max(float(settings["min_risk_per_trade_pct"]), base_risk * 0.75)
+            risk_pct = max(min_risk_floor, base_risk * 0.75)
             reason = (
                 f"deep defensive attenuato: {zero_cycles} cicli senza segnali, "
                 f"equity slope {equity_slope_value:.4f}"
@@ -381,7 +407,7 @@ class AutoCalibrationEngine:
         elif in_deep_defensive:
             score_delta = 12
             rr_delta = 0.4
-            risk_pct = max(float(settings["min_risk_per_trade_pct"]), base_risk * 0.5)
+            risk_pct = max(min_risk_floor, base_risk * 0.5)
             reason = (
                 f"deep defensive mode: equity slope {equity_slope_value:.4f} "
                 f"below threshold {deep_threshold}"
@@ -391,7 +417,7 @@ class AutoCalibrationEngine:
         ):
             score_delta = 8
             rr_delta = 0.25
-            risk_pct = max(float(settings["min_risk_per_trade_pct"]), base_risk * 0.75)
+            risk_pct = max(min_risk_floor, base_risk * 0.75)
             reason = "defensive mode after weak historical results"
         elif overall.win_rate >= 0.58 and overall.realized_pnl > 0 and (
             overall.profit_factor is None or overall.profit_factor >= 1.2

@@ -12,6 +12,7 @@ from app.core.config import Settings
 from app.core.enums import OrderMode
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Position
 from app.engine.position_management import PositionManagementEngine, StopCandidate
+from app.indicators.core import ema
 
 logger = structlog.get_logger()
 
@@ -59,7 +60,7 @@ class BtcMacroProtectionEngine:
             db.query(Candle)
             .filter(Candle.market_id == btc_market.id, Candle.timeframe == timeframe)
             .order_by(Candle.open_time.desc())
-            .limit(lookback + 20)
+            .limit(lookback + 1)
             .all()
         )[::-1]
 
@@ -73,20 +74,54 @@ class BtcMacroProtectionEngine:
 
         current_trend, delta_pct, vol_ratio = self._compute_trend(candles, config)
 
-        last_trend_str = str(config.get("_last_btc_trend", "NEUTRAL"))
-        try:
-            last_trend = BtcTrendState[last_trend_str]
-        except KeyError:
-            last_trend = BtcTrendState.NEUTRAL
+        # EMA confluence opzionale: il reversal è valido solo se concorde con il trend
+        # macro su un timeframe più alto (default: 1h, EMA 200).
+        if current_trend != BtcTrendState.NEUTRAL and bool(
+            config.get("require_ema_confirmation", False)
+        ):
+            confirmed = self._check_ema_confluence(db, btc_market, current_trend, config)
+            if not confirmed:
+                logger.debug(
+                    "btc_macro_protection_ema_confirmation_failed",
+                    candidate_trend=current_trend.value,
+                )
+                current_trend = BtcTrendState.NEUTRAL
 
-        # Salva sempre lo stato corrente (anche se non è un reversal)
-        self._save_state(db, config, current_trend, delta_pct, vol_ratio)
+        # Read last *directional* trend (NEUTRAL non lo sovrascrive). Fallback al
+        # vecchio "_last_btc_trend" per backward compatibility con setup esistenti.
+        last_directional_str = str(
+            config.get("_last_directional_trend")
+            or config.get("_last_btc_trend", "NEUTRAL")
+        )
+        try:
+            last_directional = BtcTrendState[last_directional_str]
+        except KeyError:
+            last_directional = BtcTrendState.NEUTRAL
 
         is_reversal = (
-            last_trend != BtcTrendState.NEUTRAL
+            last_directional != BtcTrendState.NEUTRAL
             and current_trend != BtcTrendState.NEUTRAL
-            and last_trend != current_trend
+            and last_directional != current_trend
         )
+
+        # Save observed trend in a dedicated commit. Anche se un rollback successivo
+        # dovesse cancellare le modifiche alle posizioni, l'osservazione resta persistente.
+        # Il directional viene aggiornato solo quando current_trend non è NEUTRAL.
+        next_directional = (
+            current_trend if current_trend != BtcTrendState.NEUTRAL else last_directional
+        )
+        self._save_state(
+            db,
+            observed=current_trend,
+            directional=next_directional,
+            delta_pct=delta_pct,
+            vol_ratio=vol_ratio,
+        )
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            logger.warning("btc_macro_protection_state_persist_failed", error=str(exc))
 
         if not is_reversal:
             return 0
@@ -94,9 +129,9 @@ class BtcMacroProtectionEngine:
         db.add(
             DecisionLog(
                 event_type="btc_macro_reversal_detected",
-                message=f"BTC trend reversed: {last_trend.value} → {current_trend.value}",
+                message=f"BTC trend reversed: {last_directional.value} → {current_trend.value}",
                 data={
-                    "from_trend": last_trend.value,
+                    "from_trend": last_directional.value,
                     "to_trend": current_trend.value,
                     "delta_pct": round(delta_pct, 4),
                     "vol_ratio": round(vol_ratio, 4),
@@ -105,6 +140,7 @@ class BtcMacroProtectionEngine:
                 },
             )
         )
+        db.commit()
 
         open_positions = (
             db.query(Position)
@@ -121,6 +157,7 @@ class BtcMacroProtectionEngine:
                 if self._apply_to_position(
                     db, executor, position, current_trend, delta_pct, vol_ratio, config, trading_client
                 ):
+                    db.commit()
                     updated += 1
             except Exception as exc:
                 db.rollback()
@@ -130,12 +167,9 @@ class BtcMacroProtectionEngine:
                     error=str(exc),
                 )
 
-        if updated:
-            db.commit()
-
         logger.info(
             "btc_macro_protection_applied",
-            reversal=f"{last_trend.value}→{current_trend.value}",
+            reversal=f"{last_directional.value}→{current_trend.value}",
             positions_updated=updated,
         )
         return updated
@@ -149,8 +183,9 @@ class BtcMacroProtectionEngine:
     def _save_state(
         self,
         db: Session,
-        config: dict[str, Any],
-        trend: BtcTrendState,
+        *,
+        observed: BtcTrendState,
+        directional: BtcTrendState,
         delta_pct: float,
         vol_ratio: float,
     ) -> None:
@@ -158,13 +193,13 @@ class BtcMacroProtectionEngine:
         if setting is None:
             return
         updated = dict(setting.value or {})
-        updated["_last_btc_trend"] = trend.value
+        updated["_last_btc_trend"] = observed.value
+        updated["_last_directional_trend"] = directional.value
         updated["_last_delta_pct"] = round(delta_pct, 4)
         updated["_last_vol_ratio"] = round(vol_ratio, 4)
         updated["_last_checked_at"] = datetime.now(timezone.utc).isoformat()
         setting.value = updated
         db.add(setting)
-        db.flush()
 
     def _compute_trend(
         self,
@@ -201,6 +236,56 @@ class BtcMacroProtectionEngine:
 
         return BtcTrendState.NEUTRAL, delta_pct, vol_ratio
 
+    def _check_ema_confluence(
+        self,
+        db: Session,
+        btc_market: Market,
+        candidate: BtcTrendState,
+        config: dict[str, Any],
+    ) -> bool:
+        confirmation_tf = str(config.get("confirmation_timeframe", "1h"))
+        ema_period = int(config.get("confirmation_ema_period", 200))
+        candles = (
+            db.query(Candle)
+            .filter(Candle.market_id == btc_market.id, Candle.timeframe == confirmation_tf)
+            .order_by(Candle.open_time.desc())
+            .limit(ema_period * 3)
+            .all()
+        )[::-1]
+        if len(candles) < ema_period:
+            return False
+        closes = [float(c.close) for c in candles]
+        ema_value = ema(closes, ema_period)[-1]
+        if ema_value is None:
+            return False
+        last_close = closes[-1]
+        if candidate == BtcTrendState.BULLISH and last_close > ema_value:
+            return True
+        if candidate == BtcTrendState.BEARISH and last_close < ema_value:
+            return True
+        return False
+
+    def _latest_close(self, db: Session, market_id: int) -> Decimal | None:
+        row = (
+            db.query(Candle)
+            .filter(Candle.market_id == market_id)
+            .order_by(Candle.open_time.desc())
+            .first()
+        )
+        return row.close if row is not None else None
+
+    def _is_position_in_profit(self, db: Session, position: Position) -> bool:
+        """Ricalcola in-line se la posizione è in profitto, evitando di affidarsi al
+        `unrealized_pnl` che può essere stale o nullo."""
+        last_close = self._latest_close(db, position.market_id)
+        if last_close is None or last_close <= 0:
+            # Fallback: usa il valore stored (può essere stale ma è l'unica info disponibile)
+            return float(position.unrealized_pnl or 0) > 0
+        side = position.side.lower()
+        if side == "long":
+            return last_close > position.entry_price
+        return last_close < position.entry_price
+
     def _apply_to_position(
         self,
         db: Session,
@@ -213,8 +298,7 @@ class BtcMacroProtectionEngine:
         trading_client: Any,
     ) -> bool:
         side = position.side.lower()
-        unrealized = float(position.unrealized_pnl or 0)
-        in_profit = unrealized > 0
+        in_profit = self._is_position_in_profit(db, position)
         loss_exit_enabled = bool(config.get("loss_exit_enabled", True))
         buffer_pct = Decimal(str(config.get("breakeven_buffer_pct", 0.3)))
 

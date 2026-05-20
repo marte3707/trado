@@ -72,6 +72,7 @@ class CoinGeckoUsage:
 @dataclass(frozen=True)
 class GlobalMarketData:
     btc_price_usd: float | None
+    btc_price_change_24h_pct: float | None
     total_market_cap_usd: float | None
     total_market_cap_ex_top10_usd: float | None
     total_volume_24h_usd: float | None
@@ -222,6 +223,7 @@ class CoinGeckoClient:
             self._prev_volume = total_volume
 
         btc_price: float | None = None
+        btc_price_change_24h: float | None = None
         top10_market_cap: float | None = None
         try:
             top_resp = httpx.get(
@@ -245,6 +247,7 @@ class CoinGeckoClient:
                 )
                 if btc_coin:
                     btc_price = _as_float(btc_coin.get("current_price"))
+                    btc_price_change_24h = _as_float(btc_coin.get("price_change_percentage_24h"))
                 top10_market_cap = sum(
                     _as_float(c.get("market_cap")) or 0
                     for c in top_coins
@@ -261,6 +264,7 @@ class CoinGeckoClient:
 
         return GlobalMarketData(
             btc_price_usd=btc_price,
+            btc_price_change_24h_pct=btc_price_change_24h,
             total_market_cap_usd=total_market_cap,
             total_market_cap_ex_top10_usd=ex_top10,
             total_volume_24h_usd=total_volume,

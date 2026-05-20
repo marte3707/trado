@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
@@ -41,6 +42,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
     "min_trades_per_step": 50,
     "improvement_threshold": 0.0,
+    # Quando > 0, la soglia di promozione viene calcolata come max(improvement_threshold,
+    # adaptive_threshold_multiplier × std(pnl)) — riduce i falsi successi.
+    "adaptive_threshold_multiplier": 0.5,
     "sequence": DEFAULT_SEQUENCE,
 }
 
@@ -167,6 +171,17 @@ class AutoTuner:
         metrics_before = dict(state.get("metrics_before") or {})
         metrics_after = self._metrics_for(post_positions)
         threshold = float(config.get("improvement_threshold", 0.0))
+        adaptive_multiplier = float(config.get("adaptive_threshold_multiplier", 0.0))
+        if adaptive_multiplier > 0:
+            pnl_values = [
+                float(p.realized_pnl) for p in post_positions if p.realized_pnl is not None
+            ]
+            if len(pnl_values) >= 2:
+                mean = sum(pnl_values) / len(pnl_values)
+                variance = sum((x - mean) ** 2 for x in pnl_values) / (len(pnl_values) - 1)
+                std_pnl = math.sqrt(variance)
+                adaptive_threshold = adaptive_multiplier * std_pnl
+                threshold = max(threshold, adaptive_threshold)
         slope_before = float(metrics_before.get("equity_slope", 0.0))
         slope_after = float(metrics_after.get("equity_slope", 0.0))
         improved = slope_after >= slope_before + threshold
@@ -211,6 +226,7 @@ class AutoTuner:
                 "metrics_after": metrics_after,
                 "improvement_threshold": threshold,
                 "trades_evaluated": len(post_positions),
+                "adaptive_threshold_multiplier": adaptive_multiplier,
             },
         )
         db.commit()
@@ -362,16 +378,26 @@ class AutoTuner:
 
     def _positions_after(self, positions: list[Position], activated_at_iso: str | None) -> list[Position]:
         if not activated_at_iso:
-            return positions
+            # Stato corrotto: senza activated_at non possiamo identificare le posizioni
+            # post-attivazione, quindi non valutiamo (ritornando lista vuota teniamo lo
+            # step in "in_progress" finché lo state non viene riparato/resettato).
+            return []
         try:
             cutoff = datetime.fromisoformat(activated_at_iso)
         except ValueError:
-            return positions
-        return [
-            position
-            for position in positions
-            if position.closed_at is not None and position.closed_at > cutoff
-        ]
+            return []
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+        result: list[Position] = []
+        for position in positions:
+            closed_at = position.closed_at
+            if closed_at is None:
+                continue
+            if closed_at.tzinfo is None:
+                closed_at = closed_at.replace(tzinfo=timezone.utc)
+            if closed_at > cutoff:
+                result.append(position)
+        return result
 
     def _apply_patch(self, db: Session, patch: dict[str, Any]) -> None:
         risk_setting = db.get(AppSetting, "risk") or AppSetting(key="risk", value={})

@@ -84,6 +84,26 @@ def test_apply_regime_filter_neutralizes_trend_following_in_ranging_market() -> 
         assert result_weights["rsi"] == 9
 
 
+def test_apply_regime_filter_soft_multiplier_scales_instead_of_zeroing() -> None:
+    """F-14: con `off_regime_weight_multiplier=0.5` le strategie out-of-regime
+    vengono dimezzate invece di azzerate (default rimane 0.0 = full neutralize)."""
+    weights = {"rsi": 9, "ema_crossover": 14, "bollinger_bands": 8, "macd": 12}
+    candles = _trending_candles()
+
+    result_weights, regime_info = apply_regime_filter(
+        weights, candles, enabled=True, off_regime_weight_multiplier=0.5
+    )
+
+    assert regime_info is not None
+    assert regime_info["regime"] == "trending"
+    # Mean-reverters scalati a metà, non azzerati (banker's rounding: 4.5→4)
+    assert result_weights["rsi"] == 4  # round(9 * 0.5) con banker's rounding
+    assert result_weights["bollinger_bands"] == 4  # round(8 * 0.5)
+    # Trend-followers invariati
+    assert result_weights["ema_crossover"] == 14
+    assert result_weights["macd"] == 12
+
+
 def test_apply_regime_filter_too_short_history_no_op() -> None:
     weights = {"rsi": 9}
     candles = _trending_candles(count=10)

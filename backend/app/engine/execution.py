@@ -982,11 +982,11 @@ class OrderExecutionEngine:
         if dynamic_plan:
             return dynamic_plan
         plan: list[dict[str, str | bool]] = []
+        skipped: list[str] = []
         for level, field_name, allocation in TAKE_PROFIT_ALLOCATIONS:
             price = getattr(signal, field_name)
-            if price is None:
-                continue
-            if price <= 0:
+            if price is None or price <= 0:
+                skipped.append(level)
                 continue
             plan.append(
                 {
@@ -995,6 +995,28 @@ class OrderExecutionEngine:
                     "allocation": str(allocation),
                     "filled": False,
                 }
+            )
+        if skipped and plan:
+            # Visibilità: se uno dei TP è stato saltato (es. tp3 negativo per short
+            # con R stretto), redistribuisco proporzionalmente le allocazioni
+            # sui TP rimanenti così l'intera posizione resta gestita.
+            total_alloc = sum(Decimal(str(item["allocation"])) for item in plan)
+            if total_alloc > 0 and total_alloc < Decimal("1"):
+                multiplier = Decimal("1") / total_alloc
+                for item in plan:
+                    item["allocation"] = str(
+                        (Decimal(str(item["allocation"])) * multiplier).quantize(
+                            Decimal("0.0001")
+                        )
+                    )
+            db.add(
+                DecisionLog(
+                    event_type="take_profit_rescaled",
+                    signal_id=signal.id,
+                    market_id=signal.market_id,
+                    message=f"TP riscalato: livelli saltati {skipped}",
+                    data={"skipped": skipped, "remaining_levels": [p["level"] for p in plan]},
+                )
             )
         return plan
 

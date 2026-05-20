@@ -28,6 +28,18 @@ _REASON_LABELS: dict[str, str] = {
     "reconciliazione hl": "Riconciliata HL",
 }
 
+_REASON_ICONS: dict[str, str] = {
+    "tp1": "🥉",
+    "tp2": "🥈",
+    "tp3": "🥇",
+    "take_profit": "🎯",
+    "stop_loss": "🛑",
+    "manual": "✋",
+    "btc_macro_protection_loss_exit": "🟠",
+    "btc_macro_protection_breakeven": "🟠",
+    "reconciliazione hl": "🔄",
+}
+
 
 def _fmt_price(value: Decimal | None) -> str:
     if value is None:
@@ -64,14 +76,19 @@ def _build_live_close_message(
     side_icon = _DIRECTION_ICON.get(direction, "🔔")
     sep = "━━━━━━━━━━━━━━━━━━━━"
 
+    reason_key = reason.lower()
+    reason_icon = _REASON_ICONS.get(reason_key)
+
     if is_partial:
-        header_icon = "🟡"
+        header_icon = reason_icon or "🟡"
         header = f"{header_icon} <b>LIVE · Chiusura parziale</b>"
         pnl_label = "PnL"
         pnl_value = step_pnl
     else:
         pnl_value = total_pnl
-        if pnl_value is not None and float(pnl_value) >= 0:
+        if reason_icon is not None and reason_key in {"tp1", "tp2", "tp3", "stop_loss"}:
+            header_icon = reason_icon
+        elif pnl_value is not None and float(pnl_value) >= 0:
             header_icon = "✅"
         else:
             header_icon = "🔴"

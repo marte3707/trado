@@ -52,6 +52,15 @@ function takeProfitSummary(position: Position): string {
   return pending.length > 0 ? pending.slice(0, 2).join(" · ") : "completato";
 }
 
+function liveUnrealizedPnl(position: Position): number | null {
+  const mark = asNumber(position.metadata_json?.last_mark_price);
+  if (mark == null) return null;
+  const entry = asNumber(position.entry_price);
+  const size = asNumber(position.size);
+  if (entry == null || size == null) return null;
+  return (mark - entry) * Math.abs(size) * (position.side.toLowerCase() === "short" ? -1 : 1);
+}
+
 function currentPrice(position: Position): number | null {
   const markPrice = asNumber(position.metadata_json?.last_mark_price);
   if (markPrice !== null) return markPrice;
@@ -310,7 +319,10 @@ export function DashboardScreen({
                   </tr>
                 )}
                 {pagedOpenPositions.map(p => {
-                  const pnl = asNumber(p.total_pnl ?? p.unrealized_pnl ?? p.realized_pnl);
+                  const isOpenLive = p.mode === "live" && p.status === "open";
+                  const pnl = isOpenLive
+                    ? (liveUnrealizedPnl(p) ?? asNumber(p.total_pnl ?? p.unrealized_pnl))
+                    : asNumber(p.total_pnl ?? p.unrealized_pnl ?? p.realized_pnl);
                   const markPrice = currentPrice(p);
                   const entryPrice = asNumber(p.entry_price);
                   const size = asNumber(displaySize(p));
@@ -406,19 +418,31 @@ function fmtBtcPrice(v: number | null | undefined): string {
 function GlobalMetricsRow({ globalMetrics }: { globalMetrics: MarketIntelligence["global_metrics"] }) {
   if (!globalMetrics) return null;
 
-  const { btc_price_usd, total_market_cap_usd, total_market_cap_ex_top10_usd, total_volume_24h_usd, volume_trend, btc_dominance_pct, market_cap_change_24h_pct } = globalMetrics;
+  const { btc_price_usd, btc_price_change_24h_pct, total_market_cap_usd, total_market_cap_ex_top10_usd, total_volume_24h_usd, volume_trend, btc_dominance_pct, market_cap_change_24h_pct } = globalMetrics;
 
   const mcChange = market_cap_change_24h_pct;
   const mcChangeColor = mcChange == null ? "var(--fg-3)" : mcChange >= 0 ? "var(--long)" : "var(--short)";
   const mcChangeText = mcChange != null ? `${mcChange >= 0 ? "+" : ""}${mcChange.toFixed(2)}%` : null;
 
+  const btcChange = btc_price_change_24h_pct;
+  const btcChangeColor = btcChange == null ? "var(--fg-3)" : btcChange >= 0 ? "var(--long)" : "var(--short)";
+  const btcChangeText = btcChange != null ? `${btcChange >= 0 ? "+" : ""}${btcChange.toFixed(2)}%` : null;
+  const btcDomText = btc_dominance_pct != null ? `${btc_dominance_pct.toFixed(1)}% dom.` : null;
+  const btcSubNode = (btcChangeText || btcDomText) ? (
+    <>
+      {btcChangeText && <span style={{ color: btcChangeColor }}>{btcChangeText} 24h</span>}
+      {btcChangeText && btcDomText && <span style={{ color: "var(--fg-3)" }}> · </span>}
+      {btcDomText && <span style={{ color: "var(--fg-3)" }}>{btcDomText}</span>}
+    </>
+  ) : null;
+
   return (
     <div className="card" style={{ marginBottom: "var(--gap)", padding: "10px var(--pad-x)" }}>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 0 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 0 }}>
         <GlobalMetricItem
           label="BTC Price"
           value={fmtBtcPrice(btc_price_usd)}
-          sub={btc_dominance_pct != null ? `${btc_dominance_pct.toFixed(1)}% dom.` : undefined}
+          subNode={btcSubNode}
         />
         <GlobalMetricItem
           label="Total Market Cap"
@@ -436,31 +460,27 @@ function GlobalMetricsRow({ globalMetrics }: { globalMetrics: MarketIntelligence
           sub={volume_trend === "up" ? "↑ in aumento" : volume_trend === "down" ? "↓ in calo" : undefined}
           subColor={volume_trend === "up" ? "var(--long)" : volume_trend === "down" ? "var(--short)" : undefined}
         />
-        <GlobalMetricItem
-          label="Fonte"
-          value={globalMetrics.source}
-          mono={false}
-          muted
-        />
       </div>
     </div>
   );
 }
 
-function GlobalMetricItem({ label, value, sub, subColor, mono = true, muted = false }: {
+function GlobalMetricItem({ label, value, sub, subNode, subColor, mono = true, muted = false }: {
   label: string;
   value: string;
   sub?: string;
+  subNode?: React.ReactNode;
   subColor?: string;
   mono?: boolean;
   muted?: boolean;
 }) {
+  const subContent = subNode ?? sub;
   return (
     <div style={{ padding: "6px 12px", borderRight: "1px solid var(--border)" }}>
       <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--fg-3)", marginBottom: 3 }}>{label}</div>
       <div style={{ fontSize: "var(--fz-md)", fontWeight: 600, fontFamily: mono ? "var(--font-mono)" : undefined, color: muted ? "var(--fg-3)" : "var(--fg)" }}>{value}</div>
-      {sub && (
-        <div style={{ fontSize: "var(--fz-xs)", color: subColor ?? "var(--fg-3)", marginTop: 2 }}>{sub}</div>
+      {subContent && (
+        <div style={{ fontSize: "var(--fz-xs)", color: subColor ?? "var(--fg-3)", marginTop: 2 }}>{subContent}</div>
       )}
     </div>
   );

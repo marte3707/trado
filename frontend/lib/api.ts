@@ -54,6 +54,7 @@ export type MarketIntelligence = {
   } | null;
   global_metrics: {
     btc_price_usd: number | null;
+    btc_price_change_24h_pct: number | null;
     total_market_cap_usd: number | null;
     total_market_cap_ex_top10_usd: number | null;
     total_volume_24h_usd: number | null;
@@ -105,6 +106,7 @@ export type AccountMonitor = {
     withdrawable: string | null;
     total_margin_used: string | null;
     total_notional_position: string | null;
+    cross_ntl_pos: string | null;
     cross_account_value: string | null;
     cross_margin_used: string | null;
     cross_maintenance_margin_used: string | null;

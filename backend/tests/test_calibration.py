@@ -287,3 +287,37 @@ def test_deep_defensive_requires_two_positive_runs_to_exit() -> None:
     state_after_second = db.rows["auto_calibration_state"].value
     assert state_after_second["deep_defensive_active"] is False
     assert state_after_second["deep_defensive_positive_streak"] == 2
+
+
+def test_ambiguous_slope_escapes_deep_defensive() -> None:
+    """F-05: con pochi trade chiusi (slope inattendibile) il deep defensive viene
+    bypassato — altrimenti il sistema resta bloccato a 0 segnali."""
+    db = FakeDb({"min_signal_score": 60, "min_risk_reward": 2.0, "max_risk_per_trade_pct": 1.0})
+
+    # Pochi trade chiusi → slope ambiguo. Anche con equity_slope < threshold,
+    # il deep defensive non si attiva.
+    low_trades_stats = PerformanceStats(
+        trades=3,
+        wins=1,
+        losses=2,
+        win_rate=0.33,
+        realized_pnl=-10.0,
+        gross_profit=5,
+        gross_loss=15,
+        profit_factor=0.5,
+    )
+
+    AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        low_trades_stats,
+        {**_risk_settings(), "min_trades_for_slope": 10},
+        equity_slope_value=-5.0,
+    )
+
+    risk = db.rows["risk"].value
+    state = db.rows["auto_calibration_state"].value
+    # Risk settings tornano al baseline (60 / 2.0 / 1.0), non al deep defensive (72 / 2.4 / 0.5)
+    assert risk["min_signal_score"] == 60
+    assert risk["max_risk_per_trade_pct"] == 1.0
+    assert state["deep_defensive_active"] is False
+    assert state.get("ambiguous_slope_override") is True

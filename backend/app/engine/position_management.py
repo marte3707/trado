@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Sequence
 
@@ -19,6 +19,7 @@ from app.core.runtime_settings import (
 )
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, PositionStopUpdate, Signal
 from app.indicators.core import atr, ema
+from app.services.candle_sync import TIMEFRAME_MS
 from app.services.hyperliquid import HyperliquidTradingClient
 
 logger = structlog.get_logger()
@@ -195,10 +196,17 @@ class PositionManagementEngine:
             return None
         metadata = self.ensure_position_state(position)
         candle_key = candle.open_time.isoformat()
-        if trailing.get("updateOnlyOnCandleClose", True) and metadata.get(
-            "last_trailing_candle_open_time"
-        ) == candle_key:
-            return None
+        if trailing.get("updateOnlyOnCandleClose", True):
+            if metadata.get("last_trailing_candle_open_time") == candle_key:
+                return None
+            interval_ms = TIMEFRAME_MS.get(candle.timeframe)
+            if interval_ms is not None:
+                expected_close = candle.open_time + timedelta(milliseconds=interval_ms)
+                now = datetime.now(timezone.utc)
+                if expected_close.tzinfo is None:
+                    expected_close = expected_close.replace(tzinfo=timezone.utc)
+                if now < expected_close:
+                    return None
 
         risk_per_unit = _decimal(metadata.get("initial_risk_per_unit"), None)
         initial_stop = _decimal(metadata.get("initial_stop_loss"), position.stop_loss)
@@ -318,7 +326,7 @@ class PositionManagementEngine:
                 return None
             new_stop, reason = min(viable, key=lambda item: item[0])
 
-        if current_stop is not None:
+        if current_stop is not None and current_stop > 0:
             distance_pct = abs(new_stop - current_stop) / current_stop * Decimal("100")
             min_distance = _decimal(
                 trailing.get("minStopUpdateDistancePct"), Decimal("0.15")
@@ -413,6 +421,47 @@ class PositionManagementEngine:
             )
         )
 
+    _STUCK_STOP_ALERT_THRESHOLD = 3
+
+    def _record_stop_update_failure(
+        self,
+        db: Session,
+        position: Position,
+        *,
+        reason: str,
+        payload: dict[str, Any],
+    ) -> None:
+        metadata = dict(position.metadata_json or {})
+        attempts = int(metadata.get("stop_replacement_attempts", 0)) + 1
+        metadata["stop_replacement_attempts"] = attempts
+        metadata["last_stop_replacement_failure"] = {
+            "reason": reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        position.metadata_json = metadata
+        db.add(
+            DecisionLog(
+                event_type="live_stop_update_submit_failed",
+                market_id=position.market_id,
+                position_id=position.id,
+                message="Live stop update failed; old stop left unchanged",
+                data={**payload, "attempts": attempts, "reason": reason},
+            )
+        )
+        if attempts >= self._STUCK_STOP_ALERT_THRESHOLD:
+            db.add(
+                DecisionLog(
+                    event_type="live_stop_update_stuck",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message=(
+                        f"Stop replacement stuck after {attempts} attempts "
+                        f"({reason}); manual intervention needed"
+                    ),
+                    data={**payload, "attempts": attempts, "reason": reason},
+                )
+            )
+
     def replace_live_stop_order(
         self,
         db: Session,
@@ -441,27 +490,28 @@ class PositionManagementEngine:
                 cloid=cloid,
             )
         except Exception as exc:
-            db.add(
-                DecisionLog(
-                    event_type="live_stop_update_submit_failed",
-                    market_id=position.market_id,
-                    position_id=position.id,
-                    message="Live stop update submit failed; old stop left unchanged",
-                    data={"error": str(exc), "candidate_stop": str(candidate.price)},
-                )
+            self._record_stop_update_failure(
+                db,
+                position,
+                reason="submit_exception",
+                payload={"error": str(exc), "candidate_stop": str(candidate.price)},
             )
             return False
         if result.status != "ok":
-            db.add(
-                DecisionLog(
-                    event_type="live_stop_update_submit_failed",
-                    market_id=position.market_id,
-                    position_id=position.id,
-                    message="Live stop update rejected; old stop left unchanged",
-                    data={"response": result.raw_response, "candidate_stop": str(candidate.price)},
-                )
+            self._record_stop_update_failure(
+                db,
+                position,
+                reason="submit_rejected",
+                payload={
+                    "response": result.raw_response,
+                    "candidate_stop": str(candidate.price),
+                },
             )
             return False
+        # Successo: azzeriamo il contatore degli attempt falliti
+        metadata = dict(position.metadata_json or {})
+        metadata["stop_replacement_attempts"] = 0
+        position.metadata_json = metadata
 
         new_order = Order(
             position_id=position.id,

@@ -272,7 +272,7 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
   }, [periodFilter]);
 
   const periodFiltered = useMemo(
-    () => trackedPositions.filter(p => new Date(p.opened_at).getTime() >= cutoff),
+    () => trackedPositions.filter(p => new Date(p.closed_at ?? p.opened_at).getTime() >= cutoff),
     [trackedPositions, cutoff]
   );
 

@@ -248,6 +248,7 @@ def market_intelligence() -> dict:
         else None,
         "global_metrics": {
             "btc_price_usd": global_market.btc_price_usd,
+            "btc_price_change_24h_pct": global_market.btc_price_change_24h_pct,
             "total_market_cap_usd": global_market.total_market_cap_usd,
             "total_market_cap_ex_top10_usd": global_market.total_market_cap_ex_top10_usd,
             "total_volume_24h_usd": global_market.total_volume_24h_usd,
@@ -1183,6 +1184,7 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
             "withdrawable": _string_decimal(withdrawable),
             "total_margin_used": _string_decimal(margin.get("totalMarginUsed")),
             "total_notional_position": _string_decimal(margin.get("totalNtlPos")),
+            "cross_ntl_pos": _string_decimal(cross_margin.get("totalNtlPos")),
             "cross_account_value": _string_decimal(cross_margin.get("accountValue")),
             "cross_margin_used": _string_decimal(cross_margin.get("totalMarginUsed")),
             "cross_maintenance_margin_used": _string_decimal((user_state or {}).get("crossMaintenanceMarginUsed")),
@@ -1260,6 +1262,24 @@ def close_account_position(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     if size is None:
         raise HTTPException(status_code=409, detail="Position has no open size")
+    from sqlalchemy import or_
+    open_positions = (
+        db.query(Position)
+        .join(Position.market)
+        .filter(
+            Position.status == "open",
+            Position.mode == "live",
+            or_(
+                Market.symbol == coin,
+                Market.metadata_json["hl_coin"].astext == coin,
+            ),
+        )
+        .all()
+    )
+    exit_price = result.avg_price or Decimal(str(abs(size)))
+    executor = OrderExecutionEngine(settings)
+    for pos in open_positions:
+        executor.close_position(db, pos, exit_price=exit_price, reason="manual", commit=False)
     db.add(
         DecisionLog(
             event_type="live_account_position_close_requested",
@@ -1270,6 +1290,7 @@ def close_account_position(
                 "size": str(abs(size)),
                 "result": result.raw_response,
                 "oid": result.oid,
+                "trado_positions_closed": [pos.id for pos in open_positions],
             },
         )
     )
@@ -1281,6 +1302,112 @@ def close_account_position(
         "avg_price": str(result.avg_price) if result.avg_price is not None else None,
         "filled_size": str(result.filled_size) if result.filled_size is not None else None,
     }
+
+
+@router.post("/account/positions/patch-missing-exit-data")
+def patch_missing_exit_data(db: Session = Depends(get_db)) -> dict:
+    """Reconcile exit data for closed live positions using HL fill history.
+
+    Three cases are handled in a single pass:
+    1. realized_pnl IS NULL (e.g. UNI: no SL order in DB, no fill matched).
+    2. A filled exit order exists whose oid is NOT in HL fills — data is wrong
+       (e.g. BTC: reconciliation matched the wrong fill; actual close was a
+       manual market order). Overrides with the real HL close fill.
+    3. exit_price missing from metadata — written from the last filled exit
+       order without changing realized_pnl.
+    """
+    settings = get_settings()
+    address = settings.hyperliquid_account_address
+    if not address:
+        raise HTTPException(status_code=400, detail="HYPERLIQUID_ACCOUNT_ADDRESS is required")
+    from app.services.live_reconciliation import _index_fills, _index_fills_by_coin, _find_close_fill
+    from app.engine.execution import coin_for_market
+    trading = HyperliquidTradingClient(settings)
+    try:
+        raw_fills = trading.user_fills(address)
+    except HyperliquidError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    _, fills_by_oid = _index_fills(raw_fills or [])
+    fills_by_coin = _index_fills_by_coin(raw_fills or [])
+    all_closed = (
+        db.query(Position)
+        .options(joinedload(Position.market))
+        .filter(Position.mode == "live", Position.status == "closed")
+        .all()
+    )
+    patched = []
+    for pos in all_closed:
+        if pos.market is None:
+            continue
+        try:
+            coin = coin_for_market(pos.market)
+        except ValueError:
+            continue
+        metadata = dict(pos.metadata_json or {})
+        exit_orders = (
+            db.query(Order)
+            .filter(
+                Order.position_id == pos.id,
+                Order.order_type.in_(["tp1", "tp2", "tp3", "stop_loss", "manual"]),
+                Order.status == "filled",
+            )
+            .order_by(Order.id.desc())
+            .all()
+        )
+        last_exit = exit_orders[0] if exit_orders else None
+
+        # Case 2: filled exit order whose oid is not in HL fills → wrong data
+        wrong_data = False
+        if last_exit is not None and last_exit.hyperliquid_order_id:
+            try:
+                oid_int = int(last_exit.hyperliquid_order_id)
+                wrong_data = oid_int not in fills_by_oid
+            except (TypeError, ValueError):
+                pass
+
+        # Case 1: no pnl at all; Case 2: wrong data from bad fill match
+        if pos.realized_pnl is None or wrong_data:
+            hl_fill = _find_close_fill(coin, pos.opened_at, fills_by_coin)
+            if hl_fill is None:
+                continue
+            hl_px = _decimal(hl_fill.get("px"))
+            hl_pnl = _decimal(hl_fill.get("closedPnl"))
+            if hl_px is None or hl_pnl is None:
+                continue
+            pos.realized_pnl = hl_pnl
+            metadata["realized_pnl"] = str(hl_pnl)
+            metadata["exit_price"] = str(hl_px)
+            metadata["exit_reason"] = "hl_fill_patch"
+            # If the exit order was incorrectly marked as filled, correct it
+            if wrong_data and last_exit is not None:
+                last_exit.status = "canceled"
+                last_exit.raw_response = {**(last_exit.raw_response or {}), "patched_to_canceled": True}
+                db.add(last_exit)
+            pos.metadata_json = metadata
+            db.add(pos)
+            db.add(DecisionLog(
+                event_type="live_position_exit_data_patched",
+                market_id=pos.market_id,
+                position_id=pos.id,
+                message="Exit data reconciled from HL fill history",
+                data={"coin": coin, "exit_price": str(hl_px), "realized_pnl": str(hl_pnl),
+                      "was_wrong_data": wrong_data},
+            ))
+            patched.append({"position_id": pos.id, "coin": coin,
+                            "exit_price": str(hl_px), "realized_pnl": str(hl_pnl),
+                            "was_wrong_data": wrong_data})
+            continue
+
+        # Case 3: pnl is correct but exit_price missing from metadata
+        if "exit_price" not in metadata and last_exit is not None and last_exit.price is not None:
+            metadata["exit_price"] = str(last_exit.price)
+            pos.metadata_json = metadata
+            db.add(pos)
+            patched.append({"position_id": pos.id, "coin": coin,
+                            "exit_price": str(last_exit.price), "realized_pnl": None,
+                            "was_wrong_data": False})
+    db.commit()
+    return {"patched": len(patched), "positions": patched}
 
 
 @router.get("/logs")

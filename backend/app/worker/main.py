@@ -132,15 +132,21 @@ def _starvation_soft_threshold(db) -> int:
 
 
 def _consecutive_zero_signal_cycles_from_log(db) -> int:
+    # Include sia "worker_cycle" (con generated=0) sia "worker_cycle_failed":
+    # un crash del cycle non genera segnali ed è semanticamente equivalente a
+    # uno zero-cycle ai fini dello starvation override.
     recent = (
         db.query(DecisionLog)
-        .filter(DecisionLog.event_type == "worker_cycle")
+        .filter(DecisionLog.event_type.in_(["worker_cycle", "worker_cycle_failed"]))
         .order_by(DecisionLog.timestamp.desc())
         .limit(120)
         .all()
     )
     streak = 0
     for entry in recent:
+        if entry.event_type == "worker_cycle_failed":
+            streak += 1
+            continue
         if isinstance(entry.data, dict) and int(entry.data.get("generated", 0)) == 0:
             streak += 1
         else:
