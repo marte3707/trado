@@ -8,6 +8,7 @@ import {
   Calibration,
   CalibrationChange,
   CalibrationHistoryEntry,
+  DiagnosticReport,
   SignalRejections,
   TunerStepHistory,
   WorkerCycle,
@@ -596,6 +597,8 @@ export function CalibrationScreen({
   const [localCycles, setLocalCycles] = useState(workerCycles);
   const [localRejections, setLocalRejections] = useState(signalRejections);
   const [busy, setBusy] = useState(false);
+  const [reportBusy, setReportBusy] = useState(false);
+  const [reportSent, setReportSent] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const enabled = settings.auto_calibration?.enabled !== false;
   const lastStatus = String(localCalibration.state?.last_status ?? "nessun run");
@@ -651,6 +654,20 @@ export function CalibrationScreen({
     await onRefresh();
   }
 
+  async function sendReport() {
+    setReportBusy(true);
+    setError(null);
+    try {
+      await apiPost<DiagnosticReport>("/api/analytics/report/send");
+      setReportSent(true);
+      setTimeout(() => setReportSent(false), 5000);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore invio report");
+    } finally {
+      setReportBusy(false);
+    }
+  }
+
   const appliedChanges = Array.isArray(localCalibration.state?.last_changes)
     ? localCalibration.state.last_changes as CalibrationChange[]
     : [];
@@ -667,6 +684,9 @@ export function CalibrationScreen({
         </div>
         <div className="page-actions">
           <button className="btn ghost" aria-label="Aggiorna" onClick={onRefresh}><Icon name="refresh" size={12} /></button>
+          <button className="btn ghost" disabled={reportBusy} onClick={sendReport}>
+            {reportSent ? "✓ Report inviato" : reportBusy ? "Invio..." : "Invia report"}
+          </button>
           <button className="btn primary" disabled={busy} onClick={runNow}>
             <Icon name="refresh" size={12} /> {busy ? "Calibrazione..." : "Calibra ora"}
           </button>

@@ -392,6 +392,22 @@ export type SignalRejections = {
   recent: { id: number; timestamp: string; reasons: string[] }[];
 };
 
+export type DiagnosticReport = {
+  lookback: number;
+  trade_count: number;
+  generated_at: string;
+  overall: CalibrationStats;
+  equity_slope: number;
+  by_direction: Record<string, CalibrationStats>;
+  by_strategy: Record<string, CalibrationStats>;
+  by_timeframe: Record<string, CalibrationStats>;
+  anomalies: string[];
+  top_strategies: Array<CalibrationStats & { name: string }>;
+  bottom_strategies: Array<CalibrationStats & { name: string }>;
+  calibration_state: Record<string, unknown>;
+  baseline_vs_current: Record<string, unknown>;
+};
+
 export async function apiGet<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
   if (!response.ok) {

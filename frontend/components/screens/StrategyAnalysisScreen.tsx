@@ -738,7 +738,7 @@ function RankingTab({ stats, strategies, tfFilter, availableTfs }: {
               <span className="mono" style={{ marginLeft: 14 }}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "var(--warn)", marginRight: 5 }} />misto o pochi dati</span>
               <span className="mono" style={{ marginLeft: 14 }}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "var(--short)", marginRight: 5 }} />WR&lt;40% e avgR&lt;0</span>
               <span className="muted" style={{ marginLeft: 20 }}>· Accordo = % volte che la strategia ha votato nella direzione del segnale finale</span>
-              <span className="muted" style={{ marginLeft: 20 }}>· Il W/R per indicatore indica quando quell'indicatore era nella coalizione vincente, non che abbia deciso da solo — vedi tab Combinazioni</span>
+              <span className="muted" style={{ marginLeft: 20 }}>· Il W/R per indicatore indica quando quell&apos;indicatore era nella coalizione vincente, non che abbia deciso da solo — vedi tab Combinazioni</span>
             </div>
           </>
         )}
