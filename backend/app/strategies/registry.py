@@ -9,6 +9,7 @@ from app.strategies.supertrend_strategy import SupertrendStrategy
 from app.strategies.support_resistance_strategy import SupportResistanceStrategy
 from app.strategies.vwap_strategy import VwapStrategy
 from app.strategies.volume_spike import VolumeSpikeStrategy
+from app.strategies.oi_trend_strategy import OITrendStrategy
 from app.strategies.wyckoff_strategy import WyckoffSpringUpthrustStrategy
 
 
@@ -25,5 +26,6 @@ def strategy_registry() -> dict[str, Strategy]:
         VwapStrategy(),
         CandlestickPatternStrategy(),
         WyckoffSpringUpthrustStrategy(),
+        OITrendStrategy(),
     ]
     return {strategy.name: strategy for strategy in strategies}

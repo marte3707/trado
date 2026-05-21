@@ -4,6 +4,7 @@ from decimal import Decimal
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -50,6 +51,7 @@ class Candle(Base):
     low: Mapped[Decimal] = mapped_column(Numeric(28, 10))
     close: Mapped[Decimal] = mapped_column(Numeric(28, 10))
     volume: Mapped[Decimal] = mapped_column(Numeric(28, 10))
+    open_interest: Mapped[float | None] = mapped_column(Float(), nullable=True)
     source: Mapped[str] = mapped_column(String(32), default="hyperliquid")
 
     market: Mapped[Market] = relationship(back_populates="candles")

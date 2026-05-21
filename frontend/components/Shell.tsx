@@ -4,7 +4,7 @@ import React from "react";
 import { Icon } from "@/components/atoms";
 import { Health } from "@/lib/api";
 
-export type Route = "dash" | "signals" | "coin" | "account" | "strategies" | "calibration" | "history" | "alerts" | "settings";
+export type Route = "dash" | "signals" | "coin" | "account" | "strategies" | "calibration" | "history" | "alerts" | "settings" | "strategy-lab";
 export type TradingMode = "signal" | "paper" | "live";
 
 interface SidebarProps {
@@ -24,11 +24,12 @@ export const Sidebar = ({ route, setRoute, counts, wsLive, health, collapsed, on
     { id: "account", label: "Account",   icon: "wallet"  },
   ];
   const bottomItems: { id: Route; label: string; icon: string; badge?: number }[] = [
-    { id: "strategies", label: "Strategie", icon: "sliders"  },
-    { id: "calibration", label: "Calibration", icon: "refresh" },
-    { id: "history",    label: "Storico",   icon: "history"  },
-    { id: "alerts",     label: "Alert",     icon: "bell", badge: counts.alerts > 0 ? counts.alerts : undefined },
-    { id: "settings",   label: "Settings",  icon: "settings" },
+    { id: "strategies",   label: "Strategie", icon: "sliders"  },
+    { id: "strategy-lab", label: "Analisi",   icon: "bolt"     },
+    { id: "calibration",  label: "Calibration", icon: "refresh" },
+    { id: "history",      label: "Storico",   icon: "history"  },
+    { id: "alerts",       label: "Alert",     icon: "bell", badge: counts.alerts > 0 ? counts.alerts : undefined },
+    { id: "settings",     label: "Settings",  icon: "settings" },
   ];
 
 
@@ -89,15 +90,16 @@ export const Sidebar = ({ route, setRoute, counts, wsLive, health, collapsed, on
 };
 
 const ROUTE_LABELS: Record<Route, string> = {
-  dash:       "Dashboard",
-  signals:    "Segnali live",
-  coin:       "Mercati",
-  account:    "Account monitor",
-  strategies: "Strategie",
-  calibration: "Calibration",
-  history:    "Storico segnali",
-  alerts:     "Alert",
-  settings:   "Settings",
+  dash:           "Dashboard",
+  signals:        "Segnali live",
+  coin:           "Mercati",
+  account:        "Account monitor",
+  strategies:     "Strategie",
+  "strategy-lab": "Analisi strategie",
+  calibration:    "Calibration",
+  history:        "Storico segnali",
+  alerts:         "Alert",
+  settings:       "Settings",
 };
 
 interface TopbarProps {

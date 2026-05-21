@@ -6,8 +6,9 @@ from app.core.enums import Direction
 from app.services.hyperliquid import L2BookSnapshot
 from app.strategies.base import StrategyContext, StrategyResult
 
-# OBI: al di sotto di questa soglia il segnale è troppo rumoroso per essere utile
-_OBI_NEUTRAL_THRESHOLD = 0.10
+# OBI: soglia alzata a 0.30 — ob_imbalance agisce solo come conferma su squilibri
+# forti, non come sorgente primaria di segnale. Valori 0.10-0.30 sono rumorosi.
+_OBI_NEUTRAL_THRESHOLD = 0.30
 # Un livello è considerato "muro" se la sua dimensione è >= N volte la media
 _WALL_MULTIPLIER = 3.0
 # Ricerca muri entro questa distanza percentuale dal prezzo di entry

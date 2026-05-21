@@ -80,9 +80,18 @@ class AutoCalibrationEngine:
         changes.extend(self._calibrate_strategy_weights(db, settings))
         changes.extend(self._calibrate_strategy_params(db, settings))
         slope_value = equity_slope(positions)
+        recent_window = int(settings.get("recent_window", 50))
+        recent_positions = positions[:recent_window]
+        recent_stats = self.analyzer.summarize_positions(recent_positions)
+        recent_slope = equity_slope(recent_positions)
         changes.extend(
             self._calibrate_risk_settings(
-                db, overall, settings, equity_slope_value=slope_value
+                db,
+                overall,
+                settings,
+                equity_slope_value=slope_value,
+                recent_stats=recent_stats,
+                recent_slope_value=recent_slope,
             )
         )
         strategy_changes = {
@@ -133,6 +142,8 @@ class AutoCalibrationEngine:
             "starvation_soft_cycles": 10,
             "starvation_hard_cycles": 15,
             "min_trades_for_slope": 10,
+            "recent_window": 50,
+            "recent_slope_exit_cycles": 3,
         }
         return {**defaults, **value}
 
@@ -317,6 +328,8 @@ class AutoCalibrationEngine:
         settings: dict[str, Any],
         *,
         equity_slope_value: float = 0.0,
+        recent_stats: PerformanceStats | None = None,
+        recent_slope_value: float = 0.0,
     ) -> list[CalibrationChange]:
         baseline = self._baseline_state(db).get("risk", {})
         app_settings = get_settings()
@@ -334,22 +347,35 @@ class AutoCalibrationEngine:
             else {}
         )
         prev_streak = int(state_value.get("deep_defensive_positive_streak", 0))
+        prev_recent_streak = int(state_value.get("deep_defensive_recent_positive_streak", 0))
         prev_in_deep = bool(state_value.get("deep_defensive_active", False))
         deep_threshold = float(settings.get("deep_defensive_slope_threshold", -2.0))
+        recent_slope_exit_cycles = int(settings.get("recent_slope_exit_cycles", 3))
 
         min_risk_floor = float(settings.get("min_risk_per_trade_pct", 0.25))
+
+        # Aggiorna streak per slope recente (ultimi N trade)
+        new_recent_streak = (prev_recent_streak + 1) if recent_slope_value >= 0 else 0
 
         in_deep_defensive = False
         new_streak = 0
         if equity_slope_value < deep_threshold:
             in_deep_defensive = True
             new_streak = 0
+            new_recent_streak = 0
         elif equity_slope_value >= 0:
             new_streak = prev_streak + 1
             in_deep_defensive = prev_in_deep and new_streak < 2
         else:
             new_streak = 0
             in_deep_defensive = prev_in_deep
+
+        # Uscita via slope recente: se il trend degli ultimi N trade è positivo
+        # per abbastanza cicli consecutivi, il recupero è in corso — usciamo dal deep
+        # defensive senza aspettare che l'intera finestra storica si aggiusti.
+        if in_deep_defensive and new_recent_streak >= recent_slope_exit_cycles:
+            in_deep_defensive = False
+            new_streak = 0
 
         # Starvation recovery: se troppi cicli consecutivi senza segnali il deep
         # defensive non sta proteggendo nulla — allentare progressivamente.
@@ -375,6 +401,19 @@ class AutoCalibrationEngine:
         state_value["consecutive_zero_signal_cycles"] = zero_cycles
         state_value["starvation_override_active"] = starvation_override
         state_value["ambiguous_slope_override"] = ambiguous_slope and starvation_override
+
+        # Trend recente positivo: profit_factor > 1 sugli ultimi N trade indica che
+        # il sistema sta guadagnando più di quanto perde, indipendentemente dal win rate.
+        # È la metrica corretta perché incorpora già il rapporto RR reale conseguito:
+        # un 40% WR con RR 1:3 dà PF=2.0 — ben sopra la soglia — mentre un WR del 50%
+        # con RR 1:1 dà PF=1.0. La soglia fissa sul win rate ignorerebbe questa distinzione.
+        recent_min_trades = int(settings.get("recent_window", 50)) // 2
+        recent_recovering = (
+            recent_stats is not None
+            and recent_stats.trades >= recent_min_trades
+            and recent_stats.profit_factor is not None
+            and recent_stats.profit_factor > 1.0
+        )
 
         score_delta = 0
         rr_delta = 0.0
@@ -415,21 +454,41 @@ class AutoCalibrationEngine:
         elif overall.realized_pnl < 0 or overall.win_rate < 0.4 or (
             overall.profit_factor is not None and overall.profit_factor < 0.9
         ):
-            score_delta = 8
-            rr_delta = 0.25
-            risk_pct = max(min_risk_floor, base_risk * 0.75)
-            reason = "defensive mode after weak historical results"
-        elif overall.win_rate >= 0.58 and overall.realized_pnl > 0 and (
-            overall.profit_factor is None or overall.profit_factor >= 1.2
+            if recent_recovering:
+                # Il trend recente è positivo: il recupero è in corso.
+                # Usciamo dal defensive senza aspettare che l'intera finestra storica
+                # (fino a 500 trade) ritorni positiva — sarebbe un requisito irraggiungibile.
+                score_delta = 0
+                rr_delta = 0.0
+                risk_pct = base_risk
+                reason = (
+                    f"recovering: ultimi {recent_stats.trades} trade positivi "  # type: ignore[union-attr]
+                    f"(wr={recent_stats.win_rate:.2f}), ripristino baseline"  # type: ignore[union-attr]
+                )
+            else:
+                score_delta = 8
+                rr_delta = 0.25
+                risk_pct = max(min_risk_floor, base_risk * 0.75)
+                reason = "defensive mode after weak historical results"
+        elif recent_recovering or (
+            overall.win_rate >= 0.58
+            and overall.realized_pnl > 0
+            and (overall.profit_factor is None or overall.profit_factor >= 1.2)
         ):
             score_delta = 0
             rr_delta = 0.0
             risk_pct = base_risk
-            reason = "restore baseline after strong historical results"
+            reason = (
+                "restore baseline after strong recent results"
+                if recent_recovering
+                else "restore baseline after strong historical results"
+            )
 
         state_value["deep_defensive_active"] = in_deep_defensive
         state_value["deep_defensive_positive_streak"] = new_streak
+        state_value["deep_defensive_recent_positive_streak"] = new_recent_streak
         state_value["last_equity_slope"] = equity_slope_value
+        state_value["last_recent_slope"] = recent_slope_value
         state_setting_to_persist = state_setting or AppSetting(
             key="auto_calibration_state", value={}
         )

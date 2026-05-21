@@ -37,6 +37,7 @@ class CandleSyncService:
         market: Market,
         timeframe: str,
         lookback: int = DEFAULT_CANDLE_LOOKBACK,
+        open_interest: float | None = None,
     ) -> int:
         now = datetime.now(timezone.utc)
         interval_ms = TIMEFRAME_MS[timeframe]
@@ -88,5 +89,14 @@ class CandleSyncService:
             )
             db.execute(statement)
             inserted += 1
+        if open_interest is not None:
+            latest = (
+                db.query(Candle)
+                .filter(Candle.market_id == market.id, Candle.timeframe == timeframe)
+                .order_by(Candle.open_time.desc())
+                .first()
+            )
+            if latest is not None:
+                latest.open_interest = open_interest
         db.commit()
         return inserted

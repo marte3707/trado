@@ -15,6 +15,7 @@ class CandleInput:
     low: float
     close: float
     volume: float
+    open_interest: float | None = None
 
 
 @dataclass(frozen=True)

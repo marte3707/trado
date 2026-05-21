@@ -230,20 +230,28 @@ class OrderExecutionEngine:
         existing_position = self._find_idempotent_position(db, signal, market_cloid)
         if existing_position is not None:
             return existing_position
+        hl_max_lev = (market.metadata_json or {}).get("raw", {}).get("maxLeverage")
+        safe_leverage = (
+            min(plan.max_leverage, int(hl_max_lev))
+            if hl_max_lev is not None
+            else plan.max_leverage
+        )
+        _FALLBACK_LEVERAGE = 3
         try:
-            trading.set_leverage(coin, plan.max_leverage, is_cross=False)
+            trading.set_leverage(coin, safe_leverage, is_cross=False)
         except Exception as exc:
             db.add(
                 DecisionLog(
                     event_type="live_set_leverage_failed",
                     market_id=signal.market_id,
                     signal_id=signal.id,
-                    message="set_leverage failed before order submission",
-                    data={"coin": coin, "leverage": plan.max_leverage, "is_cross": False, "error": str(exc)},
+                    message=f"set_leverage({safe_leverage}) failed, retrying with fallback {_FALLBACK_LEVERAGE}x",
+                    data={"coin": coin, "leverage": safe_leverage, "is_cross": False, "error": str(exc)},
                 )
             )
             db.commit()
-            raise
+            trading.set_leverage(coin, _FALLBACK_LEVERAGE, is_cross=False)
+            safe_leverage = _FALLBACK_LEVERAGE
         entry_result = trading.submit_market_order(
             coin=coin,
             is_buy=plan.side == "long",

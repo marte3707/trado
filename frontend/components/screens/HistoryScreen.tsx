@@ -2,11 +2,10 @@
 
 import React, { useMemo, useState } from "react";
 import { Icon, Seg, fmt } from "@/components/atoms";
-import { Position, Signal, Order } from "@/lib/api";
+import { Position, Order } from "@/lib/api";
 
 interface Props {
   positions: Position[];
-  signals: Signal[];
   orders: Order[];
 }
 
@@ -186,10 +185,6 @@ function fmtR(value: number | null | undefined, digits = 2): string {
   return `${value >= 0 ? "+" : ""}${value.toFixed(digits)}R`;
 }
 
-function positionSourceSignalId(position: Position) {
-  const parsed = asNumber(position.metadata_json?.source_signal_id);
-  return parsed === null ? null : Math.trunc(parsed);
-}
 
 function positionEventTime(position: Position): number {
   const parsed = new Date(position.closed_at ?? position.opened_at).getTime();
@@ -248,7 +243,7 @@ function positionSearchText(position: Position, exitOrders: Order[]): string {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-export function HistoryScreen({ positions, signals, orders }: Props) {
+export function HistoryScreen({ positions, orders }: Props) {
   const [modeFilter, setModeFilter] = useState<ModeFilter>("all");
   const [marketTypeFilter, setMarketTypeFilter] = useState<"all" | "perp" | "spot">("all");
   const [periodFilter, setPeriodFilter] = useState("7d");
@@ -258,8 +253,6 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
   const [historyPage, setHistoryPage] = useState(1);
   const [historyPageSize, setHistoryPageSize] = useState(10);
   const [perfExpanded, setPerfExpanded] = useState(false);
-  const [stratExpanded, setStratExpanded] = useState(false);
-  const [timeframeExpanded, setTimeframeExpanded] = useState(false);
 
   const trackedPositions = useMemo(() => positions.filter(p => hasExitActivity(p, orders)), [positions, orders]);
 
@@ -323,6 +316,8 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
   const paper  = useMemo(() => marketTypeFiltered.filter(p => p.mode === "paper"), [marketTypeFiltered]);
   const visibleLive = useMemo(() => rows.filter(p => p.mode === "live"), [rows]);
   const visiblePaper = useMemo(() => rows.filter(p => p.mode === "paper"), [rows]);
+  const visibleLong  = useMemo(() => rows.filter(p => p.side?.toLowerCase() === "long"),  [rows]);
+  const visibleShort = useMemo(() => rows.filter(p => p.side?.toLowerCase() === "short"), [rows]);
 
   const statsFor = (items: Position[]) => {
     const pnls = items.map(p => realizedPnl(p, exitOrdersFor(p, orders))).filter((v): v is number => v !== null);
@@ -380,111 +375,9 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
   const selectedLiveSt = statsFor(visibleLive);
   const modeLiveSt = statsFor(live);
   const modePaperSt = statsFor(paper);
+  const sideLongSt  = statsFor(visibleLong);
+  const sideShortSt = statsFor(visibleShort);
 
-  const strategyStats = useMemo(() => {
-    const signalMap = new Map<number, Signal>();
-    for (const s of signals) signalMap.set(s.id, s);
-
-    type Acc = {
-      count: number;
-      wins: number;
-      losses: number;
-      totalPnl: number;
-      totalR: number;
-      rCount: number;
-      totalScore: number;
-      scoreCount: number;
-      totalContribution: number;
-      contributionCount: number;
-    };
-    const map = new Map<string, Acc>();
-
-    for (const p of marketTypeFiltered) {
-      const sigId = positionSourceSignalId(p);
-      if (sigId === null) continue;
-      const sig = signalMap.get(sigId);
-      if (!sig) continue;
-
-      const breakdown = sig.strategy_breakdown as Record<string, Record<string, unknown>>;
-      const exitOrds = exitOrdersFor(p, orders);
-      const pnl = realizedPnl(p, exitOrds);
-      const r = positionRMultiple(p, exitOrds);
-
-      for (const [name, info] of Object.entries(breakdown)) {
-        if (name.startsWith("_") || typeof info !== "object" || info === null) continue;
-        const dir = info.direction as string;
-        if (!dir || dir === "NEUTRAL") continue;
-        const contribution = asNumber(info.contribution as unknown) ?? 0;
-
-        const acc = map.get(name) ?? {
-          count: 0,
-          wins: 0,
-          losses: 0,
-          totalPnl: 0,
-          totalR: 0,
-          rCount: 0,
-          totalScore: 0,
-          scoreCount: 0,
-          totalContribution: 0,
-          contributionCount: 0,
-        };
-        acc.count++;
-        if (pnl !== null) {
-          if (pnl > 0) acc.wins++;
-          else acc.losses++;
-          acc.totalPnl += pnl;
-        }
-        if (r !== null) { acc.totalR += r; acc.rCount++; }
-        acc.totalScore += sig.score;
-        acc.scoreCount++;
-        acc.totalContribution += contribution;
-        acc.contributionCount++;
-        map.set(name, acc);
-      }
-    }
-
-    return Array.from(map.entries())
-      .map(([name, st]) => ({
-        name,
-        trades: st.count,
-        wins: st.wins,
-        losses: st.losses,
-        wr: st.wins + st.losses > 0 ? (st.wins / (st.wins + st.losses)) * 100 : 0,
-        avgR: st.rCount > 0 ? st.totalR / st.rCount : null,
-        avgScore: st.scoreCount > 0 ? st.totalScore / st.scoreCount : null,
-        avgContribution: st.contributionCount > 0 ? st.totalContribution / st.contributionCount : null,
-        totalPnl: st.totalPnl,
-      }))
-      .sort((a, b) => b.trades - a.trades);
-  }, [marketTypeFiltered, signals, orders]);
-
-  const timeframeStats = useMemo(() => {
-    type Acc = { count: number; wins: number; losses: number; totalPnl: number; totalR: number; rCount: number };
-    const map = new Map<string, Acc>();
-    for (const p of marketTypeFiltered) {
-      const tf = p.metadata_json?.source_timeframe;
-      if (!tf || typeof tf !== "string") continue;
-      const exitOrds = exitOrdersFor(p, orders);
-      const pnl = realizedPnl(p, exitOrds);
-      const r = positionRMultiple(p, exitOrds);
-      const acc = map.get(tf) ?? { count: 0, wins: 0, losses: 0, totalPnl: 0, totalR: 0, rCount: 0 };
-      acc.count++;
-      if (pnl !== null) { if (pnl > 0) acc.wins++; else acc.losses++; acc.totalPnl += pnl; }
-      if (r !== null) { acc.totalR += r; acc.rCount++; }
-      map.set(tf, acc);
-    }
-    return Array.from(map.entries())
-      .map(([timeframe, st]) => ({
-        timeframe,
-        trades: st.count,
-        wins: st.wins,
-        losses: st.losses,
-        wr: st.wins + st.losses > 0 ? (st.wins / (st.wins + st.losses)) * 100 : 0,
-        avgR: st.rCount > 0 ? st.totalR / st.rCount : null,
-        totalPnl: st.totalPnl,
-      }))
-      .sort((a, b) => b.trades - a.trades);
-  }, [marketTypeFiltered, orders]);
 
   function changeModeFilter(next: ModeFilter) {
     setModeFilter(next);
@@ -624,8 +517,8 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
               </div>
             </div>
 
-            {/* Per-mode + equity curve */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
+            {/* Per-mode + per-side + equity curve */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
               <div className="card">
                 <div className="card-head">
                   <span className="title">Performance per modalità</span>
@@ -652,6 +545,50 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
 
               <div className="card">
                 <div className="card-head">
+                  <span className="title">Performance per side</span>
+                  {(() => {
+                    const bias = sideLongSt.count > 0 && sideShortSt.count > 0
+                      ? sideLongSt.count / (sideLongSt.count + sideShortSt.count)
+                      : null;
+                    if (bias === null) return null;
+                    const label = bias > 0.65 ? "bias LONG" : bias < 0.35 ? "bias SHORT" : "bilanciato";
+                    const tone = bias > 0.65 ? "long" : bias < 0.35 ? "short" : "muted";
+                    return <span className={`badge ${tone}`}>{label}</span>;
+                  })()}
+                </div>
+                <div style={{ padding: "4px 18px 14px" }}>
+                  {[
+                    { label: "Long",  stats: sideLongSt,  color: "var(--long)" },
+                    { label: "Short", stats: sideShortSt, color: "var(--short)" },
+                  ].map((row, i) => (
+                    <div key={i} style={{ display: "grid", gridTemplateColumns: "80px 60px 1fr 80px", alignItems: "center", gap: 12, padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
+                      <span style={{ fontSize: "var(--fz-sm)", display: "flex", alignItems: "center", gap: 6 }}>
+                        <span style={{ width: 5, height: 5, borderRadius: "50%", background: row.color, display: "inline-block" }} />
+                        {row.label}
+                      </span>
+                      <span className="mono muted" style={{ fontSize: "var(--fz-sm)" }}>{row.stats.count}t</span>
+                      <WrBar wr={row.stats.wr} />
+                      <span className={"mono " + pnlTone(row.stats.total)} style={{ fontSize: "var(--fz-sm)", textAlign: "right" }}>
+                        {fmt.pnl(row.stats.total)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div style={{ padding: "0 18px 14px", display: "flex", gap: 20 }}>
+                  {[
+                    { label: "Long", st: sideLongSt },
+                    { label: "Short", st: sideShortSt },
+                  ].map(({ label, st }) => (
+                    <div key={label} style={{ fontSize: "var(--fz-xs)", color: "var(--fg-3)", lineHeight: 1.7 }}>
+                      <div><span className="muted">{label} WR </span><span className="mono">{st.wr.toFixed(0)}%</span></div>
+                      <div><span className="muted">avg R </span><span className="mono">{fmtR(st.avgR)}</span></div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="card">
+                <div className="card-head">
                   <span className="title">Equity curve</span>
                   <div className="right" style={{ display: "flex", gap: 10, fontSize: "var(--fz-xs)" }}>
                     <span className="mono"><span className="dot red" /> Live</span>
@@ -662,40 +599,7 @@ export function HistoryScreen({ positions, signals, orders }: Props) {
               </div>
             </div>
 
-            {/* Performance per strategia */}
-            <div className="card" style={{ marginBottom: "var(--gap)" }}>
-              <div className="card-head" style={{ cursor: "pointer" }} onClick={() => setStratExpanded(v => !v)}>
-                <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ display: "inline-flex", transition: "transform 0.15s", transform: stratExpanded ? "rotate(90deg)" : "none", color: "var(--fg-2)" }}>
-                    <Icon name="chevron" size={12} />
-                  </span>
-                  <span className="title">Performance per strategia</span>
-                  {!stratExpanded && strategyStats.length > 0 && (
-                    <span className="muted mono" style={{ fontSize: "var(--fz-xs)" }}>{strategyStats.length} indicatori</span>
-                  )}
-                </span>
-                <div className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>tutti i mode · periodo selezionato</div>
-              </div>
-              {stratExpanded && <StrategyPerformanceRows rows={strategyStats} />}
-            </div>
-
-            {/* Performance per timeframe */}
-            <div className="card" style={{ marginBottom: "var(--gap)" }}>
-              <div className="card-head" style={{ cursor: "pointer" }} onClick={() => setTimeframeExpanded(v => !v)}>
-                <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ display: "inline-flex", transition: "transform 0.15s", transform: timeframeExpanded ? "rotate(90deg)" : "none", color: "var(--fg-2)" }}>
-                    <Icon name="chevron" size={12} />
-                  </span>
-                  <span className="title">Performance per timeframe</span>
-                  {!timeframeExpanded && timeframeStats.length > 0 && (
-                    <span className="muted mono" style={{ fontSize: "var(--fz-xs)" }}>{timeframeStats.length} timeframe</span>
-                  )}
-                </span>
-                <div className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>tutti i mode · periodo selezionato</div>
-              </div>
-              {timeframeExpanded && <TimeframePerformanceRows rows={timeframeStats} />}
-            </div>
-          </>
+</>
         )}
       </div>
 
@@ -1118,64 +1022,6 @@ function PositionDetails({ position, orders }: { position: Position; orders: Ord
   );
 }
 
-type StrategyRow = {
-  name: string;
-  trades: number;
-  wins: number;
-  losses: number;
-  wr: number;
-  avgR: number | null;
-  avgScore: number | null;
-  avgContribution: number | null;
-  totalPnl: number;
-};
-
-function StrategyPerformanceRows({ rows }: { rows: StrategyRow[] }) {
-  if (rows.length === 0) {
-    return (
-      <div className="muted mono" style={{ padding: "18px 18px", fontSize: "var(--fz-sm)" }}>
-        Nessun segnale con breakdown di strategia nel periodo
-      </div>
-    );
-  }
-  return (
-    <div style={{ padding: "4px 18px 14px", overflowX: "auto" }}>
-      <div className="muted mono" style={{ display: "grid", gridTemplateColumns: "1.45fr 58px 64px 1fr 82px 76px 76px 96px", minWidth: 840, alignItems: "center", gap: 12, padding: "7px 0", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", borderBottom: "1px solid var(--border)" }}>
-        <span>Indicatore</span>
-        <span>Trade</span>
-        <span>W/L</span>
-        <span>WR</span>
-        <span style={{ textAlign: "right" }}>Avg R</span>
-        <span style={{ textAlign: "right" }}>Score</span>
-        <span style={{ textAlign: "right" }}>Contr.</span>
-        <span style={{ textAlign: "right" }}>P&L</span>
-      </div>
-      {rows.map((r) => {
-        const tone = pnlTone(r.totalPnl);
-        return (
-          <div key={r.name} style={{ display: "grid", gridTemplateColumns: "1.45fr 58px 64px 1fr 82px 76px 76px 96px", minWidth: 840, alignItems: "center", gap: 12, padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
-            <span style={{ fontSize: "var(--fz-sm)" }}>{r.name}</span>
-            <span className="mono muted" style={{ fontSize: "var(--fz-sm)" }}>{r.trades}t</span>
-            <span className="mono muted" style={{ fontSize: "var(--fz-sm)" }}>{r.wins}W/{r.losses}L</span>
-            <WrBar wr={r.wr} />
-            <span className="mono muted" style={{ fontSize: "var(--fz-sm)", textAlign: "right" }}>
-              {r.avgR !== null ? `${r.avgR >= 0 ? "+" : ""}${r.avgR.toFixed(1)}R` : "—"}
-            </span>
-            <span className="mono muted" style={{ fontSize: "var(--fz-sm)", textAlign: "right" }}>
-              {r.avgScore !== null ? r.avgScore.toFixed(0) : "—"}
-            </span>
-            <span className="mono muted" style={{ fontSize: "var(--fz-sm)", textAlign: "right" }}>
-              {r.avgContribution !== null ? r.avgContribution.toFixed(1) : "—"}
-            </span>
-            <span className={"mono " + tone} style={{ fontSize: "var(--fz-sm)", textAlign: "right" }}>
-              {fmt.pnl(r.totalPnl)}
-            </span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
 
 function WrBar({ wr }: { wr: number }) {
   const barColor = wr >= 60 ? "var(--long)" : wr >= 50 ? "var(--warn)" : "var(--short)";
@@ -1195,54 +1041,6 @@ function DetailMetric({ label, value, tone }: { label: string; value: string; to
   );
 }
 
-type TimeframeRow = {
-  timeframe: string;
-  trades: number;
-  wins: number;
-  losses: number;
-  wr: number;
-  avgR: number | null;
-  totalPnl: number;
-};
-
-function TimeframePerformanceRows({ rows }: { rows: TimeframeRow[] }) {
-  if (rows.length === 0) {
-    return (
-      <div className="muted mono" style={{ padding: "18px 18px", fontSize: "var(--fz-sm)" }}>
-        Nessun segnale con timeframe nel periodo
-      </div>
-    );
-  }
-  return (
-    <div style={{ padding: "4px 18px 14px", overflowX: "auto" }}>
-      <div className="muted mono" style={{ display: "grid", gridTemplateColumns: "1fr 58px 64px 1fr 82px 96px", minWidth: 560, alignItems: "center", gap: 12, padding: "7px 0", fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", borderBottom: "1px solid var(--border)" }}>
-        <span>Timeframe</span>
-        <span>Trade</span>
-        <span>W/L</span>
-        <span>WR</span>
-        <span style={{ textAlign: "right" }}>Avg R</span>
-        <span style={{ textAlign: "right" }}>P&L</span>
-      </div>
-      {rows.map((r) => {
-        const tone = pnlTone(r.totalPnl);
-        return (
-          <div key={r.timeframe} style={{ display: "grid", gridTemplateColumns: "1fr 58px 64px 1fr 82px 96px", minWidth: 560, alignItems: "center", gap: 12, padding: "8px 0", borderBottom: "1px solid var(--border)" }}>
-            <span className="mono fg" style={{ fontSize: "var(--fz-sm)" }}>{r.timeframe}</span>
-            <span className="mono muted" style={{ fontSize: "var(--fz-sm)" }}>{r.trades}t</span>
-            <span className="mono muted" style={{ fontSize: "var(--fz-sm)" }}>{r.wins}W/{r.losses}L</span>
-            <WrBar wr={r.wr} />
-            <span className="mono muted" style={{ fontSize: "var(--fz-sm)", textAlign: "right" }}>
-              {r.avgR !== null ? `${r.avgR >= 0 ? "+" : ""}${r.avgR.toFixed(1)}R` : "—"}
-            </span>
-            <span className={"mono " + tone} style={{ fontSize: "var(--fz-sm)", textAlign: "right" }}>
-              {fmt.pnl(r.totalPnl)}
-            </span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
 
 function toCumulative(posns: Position[]): EquityPoint[] {
   const sorted = [...posns]

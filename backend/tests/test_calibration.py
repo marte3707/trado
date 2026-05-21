@@ -321,3 +321,91 @@ def test_ambiguous_slope_escapes_deep_defensive() -> None:
     assert risk["max_risk_per_trade_pct"] == 1.0
     assert state["deep_defensive_active"] is False
     assert state.get("ambiguous_slope_override") is True
+
+
+def test_deep_defensive_exits_via_recent_slope_before_full_slope_recovers() -> None:
+    """Il deep defensive può uscire se il trend recente (ultimi N trade) è positivo
+    per abbastanza cicli consecutivi, anche quando lo slope sull'intera finestra
+    storica rimane negativo."""
+    db = FakeDb({"min_signal_score": 72, "min_risk_reward": 2.4, "max_risk_per_trade_pct": 0.5})
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={
+            "deep_defensive_active": True,
+            "deep_defensive_positive_streak": 0,
+            "deep_defensive_recent_positive_streak": 2,  # già 2 cicli positivi
+        },
+    )
+
+    AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        stats(win_rate=0.50, pnl=-30, profit_factor=0.95),
+        {**_risk_settings(), "recent_slope_exit_cycles": 3},
+        equity_slope_value=-0.5,   # slope globale ancora negativo
+        recent_slope_value=1.2,    # ma trend recente positivo → streak diventa 3
+    )
+
+    state = db.rows["auto_calibration_state"].value
+    assert state["deep_defensive_active"] is False
+    assert state["deep_defensive_recent_positive_streak"] == 3
+
+
+def test_defensive_mode_exits_when_recent_profit_factor_above_one() -> None:
+    """Se profit_factor recente > 1.0 usciamo dal defensive anche con storico negativo.
+    Copre il caso 40% WR con RR 1:3: PF=2.0, sistema profittevole nonostante WR basso."""
+    db = FakeDb({"min_signal_score": 60, "min_risk_reward": 2.0, "max_risk_per_trade_pct": 1.0})
+
+    # 40% WR con RR 1:3 → gross_profit=120, gross_loss=60 → PF=2.0
+    recent_40wr_rr3 = PerformanceStats(
+        trades=30,
+        wins=12,
+        losses=18,
+        win_rate=0.40,
+        realized_pnl=60.0,
+        gross_profit=120.0,
+        gross_loss=60.0,
+        profit_factor=2.0,
+    )
+
+    AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        stats(win_rate=0.35, pnl=-500, profit_factor=0.8),  # storico debole
+        {**_risk_settings(), "recent_window": 50},
+        recent_stats=recent_40wr_rr3,
+    )
+
+    risk = db.rows["risk"].value
+    # PF recente > 1.0 → baseline, nonostante WR=40% e storico negativo
+    assert risk["min_signal_score"] == 60
+    assert risk["min_risk_reward"] == 2.0
+    assert risk["max_risk_per_trade_pct"] == 1.0
+
+
+def test_defensive_mode_stays_when_recent_profit_factor_below_one() -> None:
+    """Se profit_factor recente <= 1.0 il defensive rimane attivo,
+    anche se il win rate fosse alto (50% WR con RR 1:1 dà PF=1.0, non > 1.0)."""
+    db = FakeDb({"min_signal_score": 60, "min_risk_reward": 2.0, "max_risk_per_trade_pct": 1.0})
+
+    recent_losing = PerformanceStats(
+        trades=30,
+        wins=15,
+        losses=15,
+        win_rate=0.50,
+        realized_pnl=-10.0,
+        gross_profit=150.0,
+        gross_loss=160.0,
+        profit_factor=0.94,
+    )
+
+    AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        stats(win_rate=0.35, pnl=-500, profit_factor=0.8),
+        {**_risk_settings(), "recent_window": 50},
+        recent_stats=recent_losing,
+    )
+
+    risk = db.rows["risk"].value
+    # PF recente <= 1.0 → defensive rimane attivo
+    assert risk["min_signal_score"] == 68  # 60 + 8
+    assert risk["min_risk_reward"] == 2.25
+    assert risk["max_risk_per_trade_pct"] == 0.75

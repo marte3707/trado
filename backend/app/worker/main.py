@@ -22,7 +22,7 @@ from app.engine.execution import OrderExecutionEngine
 from app.engine.signal_engine import SignalEngine
 from app.notifications.telegram import TelegramNotifier
 from app.services.candle_sync import CandleSyncService, TIMEFRAME_MS
-from app.services.hyperliquid import HyperliquidTransientError
+from app.services.hyperliquid import HyperliquidTransientError, fetch_perp_open_interests
 from app.services.live_reconciliation import reconcile_live_positions
 from app.services.market_sync import MarketSyncService
 from app.services.position_pnl import refresh_open_position_pnls
@@ -445,6 +445,7 @@ async def run_once(
         )
         if settings.external_quote_enrichment_enabled:
             signal_engine.market_data.prefetch_quotes([m.base for m in markets])
+        perp_oi_map = await asyncio.to_thread(fetch_perp_open_interests, settings.info_url)
         synced = 0
         skipped = 0
         generated = 0
@@ -456,9 +457,11 @@ async def run_once(
             if time.monotonic() - last_heartbeat > 30:
                 _record_heartbeat("running")
                 last_heartbeat = time.monotonic()
+            hl_coin = (market.metadata_json or {}).get("hl_coin") or market.symbol
+            market_oi = perp_oi_map.get(str(hl_coin))
             for timeframe in active_timeframes:
                 try:
-                    await candle_sync.sync_market(db, market, timeframe)
+                    await candle_sync.sync_market(db, market, timeframe, open_interest=market_oi)
                 except HyperliquidTransientError as exc:
                     skipped += 1
                     logger.warning(

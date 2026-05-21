@@ -88,6 +88,32 @@ def fetch_predicted_fundings(info_url: str) -> dict[str, float]:
         return {}
 
 
+def fetch_perp_open_interests(info_url: str) -> dict[str, float]:
+    """Returns coin → open interest in USD notional. Empty dict on failure. Perpetuals only."""
+    try:
+        with httpx.Client(timeout=10) as client:
+            response = client.post(info_url, json={"type": "metaAndAssetCtxs"})
+            if response.is_error:
+                return {}
+            data = response.json()
+            if not isinstance(data, list) or len(data) < 2:
+                return {}
+            meta, asset_ctxs = data[0], data[1]
+            universe = meta.get("universe", [])
+            result: dict[str, float] = {}
+            for asset, ctx in zip(universe, asset_ctxs):
+                coin = asset.get("name", "")
+                oi_str = ctx.get("openInterest")
+                if coin and oi_str is not None:
+                    try:
+                        result[coin] = float(oi_str)
+                    except (ValueError, TypeError):
+                        pass
+            return result
+    except Exception:
+        return {}
+
+
 class HyperliquidError(RuntimeError):
     pass
 

@@ -265,6 +265,7 @@ class SignalEngine:
                 low=float(row.low),
                 close=float(row.close),
                 volume=float(row.volume),
+                open_interest=float(row.open_interest) if row.open_interest is not None else None,
             )
             for row in reversed(rows)
         ]
@@ -393,21 +394,24 @@ class SignalEngine:
                 continue
             results.append(strategy.evaluate(context, config.params))
             weights[config.strategy_name] = config.weight
+        disabled_sources = set(risk_value.get("disabled_signal_sources", []))
         fear_greed = self.market_data.latest_fear_greed()
-        fear_greed_result = self._fear_greed_result(context, fear_greed)
-        if fear_greed_result is not None:
-            results.append(fear_greed_result)
-            weights[fear_greed_result.strategy_name] = max(0, settings.fear_greed_weight)
+        if "fear_greed" not in disabled_sources:
+            fear_greed_result = self._fear_greed_result(context, fear_greed)
+            if fear_greed_result is not None:
+                results.append(fear_greed_result)
+                weights[fear_greed_result.strategy_name] = max(0, settings.fear_greed_weight)
         altcoin_season = self.market_data.latest_altcoin_season()
         altcoin_season_result = self._altcoin_season_result(context, altcoin_season, market.base)
         if altcoin_season_result is not None:
             results.append(altcoin_season_result)
             weights[altcoin_season_result.strategy_name] = max(0, settings.altcoin_season_weight)
-        whale_flow = self.whales.recent_flow(market.base)
-        whale_flow_result = self._whale_flow_result(context, whale_flow)
-        if whale_flow_result is not None:
-            results.append(whale_flow_result)
-            weights[whale_flow_result.strategy_name] = max(0, settings.whale_flow_weight)
+        whale_flow = self.whales.recent_flow(market.base) if "whale_flow" not in disabled_sources else None
+        if "whale_flow" not in disabled_sources:
+            whale_flow_result = self._whale_flow_result(context, whale_flow)
+            if whale_flow_result is not None:
+                results.append(whale_flow_result)
+                weights[whale_flow_result.strategy_name] = max(0, settings.whale_flow_weight)
         coin = (market.metadata_json or {}).get("hl_coin") or market.symbol
         fundings = fetch_predicted_fundings(settings.info_url)
         funding_rate_value: float | None = fundings.get(str(coin))
@@ -599,6 +603,7 @@ class SignalEngine:
                         low=float(row.low),
                         close=float(row.close),
                         volume=float(row.volume),
+                        open_interest=float(row.open_interest) if row.open_interest is not None else None,
                     )
                     for row in reversed(higher_rows)
                 ]

@@ -249,6 +249,131 @@ function TunerStepHistoryTable({ history }: { history: TunerStepHistory[] }) {
   );
 }
 
+function slopeColor(v: number) {
+  if (v > 0.5) return "var(--long)";
+  if (v < -0.5) return "var(--short)";
+  return "var(--fg-2)";
+}
+
+function slopeArrow(v: number) {
+  if (v > 0.5) return "↑";
+  if (v < -0.5) return "↓";
+  return "→";
+}
+
+function slopeLabel(v: number) {
+  if (v > 2) return "forte crescita";
+  if (v > 0.5) return "crescita";
+  if (v > -0.5) return "neutro";
+  if (v > -2) return "declino";
+  return "forte declino";
+}
+
+function EquitySlopeCard({ calibration }: { calibration: Calibration }) {
+  const state = calibration.state ?? {};
+  const fullSlope = typeof state.last_equity_slope === "number" ? state.last_equity_slope : null;
+  const recentSlope = typeof state.last_recent_slope === "number" ? state.last_recent_slope : null;
+  const deepActive = state.deep_defensive_active === true;
+  const fullStreak = typeof state.deep_defensive_positive_streak === "number" ? state.deep_defensive_positive_streak : 0;
+  const recentStreak = typeof state.deep_defensive_recent_positive_streak === "number" ? state.deep_defensive_recent_positive_streak : 0;
+  const zeroCycles = typeof state.consecutive_zero_signal_cycles === "number" ? state.consecutive_zero_signal_cycles : 0;
+  const starvation = state.starvation_override_active === true;
+
+  const rows: { label: string; value: string; color: string; sub?: string }[] = [];
+
+  if (fullSlope !== null) {
+    rows.push({
+      label: "Slope equity (500 trade)",
+      value: `${slopeArrow(fullSlope)} ${fullSlope.toFixed(3)}`,
+      color: slopeColor(fullSlope),
+      sub: slopeLabel(fullSlope),
+    });
+  }
+  if (recentSlope !== null) {
+    rows.push({
+      label: "Slope recente (50 trade)",
+      value: `${slopeArrow(recentSlope)} ${recentSlope.toFixed(3)}`,
+      color: slopeColor(recentSlope),
+      sub: slopeLabel(recentSlope),
+    });
+  }
+
+  return (
+    <div className="card">
+      <div className="card-head">
+        <span className="title">Equity slope</span>
+        {deepActive
+          ? <span className="badge short">deep defensive</span>
+          : starvation
+            ? <span className="badge warn">starvation override</span>
+            : <span className="badge muted">normale</span>
+        }
+      </div>
+      <div className="card-body" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 20 }}>
+        {/* slope metrics */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {rows.length === 0 && (
+            <span className="muted" style={{ fontSize: "var(--fz-sm)" }}>
+              Nessun dato disponibile — la calibrazione non ha ancora completato un run.
+            </span>
+          )}
+          {rows.map(r => (
+            <div key={r.label}>
+              <div className="stat-label" style={{ marginBottom: 4 }}>{r.label}</div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: "var(--fz-md)", fontWeight: 600, color: r.color }}>
+                {r.value}
+              </div>
+              <div className="muted" style={{ fontSize: "var(--fz-xs)", marginTop: 2 }}>{r.sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* defensive status */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div className="stat-label">Stato modalità difensiva</div>
+          <table style={{ fontSize: "var(--fz-sm)", borderCollapse: "collapse", width: "100%" }}>
+            <tbody>
+              <tr>
+                <td className="muted" style={{ paddingBottom: 6, paddingRight: 12 }}>Deep defensive</td>
+                <td style={{ color: deepActive ? "var(--short)" : "var(--long)", fontWeight: 500 }}>
+                  {deepActive ? "attiva" : "inattiva"}
+                </td>
+              </tr>
+              <tr>
+                <td className="muted" style={{ paddingBottom: 6, paddingRight: 12 }}>Streak slope globale ≥ 0</td>
+                <td style={{ fontVariantNumeric: "tabular-nums" }}>
+                  {fullStreak} / 2 cicli
+                  {fullStreak > 0 && <span className="muted"> ({fullStreak >= 2 ? "uscita via slope globale" : "in corso"})</span>}
+                </td>
+              </tr>
+              <tr>
+                <td className="muted" style={{ paddingBottom: 6, paddingRight: 12 }}>Streak slope recente ≥ 0</td>
+                <td style={{ fontVariantNumeric: "tabular-nums" }}>
+                  {recentStreak} / 3 cicli
+                  {recentStreak > 0 && <span className="muted"> ({recentStreak >= 3 ? "uscita via slope recente" : "in corso"})</span>}
+                </td>
+              </tr>
+              <tr>
+                <td className="muted" style={{ paddingRight: 12 }}>Cicli senza segnali</td>
+                <td style={{ color: zeroCycles >= 10 ? "var(--warn, var(--fg-2))" : "var(--fg)", fontVariantNumeric: "tabular-nums" }}>
+                  {zeroCycles}
+                  {zeroCycles >= 15 && <span className="muted"> (starvation hard)</span>}
+                  {zeroCycles >= 10 && zeroCycles < 15 && <span className="muted"> (starvation soft)</span>}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div className="muted" style={{ fontSize: "var(--fz-xs)", lineHeight: 1.5 }}>
+            Lo slope è la pendenza della regressione lineare sulla curva del PnL cumulativo.
+            Positivo = curva in salita. La versione recente usa solo gli ultimi 50 trade,
+            permettendo di uscire dal deep defensive prima che l&apos;intera finestra storica si aggiusti.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ActiveStrategyCard({ calibration, tuner, settings }: { calibration: Calibration; tuner: AutoTunerStatus | null; settings: AppSettings }) {
   const risk = (settings.risk ?? {}) as Record<string, unknown>;
   const deepDefensive = calibration.state?.deep_defensive_active === true;
@@ -596,6 +721,11 @@ export function CalibrationScreen({
           <div className="stat-value">{localHistory.length}</div>
           <div className="stat-delta">{appliedCount} applicati · {failedCount} saltati/falliti</div>
         </div>
+      </div>
+
+      {/* ── equity slope ─────────────────────────────────────────────────── */}
+      <div style={{ marginBottom: "var(--gap)" }}>
+        <EquitySlopeCard calibration={localCalibration} />
       </div>
 
       {/* ── auto-tuner section ────────────────────────────────────────────── */}

@@ -13,6 +13,7 @@ import { CalibrationScreen } from "@/components/screens/CalibrationScreen";
 import { HistoryScreen } from "@/components/screens/HistoryScreen";
 import { AlertsScreen } from "@/components/screens/AlertsScreen";
 import { SettingsScreen } from "@/components/screens/SettingsScreen";
+import { StrategyAnalysisScreen } from "@/components/screens/StrategyAnalysisScreen";
 import {
   apiGet, apiPatch, apiPost,
   Health, Market, Signal, Position, Order, AppSettings, Strategy, DecisionLog, MarketIntelligence,
@@ -292,8 +293,16 @@ export function AppShell({ initialData }: AppShellProps) {
           {route === "history" && (
             <HistoryScreen
               positions={positions}
-              signals={signals}
               orders={orders}
+            />
+          )}
+
+          {route === "strategy-lab" && (
+            <StrategyAnalysisScreen
+              signals={signals}
+              positions={positions}
+              orders={orders}
+              strategies={strategies}
             />
           )}
 

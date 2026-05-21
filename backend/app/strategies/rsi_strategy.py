@@ -25,14 +25,6 @@ class RsiStrategy:
                 direction = Direction.SHORT
                 confidence = min(90, int(50 + (latest - overbought) * 2))
                 reason = f"RSI overbought at {latest:.2f}"
-            elif 45 <= latest <= 65:
-                direction = Direction.LONG
-                confidence = 35
-                reason = f"RSI constructive at {latest:.2f}"
-            elif 35 <= latest < 45:
-                direction = Direction.SHORT
-                confidence = 25
-                reason = f"RSI weak at {latest:.2f}"
             else:
                 reason = f"RSI neutral at {latest:.2f}"
         return StrategyResult(

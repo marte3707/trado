@@ -483,6 +483,8 @@ class CoinMarketCapClient:
         return self._coingecko.key_usage(force=force)
 
     def latest_fear_greed(self) -> FearGreedIndex | None:
+        if not self.settings.coinmarketcap_enabled:
+            return None
         if self._cmc_available():
             now = time.time()
             if (

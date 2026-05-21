@@ -18,6 +18,7 @@ DEFAULT_STRATEGIES = {
     "vwap": {"period": 48, "tolerance_pct": 0.002},
     "candlestick_patterns": {},
     "wyckoff_spring_upthrust": {"lookback": 50, "pivot_window": 5, "tolerance_pct": 0.002, "volume_factor": 1.3},
+    "oi_trend": {"min_candles": 5, "oi_change_threshold": 0.02, "price_change_threshold": 0.001},
 }
 
 DEFAULT_STRATEGY_WEIGHTS = {
@@ -32,6 +33,7 @@ DEFAULT_STRATEGY_WEIGHTS = {
     "vwap": 8,
     "candlestick_patterns": 5,
     "wyckoff_spring_upthrust": 12,
+    "oi_trend": 10,
 }
 
 LEGACY_DEFAULT_STRATEGY_WEIGHTS = {
