@@ -19,6 +19,20 @@ DEFAULT_STRATEGIES = {
     "candlestick_patterns": {},
     "wyckoff_spring_upthrust": {"lookback": 50, "pivot_window": 5, "tolerance_pct": 0.002, "volume_factor": 1.3},
     "oi_trend": {"min_candles": 5, "oi_change_threshold": 0.02, "price_change_threshold": 0.001},
+    "cvd_divergence": {"lookback": 30, "min_divergence_pct": 0.005},
+    "liquidation_cascade": {
+        "lookback": 50,
+        "volume_factor": 2.5,
+        "range_factor": 2.0,
+        "wick_min_ratio": 0.55,
+        "close_position_threshold": 0.35,
+    },
+    "volume_profile": {
+        "lookback": 100,
+        "bins": 30,
+        "proximity_pct": 0.004,
+        "hvn_percentile": 0.80,
+    },
 }
 
 DEFAULT_STRATEGY_WEIGHTS = {
@@ -34,6 +48,11 @@ DEFAULT_STRATEGY_WEIGHTS = {
     "candlestick_patterns": 5,
     "wyckoff_spring_upthrust": 12,
     "oi_trend": 10,
+    # Weight conservativi per le strategie nuove: il sistema le promuoverà via
+    # Wilson-based calibration se mostrano edge reale dopo ≥ min_strategy_trades (20).
+    "cvd_divergence": 8,
+    "liquidation_cascade": 10,
+    "volume_profile": 9,
 }
 
 LEGACY_DEFAULT_STRATEGY_WEIGHTS = {
@@ -130,7 +149,7 @@ def seed_defaults(db: Session) -> None:
                     "enabled": True,
                     "lookback_trades": 500,
                     "min_closed_trades": 20,
-                    "min_strategy_trades": 8,
+                    "min_strategy_trades": 20,
                     "min_weight": 1,
                     "max_weight": 30,
                     "min_signal_score_floor": 55,
@@ -138,9 +157,30 @@ def seed_defaults(db: Session) -> None:
                     "min_risk_reward_floor": 2.0,
                     "min_risk_reward_ceiling": 3.0,
                     "min_risk_per_trade_pct": 0.25,
+                    "deep_defensive_slope_threshold": -0.1,
+                    "auto_disable_retest_after_trades": 200,
                 },
             )
         )
+    else:
+        # Idempotent upgrade: il default della slope threshold è cambiato da -2.0
+        # (USD/trade-index, dipendente dalla scala) a -0.1 (unit-less, normalizzato
+        # per |PnL| mediano). Aggiorna SOLO se il valore in DB è il vecchio default.
+        existing = db.get(AppSetting, "auto_calibration")
+        if existing is not None and isinstance(existing.value, dict):
+            updated = dict(existing.value)
+            mutated = False
+            if updated.get("deep_defensive_slope_threshold") == -2.0:
+                updated["deep_defensive_slope_threshold"] = -0.1
+                mutated = True
+            if updated.get("min_strategy_trades") == 8:
+                updated["min_strategy_trades"] = 20
+                mutated = True
+            if "auto_disable_retest_after_trades" not in updated:
+                updated["auto_disable_retest_after_trades"] = 200
+                mutated = True
+            if mutated:
+                existing.value = updated
     if db.get(AppSetting, "btc_macro_protection") is None:
         db.add(
             AppSetting(

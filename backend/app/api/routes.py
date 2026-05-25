@@ -1,7 +1,12 @@
 import uuid
+import os
+import shlex
+import subprocess
+from collections import deque
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path as FilePath
 from time import perf_counter
 from typing import Any
 
@@ -178,6 +183,19 @@ def health(db: Session = Depends(get_db)) -> dict:
 # Worker tick cadence is 60s (worker/main.py). Beyond ~3x interval we treat the
 # worker as unhealthy — gives one missed cycle of grace before alarming.
 WORKER_HEALTHY_THRESHOLD_SECONDS = 180
+SYSTEM_SERVICES = {
+    "backend": {
+        "label": "com.trado.backend",
+        "plist": FilePath.home() / "Library/LaunchAgents/com.trado.backend.plist",
+        "error_log": FilePath.home() / "Library/Logs/trado-backend.err.log",
+    },
+    "worker": {
+        "label": "com.trado.worker",
+        "plist": FilePath.home() / "Library/LaunchAgents/com.trado.worker.plist",
+        "error_log": FilePath.home() / "Library/Logs/trado-worker.err.log",
+    },
+}
+SYSTEM_ACTIONS = {"start", "stop", "reboot"}
 
 
 def _worker_status(db: Session) -> dict:
@@ -216,6 +234,67 @@ def _worker_status(db: Session) -> dict:
         "last_cycle": dict(last_cycle.data) if last_cycle and last_cycle.data else None,
         "last_error_at": last_error.timestamp.isoformat() if last_error else None,
         "last_error_message": (last_error.data or {}).get("error") if last_error else None,
+    }
+
+
+def _service_script(service: str, action: str) -> str:
+    config = SYSTEM_SERVICES[service]
+    domain = f"gui/{os.getuid()}"
+    target = f"{domain}/{config['label']}"
+    plist = FilePath(config["plist"])
+    if action in {"start", "reboot"} and not plist.exists():
+        raise HTTPException(status_code=404, detail=f"LaunchAgent plist not found: {plist}")
+
+    quoted_domain = shlex.quote(domain)
+    quoted_target = shlex.quote(target)
+    quoted_plist = shlex.quote(str(plist))
+
+    if action == "stop":
+        command = f"/bin/launchctl bootout {quoted_target}"
+    elif action == "start":
+        command = (
+            f"/bin/launchctl bootstrap {quoted_domain} {quoted_plist}; "
+            f"/bin/launchctl kickstart {quoted_target}"
+        )
+    else:
+        command = (
+            f"/bin/launchctl kickstart -k {quoted_target} || "
+            f"/bin/launchctl bootstrap {quoted_domain} {quoted_plist}"
+        )
+    return f"sleep 0.2; {command}"
+
+
+def _schedule_service_action(service: str, action: str) -> None:
+    script = _service_script(service, action)
+    subprocess.Popen(
+        ["/bin/sh", "-lc", script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _tail_error_log(path: FilePath, limit: int) -> dict:
+    if not path.exists():
+        return {
+            "path": str(path),
+            "exists": False,
+            "updated_at": None,
+            "lines": [],
+        }
+    try:
+        with path.open("rb") as handle:
+            lines = deque(handle, maxlen=limit)
+    except OSError as exc:
+        error_id = _log_and_redact("system_error_log_read_failed", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to read log, error_id={error_id}") from exc
+
+    return {
+        "path": str(path),
+        "exists": True,
+        "updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+        "lines": [line.decode("utf-8", errors="replace").rstrip("\n") for line in lines],
     }
 
 
@@ -308,7 +387,7 @@ async def candles(
     market_type: str | None = Query(None, max_length=16, pattern=r"^[a-z]+$"),
     limit: int = Query(300, ge=1, le=1000),
     db: Session = Depends(get_db),
-) -> list[Candle | dict]:
+) -> list[Any]:
     market_query = db.query(Market).filter(Market.symbol == symbol)
     if market_type:
         market_query = market_query.filter(Market.market_type == market_type)
@@ -744,6 +823,18 @@ def analytics_diagnostics(
     return build_diagnostics_report(db, lookback=lookback, history_limit=history_limit)
 
 
+@router.post("/analytics/report/send")
+async def send_diagnostic_report(
+    lookback: int = Query(200, ge=10, le=2000),
+    db: Session = Depends(get_db),
+) -> dict:
+    from app.notifications.diagnostic_report import DiagnosticReporter
+    from app.notifications.telegram import TelegramNotifier
+    settings = get_settings()
+    notifier = TelegramNotifier(settings)
+    return await DiagnosticReporter().send(db, notifier, lookback=lookback)
+
+
 @router.get("/analytics/calibration")
 def calibration_preview(db: Session = Depends(get_db)) -> dict:
     result = AutoCalibrationEngine().preview(db)
@@ -842,6 +933,92 @@ def calibration_history(db: Session = Depends(get_db), limit: int = Query(100, g
     ]
 
 
+@router.get("/analytics/calibration/stability")
+def calibration_stability(db: Session = Depends(get_db)) -> dict:
+    """Diagnostica walk-forward per strategia: train vs test stats + factor history.
+
+    Mostra per ogni `(timeframe:strategy)`:
+    - WR / PnL / PF su finestra di train (più vecchia) e test (più recente)
+    - "concordance": train e test puntano nello stesso verso (defensive vs baseline)?
+    - factor_history: storico dei factor decisi dalle ultime N calibrazioni
+    - factor_stddev: deviazione standard dei factor recenti (proxy di overfitting)
+    """
+    import math as _math
+
+    from app.engine.performance import SignalPerformanceAnalyzer, serialize_stats
+
+    analyzer = SignalPerformanceAnalyzer()
+    auto_cal_setting = db.get(AppSetting, "auto_calibration")
+    settings = (
+        auto_cal_setting.value if auto_cal_setting and isinstance(auto_cal_setting.value, dict)
+        else {}
+    )
+    train_ratio = float(settings.get("walk_forward_train_ratio", 0.7))
+    min_per_side = int(settings.get("walk_forward_min_per_side", 5))
+    lookback = int(settings.get("lookback_trades", 500))
+
+    state_setting = db.get(AppSetting, "auto_calibration_state")
+    state_value = (
+        state_setting.value if state_setting and isinstance(state_setting.value, dict)
+        else {}
+    )
+    factor_history = dict(state_value.get("factor_history") or {})
+
+    strategies = db.query(StrategyConfig).all()
+    timeframes = sorted({s.timeframe for s in strategies})
+
+    by_strategy: list[dict] = []
+    for timeframe in timeframes:
+        positions_by_strategy = analyzer.strategy_positions(
+            db, timeframe=timeframe, limit=lookback
+        )
+        for strategy_config in strategies:
+            if strategy_config.timeframe != timeframe:
+                continue
+            key = f"{timeframe}:{strategy_config.strategy_name}"
+            positions = positions_by_strategy.get(strategy_config.strategy_name, [])
+            history = factor_history.get(key, [])
+            stddev = 0.0
+            if len(history) >= 2:
+                mean = sum(history) / len(history)
+                stddev = _math.sqrt(sum((v - mean) ** 2 for v in history) / len(history))
+            split = SignalPerformanceAnalyzer.holdout_split_stats(
+                positions, train_ratio=train_ratio, min_samples_per_side=min_per_side
+            )
+            entry: dict = {
+                "key": key,
+                "timeframe": timeframe,
+                "strategy": strategy_config.strategy_name,
+                "enabled": strategy_config.enabled,
+                "weight": strategy_config.weight,
+                "trades": len(positions),
+                "factor_history": history,
+                "factor_stddev": round(stddev, 4),
+                "stable": stddev <= float(settings.get("factor_history_std_threshold", 0.25)),
+            }
+            if split is None:
+                entry["holdout"] = None
+            else:
+                train, test = split
+                entry["holdout"] = {
+                    "train": serialize_stats(train),
+                    "test": serialize_stats(test),
+                    "wr_delta": round(test.win_rate - train.win_rate, 4),
+                }
+            by_strategy.append(entry)
+    return {
+        "settings": {
+            "walk_forward_train_ratio": train_ratio,
+            "walk_forward_min_per_side": min_per_side,
+            "factor_history_window": int(settings.get("factor_history_window", 5)),
+            "factor_history_std_threshold": float(
+                settings.get("factor_history_std_threshold", 0.25)
+            ),
+        },
+        "by_strategy": by_strategy,
+    }
+
+
 @router.get("/analytics/worker-cycles")
 def worker_cycles(db: Session = Depends(get_db), limit: int = Query(20, ge=1, le=100)) -> list[dict]:
     rows = (
@@ -860,6 +1037,30 @@ def worker_cycles(db: Session = Depends(get_db), limit: int = Query(20, ge=1, le
         }
         for row in rows
     ]
+
+
+@router.post("/system/services/{service}/{action}")
+def system_service_action(
+    service: str = Path(..., pattern=r"^(backend|worker)$"),
+    action: str = Path(..., pattern=r"^(start|stop|reboot)$"),
+) -> dict:
+    if service not in SYSTEM_SERVICES or action not in SYSTEM_ACTIONS:
+        raise HTTPException(status_code=404, detail="Unknown service action")
+    _schedule_service_action(service, action)
+    return {
+        "status": "scheduled",
+        "service": service,
+        "action": action,
+        "label": SYSTEM_SERVICES[service]["label"],
+    }
+
+
+@router.get("/system/error-logs")
+def system_error_logs(limit: int = Query(20, ge=1, le=200)) -> dict:
+    return {
+        service: _tail_error_log(FilePath(config["error_log"]), limit)
+        for service, config in SYSTEM_SERVICES.items()
+    }
 
 
 @router.get("/analytics/signal-rejections")
@@ -1399,7 +1600,7 @@ def patch_missing_exit_data(db: Session = Depends(get_db)) -> dict:
             continue
 
         # Case 3: pnl is correct but exit_price missing from metadata
-        if "exit_price" not in metadata and last_exit is not None and last_exit.price is not None:
+        if not metadata.get("exit_price") and last_exit is not None and last_exit.price is not None:
             metadata["exit_price"] = str(last_exit.price)
             pos.metadata_json = metadata
             db.add(pos)

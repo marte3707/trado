@@ -1,6 +1,33 @@
-from app.db.models import AppSetting, StrategyConfig
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+from app.db.models import AppSetting, Position, StrategyConfig
 from app.engine.calibration import AutoCalibrationEngine
-from app.engine.performance import PerformanceStats
+from app.engine.performance import PerformanceStats, SignalPerformanceAnalyzer
+
+
+def _positions_matching(target: PerformanceStats) -> list[Position]:
+    """Crea posizioni mock che, passate a summarize_positions, restituiscono
+    gli stats target. Usato dai test per simulare lo storico di una strategia
+    senza dover persistere oggetti reali in DB."""
+    win_pnl = target.gross_profit / target.wins if target.wins else 0.0
+    loss_pnl = -target.gross_loss / target.losses if target.losses else 0.0
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    positions: list[Position] = []
+    for i in range(target.wins):
+        positions.append(
+            Position(realized_pnl=Decimal(str(win_pnl)), closed_at=base + timedelta(hours=i))
+        )
+    for i in range(target.losses):
+        positions.append(
+            Position(
+                realized_pnl=Decimal(str(loss_pnl)),
+                closed_at=base + timedelta(hours=target.wins + i),
+            )
+        )
+    # Ritorna desc come `closed_paper_positions`
+    positions.sort(key=lambda p: p.closed_at, reverse=True)
+    return positions
 
 
 class FakeDb:
@@ -89,8 +116,10 @@ def test_strong_historical_performance_restores_baseline_not_extra_risk() -> Non
 
 
 def test_strategy_factor_penalizes_unprofitable_strategy() -> None:
+    # Con Wilson UB su 30 trade: serve WR puntuale ~0.23 perché UB < 0.40 + PnL < 0
+    # → factor 0.6. Le vecchie soglie WR-pure davano falsi positivi su campioni piccoli.
     factor, reason = AutoCalibrationEngine()._strategy_factor(
-        stats(win_rate=0.5, pnl=-25, profit_factor=0.9)
+        stats(win_rate=0.23, pnl=-100, profit_factor=0.5)
     )
 
     assert factor == 0.6
@@ -133,9 +162,16 @@ class FakeStrategyDb(FakeDb):
 class FakeAnalyzer:
     def __init__(self, by_strategy: dict[str, PerformanceStats]) -> None:
         self.by_strategy = by_strategy
+        self._real_analyzer = SignalPerformanceAnalyzer()
 
     def strategy_stats(self, db, timeframe=None, market_id=None, limit=500):  # noqa: ANN001
         return self.by_strategy
+
+    def strategy_positions(self, db, timeframe=None, market_id=None, limit=500):  # noqa: ANN001
+        return {name: _positions_matching(stats) for name, stats in self.by_strategy.items()}
+
+    def summarize_positions(self, positions):  # noqa: ANN001
+        return self._real_analyzer.summarize_positions(positions)
 
 
 def test_calibrate_strategy_params_updates_strategy_config_params() -> None:
@@ -148,11 +184,24 @@ def test_calibrate_strategy_params_updates_strategy_config_params() -> None:
     )
     db = FakeStrategyDb([strategy])
 
+    # Stats coerenti: WR=0.4 + PF=0.9 + pnl negativo (era inconsistente nel vecchio
+    # test che non simulava posizioni reali; ora summarize_positions ricalcola PF
+    # dai dati). PF<1.0 → defensive intensity=0.5 per volume_spike.
+    target = PerformanceStats(
+        trades=30, wins=12, losses=18, win_rate=0.4,
+        realized_pnl=-50.0, gross_profit=450.0, gross_loss=500.0, profit_factor=0.9,
+    )
     changes = AutoCalibrationEngine(
-        analyzer=FakeAnalyzer({"volume_spike": stats(win_rate=0.4, pnl=10, profit_factor=0.9)})  # type: ignore[arg-type]
+        analyzer=FakeAnalyzer({"volume_spike": target})  # type: ignore[arg-type]
     )._calibrate_strategy_params(
         db,  # type: ignore[arg-type]
-        {"min_strategy_trades": 8, "lookback_trades": 500},
+        # walk_forward_enabled=False: questo test isola la pure decisione su full stats
+        # senza il filtro holdout (testato separatamente)
+        {
+            "min_strategy_trades": 8,
+            "lookback_trades": 500,
+            "walk_forward_enabled": False,
+        },
     )
 
     assert strategy.params == {"period": 22, "multiplier": 1.7}
@@ -189,9 +238,12 @@ def test_auto_disable_chronic_underperformer_with_safety_floor() -> None:
     )
     db = FakeStrategyDb([losing, keeper])
 
+    # Con Wilson UB strict: WR puntuale 0.25 su 30 trade dà UB≈0.42 (sopra 0.30) →
+    # NON viene disabled. Per triggerare la disable serve UB < soglia. Con WR=0.05
+    # su 30 trade (1 win): UB≈0.20 < 0.30 → disable.
     analyzer = FakeAnalyzer(  # type: ignore[arg-type]
         {
-            "rsi": stats(win_rate=0.25, pnl=-200, profit_factor=0.6),
+            "rsi": stats(win_rate=0.05, pnl=-200, profit_factor=0.1),
             "macd": stats(win_rate=0.55, pnl=120, profit_factor=1.4),
         }
     )
@@ -409,3 +461,146 @@ def test_defensive_mode_stays_when_recent_profit_factor_below_one() -> None:
     assert risk["min_signal_score"] == 68  # 60 + 8
     assert risk["min_risk_reward"] == 2.25
     assert risk["max_risk_per_trade_pct"] == 0.75
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward holdout validation (§3.1)
+# ---------------------------------------------------------------------------
+
+
+def _make_positions_sequence(pnls: list[float]) -> list[Position]:
+    """Crea positions in ordine temporale (pnls[0] = più vecchia), ritorna desc."""
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    positions = [
+        Position(realized_pnl=Decimal(str(pnl)), closed_at=base + timedelta(hours=i))
+        for i, pnl in enumerate(pnls)
+    ]
+    positions.sort(key=lambda p: p.closed_at, reverse=True)
+    return positions
+
+
+def test_holdout_split_stats_separates_train_and_test_temporally() -> None:
+    # 10 trade chronologici: prima metà tutta loss, seconda metà tutta win
+    positions = _make_positions_sequence([-5.0] * 5 + [10.0] * 5)
+    split = SignalPerformanceAnalyzer.holdout_split_stats(
+        positions, train_ratio=0.5, min_samples_per_side=3
+    )
+
+    assert split is not None
+    train, test = split
+    # Train = prima metà (loss), Test = seconda metà (win)
+    assert train.win_rate == 0.0
+    assert test.win_rate == 1.0
+
+
+def test_holdout_split_stats_returns_none_when_insufficient_samples() -> None:
+    positions = _make_positions_sequence([1.0, 2.0, 3.0])  # solo 3 trade
+
+    assert SignalPerformanceAnalyzer.holdout_split_stats(positions, min_samples_per_side=5) is None
+
+
+def test_holdout_blocks_change_when_train_and_test_disagree() -> None:
+    """Se train dice 'underperform' (factor < 1) e test dice 'overperform' (factor > 1)
+    → factor 1.0 (freeze): la decisione non regge fuori campione."""
+    # 30 trade tot, train_ratio=0.7 → primi 21 nel train, ultimi 9 nel test
+    # Train: 18 loss + 3 win → factor 0.6 (PF=0.33, pnl<0, wr_ub<0.40)
+    # Test: 9 win consecutivi → factor 1.2 (wr_lb>0.55, pnl>0, PF=None>1.25)
+    positions = _make_positions_sequence([-5.0] * 18 + [10.0] * 3 + [10.0] * 9)
+    factor, reason = AutoCalibrationEngine()._strategy_factor_holdout_validated(
+        positions,
+        enabled=True,
+        train_ratio=0.7,
+        min_per_side=5,
+    )
+
+    assert factor == 1.0
+    assert "holdout instability" in reason
+
+
+def test_holdout_passes_when_train_and_test_agree() -> None:
+    """Se train e test concordano (entrambi sotto baseline) → applica factor full."""
+    # Trade tutti perdenti → factor < 1.0 ovunque (concordant)
+    positions = _make_positions_sequence([-10.0] * 30)
+    factor, reason = AutoCalibrationEngine()._strategy_factor_holdout_validated(
+        positions,
+        enabled=True,
+        train_ratio=0.7,
+        min_per_side=5,
+    )
+
+    assert factor < 1.0
+    assert "holdout ok" in reason
+
+
+def test_holdout_disabled_returns_full_factor_directly() -> None:
+    positions = _make_positions_sequence([-10.0] * 30)
+    factor_enabled, _ = AutoCalibrationEngine()._strategy_factor_holdout_validated(
+        positions, enabled=True, train_ratio=0.7, min_per_side=5
+    )
+    factor_disabled, reason = AutoCalibrationEngine()._strategy_factor_holdout_validated(
+        positions, enabled=False, train_ratio=0.7, min_per_side=5
+    )
+
+    # Senza holdout, è un puro pass-through di _strategy_factor
+    assert factor_disabled == factor_enabled  # in questo caso concordant → uguali
+    assert "holdout" not in reason
+
+
+def test_time_weighted_summarize_weights_recent_higher() -> None:
+    # 10 vecchie loss + 10 recenti win → win_rate "ingenuo" = 0.5
+    # Con time decay, le recenti pesano molto di più → win_rate pesato > 0.5
+    positions = _make_positions_sequence([-1.0] * 10 + [1.0] * 10)
+    weighted = SignalPerformanceAnalyzer.time_weighted_summarize(positions, half_life=5)
+    plain = SignalPerformanceAnalyzer().summarize_positions(positions)
+
+    assert plain.win_rate == 0.5
+    assert weighted.win_rate > 0.5
+
+
+def test_factor_stability_freezes_change_when_history_oscillates() -> None:
+    """Factor con varianza elevata negli ultimi run → freeze del peso (factor=1.0)."""
+    losing = StrategyConfig(
+        strategy_name="rsi",
+        timeframe="15m",
+        enabled=True,
+        params={"period": 14, "oversold": 30, "overbought": 70},
+        weight=9,
+    )
+    keeper = StrategyConfig(
+        strategy_name="macd",
+        timeframe="15m",
+        enabled=True,
+        params={"fast": 12, "slow": 26, "signal": 9},
+        weight=12,
+    )
+    db = FakeStrategyDb([losing, keeper])
+    # Seed factor_history con oscillazione (std alto) per rsi
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={"factor_history": {"15m:rsi": [0.6, 1.2, 0.6, 1.2]}},
+    )
+    # Stats che da soli triggerebbero factor 0.6 (pnl<0, wr_ub<0.40, PF<0.8)
+    bad_stats = PerformanceStats(
+        trades=30, wins=2, losses=28, win_rate=0.067,
+        realized_pnl=-200.0, gross_profit=10.0, gross_loss=210.0, profit_factor=0.05,
+    )
+    good_stats = stats(win_rate=0.55, pnl=120, profit_factor=1.4)
+
+    analyzer = FakeAnalyzer({"rsi": bad_stats, "macd": good_stats})  # type: ignore[arg-type]
+    changes = AutoCalibrationEngine(analyzer=analyzer)._calibrate_strategy_weights(
+        db,  # type: ignore[arg-type]
+        {
+            **_weights_settings(),
+            "walk_forward_enabled": False,  # isolare il test sulla stability
+            "factor_history_window": 5,
+            "factor_history_std_threshold": 0.25,
+        },
+    )
+
+    weight_changes = [c for c in changes if c.target == "strategy_weight" and c.key == "15m:rsi"]
+    if weight_changes:
+        assert "stability freeze" in weight_changes[0].reason
+    else:
+        # Se non c'è weight change, vuol dire che il factor è rimasto a 1.0 → niente change.
+        # Anche questo è una freeze valida.
+        assert losing.weight == 9

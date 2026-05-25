@@ -79,6 +79,30 @@ def equity_slope(positions: list[Position]) -> float:
     return num / den if den else 0.0
 
 
+def equity_slope_normalized(positions: list[Position]) -> float:
+    """Slope normalizzato per la magnitudine media dei PnL.
+
+    Why: la slope grezza è in USD/trade-index e cambia drasticamente con l'equity
+    di riferimento o la size dei trade. Dividendo per il |PnL| mediano otteniamo
+    una grandezza unit-less ("frazioni di trade medio per trade-index") che è
+    stabile rispetto alla scala. Una soglia -0.1 significa "ogni nuovo trade peggiora
+    la equity cumulata del 10% di un PnL tipico" — interpretabile e portabile.
+    """
+    pnls = [
+        abs(float(position.realized_pnl))
+        for position in positions
+        if position.realized_pnl is not None
+    ]
+    if not pnls:
+        return 0.0
+    sorted_pnls = sorted(pnls)
+    median = sorted_pnls[len(sorted_pnls) // 2]
+    if median <= 0:
+        return 0.0
+    raw_slope = equity_slope(positions)
+    return raw_slope / median
+
+
 def build_diagnostics_report(
     db: Session,
     *,

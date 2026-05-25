@@ -13,13 +13,14 @@ from app.core.logging import configure_logging
 from app.core.runtime_settings import effective_alert_min_score, effective_enabled_timeframes, effective_operation_mode
 from app.db.init_db import create_schema, seed_defaults
 from app.db.migrations import apply_migrations
-from app.db.models import AppSetting, DecisionLog, Market, Position
+from app.db.models import AppSetting, DecisionLog, Market, Position, Signal
 from app.db.session import SessionLocal
 from app.engine.auto_tuner import AutoTuner
 from app.engine.btc_macro_protection import BtcMacroProtectionEngine
 from app.engine.calibration import AutoCalibrationEngine
 from app.engine.execution import OrderExecutionEngine
 from app.engine.signal_engine import SignalEngine
+from app.notifications.diagnostic_report import DiagnosticReporter
 from app.notifications.telegram import TelegramNotifier
 from app.services.candle_sync import CandleSyncService, TIMEFRAME_MS
 from app.services.hyperliquid import HyperliquidTransientError, fetch_perp_open_interests
@@ -31,9 +32,13 @@ logger = structlog.get_logger()
 _LAST_TIMEFRAME_RUN_MS: dict[str, int] = {}
 _TICK_LOCK = asyncio.Lock()
 
-_RECAP_INTERVAL_SECONDS = 3600  # ogni ora
+_RECAP_INTERVAL_SECONDS = 10800  # ogni 3 ore
+_DIAGNOSTIC_REPORT_INTERVAL_SECONDS = 86400  # ogni 24h
+_LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS = 10800  # ogni 3 ore
 _ERROR_NOTIFY_COOLDOWN_SECONDS = 1800  # max 1 notifica errore ogni 30 min
 _next_recap_at: float = 0.0
+_next_diagnostic_at: float = 0.0
+_next_live_liquidation_guard_at: float = 0.0
 _last_error_notify_at: float = 0.0
 
 
@@ -66,6 +71,48 @@ def active_timeframes_for_tick(timeframes: list[str], now_ms: int) -> list[str]:
 def mark_timeframes_run(timeframes: list[str], started_ms: int) -> None:
     for timeframe in timeframes:
         _LAST_TIMEFRAME_RUN_MS[timeframe] = started_ms
+
+
+def paper_management_timeframes(db, enabled_timeframes: list[str]) -> list[str]:
+    """Keep paper positions manageable even after timeframe config changes."""
+    managed: list[str] = []
+    seen: set[str] = set()
+
+    for timeframe in enabled_timeframes:
+        if timeframe in TIMEFRAME_MS and timeframe not in seen:
+            managed.append(timeframe)
+            seen.add(timeframe)
+
+    positions = (
+        db.query(Position)
+        .filter(
+            Position.mode == OrderMode.PAPER.value,
+            Position.status == "open",
+        )
+        .all()
+    )
+    discovered: set[str] = set()
+    for position in positions:
+        metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+        source_timeframe = metadata.get("source_timeframe")
+        if not isinstance(source_timeframe, str) or not source_timeframe:
+            source_signal_id = metadata.get("source_signal_id")
+            try:
+                signal_id = int(source_signal_id)
+            except (TypeError, ValueError):
+                signal_id = None
+            if signal_id is not None:
+                signal = db.get(Signal, signal_id)
+                if signal is not None and isinstance(signal.timeframe, str):
+                    source_timeframe = signal.timeframe
+        if isinstance(source_timeframe, str) and source_timeframe in TIMEFRAME_MS:
+            discovered.add(source_timeframe)
+
+    for timeframe in sorted(discovered, key=lambda item: TIMEFRAME_MS[item]):
+        if timeframe not in seen:
+            managed.append(timeframe)
+            seen.add(timeframe)
+    return managed
 
 
 def reconcile_open_paper_positions(
@@ -135,6 +182,8 @@ def _consecutive_zero_signal_cycles_from_log(db) -> int:
     # Include sia "worker_cycle" (con generated=0) sia "worker_cycle_failed":
     # un crash del cycle non genera segnali ed è semanticamente equivalente a
     # uno zero-cycle ai fini dello starvation override.
+    # I tick "no-op" (active_timeframes vuoto) sono saltati: il worker non ha
+    # nemmeno provato a generare segnali, quindi non rappresentano vera starvation.
     recent = (
         db.query(DecisionLog)
         .filter(DecisionLog.event_type.in_(["worker_cycle", "worker_cycle_failed"]))
@@ -147,7 +196,12 @@ def _consecutive_zero_signal_cycles_from_log(db) -> int:
         if entry.event_type == "worker_cycle_failed":
             streak += 1
             continue
-        if isinstance(entry.data, dict) and int(entry.data.get("generated", 0)) == 0:
+        if not isinstance(entry.data, dict):
+            break
+        active_tf = entry.data.get("active_timeframes")
+        if isinstance(active_tf, list) and not active_tf:
+            continue
+        if int(entry.data.get("generated", 0)) == 0:
             streak += 1
         else:
             break
@@ -209,13 +263,13 @@ def execute_signal_for_mode(
     operation_mode: OperationMode,
     market: Market,
     timeframe: str,
-) -> None:
+) -> Position | None:
     if operation_mode == OperationMode.PAPER_TRADING:
         executor.execute_paper(db, signal)
     elif operation_mode == OperationMode.AUTO_TRADE:
         paper_position = executor.execute_paper(db, signal)
         try:
-            executor.execute_live(db, signal)
+            return executor.execute_live(db, signal)
         except PermissionError as exc:
             if paper_position is None:
                 signal.status = SignalStatus.IGNORED.value
@@ -236,6 +290,7 @@ def execute_signal_for_mode(
                 signal_id=signal.id,
                 error=str(exc),
             )
+    return None
 
 
 _FILL_EVENT_TYPES = frozenset(
@@ -374,12 +429,21 @@ async def run_once(
     tick_start = datetime.now(timezone.utc)
     settings = get_settings()
     db = SessionLocal()
+    # Invalida le cache per-cycle del signal_engine (fundings, L2 book): evitano
+    # di rieseguire chiamate HTTP per ogni (market × timeframe) nello stesso tick.
+    signal_engine.begin_cycle()
     # Catturato una volta: usa time.time() per POSIX corretto indipendente dal timezone
     now_ms = int(time.time() * 1000)
     enabled_timeframes = effective_enabled_timeframes(db, settings)
     operation_mode = effective_operation_mode(db, settings)
+    managed_paper_timeframes = paper_management_timeframes(db, enabled_timeframes)
     active_timeframes = active_timeframes_for_tick(enabled_timeframes, now_ms)
-    logger.info("worker_tick", active_timeframes=active_timeframes or None)
+    paper_active_timeframes = active_timeframes_for_tick(managed_paper_timeframes, now_ms)
+    logger.info(
+        "worker_tick",
+        active_timeframes=active_timeframes or None,
+        paper_active_timeframes=paper_active_timeframes or None,
+    )
     _record_heartbeat("running")
     pnl_updated = 0
     live_reconciled = 0
@@ -393,7 +457,7 @@ async def run_once(
         logger.exception("position_pnl_refresh_failed", error=str(exc))
         db.rollback()
     closed = await asyncio.to_thread(
-        reconcile_open_paper_positions, db, executor, enabled_timeframes
+        reconcile_open_paper_positions, db, executor, managed_paper_timeframes
     )
     calibrated = False
     calibration_attempted = False
@@ -408,7 +472,7 @@ async def run_once(
         except Exception as exc:
             logger.exception("btc_macro_protection_failed", error=str(exc))
             db.rollback()
-    if not active_timeframes:
+    if not active_timeframes and not paper_active_timeframes:
         try:
             db.add(DecisionLog(
                 event_type="worker_cycle",
@@ -416,6 +480,7 @@ async def run_once(
                 data={
                     "markets": 0,
                     "timeframes": enabled_timeframes,
+                    "paper_management_timeframes": managed_paper_timeframes,
                     "synced": 0,
                     "skipped": 0,
                     "generated": 0,
@@ -426,6 +491,7 @@ async def run_once(
                     "btc_protection_updates": btc_protection_updates,
                     "calibrated": calibrated,
                     "active_timeframes": [],
+                    "paper_active_timeframes": [],
                 },
             ))
             db.commit()
@@ -459,7 +525,7 @@ async def run_once(
                 last_heartbeat = time.monotonic()
             hl_coin = (market.metadata_json or {}).get("hl_coin") or market.symbol
             market_oi = perp_oi_map.get(str(hl_coin))
-            for timeframe in active_timeframes:
+            for timeframe in paper_active_timeframes:
                 try:
                     await candle_sync.sync_market(db, market, timeframe, open_interest=market_oi)
                 except HyperliquidTransientError as exc:
@@ -489,6 +555,9 @@ async def run_once(
                 closed += await asyncio.to_thread(
                     executor.close_paper_positions_for_timeframe, db, market, timeframe
                 )
+                if timeframe not in active_timeframes:
+                    await asyncio.sleep(0.01)
+                    continue
                 if operation_mode == OperationMode.AUTO_TRADE:
                     live_stop_updates += await asyncio.to_thread(
                         executor.position_manager.manage_live_positions_for_timeframe,
@@ -512,12 +581,17 @@ async def run_once(
                 alert_min_score = effective_alert_min_score(db, settings)
                 if signal.score >= alert_min_score:
                     await notifier.send_signal(db, signal)
-                execute_signal_for_mode(db, executor, signal, operation_mode, market, timeframe)
+                live_position = execute_signal_for_mode(db, executor, signal, operation_mode, market, timeframe)
+                if live_position is not None:
+                    try:
+                        await notifier.send_live_position_opened(live_position)
+                    except Exception:
+                        logger.exception("telegram_live_open_notify_failed")
                 await asyncio.sleep(0.05)
         if not calibration_attempted and should_run_calibration(db, closed):
             calibrated = run_calibration(db, calibration_engine)
             calibration_attempted = True
-        mark_timeframes_run(active_timeframes, now_ms)
+        mark_timeframes_run(paper_active_timeframes, now_ms)
         db.add(
             DecisionLog(
                 event_type="worker_cycle",
@@ -525,7 +599,9 @@ async def run_once(
                 data={
                     "markets": len(markets),
                     "timeframes": enabled_timeframes,
+                    "paper_management_timeframes": managed_paper_timeframes,
                     "active_timeframes": active_timeframes,
+                    "paper_active_timeframes": paper_active_timeframes,
                     "synced": synced,
                     "skipped": skipped,
                     "generated": generated,
@@ -535,6 +611,10 @@ async def run_once(
                     "live_stop_updates": live_stop_updates,
                     "btc_protection_updates": btc_protection_updates,
                     "calibrated": calibrated,
+                    # Aggregato dei motivi per cui i segnali non sono stati emessi —
+                    # in produzione gli eventi debug per skip sono filtrati, qui
+                    # restano visibili per debug "perché non genero?".
+                    "skip_reasons": signal_engine.cycle_skip_counts(),
                 },
             )
         )
@@ -575,8 +655,10 @@ async def main() -> None:
     btc_protection = BtcMacroProtectionEngine(settings)
     _record_heartbeat("starting")
 
-    global _next_recap_at, _last_error_notify_at
+    global _next_recap_at, _next_diagnostic_at, _next_live_liquidation_guard_at, _last_error_notify_at
     _next_recap_at = time.time() + _RECAP_INTERVAL_SECONDS
+    _next_diagnostic_at = time.time() + _DIAGNOSTIC_REPORT_INTERVAL_SECONDS
+    _next_live_liquidation_guard_at = 0.0
     _last_error_notify_at = 0.0
     stats = _WorkerStats()
 
@@ -631,6 +713,31 @@ async def main() -> None:
             finally:
                 recap_db.close()
             stats = _WorkerStats()
+
+        if now >= _next_diagnostic_at:
+            _next_diagnostic_at = now + _DIAGNOSTIC_REPORT_INTERVAL_SECONDS
+            diag_db = SessionLocal()
+            try:
+                await DiagnosticReporter().send(diag_db, notifier)
+            except Exception:
+                logger.exception("telegram_diagnostic_report_failed")
+            finally:
+                diag_db.close()
+
+        if now >= _next_live_liquidation_guard_at:
+            _next_live_liquidation_guard_at = now + _LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS
+            liq_db = SessionLocal()
+            try:
+                result = await asyncio.to_thread(
+                    executor.position_manager.audit_live_positions_against_liquidation,
+                    liq_db,
+                )
+                logger.info("live_liquidation_guard_cycle_completed", **result)
+            except Exception as exc:
+                logger.exception("live_liquidation_guard_cycle_failed", error=str(exc))
+                liq_db.rollback()
+            finally:
+                liq_db.close()
 
         await asyncio.sleep(60)
 

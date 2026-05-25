@@ -8,7 +8,11 @@ from typing import Any
 from app.core.config import Settings
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, PositionStopUpdate, Signal
 from app.engine.execution import OrderExecutionEngine
-from app.engine.position_management import PositionManagementEngine, r_multiple
+from app.engine.position_management import (
+    PositionManagementEngine,
+    StopCandidate,
+    r_multiple,
+)
 from app.services.hyperliquid import HyperliquidOrderResult
 
 
@@ -35,6 +39,7 @@ class FakeDb:
     signals: dict[int, Signal] = field(default_factory=dict)
     orders: list[Order] = field(default_factory=list)
     positions: list[Position] = field(default_factory=list)
+    markets: dict[int, Market] = field(default_factory=dict)
     candles: list[Candle] = field(default_factory=list)
     added: list[Any] = field(default_factory=list)
     committed: int = 0
@@ -46,6 +51,8 @@ class FakeDb:
             return self.settings.get(str(key))
         if model is Signal:
             return self.signals.get(int(key))
+        if model is Market:
+            return self.markets.get(int(key))
         return None
 
     def query(self, model: type[Any]) -> _Query:
@@ -75,9 +82,15 @@ class FakeDb:
 
 
 class FakeTrading:
-    def __init__(self, submit_status: str = "ok", cancel_raises: bool = False) -> None:
+    def __init__(
+        self,
+        submit_status: str = "ok",
+        cancel_raises: bool = False,
+        user_state_positions: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.submit_status = submit_status
         self.cancel_raises = cancel_raises
+        self.user_state_positions = user_state_positions or []
         self.submitted: list[dict[str, Any]] = []
         self.canceled: list[dict[str, Any]] = []
 
@@ -116,6 +129,9 @@ class FakeTrading:
             raise RuntimeError("cancel failed")
         self.canceled.append({"coin": coin, "oid": oid, "expires_after_seconds": expires_after_seconds})
         return {"status": "ok"}
+
+    def user_state(self, _address: str | None = None) -> dict[str, Any]:
+        return {"assetPositions": [{"position": row} for row in self.user_state_positions]}
 
 
 def _market(active: bool = True) -> Market:
@@ -220,7 +236,7 @@ def _db(config: dict[str, Any] | None = None, kill: bool = False) -> FakeDb:
     }
     if config is not None:
         settings["position_management"] = AppSetting(key="position_management", value=config)
-    return FakeDb(settings=settings)
+    return FakeDb(settings=settings, markets={1: _market()})
 
 
 def test_r_multiple_long_and_short() -> None:
@@ -399,3 +415,168 @@ def test_signal_only_mode_blocks_live_replacement() -> None:
     assert candidate is not None
 
     assert not engine.replace_live_stop_order(db, _market(), position, candidate, FakeTrading())
+
+
+def test_liquidation_guard_rejects_live_stop_update_beyond_liq() -> None:
+    engine = PositionManagementEngine(Settings(hyperliquid_account_address="0xabc"))
+    db = _db()
+    position = _position("long", "90", mode="live")
+    trading = FakeTrading(
+        user_state_positions=[
+            {
+                "coin": "BTC",
+                "szi": "10",
+                "liquidationPx": "101",
+            }
+        ]
+    )
+    candidate = StopCandidate(
+        price=Decimal("100"),
+        reason="breakeven",
+        indicators={"current_price": "112"},
+        r_multiple=Decimal("1.2"),
+    )
+
+    assert not engine.replace_live_stop_order(db, _market(), position, candidate, trading)
+    assert trading.submitted == []
+    assert any(
+        isinstance(row, DecisionLog) and row.event_type == "live_position_liquidation_guard_failed"
+        for row in db.added
+    )
+
+
+def test_periodic_liquidation_guard_audit_records_failures() -> None:
+    engine = PositionManagementEngine(Settings(hyperliquid_account_address="0xabc"))
+    db = _db()
+    long_position = _position("long", "90", mode="live")
+    short_position = _position("short", "105", mode="live")
+    short_position.id = 11
+    short_position.market = _market()
+    long_position.market = _market()
+    db.positions.extend([long_position, short_position])
+    trading = FakeTrading(
+        user_state_positions=[
+            {
+                "coin": "BTC",
+                "szi": "10",
+                "liquidationPx": "80",
+            }
+        ]
+    )
+
+    result = engine.audit_live_positions_against_liquidation(db, trading_client=trading)
+
+    assert result == {"checked": 2, "failed": 1, "skipped": 0}
+    assert long_position.metadata_json["last_liquidation_guard_status"] == "ok"
+    assert short_position.metadata_json["last_liquidation_guard_status"] == "failed"
+    assert any(
+        isinstance(row, DecisionLog) and row.event_type == "live_liquidation_guard_cycle"
+        for row in db.added
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests for replace_live_stop_order retry logic
+# ---------------------------------------------------------------------------
+
+class _RetryTrading:
+    """Simula N fallimenti consecutivi, poi successo."""
+
+    def __init__(self, fail_times: int = 0, raise_exc: bool = False) -> None:
+        self.fail_times = fail_times
+        self.raise_exc = raise_exc
+        self.call_count = 0
+        self.submitted: list[dict] = []
+        self.canceled: list[dict] = []
+
+    def submit_trigger_order(self, *, coin, is_buy, size, trigger_price, tpsl, expires_after_seconds, cloid=None):
+        self.call_count += 1
+        self.submitted.append({"cloid": cloid, "trigger_price": trigger_price})
+        if self.call_count <= self.fail_times:
+            if self.raise_exc:
+                raise RuntimeError("network error")
+            return HyperliquidOrderResult(status="error", oid=None, avg_price=None, filled_size=None, raw_response={"error": "rejected"})
+        return HyperliquidOrderResult(status="ok", oid="999", avg_price=None, filled_size=None, raw_response={"status": "ok"})
+
+    def cancel_order(self, coin, oid, expires_after_seconds):
+        self.canceled.append({"coin": coin, "oid": oid})
+        return {"status": "ok"}
+
+    def user_state(self, _address=None):
+        return {"assetPositions": []}
+
+
+def _live_position_with_metadata() -> Position:
+    p = _position(side="long", stop="90", mode="live")
+    p.metadata_json = {
+        "source_timeframe": "5m",
+        "initial_size": "10",
+        "initial_stop_loss": "90",
+        "initial_risk_per_unit": "10",
+    }
+    return p
+
+
+def test_retry_succeeds_on_second_attempt(monkeypatch) -> None:
+    monkeypatch.setattr("app.engine.position_management.time.sleep", lambda _: None)
+    engine = PositionManagementEngine(Settings())
+    position = _live_position_with_metadata()
+    db = _db()
+    trading = _RetryTrading(fail_times=1)
+    candidate = StopCandidate(
+        price=Decimal("95"),
+        reason="breakeven",
+        indicators={"current_price": "105"},
+        r_multiple=Decimal("1"),
+    )
+
+    result = engine.replace_live_stop_order(db, _market(), position, candidate, trading)
+
+    assert result is True
+    assert trading.call_count == 2
+    # ogni tentativo deve usare un cloid diverso
+    cloids = [s["cloid"] for s in trading.submitted]
+    assert len(set(cloids)) == 2
+
+
+def test_retry_all_attempts_fail_records_failure_once(monkeypatch) -> None:
+    monkeypatch.setattr("app.engine.position_management.time.sleep", lambda _: None)
+    engine = PositionManagementEngine(Settings())
+    position = _live_position_with_metadata()
+    db = _db()
+    trading = _RetryTrading(fail_times=99)
+    candidate = StopCandidate(
+        price=Decimal("95"),
+        reason="breakeven",
+        indicators={"current_price": "105"},
+        r_multiple=Decimal("1"),
+    )
+
+    result = engine.replace_live_stop_order(db, _market(), position, candidate, trading)
+
+    assert result is False
+    assert trading.call_count == 3  # 3 tentativi totali
+    failure_logs = [
+        r for r in db.added
+        if isinstance(r, DecisionLog) and r.event_type == "live_stop_update_submit_failed"
+    ]
+    assert len(failure_logs) == 1  # un solo log, non tre
+
+
+def test_retry_on_exception_succeeds_on_third_attempt(monkeypatch) -> None:
+    monkeypatch.setattr("app.engine.position_management.time.sleep", lambda _: None)
+    engine = PositionManagementEngine(Settings())
+    position = _live_position_with_metadata()
+    db = _db()
+    trading = _RetryTrading(fail_times=2, raise_exc=True)
+    candidate = StopCandidate(
+        price=Decimal("95"),
+        reason="breakeven",
+        indicators={"current_price": "105"},
+        r_multiple=Decimal("1"),
+    )
+
+    result = engine.replace_live_stop_order(db, _market(), position, candidate, trading)
+
+    assert result is True
+    assert trading.call_count == 3

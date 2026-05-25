@@ -68,12 +68,12 @@ class RiskManager:
             tp3_target = entry + risk * (target_rr + 1)
             tp1 = _target_before_resistance(resistance_levels, tp1_target, buffer)
             tp2 = _target_before_resistance(resistance_levels, tp2_target, buffer)
-            tp3 = _target_before_resistance(resistance_levels, tp3_target, buffer)
+            tp3: float | None = _target_before_resistance(resistance_levels, tp3_target, buffer)
             tp1 = max(tp1, entry + risk)
             tp2 = max(tp2, entry + risk * risk_reward_floor)
             if tp2 <= tp1:
                 tp2 = entry + risk * max(risk_reward_floor, 2.0)
-            if tp3 <= tp2:
+            if tp3 is not None and tp3 <= tp2:
                 tp3 = None
             if ob_analysis is not None:
                 wall_buf = latest_atr * 0.15

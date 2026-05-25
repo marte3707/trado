@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -7,6 +8,17 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.enums import OrderMode
 from app.db.models import Position, Signal
+
+
+def _wilson_bounds(wins: int, trades: int, z: float = 1.96) -> tuple[float, float]:
+    if trades <= 0:
+        return 0.0, 0.0
+    p_hat = wins / trades
+    z_sq = z * z
+    denom = 1.0 + z_sq / trades
+    center = (p_hat + z_sq / (2 * trades)) / denom
+    margin = z * math.sqrt((p_hat * (1 - p_hat) + z_sq / (4 * trades)) / trades) / denom
+    return max(0.0, center - margin), min(1.0, center + margin)
 
 
 @dataclass(frozen=True)
@@ -71,13 +83,20 @@ class SignalPerformanceAnalyzer:
             profit_factor=profit_factor,
         )
 
-    def strategy_stats(
+    def strategy_positions(
         self,
         db: Session,
         timeframe: str | None = None,
         market_id: int | None = None,
         limit: int = 500,
-    ) -> dict[str, PerformanceStats]:
+    ) -> dict[str, list[Position]]:
+        """Posizioni chiuse raggruppate per strategia che ha contribuito al segnale.
+
+        Why expose this: la holdout validation in `AutoCalibrationEngine` ha bisogno
+        delle posizioni *individuali* per fare lo split train/test temporale. Ricavare
+        gli stats da `summarize_positions(...)` mantiene la composizione semplice.
+        Ritorna le posizioni nello stesso ordine di `closed_paper_positions` (closed_at desc).
+        """
         positions = self.closed_paper_positions(db, timeframe, market_id, limit)
         signal_ids = {
             int(position.metadata_json["source_signal_id"])
@@ -108,10 +127,113 @@ class SignalPerformanceAnalyzer:
                 if breakdown.get("direction") == "NEUTRAL" or breakdown.get("contribution", 0) <= 0:
                     continue
                 by_strategy.setdefault(strategy_name, []).append(position)
+        return by_strategy
+
+    def strategy_stats(
+        self,
+        db: Session,
+        timeframe: str | None = None,
+        market_id: int | None = None,
+        limit: int = 500,
+    ) -> dict[str, PerformanceStats]:
         return {
-            strategy_name: self.summarize_positions(strategy_positions)
-            for strategy_name, strategy_positions in by_strategy.items()
+            name: self.summarize_positions(positions)
+            for name, positions in self.strategy_positions(
+                db, timeframe=timeframe, market_id=market_id, limit=limit
+            ).items()
         }
+
+    @staticmethod
+    def holdout_split_stats(
+        positions: list[Position],
+        train_ratio: float = 0.7,
+        min_samples_per_side: int = 5,
+    ) -> tuple[PerformanceStats, PerformanceStats] | None:
+        """Split temporale train/test per holdout validation.
+
+        Why: la calibration usa le stesse posizioni che ha contribuito a generare per
+        decidere i factor futuri (look-ahead bias). Lo split temporale crea un naive
+        out-of-sample check: la più vecchia frazione `train_ratio` è il "training",
+        la più recente è il "test". Se la decisione regge su entrambi → segnale è robusto.
+        Se diverge → probabile overfitting al rumore.
+
+        Le posizioni in input sono attese in ordine *desc* per closed_at (come ritorna
+        `closed_paper_positions`). Ritorna `None` se non ci sono abbastanza campioni
+        per uno split significativo.
+        """
+        if not positions:
+            return None
+        n = len(positions)
+        cutoff = int(n * train_ratio)
+        # input desc → ribaltiamo per avere asc temporale
+        chronological = list(reversed(positions))
+        train = chronological[:cutoff]
+        test = chronological[cutoff:]
+        if len(train) < min_samples_per_side or len(test) < min_samples_per_side:
+            return None
+        analyzer = SignalPerformanceAnalyzer()
+        return analyzer.summarize_positions(train), analyzer.summarize_positions(test)
+
+    @staticmethod
+    def time_weighted_summarize(
+        positions: list[Position],
+        half_life: int = 50,
+    ) -> PerformanceStats:
+        """PerformanceStats con peso esponenzialmente decrescente per posizioni vecchie.
+
+        Le posizioni più recenti (in fondo all'ordinamento desc) contano di più. Utile
+        quando il regime di mercato è cambiato: gli stats "puri" su lookback 500 trade
+        possono essere dominati da un periodo non più rappresentativo.
+
+        Le posizioni in input sono attese in ordine *desc* per closed_at. `half_life`
+        è espresso in numero di trade: dopo `half_life` trade dal più recente il peso
+        è 0.5; dopo 2× è 0.25; ecc.
+
+        I conteggi `trades/wins/losses` restano interi (per compatibilità) ma riflettono
+        la somma ponderata arrotondata; PnL/profit_factor sono floats pesati.
+        """
+        if not positions:
+            return PerformanceStats(0, 0, 0, 0.0, 0.0, 0.0, 0.0, None)
+        # decay: position[0] è la più recente (desc), peso 1.0 → posizioni più vecchie scendono
+        decay = math.log(2.0) / max(1, half_life)
+        weighted_wins = 0.0
+        weighted_losses = 0.0
+        weighted_gross_profit = 0.0
+        weighted_gross_loss = 0.0
+        weighted_pnl = 0.0
+        weighted_count = 0.0
+        for index, position in enumerate(positions):
+            if position.realized_pnl is None:
+                continue
+            weight = math.exp(-decay * index)
+            pnl = float(position.realized_pnl)
+            weighted_pnl += pnl * weight
+            weighted_count += weight
+            if pnl > 0:
+                weighted_wins += weight
+                weighted_gross_profit += pnl * weight
+            else:
+                weighted_losses += weight
+                weighted_gross_loss += abs(pnl) * weight
+        if weighted_count == 0:
+            return PerformanceStats(0, 0, 0, 0.0, 0.0, 0.0, 0.0, None)
+        win_rate = weighted_wins / weighted_count
+        profit_factor = (
+            weighted_gross_profit / weighted_gross_loss if weighted_gross_loss > 0 else None
+        )
+        # Per i conteggi interi: scala mantenendo le proporzioni rispetto al campione reale
+        n = len(positions)
+        scale = n / weighted_count if weighted_count else 0.0
+        return PerformanceStats(
+            trades=n,
+            wins=int(round(weighted_wins * scale)),
+            losses=int(round(weighted_losses * scale)),
+            win_rate=win_rate,
+            realized_pnl=weighted_pnl,
+            gross_profit=weighted_gross_profit,
+            gross_loss=weighted_gross_loss,
+            profit_factor=profit_factor,
+        )
 
     def adjusted_weights(
         self,
@@ -119,7 +241,7 @@ class SignalPerformanceAnalyzer:
         weights: dict[str, int],
         timeframe: str,
         market_id: int,
-        min_trades: int = 8,
+        min_trades: int = 20,
     ) -> tuple[dict[str, int], dict[str, dict]]:
         scoped_stats = self.strategy_stats(db, timeframe=timeframe, market_id=market_id)
         timeframe_stats = self.strategy_stats(db, timeframe=timeframe)
@@ -137,12 +259,16 @@ class SignalPerformanceAnalyzer:
                 strategy_stats = global_stats.get(strategy_name)
             if strategy_stats is None or strategy_stats.trades < min_trades:
                 continue
+            # Wilson bounds del WR per ridurre il rumore campionario; le stesse soglie
+            # sono usate in AutoCalibrationEngine._strategy_factor → coerenza tra i due
+            # adjuster (era una fonte di inconsistenza segnalata in audit).
+            wr_lb, wr_ub = _wilson_bounds(strategy_stats.wins, strategy_stats.trades)
             factor = 1.0
-            if strategy_stats.win_rate < 0.35:
+            if wr_ub < 0.40:
                 factor = 0.55
-            elif strategy_stats.win_rate < 0.45:
+            elif wr_ub < 0.50:
                 factor = 0.75
-            elif strategy_stats.win_rate >= 0.58 and (
+            elif wr_lb >= 0.55 and (
                 strategy_stats.profit_factor is None or strategy_stats.profit_factor >= 1.2
             ):
                 factor = 1.15
@@ -154,6 +280,8 @@ class SignalPerformanceAnalyzer:
                 "scope": scope,
                 "trades": strategy_stats.trades,
                 "win_rate": strategy_stats.win_rate,
+                "wr_lower_bound": wr_lb,
+                "wr_upper_bound": wr_ub,
                 "realized_pnl": strategy_stats.realized_pnl,
                 "profit_factor": strategy_stats.profit_factor,
             }

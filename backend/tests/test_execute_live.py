@@ -106,11 +106,14 @@ class FakeTradingClient:
         account_value: Decimal = Decimal("1000"),
         market_status: str = "ok",
         trigger_failures: set[str] | None = None,
+        user_state_positions: list[dict[str, Any]] | None = None,
     ) -> None:
         self._account_value = account_value
         self.market_status = market_status
         self.trigger_failures = trigger_failures or set()
+        self.user_state_positions = user_state_positions or []
         self.market_orders: list[dict[str, Any]] = []
+        self.close_orders: list[dict[str, Any]] = []
         self.trigger_orders: list[dict[str, Any]] = []
         self.leverage_calls: list[dict[str, Any]] = []
 
@@ -184,6 +187,34 @@ class FakeTradingClient:
             filled_size=size,
             raw_response={"status": "ok", "tpsl": tpsl},
         )
+
+    def submit_market_close(
+        self,
+        coin: str,
+        is_buy: bool,
+        size: Decimal,
+        max_slippage_pct: float,
+        expires_after_seconds: int,
+    ) -> HyperliquidOrderResult:
+        self.close_orders.append(
+            {
+                "coin": coin,
+                "is_buy": is_buy,
+                "size": size,
+                "max_slippage_pct": max_slippage_pct,
+                "expires_after_seconds": expires_after_seconds,
+            }
+        )
+        return HyperliquidOrderResult(
+            status="ok",
+            oid=f"close-{len(self.close_orders)}",
+            avg_price=Decimal("100"),
+            filled_size=size,
+            raw_response={"status": "ok"},
+        )
+
+    def user_state(self, _address: str | None = None) -> dict[str, Any]:
+        return {"assetPositions": [{"position": row} for row in self.user_state_positions]}
 
 
 def _build_settings() -> Settings:
@@ -335,6 +366,34 @@ def test_execute_live_records_partial_failure_when_trigger_fails(monkeypatch: py
     assert any("stop_loss" in e for e in position.metadata_json["protection_order_errors"])
     events = [row.event_type for row in db.added_of(DecisionLog)]
     assert "live_protection_orders_partial_failure" in events
+
+
+def test_execute_live_closes_position_when_stop_is_beyond_liquidation(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_short_signal()
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient(
+        user_state_positions=[
+            {
+                "coin": "BTC",
+                "szi": "-1",
+                "liquidationPx": "104",
+            }
+        ]
+    )
+
+    with pytest.raises(PermissionError, match="stop loss is not before liquidation price"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.close_orders != []
+    assert trading.trigger_orders == []
+    position = db.added_of(Position)[0]
+    assert position.status == "closed"
+    assert any(
+        row.event_type == "live_position_liquidation_guard_failed"
+        for row in db.added_of(DecisionLog)
+    )
 
 
 def test_execute_live_raises_permission_error_when_validation_fails(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -34,6 +35,19 @@ class StopCandidate:
     reason: str
     indicators: dict[str, Any]
     r_multiple: Decimal
+
+
+@dataclass(frozen=True)
+class LiquidationGuardResult:
+    status: str
+    reason: str
+    liquidation_price: Decimal | None
+    stop_loss: Decimal | None
+    coin: str | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.status == "failed"
 
 
 class PositionManagementEngine:
@@ -478,35 +492,79 @@ class PositionManagementEngine:
         trading = trading_client or HyperliquidTradingClient(self.settings)
         coin = _coin_for_market(market)
         sz_decimals = _sz_decimals(market)
-        cloid = uuid.uuid4().hex
-        try:
-            result = trading.submit_trigger_order(
-                coin=coin,
-                is_buy=close_is_buy,
-                size=_round_size(position.size, sz_decimals),
-                trigger_price=candidate.price,
-                tpsl="sl",
-                expires_after_seconds=int(live_settings["order_expires_after_seconds"]),
-                cloid=cloid,
-            )
-        except Exception as exc:
+        guard = self.check_liquidation_guard(
+            db,
+            position,
+            stop_loss=candidate.price,
+            coin=coin,
+            trading_client=trading,
+            source="stop_update",
+        )
+        if guard.failed:
             self._record_stop_update_failure(
                 db,
                 position,
-                reason="submit_exception",
-                payload={"error": str(exc), "candidate_stop": str(candidate.price)},
-            )
-            return False
-        if result.status != "ok":
-            self._record_stop_update_failure(
-                db,
-                position,
-                reason="submit_rejected",
+                reason="liquidation_guard_failed",
                 payload={
-                    "response": result.raw_response,
                     "candidate_stop": str(candidate.price),
+                    "liquidation_price": str(guard.liquidation_price)
+                    if guard.liquidation_price is not None
+                    else None,
                 },
             )
+            return False
+        order_size = _round_size(position.size, sz_decimals)
+        expires = int(live_settings["order_expires_after_seconds"])
+        _RETRY_DELAYS = (0.5, 1.5)  # secondi tra tentativo 1→2 e 2→3
+        last_exc: Exception | None = None
+        last_response: dict | None = None
+        result = None
+        cloid = uuid.uuid4().hex
+        for attempt in range(len(_RETRY_DELAYS) + 1):
+            if attempt > 0:
+                time.sleep(_RETRY_DELAYS[attempt - 1])
+                cloid = uuid.uuid4().hex  # nuovo cloid per evitare duplicate-cloid rejection su HL
+                logger.warning(
+                    "live_stop_update_retry",
+                    position_id=position.id,
+                    attempt=attempt + 1,
+                    candidate_stop=str(candidate.price),
+                )
+            try:
+                result = trading.submit_trigger_order(
+                    coin=coin,
+                    is_buy=close_is_buy,
+                    size=order_size,
+                    trigger_price=candidate.price,
+                    tpsl="sl",
+                    expires_after_seconds=expires,
+                    cloid=cloid,
+                )
+                last_exc = None
+            except Exception as exc:
+                last_exc = exc
+                last_response = None
+                continue
+            if result.status == "ok":
+                break
+            last_response = result.raw_response
+            result = None
+
+        if result is None:
+            if last_exc is not None:
+                self._record_stop_update_failure(
+                    db,
+                    position,
+                    reason="submit_exception",
+                    payload={"error": str(last_exc), "candidate_stop": str(candidate.price), "attempts": len(_RETRY_DELAYS) + 1},
+                )
+            else:
+                self._record_stop_update_failure(
+                    db,
+                    position,
+                    reason="submit_rejected",
+                    payload={"response": last_response, "candidate_stop": str(candidate.price), "attempts": len(_RETRY_DELAYS) + 1},
+                )
             return False
         # Successo: azzeriamo il contatore degli attempt falliti
         metadata = dict(position.metadata_json or {})
@@ -595,6 +653,227 @@ class PositionManagementEngine:
         position.metadata_json = metadata
         return metadata
 
+    def audit_live_positions_against_liquidation(
+        self,
+        db: Session,
+        trading_client: HyperliquidTradingClient | None = None,
+    ) -> dict[str, int]:
+        positions = (
+            db.query(Position)
+            .filter(
+                Position.mode == OrderMode.LIVE.value,
+                Position.status == "open",
+            )
+            .all()
+        )
+        if not positions or not self.settings.hyperliquid_account_address:
+            return {"checked": 0, "failed": 0, "skipped": 0}
+
+        trading = trading_client or HyperliquidTradingClient(self.settings)
+        remote_positions = _remote_position_map(
+            trading.user_state(self.settings.hyperliquid_account_address)
+        )
+        checked = 0
+        failed = 0
+        skipped = 0
+        for position in positions:
+            market = position.market or db.get(Market, position.market_id)
+            if market is None:
+                result = self._persist_liquidation_guard_result(
+                    db,
+                    position,
+                    LiquidationGuardResult(
+                        status="skipped",
+                        reason="market_not_found",
+                        liquidation_price=None,
+                        stop_loss=position.stop_loss,
+                    ),
+                    source="periodic_audit",
+                )
+            else:
+                coin = _coin_for_market(market)
+                result = self.check_liquidation_guard(
+                    db,
+                    position,
+                    coin=coin,
+                    remote_position=remote_positions.get(coin),
+                    source="periodic_audit",
+                )
+            checked += 1
+            if result.failed:
+                failed += 1
+            elif result.status == "skipped":
+                skipped += 1
+        db.add(
+            DecisionLog(
+                event_type="live_liquidation_guard_cycle",
+                message="Periodic liquidation guard audit completed",
+                data={
+                    "checked": checked,
+                    "failed": failed,
+                    "skipped": skipped,
+                },
+            )
+        )
+        db.commit()
+        return {"checked": checked, "failed": failed, "skipped": skipped}
+
+    def check_liquidation_guard(
+        self,
+        db: Session,
+        position: Position,
+        *,
+        stop_loss: Decimal | None = None,
+        coin: str | None = None,
+        remote_position: dict[str, Any] | None = None,
+        trading_client: HyperliquidTradingClient | None = None,
+        source: str,
+    ) -> LiquidationGuardResult:
+        checked_stop = stop_loss if stop_loss is not None else position.stop_loss
+        resolved_coin = coin
+        remote = remote_position
+        if remote is None and resolved_coin is not None:
+            if not self.settings.hyperliquid_account_address:
+                return self._persist_liquidation_guard_result(
+                    db,
+                    position,
+                    LiquidationGuardResult(
+                        status="skipped",
+                        reason="missing_account_address",
+                        liquidation_price=None,
+                        stop_loss=checked_stop,
+                        coin=resolved_coin,
+                    ),
+                    source=source,
+                )
+            try:
+                trading = trading_client or HyperliquidTradingClient(self.settings)
+                state = trading.user_state(self.settings.hyperliquid_account_address)
+                remote = _remote_position_map(state).get(resolved_coin)
+            except Exception as exc:
+                logger.warning(
+                    "liquidation_guard_remote_lookup_failed",
+                    position_id=position.id,
+                    coin=resolved_coin,
+                    error=str(exc),
+                )
+                return self._persist_liquidation_guard_result(
+                    db,
+                    position,
+                    LiquidationGuardResult(
+                        status="skipped",
+                        reason="remote_lookup_failed",
+                        liquidation_price=None,
+                        stop_loss=checked_stop,
+                        coin=resolved_coin,
+                    ),
+                    source=source,
+                )
+        result = self._evaluate_liquidation_guard(
+            position,
+            stop_loss=checked_stop,
+            liquidation_price=_decimal(
+                remote.get("liquidationPx") if isinstance(remote, dict) else None,
+                None,
+            ),
+            coin=resolved_coin,
+        )
+        return self._persist_liquidation_guard_result(db, position, result, source=source)
+
+    def _evaluate_liquidation_guard(
+        self,
+        position: Position,
+        *,
+        stop_loss: Decimal | None,
+        liquidation_price: Decimal | None,
+        coin: str | None,
+    ) -> LiquidationGuardResult:
+        if stop_loss is None:
+            return LiquidationGuardResult(
+                status="skipped",
+                reason="missing_stop_loss",
+                liquidation_price=liquidation_price,
+                stop_loss=stop_loss,
+                coin=coin,
+            )
+        if liquidation_price is None or liquidation_price <= 0:
+            return LiquidationGuardResult(
+                status="skipped",
+                reason="missing_liquidation_price",
+                liquidation_price=liquidation_price,
+                stop_loss=stop_loss,
+                coin=coin,
+            )
+        side = position.side.lower()
+        if side == "long":
+            ok = stop_loss > liquidation_price
+        elif side == "short":
+            ok = stop_loss < liquidation_price
+        else:
+            return LiquidationGuardResult(
+                status="skipped",
+                reason="invalid_side",
+                liquidation_price=liquidation_price,
+                stop_loss=stop_loss,
+                coin=coin,
+            )
+        return LiquidationGuardResult(
+            status="ok" if ok else "failed",
+            reason="stop_before_liquidation" if ok else "stop_not_before_liquidation",
+            liquidation_price=liquidation_price,
+            stop_loss=stop_loss,
+            coin=coin,
+        )
+
+    def _persist_liquidation_guard_result(
+        self,
+        db: Session,
+        position: Position,
+        result: LiquidationGuardResult,
+        *,
+        source: str,
+    ) -> LiquidationGuardResult:
+        metadata = dict(position.metadata_json or {})
+        now = datetime.now(timezone.utc).isoformat()
+        metadata.update(
+            {
+                "last_liquidation_guard_check_at": now,
+                "last_liquidation_guard_source": source,
+                "last_liquidation_guard_status": result.status,
+                "last_liquidation_guard_reason": result.reason,
+                "last_liquidation_guard_stop_loss": str(result.stop_loss)
+                if result.stop_loss is not None
+                else None,
+                "last_liquidation_price": str(result.liquidation_price)
+                if result.liquidation_price is not None
+                else None,
+            }
+        )
+        if result.failed:
+            metadata["last_liquidation_guard_failure_at"] = now
+        position.metadata_json = metadata
+        db.add(position)
+        if result.failed:
+            db.add(
+                DecisionLog(
+                    event_type="live_position_liquidation_guard_failed",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message="Stop loss is not before liquidation price",
+                    data={
+                        "source": source,
+                        "coin": result.coin,
+                        "side": position.side,
+                        "entry_price": str(position.entry_price),
+                        "stop_loss": str(result.stop_loss) if result.stop_loss is not None else None,
+                        "liquidation_price": str(result.liquidation_price)
+                        if result.liquidation_price is not None
+                        else None,
+                    },
+                )
+            )
+        return result
+
     def position_matches_timeframe(self, db: Session, position: Position, timeframe: str) -> bool:
         metadata = position.metadata_json or {}
         source_timeframe = metadata.get("source_timeframe")
@@ -679,6 +958,20 @@ def _coin_for_market(market: Market) -> str:
     if not isinstance(coin, str) or not coin:
         raise ValueError("market has no Hyperliquid coin mapping")
     return coin
+
+
+def _remote_position_map(user_state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for item in user_state.get("assetPositions", []):
+        if not isinstance(item, dict):
+            continue
+        position = item.get("position")
+        if not isinstance(position, dict):
+            continue
+        coin = position.get("coin")
+        if isinstance(coin, str) and coin:
+            result[coin] = position
+    return result
 
 
 def _sz_decimals(market: Market) -> int:

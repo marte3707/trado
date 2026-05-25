@@ -144,19 +144,29 @@ class OrderExecutionEngine:
         )
         notional = Decimal(str(size)) * signal.entry_price
         leverage = notional / Decimal(str(equity)) if equity > 0 else Decimal("0")
+        base_metadata: dict[str, Any] = {
+            "source_signal_id": signal.id,
+            "source_timeframe": signal.timeframe,
+            "initial_size": str(size),
+            "remaining_size": str(size),
+            "account_value_at_entry": str(equity),
+            "take_profit_plan": self._build_take_profit_plan(db, signal),
+        }
+        # AB tag propagato dal signal_engine: serve all'evaluator dell'auto-tuner
+        # per attribuire la posizione all'arm corretto (control vs test).
+        breakdown = signal.strategy_breakdown or {}
+        ab_tag = breakdown.get("_auto_tuner") if isinstance(breakdown, dict) else None
+        if isinstance(ab_tag, dict) and ab_tag.get("arm") in ("control", "test"):
+            base_metadata["_auto_tuner"] = {
+                "step_key": ab_tag.get("step_key"),
+                "arm": ab_tag.get("arm"),
+            }
         metadata = self.position_manager.initial_metadata(
             db,
             signal,
             size=Decimal(str(size)),
             planned_notional=notional,
-            base={
-                "source_signal_id": signal.id,
-                "source_timeframe": signal.timeframe,
-                "initial_size": str(size),
-                "remaining_size": str(size),
-                "account_value_at_entry": str(equity),
-                "take_profit_plan": self._build_take_profit_plan(db, signal),
-            },
+            base=base_metadata,
         )
         position = Position(
             market_id=signal.market_id,
@@ -336,22 +346,30 @@ class OrderExecutionEngine:
     ) -> Position:
         filled_size = entry_result.filled_size or requested_size
         entry_price = entry_result.avg_price or signal.entry_price
+        live_base: dict[str, Any] = {
+            "source_signal_id": signal.id,
+            "source_timeframe": signal.timeframe,
+            "initial_size": str(filled_size),
+            "remaining_size": str(filled_size),
+            "account_value_at_entry": str(account_value),
+            "contract_leverage": plan.max_leverage,
+            "entry_response": entry_result.raw_response,
+            "take_profit_plan": self._build_take_profit_plan(db, signal),
+            "funding_rate": (signal.strategy_breakdown or {}).get("_funding_rate"),
+        }
+        breakdown = signal.strategy_breakdown or {}
+        ab_tag = breakdown.get("_auto_tuner") if isinstance(breakdown, dict) else None
+        if isinstance(ab_tag, dict) and ab_tag.get("arm") in ("control", "test"):
+            live_base["_auto_tuner"] = {
+                "step_key": ab_tag.get("step_key"),
+                "arm": ab_tag.get("arm"),
+            }
         metadata = self.position_manager.initial_metadata(
             db,
             signal,
             size=filled_size,
             planned_notional=plan.notional,
-            base={
-                "source_signal_id": signal.id,
-                "source_timeframe": signal.timeframe,
-                "initial_size": str(filled_size),
-                "remaining_size": str(filled_size),
-                "account_value_at_entry": str(account_value),
-                "contract_leverage": plan.max_leverage,
-                "entry_response": entry_result.raw_response,
-                "take_profit_plan": self._build_take_profit_plan(db, signal),
-                "funding_rate": (signal.strategy_breakdown or {}).get("_funding_rate"),
-            },
+            base=live_base,
         )
         position = Position(
             market_id=signal.market_id,
@@ -477,6 +495,24 @@ class OrderExecutionEngine:
         close_is_buy = position.side.lower() == "short"
         protection_errors: list[str] = []
         submitted_parts: list[str] = []
+
+        guard = self.position_manager.check_liquidation_guard(
+            db,
+            position,
+            coin=coin,
+            trading_client=trading,
+            source="post_entry",
+        )
+        if guard.failed:
+            self.close_live_position(
+                db,
+                position,
+                reason="liquidation_guard_failed",
+                trading_client=trading,
+            )
+            raise PermissionError(
+                "stop loss is not before liquidation price; live position closed immediately"
+            )
 
         if signal.stop_loss is not None:
             sl_cloid = make_cloid(signal.id, "sl")

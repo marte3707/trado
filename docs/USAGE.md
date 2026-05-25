@@ -374,3 +374,115 @@ bash scripts/launchd/uninstall.sh
 ## 3. Controlla che il tuner abbia ripreso bene
 
 curl -s <http://localhost:8000/api/auto-tuner/status> | jq
+
+### TODO
+
+§3.1 walk-forward calibration (refactor architetturale) -> **FATTO**
+§2.1 vectorization indicators con numpy/pandas-ta -> **NON APPLICATO**
+§4.8 nuove strategie (CVD, liquidation cascade, volume profile) -> **FATTO**
+§4.9 regime detection alternativo (Hurst, GARCH) -> **FATTO**
+§3.10 A/B testing auto-tuner -> **FATTO**
+
+## A/B testing auto-tuner (§3.10)
+
+L'auto-tuner storico (`mode: "sequential"`, default) confronta i trade pre e post-attivazione del patch sulla stessa popolazione di mercato. Il problema noto: se le condizioni di regime cambiano fra finestra pre e post, il confronto è confuso da bias temporali.
+
+In `mode: "ab_test"` l'auto-tuner non modifica mai globalmente `risk` finché lo step non viene promosso. Per ogni nuovo segnale `SignalEngine.evaluate()` chiama `active_ab_overlay()`, sceglie randomicamente fra arm `control` (overlay = `step.revert`) e arm `test` (overlay = `step.patch`) con probabilità `ab_test_allocation`, e mergia l'overlay nel `risk_value` locale prima di derivare i filtri. La posizione che ne nasce viene taggata in `metadata_json["_auto_tuner"] = {"step_key", "arm"}` (sia paper sia live).
+
+Quando entrambi gli arm hanno raccolto almeno `ab_test_min_trades_per_arm` posizioni chiuse post-attivazione, l'auto-tuner esegue un Welch's t-test sulla media del PnL realizzato e:
+
+- promuove (`status: "promoted"`, applica `step.patch` a `risk`) se `mean_test > mean_control` *e* `p_one_tailed < ab_test_significance_level`
+- rifiuta (`status: "rejected"`, nessuna modifica al setting) altrimenti
+
+In entrambi i casi lo step viene chiuso e la cronologia (`step_history`) include `n_control`, `n_test`, `mean_control`, `mean_test`, `t_statistic`, `degrees_of_freedom`, `p_one_tailed`.
+
+### Configurazione
+
+Si imposta via `PATCH /api/settings`:
+
+```bash
+curl -X PATCH http://localhost:8000/api/settings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "auto_tuner_config": {
+      "value": {
+        "enabled": true,
+        "mode": "ab_test",
+        "ab_test_min_trades_per_arm": 30,
+        "ab_test_significance_level": 0.05,
+        "ab_test_allocation": 0.5,
+        "sequence": [
+          {"key": "regime_filter", "label": "Regime filter (ADX)",
+           "patch": {"regime_filter_enabled": true},
+           "revert": {"regime_filter_enabled": false}}
+        ]
+      }
+    }
+  }'
+```
+
+Parametri:
+
+- `ab_test_min_trades_per_arm` (default 30): minimo di trade chiusi per arm prima di valutare. Sotto questa soglia `run()` ritorna `status: "in_progress"`.
+- `ab_test_significance_level` (default 0.05): α one-tailed per promuovere il patch.
+- `ab_test_allocation` (default 0.5): P(test). 0.5 = 50/50; valori più bassi (es. 0.2) consentono di limitare l'esposizione al rischio della variante non testata.
+
+Il p-value è calcolato con approssimazione normale del CDF di Student (sufficiente per n ≥ ~20 per arm). Per popolazioni più piccole o distribuzioni molto fat-tailed l'errore di approssimazione è conservativo (sotto-stima la significatività).
+
+### Stato e controllo
+
+`GET /api/auto-tuner/status` espone, in modalità AB:
+
+```json
+{
+  "enabled": true,
+  "mode": "ab_test",
+  "current_step_key": "regime_filter",
+  "current_step_mode": "ab_test",
+  "ab_test_state": {
+    "control_overlay": {"regime_filter_enabled": false},
+    "test_overlay":    {"regime_filter_enabled": true},
+    "allocation": 0.5
+  },
+  "ab_progress": {"trades_control": 18, "trades_test": 21, "trades_required_per_arm": 30}
+}
+```
+
+`POST /api/auto-tuner/rollback` chiude lo step corrente senza alcuna modifica a `risk` (in AB mode il patch non era stato applicato). `POST /api/auto-tuner/reset` azzera anche la history.
+
+### Limitazioni note
+
+- Gli overlay attualmente in `DEFAULT_SEQUENCE` (regime, MTF, volatility, participation ratio) toccano solo filtri di signal-generation. Patch che modifichino parametri di sizing/execution (es. `max_risk_per_trade_pct`) non sono pienamente A/B-isolati: `OrderExecutionEngine` legge `risk` direttamente al momento dell'apertura della posizione e userebbe il valore "globale" (= control), creando un sottile leak fra arm. Per quei casi servirebbe propagare anche `_auto_tuner` overlay all'esecuzione.
+- L'assegnazione arm è random per-segnale (`random.random()`), quindi non riproducibile fra worker tick. Per audit fine usare il tag `_auto_tuner.arm` persistito sulla `Position`.
+- L'auto-tuner valuta solo posizioni paper (`SignalPerformanceAnalyzer.closed_paper_positions`). Il tag viene comunque scritto anche su posizioni live per coerenza.
+
+## Regime detection alternativo
+
+Oltre al classico ADX, `risk_controls.regime_method` permette di selezionare metodi alternativi per la classificazione di mercato:
+
+- `adx` (default) — soglie su ADX con isteresi `regime_confirm_candles`.
+- `hurst` — esponente di Hurst via R/S analysis sui log-returns. `H ≥ regime_hurst_trending` (default 0.55) → trending; `H ≤ regime_hurst_ranging` (default 0.45) → ranging; intervallo intermedio → mixed (random walk). Richiede almeno `regime_hurst_max_lag * 4` candele.
+- `garch` — proxy GARCH-lite: autocorrelazione lag-`regime_garch_lag` (default 1) dei rendimenti al quadrato su una finestra di `regime_garch_window` candele (default 50). Valori ≥ `regime_garch_cluster_threshold` (default 0.2) indicano vol clustering → trending; valori ≤ threshold/2 → ranging.
+- `hybrid` — esegue tutti i sub-detectors disponibili e prende il consensus a maggioranza; richiede ≥ 2 metodi concordi per dichiarare un regime non-mixed.
+
+Parametri in `AppSetting("risk_controls")`:
+
+```json
+{
+  "regime_filter_enabled": true,
+  "regime_method": "adx",
+  "regime_adx_trending": 25.0,
+  "regime_adx_ranging": 18.0,
+  "regime_confirm_candles": 2,
+  "regime_off_weight_multiplier": 0.5,
+  "regime_hurst_trending": 0.55,
+  "regime_hurst_ranging": 0.45,
+  "regime_hurst_min_lag": 2,
+  "regime_hurst_max_lag": 20,
+  "regime_garch_window": 50,
+  "regime_garch_lag": 1,
+  "regime_garch_cluster_threshold": 0.2
+}
+```
+
+Le metriche calcolate (es. `hurst`, `garch`, `adx`) e i sub-regimi finiscono nel breakdown `_regime` del segnale, visibile nella UI di analisi sotto "Filtri di sistema".

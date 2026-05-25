@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -7,9 +8,9 @@ import structlog
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import get_settings
-from app.core.enums import OrderMode
+from app.core.enums import OrderMode, SignalStatus
 from app.core.runtime_settings import effective_live_execution_settings
-from app.db.models import DecisionLog, Market, Order, Position
+from app.db.models import DecisionLog, Market, Order, Position, Signal
 from app.services.hyperliquid import HyperliquidTradingClient
 
 logger = structlog.get_logger()
@@ -36,6 +37,13 @@ _TPSL_BY_ORDER_TYPE: dict[str, str] = {
 # After this many consecutive failed re-submissions we stop retrying to avoid
 # infinite resubmit loops when HL persistently rejects the order.
 _MAX_RESUBMIT_ATTEMPTS = 3
+
+
+@dataclass(frozen=True)
+class _ExitFillMatch:
+    realized_delta: Decimal
+    last_exit_price: Decimal | None
+    last_exit_reason: str | None
 
 
 def _decimal(value: str | int | float | Decimal | None) -> Decimal | None:
@@ -93,7 +101,7 @@ def _reconcile_exit_fills(
     coin: str,
     fills_by_cloid: dict[str, list[dict]],
     fills_by_oid: dict[int, list[dict]],
-) -> Decimal:
+) -> _ExitFillMatch:
     """Match pending TP/SL orders against HL fills and finalize them.
 
     Returns the realized-PnL delta to add to the position. Mutates the
@@ -111,12 +119,18 @@ def _reconcile_exit_fills(
         .all()
     )
     if not pending_orders:
-        return Decimal("0")
+        return _ExitFillMatch(
+            realized_delta=Decimal("0"),
+            last_exit_price=None,
+            last_exit_reason=None,
+        )
 
     metadata = position.metadata_json or {}
     plan = metadata.get("take_profit_plan")
     plan_mut = plan if isinstance(plan, list) else None
     realized_delta = Decimal("0")
+    last_exit_price: Decimal | None = None
+    last_exit_reason: str | None = None
 
     for order in pending_orders:
         # Defensive: SQL filter should already exclude these, but never
@@ -178,6 +192,9 @@ def _reconcile_exit_fills(
                 metadata["runner_active"] = True
 
         realized_delta += total_pnl
+        if avg_px is not None:
+            last_exit_price = avg_px
+            last_exit_reason = order.order_type
         db.add(
             DecisionLog(
                 event_type=f"live_reconciliation_{order.order_type}_filled",
@@ -196,7 +213,11 @@ def _reconcile_exit_fills(
             )
         )
 
-    return realized_delta
+    return _ExitFillMatch(
+        realized_delta=realized_delta,
+        last_exit_price=last_exit_price,
+        last_exit_reason=last_exit_reason,
+    )
 
 
 def _sz_decimals(market: Market | None) -> int:
@@ -242,15 +263,150 @@ def _index_open_orders(open_orders: list[dict]) -> tuple[set[int], set[str]]:
     return oids, cloids
 
 
+def _index_frontend_open_orders(frontend_open_orders: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for order in frontend_open_orders:
+        if not isinstance(order, dict):
+            continue
+        coin = order.get("coin")
+        if isinstance(coin, str) and coin:
+            grouped.setdefault(coin, []).append(order)
+    return grouped
+
+
+def _frontend_order_tpsl(order: dict, position: Position) -> str | None:
+    if not bool(order.get("reduceOnly")) or not bool(order.get("isTrigger")):
+        return None
+    order_type = str(order.get("orderType") or "").strip().lower()
+    if "take profit" in order_type:
+        return "tp"
+    if "stop" in order_type:
+        return "sl"
+
+    trigger_px = _decimal(order.get("triggerPx"))
+    if trigger_px is None:
+        return None
+    side = position.side.lower()
+    if side == "long":
+        return "tp" if trigger_px >= position.entry_price else "sl"
+    if side == "short":
+        return "tp" if trigger_px <= position.entry_price else "sl"
+    return None
+
+
+def _match_frontend_protection_order(
+    frontend_orders: list[dict],
+    order: Order,
+    position: Position,
+) -> dict | None:
+    desired_tpsl = _TPSL_BY_ORDER_TYPE.get(order.order_type)
+    if desired_tpsl is None:
+        return None
+
+    matches: list[dict] = [
+        item
+        for item in frontend_orders
+        if _frontend_order_tpsl(item, position) == desired_tpsl
+    ]
+    if not matches:
+        return None
+
+    if desired_tpsl == "tp" and order.price is not None:
+        for item in matches:
+            trigger_px = _decimal(item.get("triggerPx"))
+            if trigger_px == order.price:
+                return item
+        return None
+
+    if desired_tpsl == "sl" and order.price is not None:
+        for item in matches:
+            trigger_px = _decimal(item.get("triggerPx"))
+            if trigger_px == order.price:
+                return item
+
+    return matches[0]
+
+
+def _sync_order_from_frontend_open_order(
+    db: Session,
+    position: Position,
+    order: Order,
+    frontend_order: dict,
+) -> None:
+    old_oid = order.hyperliquid_order_id
+    old_price = order.price
+    trigger_px = _decimal(frontend_order.get("triggerPx"))
+    synced_size = _decimal(frontend_order.get("sz")) or _decimal(frontend_order.get("origSz"))
+    frontend_oid = frontend_order.get("oid")
+    frontend_cloid = frontend_order.get("cloid")
+
+    if trigger_px is not None:
+        order.price = trigger_px
+        if order.order_type == "stop_loss":
+            position.stop_loss = trigger_px
+            db.add(position)
+    if synced_size is not None and synced_size > 0:
+        order.size = synced_size
+    if isinstance(frontend_oid, int):
+        order.hyperliquid_order_id = str(frontend_oid)
+    if isinstance(frontend_cloid, str) and frontend_cloid:
+        order.cloid = frontend_cloid.lower().removeprefix("0x")
+    order.status = "open"
+    raw = dict(order.raw_response or {})
+    raw["frontend_open_order_sync"] = {
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+        "old_oid": old_oid,
+        "new_oid": order.hyperliquid_order_id,
+        "old_price": str(old_price) if old_price is not None else None,
+        "new_price": str(order.price) if order.price is not None else None,
+        "frontend_order_type": frontend_order.get("orderType"),
+    }
+    order.raw_response = raw
+    db.add(order)
+    db.add(
+        DecisionLog(
+            event_type="live_protection_order_synced_from_frontend",
+            market_id=position.market_id,
+            position_id=position.id,
+            message=(
+                f"Protection order {order.order_type} synced from frontend open order: "
+                f"price {order.price}, size {order.size}"
+            ),
+            data={
+                "order_id": order.id,
+                "order_type": order.order_type,
+                "old_oid": old_oid,
+                "new_oid": order.hyperliquid_order_id,
+                "old_price": str(old_price) if old_price is not None else None,
+                "new_price": str(order.price) if order.price is not None else None,
+            },
+        )
+    )
+
+
+def _violates_liquidation_guard(position: Position, stop_price: Decimal, remote_position: dict | None) -> bool:
+    if order_side := position.side.lower():
+        liquidation_price = _decimal(remote_position.get("liquidationPx")) if isinstance(remote_position, dict) else None
+        if liquidation_price is None or liquidation_price <= 0:
+            return False
+        if order_side == "long":
+            return stop_price <= liquidation_price
+        if order_side == "short":
+            return stop_price >= liquidation_price
+    return False
+
+
 def _resubmit_missing_protection_orders(
     db: Session,
     position: Position,
     coin: str,
     hl_open_oids: set[int],
     hl_open_cloids: set[str],
+    frontend_orders: list[dict],
     trading: HyperliquidTradingClient,
     expires_after_seconds: int,
     sz_decimals: int,
+    remote_position: dict | None = None,
     remote_size: Decimal | None = None,
 ) -> None:
     """Detect protection orders that have disappeared from HL and re-submit them.
@@ -308,11 +464,63 @@ def _resubmit_missing_protection_orders(
         ):
             continue  # order is still open on HL — nothing to do
 
+        frontend_match = _match_frontend_protection_order(frontend_orders, order, position)
+        if frontend_match is not None:
+            _sync_order_from_frontend_open_order(db, position, order, frontend_match)
+            continue
+
         if order.price is None:
             continue
 
         tpsl = _TPSL_BY_ORDER_TYPE.get(order.order_type)
         if tpsl is None:
+            continue
+
+        if order.order_type == "stop_loss" and _violates_liquidation_guard(
+            position,
+            order.price,
+            remote_position,
+        ):
+            raw["resubmits"] = [
+                *resubmits,
+                {
+                    "old_oid": order.hyperliquid_order_id,
+                    "status": "skipped_liquidation_guard",
+                    "trigger_price": str(order.price),
+                    "liquidation_price": str(_decimal(remote_position.get("liquidationPx")))
+                    if isinstance(remote_position, dict)
+                    else None,
+                },
+            ]
+            order.raw_response = raw
+            db.add(order)
+            db.add(
+                DecisionLog(
+                    event_type="live_protection_order_resubmit_skipped_liquidation_guard",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message=(
+                        f"Protection order {order.order_type} re-submit skipped: "
+                        "trigger is not before liquidation price"
+                    ),
+                    data={
+                        "coin": coin,
+                        "order_id": order.id,
+                        "order_type": order.order_type,
+                        "trigger_price": str(order.price),
+                        "liquidation_price": str(_decimal(remote_position.get("liquidationPx")))
+                        if isinstance(remote_position, dict)
+                        else None,
+                    },
+                )
+            )
+            logger.warning(
+                "live_protection_order_resubmit_skipped_liquidation_guard",
+                position_id=position.id,
+                order_id=order.id,
+                order_type=order.order_type,
+                trigger_price=str(order.price),
+            )
             continue
 
         # Compute the correct submission size:
@@ -502,6 +710,73 @@ def _resize_local_stop_orders(
         )
 
 
+def _close_companion_paper_position(
+    db: Session,
+    live_position: Position,
+    exit_price: Decimal | None,
+    now: datetime,
+) -> None:
+    """If a companion paper position exists for the same signal, close it at exit_price."""
+    source_signal_id = (live_position.metadata_json or {}).get("source_signal_id")
+    if source_signal_id is None:
+        return
+    try:
+        signal_id = int(source_signal_id)
+    except (TypeError, ValueError):
+        return
+    paper_position = (
+        db.query(Position)
+        .filter(
+            Position.market_id == live_position.market_id,
+            Position.mode == OrderMode.PAPER.value,
+            Position.status == "open",
+        )
+        .filter(
+            Position.metadata_json["source_signal_id"].astext == str(signal_id)
+        )
+        .first()
+    )
+    if paper_position is None:
+        return
+    effective_exit = exit_price if exit_price is not None else paper_position.entry_price
+    side = paper_position.side.lower()
+    pnl_sign = Decimal("1") if side == "long" else Decimal("-1")
+    realized_pnl = (effective_exit - paper_position.entry_price) * paper_position.size * pnl_sign
+    paper_metadata = dict(paper_position.metadata_json or {})
+    paper_metadata.update(
+        {
+            "exit_price": str(effective_exit),
+            "exit_reason": "live_reconciliation_companion_close",
+            "realized_pnl": str(realized_pnl),
+            "remaining_size": "0",
+        }
+    )
+    paper_position.status = "closed"
+    paper_position.closed_at = now
+    paper_position.size = Decimal("0")
+    paper_position.realized_pnl = realized_pnl
+    paper_position.unrealized_pnl = Decimal("0")
+    paper_position.metadata_json = paper_metadata
+    signal = db.get(Signal, signal_id)
+    if signal is not None and signal.status != SignalStatus.CLOSED.value:
+        signal.status = SignalStatus.CLOSED.value
+        db.add(signal)
+    db.add(paper_position)
+    db.add(
+        DecisionLog(
+            event_type="paper_position_companion_closed",
+            market_id=paper_position.market_id,
+            position_id=paper_position.id,
+            message="Paper position closed because companion live position was reconciled as closed",
+            data={
+                "live_position_id": live_position.id,
+                "exit_price": str(effective_exit),
+                "realized_pnl": str(realized_pnl),
+            },
+        )
+    )
+
+
 def _index_fills_by_coin(raw_fills: list[dict]) -> dict[str, list[dict]]:
     result: dict[str, list[dict]] = {}
     for fill in raw_fills:
@@ -577,6 +852,12 @@ def reconcile_live_positions(
         raw_open_orders = []
         open_orders_available = False
     hl_open_oids, hl_open_cloids = _index_open_orders(raw_open_orders)
+    try:
+        raw_frontend_open_orders = trading.frontend_open_orders(settings.hyperliquid_account_address)
+    except Exception as exc:
+        logger.warning("live_reconciliation_frontend_open_orders_failed", error=str(exc))
+        raw_frontend_open_orders = []
+    frontend_open_orders_by_coin = _index_frontend_open_orders(raw_frontend_open_orders)
 
     live_settings = effective_live_execution_settings(db, settings)
     expires_after_seconds = int(live_settings["order_expires_after_seconds"])
@@ -590,9 +871,10 @@ def reconcile_live_positions(
         remote = remote_positions.get(coin)
         metadata = dict(position.metadata_json or {})
         position.metadata_json = metadata
-        realized_delta = _reconcile_exit_fills(
+        fill_match = _reconcile_exit_fills(
             db, position, coin, fills_by_cloid, fills_by_oid
         )
+        realized_delta = fill_match.realized_delta
         if realized_delta != 0:
             position.realized_pnl = (
                 Decimal(position.realized_pnl or 0) + realized_delta
@@ -604,6 +886,11 @@ def reconcile_live_positions(
             position.closed_at = now
             position.size = Decimal("0")
             metadata["reconciled_closed_at"] = now.isoformat()
+
+            if not metadata.get("exit_price") and fill_match.last_exit_price is not None:
+                metadata["exit_price"] = str(fill_match.last_exit_price)
+                if fill_match.last_exit_reason is not None:
+                    metadata["exit_reason"] = fill_match.last_exit_reason
 
             if realized_delta == 0 and position.realized_pnl is None:
                 # Fill not matched via cloid/oid. Strategy (highest accuracy first):
@@ -672,7 +959,7 @@ def reconcile_live_positions(
                             )
                         )
 
-            if "exit_price" not in metadata:
+            if not metadata.get("exit_price"):
                 # Fill was matched (realized_delta != 0) but exit_price not stored:
                 # derive it from the most recently filled exit order's avg price.
                 last_filled = (
@@ -700,6 +987,9 @@ def reconcile_live_positions(
                     data={"coin": coin},
                 )
             )
+            exit_price_str = metadata.get("exit_price")
+            companion_exit = _decimal(exit_price_str) if exit_price_str else None
+            _close_companion_paper_position(db, position, companion_exit, now)
             updated += 1
             continue
 
@@ -715,9 +1005,11 @@ def reconcile_live_positions(
                 coin,
                 hl_open_oids,
                 hl_open_cloids,
+                frontend_open_orders_by_coin.get(coin, []),
                 trading,
                 expires_after_seconds,
                 _sz_decimals(position.market),
+                remote_position=remote,
                 remote_size=remote_abs,
             )
 

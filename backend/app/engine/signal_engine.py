@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Any
 
 import structlog
 from sqlalchemy.exc import IntegrityError
@@ -7,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.enums import Direction, SignalStatus
 from app.db.models import AppSetting, Candle, Indicator, Market, Signal, StrategyConfig
+from app.engine.auto_tuner import active_ab_overlay
 from app.engine.mtf import check_mtf_confluence, higher_timeframe
 from app.engine.orderbook import OrderBookAnalysis, analyze_order_book, ob_imbalance_result
 from app.engine.performance import SignalPerformanceAnalyzer
@@ -29,6 +31,21 @@ from app.strategies.registry import strategy_registry
 logger = structlog.get_logger()
 
 
+# Stop distance minimo scalato per timeframe. Era hardcoded a 2% per tutti i TF,
+# rendendo irraggiungibile il RR target su 1m/5m e gonfiando inutilmente il rischio
+# per trade. Override possibile via risk.min_stop_distance_pct in AppSetting.
+_DEFAULT_MIN_STOP_BY_TF: dict[str, float] = {
+    "1m": 0.004,   # 0.4%
+    "5m": 0.007,   # 0.7%
+    "15m": 0.010,  # 1.0%
+    "30m": 0.013,  # 1.3%
+    "1h": 0.016,   # 1.6%
+    "2h": 0.018,   # 1.8%
+    "4h": 0.022,   # 2.2%
+    "1d": 0.030,   # 3.0%
+}
+
+
 class SignalEngine:
     def __init__(self) -> None:
         self.registry = strategy_registry()
@@ -38,6 +55,28 @@ class SignalEngine:
         settings = get_settings()
         self.market_data = CoinMarketCapClient(settings)
         self.whales = WhaleAlertClient(settings)
+        # Cache valida per la durata di un worker tick: il worker chiama
+        # `begin_cycle()` ad ogni nuovo tick per invalidare. Evita chiamate HTTP
+        # ripetute (fundings/orderbook) per market × timeframe nello stesso tick.
+        self._cycle_fundings: dict[str, float] | None = None
+        self._cycle_l2_cache: dict[str, Any] = {}
+        # Aggregated skip-reason counter per cycle. In debug-log mode i singoli
+        # "signal_skipped_*" non si vedono in produzione; questo conta dove muoiono
+        # i segnali per esporre un breakdown nel `worker_cycle` event.
+        self._cycle_skip_counts: dict[str, int] = {}
+
+    def begin_cycle(self) -> None:
+        """Invalidate per-cycle caches at the start of each worker tick."""
+        self._cycle_fundings = None
+        self._cycle_l2_cache = {}
+        self._cycle_skip_counts = {}
+
+    def cycle_skip_counts(self) -> dict[str, int]:
+        """Snapshot dei contatori di skip aggregati per il tick in corso."""
+        return dict(self._cycle_skip_counts)
+
+    def _record_skip(self, reason: str) -> None:
+        self._cycle_skip_counts[reason] = self._cycle_skip_counts.get(reason, 0) + 1
 
     @staticmethod
     def _average_quote_volume(candles: list[CandleInput], window: int = 20) -> float:
@@ -276,6 +315,7 @@ class SignalEngine:
                 timeframe=timeframe,
                 candle_count=len(candles),
             )
+            self._record_skip("insufficient_candles")
             return None
 
         risk_settings = db.get(AppSetting, "risk")
@@ -283,33 +323,31 @@ class SignalEngine:
         min_risk_reward = settings.min_risk_reward
         min_average_quote_volume_usd = settings.min_average_quote_volume_usd
         min_atr_multiplier = 1.5
-        min_stop_distance_pct = 0.020
-        if risk_settings:
-            min_signal_score = int(
-                risk_settings.value.get(
-                    "min_signal_score",
-                    min_signal_score,
-                )
-            )
-            min_risk_reward = float(
-                risk_settings.value.get(
-                    "min_risk_reward",
-                    min_risk_reward,
-                )
-            )
-            min_average_quote_volume_usd = float(
-                risk_settings.value.get(
-                    "min_average_quote_volume_usd",
-                    min_average_quote_volume_usd,
-                )
-            )
-            min_atr_multiplier = float(
-                risk_settings.value.get("min_atr_multiplier", min_atr_multiplier)
-            )
-            min_stop_distance_pct = float(
-                risk_settings.value.get("min_stop_distance_pct", min_stop_distance_pct)
-            )
-        risk_value = risk_settings.value if risk_settings else {}
+        # Stop minimum scalato per timeframe: lo stop "duro" di 2% è sensato su 4h ma
+        # eccessivo su 5m (= 4-6 ATR di noise) e penalizza il RR raggiungibile. Le
+        # scale derivano dalla volatilità tipica per candela su BTC/ETH perpetual.
+        min_stop_distance_pct = _DEFAULT_MIN_STOP_BY_TF.get(timeframe, 0.020)
+        # AB testing auto-tuner (§3.10): in mode="ab_test" l'auto-tuner non modifica
+        # `risk` globalmente — ogni segnale è assegnato a control o test e l'overlay
+        # del relativo arm viene mergiato in `risk_value` prima di derivare i filtri.
+        ab_overlay_payload = active_ab_overlay(db)
+        ab_overlay: dict[str, Any] = (
+            dict(ab_overlay_payload.get("overlay", {})) if ab_overlay_payload else {}
+        )
+        risk_value: dict[str, Any] = (
+            dict(risk_settings.value) if risk_settings and isinstance(risk_settings.value, dict) else {}
+        )
+        if ab_overlay:
+            risk_value.update(ab_overlay)
+        min_signal_score = int(risk_value.get("min_signal_score", min_signal_score))
+        min_risk_reward = float(risk_value.get("min_risk_reward", min_risk_reward))
+        min_average_quote_volume_usd = float(
+            risk_value.get("min_average_quote_volume_usd", min_average_quote_volume_usd)
+        )
+        min_atr_multiplier = float(risk_value.get("min_atr_multiplier", min_atr_multiplier))
+        min_stop_distance_pct = float(
+            risk_value.get("min_stop_distance_pct", min_stop_distance_pct)
+        )
         scoring_settings = db.get(AppSetting, "scoring")
         scoring_value = (
             scoring_settings.value
@@ -329,19 +367,38 @@ class SignalEngine:
                 )
             except (TypeError, ValueError):
                 label_tuple = None
-        scoring_engine = SignalScoringEngine(
-            strong_score_threshold=strong_threshold,
-            **({"label_thresholds": label_tuple} if label_tuple else {}),
-        )
+        if label_tuple:
+            scoring_engine = SignalScoringEngine(
+                strong_score_threshold=strong_threshold,
+                label_thresholds=label_tuple,
+            )
+        else:
+            scoring_engine = SignalScoringEngine(
+                strong_score_threshold=strong_threshold,
+            )
         regime_filter_enabled = bool(risk_value.get("regime_filter_enabled", False))
+        regime_method_raw = str(risk_value.get("regime_method", "adx")).lower()
+        if regime_method_raw not in ("adx", "hurst", "garch", "hybrid"):
+            regime_method_raw = "adx"
         regime_adx_trending = float(risk_value.get("regime_adx_trending", 25.0))
         regime_adx_ranging = float(risk_value.get("regime_adx_ranging", 18.0))
         regime_confirm_candles = int(risk_value.get("regime_confirm_candles", 2))
         regime_off_multiplier = float(risk_value.get("regime_off_weight_multiplier", 0.5))
+        regime_hurst_trending = float(risk_value.get("regime_hurst_trending", 0.55))
+        regime_hurst_ranging = float(risk_value.get("regime_hurst_ranging", 0.45))
+        regime_hurst_min_lag = int(risk_value.get("regime_hurst_min_lag", 2))
+        regime_hurst_max_lag = int(risk_value.get("regime_hurst_max_lag", 20))
+        regime_garch_window = int(risk_value.get("regime_garch_window", 50))
+        regime_garch_lag = int(risk_value.get("regime_garch_lag", 1))
+        regime_garch_cluster_threshold = float(
+            risk_value.get("regime_garch_cluster_threshold", 0.2)
+        )
         participation_ratio = float(risk_value.get("participation_ratio", 0.35))
         volatility_filter_enabled = bool(risk_value.get("volatility_filter_enabled", False))
-        atr_pct_min = float(risk_value.get("atr_pct_min", 0.10))
-        atr_pct_max = float(risk_value.get("atr_pct_max", 0.95))
+        # Default 25-90: 10-95 era 85% della distribuzione — filtro decorativo. 25-90
+        # taglia effettivamente mercati morti (sotto p25) e panic moves (sopra p90).
+        atr_pct_min = float(risk_value.get("atr_pct_min", 0.25))
+        atr_pct_max = float(risk_value.get("atr_pct_max", 0.90))
         mtf_confluence_enabled = bool(risk_value.get("mtf_confluence_enabled", False))
         mtf_ema_period = int(risk_value.get("mtf_ema_period", 50))
         volatility_passed, volatility_info = evaluate_volatility(
@@ -357,6 +414,7 @@ class SignalEngine:
                 timeframe=timeframe,
                 volatility=volatility_info,
             )
+            self._record_skip("volatility_filter")
             db.commit()
             return None
         global_quote = self._global_volume_quote(market)
@@ -371,67 +429,14 @@ class SignalEngine:
                     hyperliquid_average_quote_volume=hyperliquid_average_quote_volume,
                     min_average_quote_volume_usd=min_average_quote_volume_usd,
                 )
+                self._record_skip("low_liquidity")
                 return None
 
         latest_candle_open_time = rows[0].open_time
-        configs = (
-            db.query(StrategyConfig)
-            .filter(StrategyConfig.timeframe == timeframe, StrategyConfig.enabled.is_(True))
-            .all()
-        )
-        context = StrategyContext(
-            market="hyperliquid",
-            symbol=market.symbol,
-            timeframe=timeframe,
-            market_type=market.market_type,
-            candles=candles,
-        )
-        results = []
-        weights: dict[str, int] = {}
-        for config in configs:
-            strategy = self.registry.get(config.strategy_name)
-            if strategy is None:
-                continue
-            results.append(strategy.evaluate(context, config.params))
-            weights[config.strategy_name] = config.weight
-        disabled_sources = set(risk_value.get("disabled_signal_sources", []))
-        fear_greed = self.market_data.latest_fear_greed()
-        if "fear_greed" not in disabled_sources:
-            fear_greed_result = self._fear_greed_result(context, fear_greed)
-            if fear_greed_result is not None:
-                results.append(fear_greed_result)
-                weights[fear_greed_result.strategy_name] = max(0, settings.fear_greed_weight)
-        altcoin_season = self.market_data.latest_altcoin_season()
-        altcoin_season_result = self._altcoin_season_result(context, altcoin_season, market.base)
-        if altcoin_season_result is not None:
-            results.append(altcoin_season_result)
-            weights[altcoin_season_result.strategy_name] = max(0, settings.altcoin_season_weight)
-        whale_flow = self.whales.recent_flow(market.base) if "whale_flow" not in disabled_sources else None
-        if "whale_flow" not in disabled_sources:
-            whale_flow_result = self._whale_flow_result(context, whale_flow)
-            if whale_flow_result is not None:
-                results.append(whale_flow_result)
-                weights[whale_flow_result.strategy_name] = max(0, settings.whale_flow_weight)
-        coin = (market.metadata_json or {}).get("hl_coin") or market.symbol
-        fundings = fetch_predicted_fundings(settings.info_url)
-        funding_rate_value: float | None = fundings.get(str(coin))
-        funding_result = self._funding_rate_result(context, funding_rate_value)
-        if funding_result is not None:
-            results.append(funding_result)
-            weights[funding_result.strategy_name] = max(0, settings.funding_rate_weight)
-        ob_analysis: OrderBookAnalysis | None = None
-        ob_snapshot = fetch_l2_book(settings.info_url, str(coin), n_levels=settings.ob_imbalance_n_levels)
-        if ob_snapshot is not None:
-            ob_analysis = analyze_order_book(
-                ob_snapshot,
-                entry=candles[-1].close,
-                n_levels=settings.ob_imbalance_n_levels,
-            )
-            ob_result = ob_imbalance_result(context, ob_analysis)
-            if ob_result is not None:
-                results.append(ob_result)
-                weights[ob_result.strategy_name] = max(0, settings.ob_imbalance_weight)
-        self._persist_indicators(db, market, timeframe, latest_candle_open_time, results)
+        # Early-exit duplicate check: evita di pagare HTTP esterne (fundings, L2 book,
+        # whale/altcoin/fear-greed) e l'esecuzione di tutte le strategie quando un
+        # segnale per questa candela è già stato emesso. Era a metà funzione, dopo i
+        # costi pesanti — adesso è il primo controllo dopo aver identificato la candela.
         existing_signal = (
             db.query(Signal)
             .filter(
@@ -448,8 +453,93 @@ class SignalEngine:
                 timeframe=timeframe,
                 existing_signal_id=existing_signal.id,
             )
-            db.commit()
+            self._record_skip("duplicate")
             return None
+        configs = (
+            db.query(StrategyConfig)
+            .filter(StrategyConfig.timeframe == timeframe, StrategyConfig.enabled.is_(True))
+            .all()
+        )
+        context = StrategyContext(
+            market="hyperliquid",
+            symbol=market.symbol,
+            timeframe=timeframe,
+            market_type=market.market_type,
+            candles=candles,
+        )
+        results = []
+        weights: dict[str, int] = {}
+        # Snapshot del peso "calibrated" (post-AutoCalibrationEngine, prima del
+        # performance adjustment e del regime filter). Serve per esporre la pipeline
+        # completa nel breakdown del segnale.
+        calibrated_weights: dict[str, int] = {}
+        for config in configs:
+            strategy = self.registry.get(config.strategy_name)
+            if strategy is None:
+                continue
+            results.append(strategy.evaluate(context, config.params))
+            weights[config.strategy_name] = config.weight
+            calibrated_weights[config.strategy_name] = config.weight
+        disabled_sources = set(risk_value.get("disabled_signal_sources", []))
+        fear_greed = self.market_data.latest_fear_greed()
+        if "fear_greed" not in disabled_sources:
+            fear_greed_result = self._fear_greed_result(context, fear_greed)
+            if fear_greed_result is not None:
+                results.append(fear_greed_result)
+                weights[fear_greed_result.strategy_name] = max(0, settings.fear_greed_weight)
+        altcoin_season = (
+            self.market_data.latest_altcoin_season()
+            if "altcoin_season" not in disabled_sources
+            else None
+        )
+        altcoin_season_result = self._altcoin_season_result(context, altcoin_season, market.base)
+        if altcoin_season_result is not None:
+            results.append(altcoin_season_result)
+            weights[altcoin_season_result.strategy_name] = max(0, settings.altcoin_season_weight)
+        whale_flow = self.whales.recent_flow(market.base) if "whale_flow" not in disabled_sources else None
+        if "whale_flow" not in disabled_sources:
+            whale_flow_result = self._whale_flow_result(context, whale_flow)
+            if whale_flow_result is not None:
+                results.append(whale_flow_result)
+                weights[whale_flow_result.strategy_name] = max(0, settings.whale_flow_weight)
+        coin = (market.metadata_json or {}).get("hl_coin") or market.symbol
+        funding_rate_value: float | None = None
+        if "funding_rate" not in disabled_sources:
+            if self._cycle_fundings is None:
+                # fetch_predicted_fundings ritorna la mappa di TUTTI i coin con un'unica
+                # richiesta HTTP. Cachata per cycle evita di chiamarla 1 volta per ogni
+                # (market × timeframe) durante un tick.
+                self._cycle_fundings = fetch_predicted_fundings(settings.info_url)
+            funding_rate_value = self._cycle_fundings.get(str(coin))
+        funding_result = self._funding_rate_result(context, funding_rate_value)
+        if funding_result is not None:
+            results.append(funding_result)
+            weights[funding_result.strategy_name] = max(0, settings.funding_rate_weight)
+        ob_analysis: OrderBookAnalysis | None = None
+        ob_snapshot = None
+        if "ob_imbalance" not in disabled_sources:
+            # L2 book cachato per (coin, n_levels) per la durata del tick: lo stesso market
+            # è chiamato 1 volta per timeframe (1m/5m/15m...) e l'orderbook non cambia
+            # significativamente in pochi secondi rispetto al costo della call HTTP.
+            ob_cache_key = f"{coin}:{settings.ob_imbalance_n_levels}"
+            if ob_cache_key in self._cycle_l2_cache:
+                ob_snapshot = self._cycle_l2_cache[ob_cache_key]
+            else:
+                ob_snapshot = fetch_l2_book(
+                    settings.info_url, str(coin), n_levels=settings.ob_imbalance_n_levels
+                )
+                self._cycle_l2_cache[ob_cache_key] = ob_snapshot
+        if ob_snapshot is not None:
+            ob_analysis = analyze_order_book(
+                ob_snapshot,
+                entry=candles[-1].close,
+                n_levels=settings.ob_imbalance_n_levels,
+            )
+            ob_result = ob_imbalance_result(context, ob_analysis)
+            if ob_result is not None:
+                results.append(ob_result)
+                weights[ob_result.strategy_name] = max(0, settings.ob_imbalance_weight)
+        self._persist_indicators(db, market, timeframe, latest_candle_open_time, results)
 
         weights, performance_notes = self.performance.adjusted_weights(
             db,
@@ -457,14 +547,23 @@ class SignalEngine:
             timeframe=timeframe,
             market_id=market.id,
         )
+        performance_adjusted_weights = dict(weights)
         weights, regime_info = apply_regime_filter(
             weights,
             candles,
             enabled=regime_filter_enabled,
+            method=regime_method_raw,  # type: ignore[arg-type]
             adx_trending=regime_adx_trending,
             adx_ranging=regime_adx_ranging,
             confirm_candles=regime_confirm_candles,
             off_regime_weight_multiplier=regime_off_multiplier,
+            hurst_trending=regime_hurst_trending,
+            hurst_ranging=regime_hurst_ranging,
+            hurst_min_lag=regime_hurst_min_lag,
+            hurst_max_lag=regime_hurst_max_lag,
+            garch_window=regime_garch_window,
+            garch_lag=regime_garch_lag,
+            garch_cluster_threshold=regime_garch_cluster_threshold,
         )
         if regime_info is not None and regime_info["neutralized"]:
             logger.debug(
@@ -472,7 +571,10 @@ class SignalEngine:
                 market=market.symbol,
                 timeframe=timeframe,
                 regime=regime_info["regime"],
-                adx=regime_info["adx"],
+                method=regime_info.get("method"),
+                adx=regime_info.get("adx"),
+                hurst=regime_info.get("hurst"),
+                garch=regime_info.get("garch"),
                 neutralized=regime_info["neutralized"],
             )
         score = scoring_engine.score(results, weights, participation_ratio=participation_ratio)
@@ -480,6 +582,16 @@ class SignalEngine:
             score.breakdown["_performance_adjustments"] = performance_notes
         if regime_info is not None:
             score.breakdown["_regime"] = regime_info
+        # Pipeline esplicita dei pesi: utile per debug quando un segnale "evapora"
+        # tra strategia, calibrazione, performance adjustment e regime filter.
+        score.breakdown["_weight_pipeline"] = {
+            name: {
+                "calibrated": calibrated_weights.get(name),
+                "performance_adjusted": performance_adjusted_weights.get(name),
+                "regime_filtered": weights.get(name),
+            }
+            for name in calibrated_weights
+        }
         if volatility_info is not None:
             score.breakdown["_volatility"] = volatility_info
         score.breakdown["_funding_rate"] = {
@@ -539,6 +651,7 @@ class SignalEngine:
                 threshold_pct = None
             else:
                 # threshold espresso in % per 8h (es. 0.05 = 0.05%/8h)
+                assert threshold_pct is not None
                 funding_pct = funding_rate_value * 100
                 if (
                     funding_pct > threshold_pct
@@ -555,6 +668,7 @@ class SignalEngine:
                         threshold_pct=threshold_pct,
                         direction=score.direction.value,
                     )
+                    self._record_skip("funding_block")
                     db.commit()
                     return None
         if (
@@ -571,6 +685,7 @@ class SignalEngine:
                 whale_confidence=whale_flow.confidence,
                 whale_net_flow_usd=whale_flow.net_flow_usd,
             )
+            self._record_skip("whale_contra_flow")
             db.commit()
             return None
         if score.direction == Direction.NEUTRAL or score.score < min_signal_score:
@@ -583,6 +698,7 @@ class SignalEngine:
                 min_score=min_signal_score,
                 reason=score.reason,
             )
+            self._record_skip("low_score")
             db.commit()
             return None
         if mtf_confluence_enabled:
@@ -623,6 +739,7 @@ class SignalEngine:
                         higher_timeframe=higher_tf,
                         mtf=mtf_info,
                     )
+                    self._record_skip("mtf_confluence")
                     db.commit()
                     return None
         risk_plan = self.risk.build_plan(
@@ -642,8 +759,14 @@ class SignalEngine:
                 risk_reward=risk_plan.risk_reward if risk_plan else None,
                 min_risk_reward=min_risk_reward,
             )
+            self._record_skip("risk_reward")
             db.commit()
             return None
+        if ab_overlay_payload is not None:
+            score.breakdown["_auto_tuner"] = {
+                "step_key": ab_overlay_payload["step_key"],
+                "arm": ab_overlay_payload["arm"],
+            }
         signal = Signal(
             market_id=market.id,
             timeframe=timeframe,

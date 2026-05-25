@@ -19,8 +19,8 @@ def evaluate_volatility(
     candles: list[CandleInput],
     *,
     enabled: bool,
-    pct_min: float = 0.10,
-    pct_max: float = 0.95,
+    pct_min: float = 0.25,
+    pct_max: float = 0.90,
     atr_period: int = 14,
     min_history: int = 50,
 ) -> tuple[bool, dict[str, Any] | None]:

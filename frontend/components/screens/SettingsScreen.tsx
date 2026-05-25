@@ -2,7 +2,19 @@
 
 import React, { useEffect, useState } from "react";
 import { Icon, Seg } from "@/components/atoms";
-import { AppSettings, CoinGeckoUsage, CoinMarketCapUsage, Health, apiGet, apiPatch } from "@/lib/api";
+import {
+  AppSettings,
+  CoinGeckoUsage,
+  CoinMarketCapUsage,
+  Health,
+  SystemErrorLogs,
+  SystemService,
+  SystemServiceAction,
+  SystemServiceResult,
+  apiGet,
+  apiPatch,
+  apiPost,
+} from "@/lib/api";
 
 interface Props {
   settings: AppSettings;
@@ -230,6 +242,10 @@ export function SettingsScreen({ settings, health, onRefresh }: Props) {
   const [cgUsage, setCgUsage] = useState<CoinGeckoUsage | null>(null);
   const [cgUsageError, setCgUsageError] = useState<string | null>(null);
   const [usageKey, setUsageKey] = useState(0);
+  const [systemLogs, setSystemLogs] = useState<SystemErrorLogs | null>(null);
+  const [systemLogsError, setSystemLogsError] = useState<string | null>(null);
+  const [systemLogsKey, setSystemLogsKey] = useState(0);
+  const [serviceBusy, setServiceBusy] = useState<string | null>(null);
 
   useEffect(() => {
     setMode(String(settings.operation_mode?.mode ?? health.mode ?? "SIGNAL_ONLY"));
@@ -301,12 +317,54 @@ export function SettingsScreen({ settings, health, onRefresh }: Props) {
     return () => { mounted = false; };
   }, [usageKey]);
 
+  useEffect(() => {
+    let mounted = true;
+    apiGet<SystemErrorLogs>("/api/system/error-logs?limit=20")
+      .then((logs) => {
+        if (!mounted) return;
+        setSystemLogs(logs);
+        setSystemLogsError(null);
+      })
+      .catch((error) => {
+        if (!mounted) return;
+        setSystemLogs(null);
+        setSystemLogsError(error instanceof Error ? error.message : "Log errori non disponibili");
+      });
+    return () => { mounted = false; };
+  }, [systemLogsKey]);
+
   function refreshUsage() {
     setCmcUsage(null);
     setCmcUsageError(null);
     setCgUsage(null);
     setCgUsageError(null);
     setUsageKey((k) => k + 1);
+  }
+
+  function refreshSystemLogs() {
+    setSystemLogs(null);
+    setSystemLogsError(null);
+    setSystemLogsKey((k) => k + 1);
+  }
+
+  async function runServiceAction(service: SystemService, action: SystemServiceAction) {
+    const key = `${service}:${action}`;
+    setServiceBusy(key);
+    setToast(null);
+    try {
+      const result = await apiPost<SystemServiceResult>(`/api/system/services/${service}/${action}`);
+      const serviceLabel = result.service === "backend" ? "Backend" : "Worker";
+      const actionLabel = action === "start" ? "avvio" : action === "stop" ? "stop" : "reboot";
+      setToast({ tone: "success", message: `${serviceLabel}: comando ${actionLabel} inviato` });
+      window.setTimeout(() => {
+        void Promise.resolve(onRefresh()).catch(() => undefined);
+        refreshSystemLogs();
+      }, action === "stop" && service === "backend" ? 300 : 900);
+    } catch (error) {
+      setToast({ tone: "error", message: error instanceof Error ? error.message : "Comando servizio fallito" });
+    } finally {
+      setServiceBusy(null);
+    }
   }
 
   function toggleTimeframe(timeframe: string) {
@@ -416,7 +474,7 @@ export function SettingsScreen({ settings, health, onRefresh }: Props) {
           </div>
         </div>
         <div className="page-actions">
-          <button className="btn ghost" onClick={() => { void onRefresh(); refreshUsage(); }}>
+          <button className="btn ghost" onClick={() => { void onRefresh(); refreshUsage(); refreshSystemLogs(); }}>
             <Icon name="refresh" size={12} />
           </button>
           <button className="btn primary" disabled={busy} onClick={save}>
@@ -849,7 +907,8 @@ export function SettingsScreen({ settings, health, onRefresh }: Props) {
       {/* ── Monitoraggio ── */}
       <SectionDivider label="Monitoraggio" />
       <div style={{ marginTop: "var(--gap)" }}>
-        <WorkerStatusPanel worker={health.worker} />
+        <WorkerStatusPanel worker={health.worker} serviceBusy={serviceBusy} onServiceAction={runServiceAction} />
+        <SystemErrorLogsPanel logs={systemLogs} error={systemLogsError} onRefresh={refreshSystemLogs} />
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)" }}>
           <CoinMarketCapUsagePanel usage={cmcUsage} error={cmcUsageError} />
           <CoinGeckoUsagePanel usage={cgUsage} error={cgUsageError} />
@@ -1011,7 +1070,15 @@ function BtcMacroProtectionCard({
 }
 
 /* ─── Worker status panel ──────────────────────────────────────────────── */
-function WorkerStatusPanel({ worker }: { worker: Health["worker"] }) {
+function WorkerStatusPanel({
+  worker,
+  serviceBusy,
+  onServiceAction,
+}: {
+  worker: Health["worker"];
+  serviceBusy: string | null;
+  onServiceAction: (service: SystemService, action: SystemServiceAction) => void | Promise<void>;
+}) {
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -1028,6 +1095,7 @@ function WorkerStatusPanel({ worker }: { worker: Health["worker"] }) {
         </div>
         <div className="card-body" style={{ color: "var(--fg-3)", fontSize: "var(--fz-sm)" }}>
           Stato worker non disponibile.
+          <ServiceControlGrid serviceBusy={serviceBusy} onServiceAction={onServiceAction} />
         </div>
       </div>
     );
@@ -1100,6 +1168,8 @@ function WorkerStatusPanel({ worker }: { worker: Health["worker"] }) {
         {/* Cycle stats — inline */}
         <WorkerCycleInline cycle={cycle} />
 
+        <ServiceControlGrid serviceBusy={serviceBusy} onServiceAction={onServiceAction} />
+
         {errorIsRecent && worker.last_error_message && (
           <div style={{ padding: 10, background: "var(--short-soft)", borderRadius: "var(--radius-sm)", color: "var(--short)", fontSize: "var(--fz-sm)", lineHeight: 1.5 }}>
             <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", display: "block", marginBottom: 4 }}>
@@ -1109,6 +1179,136 @@ function WorkerStatusPanel({ worker }: { worker: Health["worker"] }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function ServiceControlGrid({
+  serviceBusy,
+  onServiceAction,
+}: {
+  serviceBusy: string | null;
+  onServiceAction: (service: SystemService, action: SystemServiceAction) => void | Promise<void>;
+}) {
+  const services: { id: SystemService; label: string }[] = [
+    { id: "worker", label: "Worker" },
+    { id: "backend", label: "Backend" },
+  ];
+  const actions: { id: SystemServiceAction; label: string; icon: string; className: string }[] = [
+    { id: "stop", label: "Stop", icon: "power", className: "btn sm danger" },
+    { id: "start", label: "Avvio", icon: "check", className: "btn sm ghost" },
+    { id: "reboot", label: "Reboot", icon: "refresh", className: "btn sm" },
+  ];
+
+  return (
+    <div style={{ display: "grid", gap: 10, paddingTop: 4 }}>
+      <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+        LaunchAgents
+      </span>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        {services.map((service) => (
+          <div key={service.id} style={{ display: "grid", gap: 8, padding: "8px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-1)" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <span style={{ fontSize: "var(--fz-sm)", fontWeight: 600 }}>{service.label}</span>
+              <span className="mono muted" style={{ fontSize: "var(--fz-xs)" }}>com.trado.{service.id}</span>
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {actions.map((action) => {
+                const busy = serviceBusy === `${service.id}:${action.id}`;
+                return (
+                  <button
+                    key={action.id}
+                    type="button"
+                    className={action.className}
+                    disabled={serviceBusy != null}
+                    onClick={() => { void onServiceAction(service.id, action.id); }}
+                  >
+                    <Icon name={action.icon} size={11} />
+                    {busy ? "Invio..." : action.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SystemErrorLogsPanel({
+  logs,
+  error,
+  onRefresh,
+}: {
+  logs: SystemErrorLogs | null;
+  error: string | null;
+  onRefresh: () => void;
+}) {
+  return (
+    <div className="card" style={{ marginBottom: "var(--gap)" }}>
+      <div className="card-head">
+        <span className="title">Error log</span>
+        <button type="button" className="btn sm ghost" onClick={onRefresh}>
+          <Icon name="refresh" size={11} />
+          Aggiorna
+        </button>
+      </div>
+      <div className="card-body" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        {error ? (
+          <div style={{ gridColumn: "1 / -1", color: "var(--short)", fontSize: "var(--fz-sm)" }}>{error}</div>
+        ) : (
+          <>
+            <ErrorLogBox title="Backend" log={logs?.backend ?? null} />
+            <ErrorLogBox title="Worker" log={logs?.worker ?? null} />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ErrorLogBox({
+  title,
+  log,
+}: {
+  title: string;
+  log: SystemErrorLogs[keyof SystemErrorLogs] | null;
+}) {
+  const lines = log?.lines ?? [];
+  const updated = log?.updated_at ? formatDateTime(log.updated_at) : null;
+  return (
+    <div style={{ display: "grid", gap: 8, minWidth: 0 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+        <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>
+          {title}
+        </span>
+        <span className="mono muted" style={{ fontSize: "var(--fz-xs)" }}>
+          {updated ?? (log?.exists === false ? "file assente" : "loading")}
+        </span>
+      </div>
+      <pre style={{
+        margin: 0,
+        minHeight: 180,
+        maxHeight: 260,
+        overflow: "auto",
+        padding: 10,
+        background: "var(--bg-2)",
+        border: "1px solid var(--border)",
+        borderRadius: "var(--radius-sm)",
+        color: lines.length ? "var(--fg-2)" : "var(--fg-4)",
+        fontSize: "var(--fz-xs)",
+        lineHeight: 1.55,
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+      }}>
+        {lines.length ? lines.join("\n") : log ? "Nessun errore recente." : "Caricamento..."}
+      </pre>
+      {log?.path && (
+        <span className="mono muted" style={{ fontSize: 10, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {log.path}
+        </span>
+      )}
     </div>
   );
 }

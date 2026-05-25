@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -7,8 +8,8 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.db.models import AppSetting, DecisionLog, StrategyConfig
-from app.engine.diagnostics import equity_slope
+from app.db.models import AppSetting, DecisionLog, Position, StrategyConfig
+from app.engine.diagnostics import equity_slope_normalized
 from app.engine.performance import PerformanceStats, SignalPerformanceAnalyzer, serialize_stats
 
 
@@ -77,13 +78,26 @@ class AutoCalibrationEngine:
             )
 
         changes: list[CalibrationChange] = []
-        changes.extend(self._calibrate_strategy_weights(db, settings))
-        changes.extend(self._calibrate_strategy_params(db, settings))
-        slope_value = equity_slope(positions)
+        # Cache condivisa tra _calibrate_strategy_weights e _calibrate_strategy_params:
+        # cachata `positions per strategy` permette di derivare sia stats sia holdout
+        # split per la validazione walk-forward. Era un raddoppio di query al DB.
+        shared_positions: dict[str, dict[str, list[Position]]] = {}
+        changes.extend(
+            self._calibrate_strategy_weights(
+                db, settings, total_closed=overall.trades, positions_cache=shared_positions
+            )
+        )
+        changes.extend(
+            self._calibrate_strategy_params(db, settings, positions_cache=shared_positions)
+        )
+        # Usa la slope normalizzata per le decisioni deep-defensive: la soglia diventa
+        # indipendente dalla scala dell'equity/size, evitando che configurazioni con
+        # equity grandi entrino in deep defensive solo perché lo slope grezzo è alto.
+        slope_value = equity_slope_normalized(positions)
         recent_window = int(settings.get("recent_window", 50))
         recent_positions = positions[:recent_window]
         recent_stats = self.analyzer.summarize_positions(recent_positions)
-        recent_slope = equity_slope(recent_positions)
+        recent_slope = equity_slope_normalized(recent_positions)
         changes.extend(
             self._calibrate_risk_settings(
                 db,
@@ -118,7 +132,16 @@ class AutoCalibrationEngine:
         return self._result(bool(changes), True, "calibration completed", overall, changes, strategy_changes, settings)
 
     def preview(self, db: Session) -> CalibrationResult:
-        return self.run(db, force=True, commit=False)
+        # `run(..., commit=False)` muta comunque l'ORM (strategy.weight, risk_setting.value,
+        # baseline flush). Avvolgiamo in un SAVEPOINT in modo che TUTTE le scritture
+        # (incluso il baseline auto-creato e l'eventuale `db.commit()` di `_record_run`
+        # in caso futuro) vengano annullate quando il caller esce dal blocco.
+        savepoint = db.begin_nested()
+        try:
+            return self.run(db, force=True, commit=False)
+        finally:
+            if savepoint.is_active:
+                savepoint.rollback()
 
     def _settings(self, db: Session) -> dict[str, Any]:
         current = db.get(AppSetting, "auto_calibration")
@@ -127,7 +150,7 @@ class AutoCalibrationEngine:
             "enabled": True,
             "lookback_trades": 500,
             "min_closed_trades": 20,
-            "min_strategy_trades": 8,
+            "min_strategy_trades": 20,
             "min_weight": 1,
             "max_weight": 30,
             "min_signal_score_floor": 55,
@@ -138,7 +161,7 @@ class AutoCalibrationEngine:
             "auto_disable_enabled": True,
             "auto_disable_min_trades": 25,
             "auto_disable_win_rate": 0.30,
-            "deep_defensive_slope_threshold": -2.0,
+            "deep_defensive_slope_threshold": -0.1,
             "starvation_soft_cycles": 10,
             "starvation_hard_cycles": 15,
             "min_trades_for_slope": 10,
@@ -194,7 +217,14 @@ class AutoCalibrationEngine:
             db.add(state)
         return strategy_params
 
-    def _calibrate_strategy_weights(self, db: Session, settings: dict[str, Any]) -> list[CalibrationChange]:
+    def _calibrate_strategy_weights(
+        self,
+        db: Session,
+        settings: dict[str, Any],
+        *,
+        total_closed: int = 0,
+        positions_cache: dict[str, dict[str, list[Position]]] | None = None,
+    ) -> list[CalibrationChange]:
         baseline = self._baseline_state(db)
         baseline_weights: dict[str, int] = baseline.get("strategy_weights", {})
         min_trades = int(settings["min_strategy_trades"])
@@ -203,6 +233,7 @@ class AutoCalibrationEngine:
         auto_disable_enabled = bool(settings.get("auto_disable_enabled", True))
         auto_disable_min_trades = int(settings.get("auto_disable_min_trades", 25))
         auto_disable_win_rate = float(settings.get("auto_disable_win_rate", 0.30))
+        retest_after_trades = int(settings.get("auto_disable_retest_after_trades", 200))
         changes: list[CalibrationChange] = []
         strategies = db.query(StrategyConfig).all()
         active_per_timeframe: dict[str, int] = {}
@@ -211,29 +242,85 @@ class AutoCalibrationEngine:
                 active_per_timeframe[strategy.timeframe] = (
                     active_per_timeframe.get(strategy.timeframe, 0) + 1
                 )
-        stats_by_timeframe: dict[str, dict[str, PerformanceStats]] = {}
+
+        # Auto-disable bookkeeping: traccia il total_closed_trades al momento del disable.
+        # Quando il counter di trade chiusi è cresciuto di `retest_after_trades` dal disable
+        # rispetto alla data odierna, riabilita la strategia in modalità "probe" — eviterà
+        # di rimanere intrappolata per sempre se il regime è cambiato.
+        state_setting = db.get(AppSetting, "auto_calibration_state")
+        state_value = dict(
+            state_setting.value
+            if state_setting is not None and isinstance(state_setting.value, dict)
+            else {}
+        )
+        disabled_at: dict[str, int] = dict(state_value.get("auto_disabled_at_trade_count") or {})
+        for strategy in strategies:
+            if strategy.enabled:
+                continue
+            key = f"{strategy.timeframe}:{strategy.strategy_name}"
+            disabled_count = disabled_at.get(key)
+            if disabled_count is None:
+                continue
+            if total_closed - int(disabled_count) >= retest_after_trades:
+                strategy.enabled = True
+                active_per_timeframe[strategy.timeframe] = (
+                    active_per_timeframe.get(strategy.timeframe, 0) + 1
+                )
+                disabled_at.pop(key, None)
+                changes.append(
+                    CalibrationChange(
+                        target="strategy_enabled",
+                        key=key,
+                        before=False,
+                        after=True,
+                        reason=(
+                            f"auto-retest: re-enabled after "
+                            f"{total_closed - int(disabled_count)} new trades closed"
+                        ),
+                    )
+                )
+
+        positions_by_timeframe: dict[str, dict[str, list[Position]]] = (
+            positions_cache if positions_cache is not None else {}
+        )
+
+        # Estrai impostazioni walk-forward per la validazione holdout
+        wf_enabled = bool(settings.get("walk_forward_enabled", True))
+        wf_train_ratio = float(settings.get("walk_forward_train_ratio", 0.7))
+        wf_min_per_side = int(settings.get("walk_forward_min_per_side", 5))
+        factor_history_window = int(settings.get("factor_history_window", 5))
+        factor_history_threshold = float(settings.get("factor_history_std_threshold", 0.25))
+        # Storico dei factor decisi per strategia (serve per detectare instabilità)
+        factor_history: dict[str, list[float]] = dict(state_value.get("factor_history") or {})
 
         for strategy in strategies:
-            if strategy.timeframe not in stats_by_timeframe:
-                stats_by_timeframe[strategy.timeframe] = self.analyzer.strategy_stats(
+            if strategy.timeframe not in positions_by_timeframe:
+                positions_by_timeframe[strategy.timeframe] = self.analyzer.strategy_positions(
                     db,
                     timeframe=strategy.timeframe,
                     limit=int(settings["lookback_trades"]),
                 )
-            stats_by_strategy = stats_by_timeframe[strategy.timeframe]
-            stats = stats_by_strategy.get(strategy.strategy_name)
-            if stats is None or stats.trades < min_trades:
+            strategy_positions = positions_by_timeframe[strategy.timeframe].get(
+                strategy.strategy_name, []
+            )
+            stats = self.analyzer.summarize_positions(strategy_positions)
+            if stats.trades < min_trades:
                 continue
             key = f"{strategy.timeframe}:{strategy.strategy_name}"
+            # Auto-disable usa Wilson upper bound: disabilita solo se *anche* nel migliore
+            # dei casi (UB del 95% CI) la strategia non raggiunge la soglia. Evita di
+            # disabilitare strategie con campione piccolo ma potenziale promettente.
+            wr_ub = _wilson_upper_bound(stats.wins, stats.trades)
             if (
                 auto_disable_enabled
                 and strategy.enabled
                 and stats.trades >= auto_disable_min_trades
-                and stats.win_rate < auto_disable_win_rate
+                and wr_ub < auto_disable_win_rate
                 and active_per_timeframe.get(strategy.timeframe, 0) > 1
             ):
                 strategy.enabled = False
                 active_per_timeframe[strategy.timeframe] -= 1
+                disabled_at[key] = int(total_closed)
                 changes.append(
                     CalibrationChange(
                         target="strategy_enabled",
@@ -241,14 +328,36 @@ class AutoCalibrationEngine:
                         before=True,
                         after=False,
                         reason=(
-                            f"auto-disabled: win_rate {stats.win_rate:.2f} < "
-                            f"{auto_disable_win_rate:.2f} over {stats.trades} trades"
+                            f"auto-disabled: WR UB={wr_ub:.2f} < {auto_disable_win_rate:.2f} "
+                            f"over {stats.trades} trades"
                         ),
                     )
                 )
                 continue
             baseline_weight = int(baseline_weights.get(key, strategy.weight))
-            factor, reason = self._strategy_factor(stats)
+            factor, reason = self._strategy_factor_holdout_validated(
+                strategy_positions,
+                enabled=wf_enabled,
+                train_ratio=wf_train_ratio,
+                min_per_side=wf_min_per_side,
+            )
+            # Stability tracking: registra il factor calcolato e congela il cambio se
+            # i factor recenti per questa strategia variano troppo. La instabilità
+            # è un segnale di overfitting al rumore — meglio non muovere i pesi.
+            history = list(factor_history.get(key) or [])
+            history.append(factor)
+            history = history[-factor_history_window:]
+            factor_history[key] = history
+            if len(history) >= 3:
+                mean = sum(history) / len(history)
+                variance = sum((v - mean) ** 2 for v in history) / len(history)
+                std_dev = math.sqrt(variance)
+                if std_dev > factor_history_threshold:
+                    factor = 1.0
+                    reason = (
+                        f"stability freeze: factor std={std_dev:.2f} over last "
+                        f"{len(history)} runs above threshold {factor_history_threshold}"
+                    )
             calibrated = max(min_weight, min(max_weight, round(baseline_weight * factor)))
             if calibrated == strategy.weight:
                 continue
@@ -262,29 +371,59 @@ class AutoCalibrationEngine:
                 )
             )
             strategy.weight = calibrated
+
+        # Persisti il bookkeeping dei disable + storico dei factor (stability tracking).
+        # Il merge con il resto del state avviene in _calibrate_risk_settings (che scrive
+        # lo stesso oggetto) o in _record_run.
+        state_value["auto_disabled_at_trade_count"] = disabled_at
+        state_value["factor_history"] = factor_history
+        persisted = state_setting or AppSetting(key="auto_calibration_state", value={})
+        persisted.value = state_value
+        db.add(persisted)
         return changes
 
-    def _calibrate_strategy_params(self, db: Session, settings: dict[str, Any]) -> list[CalibrationChange]:
+    def _calibrate_strategy_params(
+        self,
+        db: Session,
+        settings: dict[str, Any],
+        *,
+        positions_cache: dict[str, dict[str, list[Position]]] | None = None,
+    ) -> list[CalibrationChange]:
         baseline_params = self._baseline_strategy_params(db)
         min_trades = int(settings["min_strategy_trades"])
+        wf_enabled = bool(settings.get("walk_forward_enabled", True))
+        wf_train_ratio = float(settings.get("walk_forward_train_ratio", 0.7))
+        wf_min_per_side = int(settings.get("walk_forward_min_per_side", 5))
         changes: list[CalibrationChange] = []
         strategies = db.query(StrategyConfig).all()
-        stats_by_timeframe: dict[str, dict[str, PerformanceStats]] = {}
+        positions_by_timeframe: dict[str, dict[str, list[Position]]] = (
+            positions_cache if positions_cache is not None else {}
+        )
 
         for strategy in strategies:
-            if strategy.timeframe not in stats_by_timeframe:
-                stats_by_timeframe[strategy.timeframe] = self.analyzer.strategy_stats(
+            if strategy.timeframe not in positions_by_timeframe:
+                positions_by_timeframe[strategy.timeframe] = self.analyzer.strategy_positions(
                     db,
                     timeframe=strategy.timeframe,
                     limit=int(settings["lookback_trades"]),
                 )
-            stats = stats_by_timeframe[strategy.timeframe].get(strategy.strategy_name)
-            if stats is None or stats.trades < min_trades:
+            strategy_positions = positions_by_timeframe[strategy.timeframe].get(
+                strategy.strategy_name, []
+            )
+            stats = self.analyzer.summarize_positions(strategy_positions)
+            if stats.trades < min_trades:
                 continue
 
             key = f"{strategy.timeframe}:{strategy.strategy_name}"
             base_params = dict(baseline_params.get(key, strategy.params or {}))
-            next_params, reason = self._strategy_params_for_stats(strategy.strategy_name, base_params, stats)
+            next_params, reason = self._strategy_params_holdout_validated(
+                strategy.strategy_name,
+                base_params,
+                strategy_positions,
+                enabled=wf_enabled,
+                train_ratio=wf_train_ratio,
+                min_per_side=wf_min_per_side,
+            )
             current_params = dict(strategy.params or {})
             if next_params == current_params:
                 continue
@@ -315,7 +454,15 @@ class AutoCalibrationEngine:
             if entry.event_type == "worker_cycle_failed":
                 streak += 1
                 continue
-            if isinstance(entry.data, dict) and int(entry.data.get("generated", 0)) == 0:
+            if not isinstance(entry.data, dict):
+                break
+            # I tick "no-op" (nessun timeframe attivo nel tick) non rappresentano vera
+            # starvation: il worker non ha nemmeno provato a generare segnali. Saltarli
+            # evita che la cadenza dei tick gonfi artificialmente il counter.
+            active_tf = entry.data.get("active_timeframes")
+            if isinstance(active_tf, list) and not active_tf:
+                continue
+            if int(entry.data.get("generated", 0)) == 0:
                 streak += 1
             else:
                 break
@@ -535,19 +682,73 @@ class AutoCalibrationEngine:
 
     def _strategy_factor(self, stats: PerformanceStats) -> tuple[float, str]:
         profit_factor = stats.profit_factor
-        if stats.realized_pnl < 0 or stats.win_rate < 0.35 or (
-            profit_factor is not None and profit_factor < 0.8
+        # Why: il win rate puntuale su poche decine di trade è rumoroso (binomial CI ampio).
+        # Usiamo Wilson lower bound al 95% CI come stima conservativa: solo se il LB
+        # supera la soglia consideriamo la strategia confermata sopra (o sotto) di essa.
+        wr_lb = _wilson_lower_bound(stats.wins, stats.trades)
+        wr_ub = _wilson_upper_bound(stats.wins, stats.trades)
+        if stats.realized_pnl < 0 and (
+            wr_ub < 0.40 or (profit_factor is not None and profit_factor < 0.8)
         ):
-            return 0.6, "strategy underperformed historically"
-        if stats.win_rate < 0.45 or (profit_factor is not None and profit_factor < 1.0):
-            return 0.8, "strategy has below-target historical performance"
-        if stats.win_rate >= 0.6 and stats.realized_pnl > 0 and (
+            return 0.6, (
+                f"strategy underperformed historically "
+                f"(WR LB={wr_lb:.2f}, UB={wr_ub:.2f}, n={stats.trades})"
+            )
+        if wr_ub < 0.50 or (profit_factor is not None and profit_factor < 1.0):
+            return 0.8, (
+                f"strategy below-target historical performance "
+                f"(WR LB={wr_lb:.2f}, UB={wr_ub:.2f}, n={stats.trades})"
+            )
+        if wr_lb >= 0.55 and stats.realized_pnl > 0 and (
             profit_factor is None or profit_factor >= 1.25
         ):
-            return 1.2, "strategy outperformed historically"
-        if stats.win_rate >= 0.55 and stats.realized_pnl > 0:
-            return 1.1, "strategy has positive historical edge"
+            return 1.2, f"strategy outperformed historically (WR LB={wr_lb:.2f}, n={stats.trades})"
+        if wr_lb >= 0.50 and stats.realized_pnl > 0:
+            return 1.1, f"strategy positive historical edge (WR LB={wr_lb:.2f}, n={stats.trades})"
         return 1.0, "strategy performance near baseline"
+
+    def _strategy_factor_holdout_validated(
+        self,
+        positions: list[Position],
+        *,
+        enabled: bool,
+        train_ratio: float,
+        min_per_side: int,
+    ) -> tuple[float, str]:
+        """Calcola il factor con validazione walk-forward holdout.
+
+        Logica: il factor "full" (su tutte le posizioni) è applicato SOLO se concorda
+        con il factor calcolato sulla sola finestra di test (più recente). Se train e
+        test divergono di un livello (es. train 0.6, test 1.0) → factor 1.0 + reason
+        "unstable across holdout split" — meglio non fare un cambio guidato dal rumore
+        in-sample che non si conferma fuori campione.
+        """
+        full_stats = self.analyzer.summarize_positions(positions)
+        full_factor, full_reason = self._strategy_factor(full_stats)
+        if not enabled:
+            return full_factor, full_reason
+        split = SignalPerformanceAnalyzer.holdout_split_stats(
+            positions, train_ratio=train_ratio, min_samples_per_side=min_per_side
+        )
+        if split is None:
+            # Non abbastanza dati per holdout. Applichiamo il factor full ma
+            # marchiamo la decisione come "no-holdout" per trasparenza.
+            return full_factor, f"{full_reason} (no holdout: n={len(positions)})"
+        train_stats, test_stats = split
+        train_factor, _ = self._strategy_factor(train_stats)
+        test_factor, _ = self._strategy_factor(test_stats)
+        # "Concordi" = factor sullo stesso lato di 1.0 (entrambi <= 1.0 o entrambi >= 1.0).
+        # Train che dice 0.6 e test che dice 1.1 = regime cambiato → no cambio peso.
+        concordant = (train_factor <= 1.0 and test_factor <= 1.0) or (
+            train_factor >= 1.0 and test_factor >= 1.0
+        )
+        if not concordant:
+            return 1.0, (
+                f"holdout instability: train_factor={train_factor:.2f} vs "
+                f"test_factor={test_factor:.2f} (n_train={train_stats.trades}, "
+                f"n_test={test_stats.trades})"
+            )
+        return full_factor, f"{full_reason} (holdout ok: train={train_factor:.2f}, test={test_factor:.2f})"
 
     def _strategy_params_for_stats(
         self,
@@ -557,23 +758,72 @@ class AutoCalibrationEngine:
     ) -> tuple[dict[str, Any], str]:
         if not baseline_params:
             return baseline_params, "strategy has no tunable parameters"
-        if stats.realized_pnl < 0 or stats.win_rate < 0.35 or (
-            stats.profit_factor is not None and stats.profit_factor < 0.8
+        wr_lb, wr_ub = _wilson_bounds(stats.wins, stats.trades)
+        pf = stats.profit_factor
+        # Strategie low-WR / high-R sono profittevoli con WR anche del 35-40% se hanno
+        # PF > 1.1 — non vanno trattate come underperformer solo perché il WR è basso.
+        # Restituiamo il baseline anche quando WR è modesto ma PF e PnL sono positivi.
+        if stats.realized_pnl > 0 and pf is not None and pf >= 1.2:
+            return dict(baseline_params), (
+                f"strategy profitable: PF={pf:.2f} su {stats.trades} trade — baseline"
+            )
+        if stats.realized_pnl < 0 and (
+            wr_ub < 0.40 or (pf is not None and pf < 0.8)
         ):
             return (
                 self._defensive_strategy_params(strategy_name, baseline_params, intensity=1.0),
-                "strategy underperformed historically; parameters made more selective",
+                f"strategy underperformed (WR UB={wr_ub:.2f}, PF={pf}); more selective",
             )
-        if stats.win_rate < 0.45 or (stats.profit_factor is not None and stats.profit_factor < 1.0):
+        if wr_ub < 0.50 or (pf is not None and pf < 1.0):
             return (
                 self._defensive_strategy_params(strategy_name, baseline_params, intensity=0.5),
-                "strategy has below-target historical performance; parameters made slightly more selective",
+                f"strategy below-target (WR UB={wr_ub:.2f}, PF={pf}); slightly more selective",
             )
-        if stats.win_rate >= 0.55 and stats.realized_pnl > 0 and (
-            stats.profit_factor is None or stats.profit_factor >= 1.1
-        ):
-            return dict(baseline_params), "strategy has recovered; parameters restored to baseline"
+        if wr_lb >= 0.50 and stats.realized_pnl > 0 and (pf is None or pf >= 1.1):
+            return dict(baseline_params), (
+                f"strategy recovered (WR LB={wr_lb:.2f}, PF={pf}); restored to baseline"
+            )
         return dict(baseline_params), "strategy performance near baseline"
+
+    def _strategy_params_holdout_validated(
+        self,
+        strategy_name: str,
+        baseline_params: dict[str, Any],
+        positions: list[Position],
+        *,
+        enabled: bool,
+        train_ratio: float,
+        min_per_side: int,
+    ) -> tuple[dict[str, Any], str]:
+        """Variante params con walk-forward holdout: applica il cambio solo se
+        train e test concordano nel "verso" dei params (defensive vs baseline)."""
+        full_stats = self.analyzer.summarize_positions(positions)
+        full_params, full_reason = self._strategy_params_for_stats(
+            strategy_name, baseline_params, full_stats
+        )
+        if not enabled:
+            return full_params, full_reason
+        split = SignalPerformanceAnalyzer.holdout_split_stats(
+            positions, train_ratio=train_ratio, min_samples_per_side=min_per_side
+        )
+        if split is None:
+            return full_params, f"{full_reason} (no holdout: n={len(positions)})"
+        train_stats, test_stats = split
+        train_params, _ = self._strategy_params_for_stats(
+            strategy_name, baseline_params, train_stats
+        )
+        test_params, _ = self._strategy_params_for_stats(
+            strategy_name, baseline_params, test_stats
+        )
+        # Concordi = stessa direzione rispetto al baseline (baseline / defensive).
+        train_is_baseline = train_params == baseline_params
+        test_is_baseline = test_params == baseline_params
+        if train_is_baseline != test_is_baseline:
+            return dict(baseline_params), (
+                f"holdout instability: params differ between train (baseline={train_is_baseline}) "
+                f"and test (baseline={test_is_baseline}) — keeping baseline"
+            )
+        return full_params, f"{full_reason} (holdout ok)"
 
     def _defensive_strategy_params(
         self,
@@ -713,6 +963,32 @@ class AutoCalibrationEngine:
             )
         )
         db.commit()
+
+
+def _wilson_bounds(wins: int, trades: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval per la proporzione di vittorie.
+
+    Why: con 20 trade e 7 wins (WR=0.35), l'intervallo di confidenza al 95% va da
+    ~0.18 a ~0.57. Decidere di tagliare un weight basandosi sul punto WR=0.35 è
+    sensibile al rumore campionario. La Wilson è preferibile alla Normal-approx
+    perché è ben definita anche con piccoli campioni e per p vicino a 0 o 1.
+    """
+    if trades <= 0:
+        return 0.0, 0.0
+    p_hat = wins / trades
+    z_sq = z * z
+    denom = 1.0 + z_sq / trades
+    center = (p_hat + z_sq / (2 * trades)) / denom
+    margin = z * math.sqrt((p_hat * (1 - p_hat) + z_sq / (4 * trades)) / trades) / denom
+    return max(0.0, center - margin), min(1.0, center + margin)
+
+
+def _wilson_lower_bound(wins: int, trades: int) -> float:
+    return _wilson_bounds(wins, trades)[0]
+
+
+def _wilson_upper_bound(wins: int, trades: int) -> float:
+    return _wilson_bounds(wins, trades)[1]
 
 
 def serialize_calibration(result: CalibrationResult) -> dict[str, Any]:

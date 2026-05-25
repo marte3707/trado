@@ -84,6 +84,25 @@ export type CoinGeckoUsage = {
   source: string;
 };
 
+export type SystemService = "backend" | "worker";
+export type SystemServiceAction = "start" | "stop" | "reboot";
+
+export type SystemServiceResult = {
+  status: string;
+  service: SystemService;
+  action: SystemServiceAction;
+  label: string;
+};
+
+export type SystemErrorLog = {
+  path: string;
+  exists: boolean;
+  updated_at: string | null;
+  lines: string[];
+};
+
+export type SystemErrorLogs = Record<SystemService, SystemErrorLog>;
+
 export type AccountMonitor = {
   status: string;
   network: string;

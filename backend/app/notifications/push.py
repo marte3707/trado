@@ -3,7 +3,7 @@ import json
 from typing import Any
 
 try:
-    from pywebpush import WebPushException, webpush  # type: ignore[import-not-found]
+    from pywebpush import WebPushException, webpush  # type: ignore[import-untyped]
 except ImportError:
     # Fallback for environments where pywebpush is not installed
     class WebPushException(Exception):  # type: ignore[no-redef]

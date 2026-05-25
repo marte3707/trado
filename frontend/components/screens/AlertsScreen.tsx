@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { Icon, ScoreChip, DirBadge, TfChip, fmt } from "@/components/atoms";
 import { AppSettings, DecisionLog, Market, apiPatch } from "@/lib/api";
 import { isPushSupported, subscribePush, unsubscribePush } from "@/lib/push";
@@ -26,6 +26,9 @@ interface AlertItem {
   detail?: string;
   channels: string[];
 }
+
+const MAX_FEED_ALERTS = 100;
+const ALERTS_PAGE_SIZE = 20;
 
 const EVENT_LABELS: Record<string, string> = {
   live_order_rejected:                   "Ordine live rifiutato",
@@ -101,17 +104,21 @@ function extractDetail(event_type: string, data: Record<string, unknown>): strin
 }
 
 function logsToAlerts(logs: DecisionLog[], marketIndex: Map<number, string>): AlertItem[] {
-  return logs.slice(0, 20).map(log => {
+  return logs.slice(0, MAX_FEED_ALERTS).map(log => {
     const t = log.event_type.toLowerCase();
+    const score = Number(log.data.score);
     let level: AlertLevel = "info";
     if (t.includes("error") || t.includes("fail") || t === "live_order_rejected") level = "risk";
-    else if (t.includes("strong") || (log.data.score as number) >= 90) level = "strong";
+    else if (t.includes("strong") || score >= 90) level = "strong";
     else if (t.includes("signal") || t === "live_order_submitted" || t === "paper_order_executed") level = "good";
     else if (t.includes("warn") || t.includes("kill") || t.includes("partial")) level = "warn";
     return {
       ts: fmt.relTime(log.timestamp),
       level,
       sym: log.market_id != null ? marketIndex.get(log.market_id) : undefined,
+      tf: typeof log.data.timeframe === "string" ? log.data.timeframe : undefined,
+      dir: typeof log.data.side === "string" ? log.data.side : typeof log.data.direction === "string" ? log.data.direction : undefined,
+      score: Number.isFinite(score) ? score : undefined,
       msg: EVENT_LABELS[log.event_type] ?? log.message,
       detail: extractDetail(log.event_type, log.data),
       channels: ["dash"],
@@ -120,7 +127,7 @@ function logsToAlerts(logs: DecisionLog[], marketIndex: Map<number, string>): Al
 }
 
 export function AlertsScreen({ logs, markets, settings, onRefresh }: Props) {
-  const marketIndex = new Map(markets.map(m => [m.id, m.base]));
+  const marketIndex = useMemo(() => new Map(markets.map(m => [m.id, m.base])), [markets]);
   const alertSettings = settings.alerts ?? {};
   const [tgEnabled, setTgEnabled] = useState(Boolean(alertSettings.telegram_enabled));
   const [pushEnabled, setPushEnabled] = useState(Boolean(alertSettings.browser_push_enabled));
@@ -133,6 +140,8 @@ export function AlertsScreen({ logs, markets, settings, onRefresh }: Props) {
   const [quietFrom, setQuietFrom] = useState(String(alertSettings.quiet_from ?? ""));
   const [quietTo, setQuietTo] = useState(String(alertSettings.quiet_to ?? ""));
   const [feedFilter, setFeedFilter] = useState<FeedFilter>("all");
+  const [search, setSearch] = useState("");
+  const [feedPage, setFeedPage] = useState(1);
   const [busy, setBusy] = useState(false);
   const [pushBusy, setPushBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -200,10 +209,40 @@ export function AlertsScreen({ logs, markets, settings, onRefresh }: Props) {
     }
   }
 
-  const alerts = logsToAlerts(logs, marketIndex);
-  const filtered: AlertItem[] = feedFilter === "all" ? alerts :
-    feedFilter === "strong" ? alerts.filter(a => a.level === "strong" || a.level === "good") :
-    alerts.filter(a => a.level === "risk" || a.level === "warn");
+  const alerts = useMemo(() => logsToAlerts(logs, marketIndex), [logs, marketIndex]);
+  const searchTokens = useMemo(() => search.trim().toLowerCase().split(/\s+/).filter(Boolean), [search]);
+  const filtered = useMemo(() => {
+    const base: AlertItem[] = feedFilter === "all" ? alerts :
+      feedFilter === "strong" ? alerts.filter(a => a.level === "strong" || a.level === "good") :
+      alerts.filter(a => a.level === "risk" || a.level === "warn");
+
+    if (searchTokens.length === 0) return base;
+
+    return base.filter((alert) => {
+      const haystack = [
+        alert.sym,
+        alert.tf,
+        alert.dir,
+        alert.level,
+        alert.msg,
+        alert.detail,
+        alert.score != null ? String(alert.score) : null,
+      ].filter(Boolean).join(" ").toLowerCase();
+      return searchTokens.every(token => haystack.includes(token));
+    });
+  }, [alerts, feedFilter, searchTokens]);
+
+  const pageCount = Math.max(1, Math.ceil(filtered.length / ALERTS_PAGE_SIZE));
+  const safePage = Math.min(feedPage, pageCount);
+  const pagedAlerts = filtered.slice((safePage - 1) * ALERTS_PAGE_SIZE, safePage * ALERTS_PAGE_SIZE);
+
+  useEffect(() => {
+    setFeedPage(1);
+  }, [feedFilter, search]);
+
+  useEffect(() => {
+    if (feedPage > pageCount) setFeedPage(pageCount);
+  }, [feedPage, pageCount]);
 
   return (
     <div className="page">
@@ -300,8 +339,21 @@ export function AlertsScreen({ logs, markets, settings, onRefresh }: Props) {
         <div className="card">
           <div className="card-head">
             <span className="title">Feed alert</span>
-            <span className="badge muted">{alerts.length} recenti</span>
+            <span className="badge muted">{filtered.length}/{alerts.length} recenti</span>
             <div className="right">
+              <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
+                <span style={{ position: "absolute", left: 9, color: "var(--fg-3)", pointerEvents: "none" }}>
+                  <Icon name="search" size={12} />
+                </span>
+                <input
+                  type="text"
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  placeholder="Cerca alert..."
+                  className="filter"
+                  style={{ width: 190, paddingLeft: 28 }}
+                />
+              </div>
               <div className="seg">
                 {(["all","strong","risk"] as FeedFilter[]).map(v => (
                   <button key={v} className={"seg-opt " + (feedFilter === v ? "active" : "")} onClick={() => setFeedFilter(v)}>
@@ -317,13 +369,31 @@ export function AlertsScreen({ logs, markets, settings, onRefresh }: Props) {
                 Nessun alert nel feed
               </div>
             )}
-            {filtered.map((a, i) => (
-              <AlertRow key={i} a={a} isLast={i === filtered.length - 1} />
+            {pagedAlerts.map((a, i) => (
+              <AlertRow key={`${a.ts}-${a.msg}-${i}`} a={a} isLast={i === pagedAlerts.length - 1} />
             ))}
           </div>
+          {filtered.length > ALERTS_PAGE_SIZE && (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "10px 18px", borderTop: "1px solid var(--border)" }}>
+              <span className="muted mono" style={{ fontSize: "var(--fz-xs)" }}>
+                {(safePage - 1) * ALERTS_PAGE_SIZE + 1}–{Math.min(filtered.length, safePage * ALERTS_PAGE_SIZE)} di {filtered.length}
+              </span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <button className="btn ghost sm" onClick={() => setFeedPage(p => Math.max(1, p - 1))} disabled={safePage <= 1} title="Precedente">
+                  <Icon name="chevron_left" size={11} />
+                </button>
+                <span className="muted mono" style={{ minWidth: 44, textAlign: "center", fontSize: "var(--fz-xs)" }}>
+                  {safePage}/{pageCount}
+                </span>
+                <button className="btn ghost sm" onClick={() => setFeedPage(p => Math.min(pageCount, p + 1))} disabled={safePage >= pageCount} title="Successiva">
+                  <Icon name="chevron" size={11} />
+                </button>
+              </div>
+            </div>
+          )}
           <div style={{ padding: "10px 18px", borderTop: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 8, fontSize: "var(--fz-sm)", color: "var(--fg-3)" }}>
             <span className={logs.length > 0 ? "dot green" : "dot red"} />
-            <span>Feed da log di sistema · {logs.length} eventi totali</span>
+            <span>Feed da log di sistema · ultimi {Math.min(logs.length, MAX_FEED_ALERTS)} di {logs.length} eventi</span>
             <span style={{ marginLeft: "auto" }} className="mono">aggiornato ora</span>
           </div>
         </div>

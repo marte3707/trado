@@ -1,8 +1,9 @@
+import random
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from app.db.models import AppSetting, DecisionLog, Position
-from app.engine.auto_tuner import AutoTuner
+from app.engine.auto_tuner import AutoTuner, active_ab_overlay
 
 
 class FakeAnalyzer:
@@ -61,7 +62,13 @@ class FakeDb:
         self.commit_count += 1
 
 
-def _position(*, pnl: float, closed_at: datetime) -> Position:
+def _position(
+    *,
+    pnl: float,
+    closed_at: datetime,
+    arm: str | None = None,
+    step_key: str = "regime_filter",
+) -> Position:
     position = Position(
         market_id=1,
         mode="paper",
@@ -72,7 +79,10 @@ def _position(*, pnl: float, closed_at: datetime) -> Position:
     )
     position.realized_pnl = Decimal(str(pnl))
     position.closed_at = closed_at
-    position.metadata_json = {}
+    meta: dict = {}
+    if arm is not None:
+        meta["_auto_tuner"] = {"step_key": step_key, "arm": arm}
+    position.metadata_json = meta
     return position
 
 
@@ -335,3 +345,398 @@ def test_positions_after_returns_empty_when_state_corrupt() -> None:
     assert tuner._positions_after(positions, "") == []
     # Stringa malformata → lista vuota (non solleva)
     assert tuner._positions_after(positions, "not-a-date") == []
+
+
+# --- §3.10 AB testing -------------------------------------------------------
+
+
+def _ab_config(**overrides) -> AppSetting:
+    sequence = [
+        {
+            "key": "regime_filter",
+            "label": "Regime",
+            "patch": {"regime_filter_enabled": True},
+            "revert": {"regime_filter_enabled": False},
+        },
+        {
+            "key": "mtf_confluence",
+            "label": "MTF",
+            "patch": {"mtf_confluence_enabled": True},
+            "revert": {"mtf_confluence_enabled": False},
+        },
+    ]
+    value = {
+        "enabled": True,
+        "mode": "ab_test",
+        "ab_test_min_trades_per_arm": 5,
+        "ab_test_significance_level": 0.05,
+        "ab_test_allocation": 0.5,
+        "sequence": sequence,
+    }
+    value.update(overrides)
+    return AppSetting(key="auto_tuner_config", value=value)
+
+
+def _tagged_positions(
+    count: int, pnl: float, start: datetime, arm: str, step_key: str = "regime_filter"
+) -> list[Position]:
+    return [
+        _position(
+            pnl=pnl,
+            closed_at=start + timedelta(minutes=i),
+            arm=arm,
+            step_key=step_key,
+        )
+        for i in range(count)
+    ]
+
+
+def test_ab_mode_start_does_not_modify_risk_setting() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    db.app_settings["risk"] = AppSetting(
+        key="risk", value={"regime_filter_enabled": False, "min_signal_score": 70}
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.run(db)
+
+    assert result["status"] == "started"
+    assert result["mode"] == "ab_test"
+    assert result["step"] == "regime_filter"
+    state = db.app_settings["auto_tuner_state"].value
+    assert state["mode"] == "ab_test"
+    assert state["ab_test"]["control_overlay"] == {"regime_filter_enabled": False}
+    assert state["ab_test"]["test_overlay"] == {"regime_filter_enabled": True}
+    # IMPORTANTE: in modalità AB il `risk` AppSetting *non* deve essere mutato.
+    # Control e test sono iniettati per-segnale dal signal_engine.
+    assert db.app_settings["risk"].value["regime_filter_enabled"] is False
+
+
+def test_ab_mode_in_progress_until_min_trades_per_arm() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(ab_test_min_trades_per_arm=10)
+    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "mode": "ab_test",
+            "activated_at": activated.isoformat(),
+            "trades_at_activation": 0,
+            "ab_test": {
+                "control_overlay": {"regime_filter_enabled": False},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 0.5,
+            },
+            "step_history": [],
+        },
+    )
+    db.app_settings["risk"] = AppSetting(key="risk", value={})
+    # 3 control + 3 test → entrambi sotto il min di 10
+    positions = (
+        _tagged_positions(3, 1.0, activated + timedelta(minutes=1), "control")
+        + _tagged_positions(3, 2.0, activated + timedelta(minutes=4), "test")
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer(positions))
+
+    result = tuner.run(db)
+
+    assert result["status"] == "in_progress"
+    assert result["mode"] == "ab_test"
+    assert result["trades_control"] == 3
+    assert result["trades_test"] == 3
+    assert result["trades_required_per_arm"] == 10
+
+
+def test_ab_mode_promotes_when_test_significantly_better() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(
+        ab_test_min_trades_per_arm=10, ab_test_significance_level=0.05
+    )
+    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "mode": "ab_test",
+            "activated_at": activated.isoformat(),
+            "trades_at_activation": 0,
+            "ab_test": {
+                "control_overlay": {"regime_filter_enabled": False},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 0.5,
+            },
+            "step_history": [],
+        },
+    )
+    db.app_settings["risk"] = AppSetting(
+        key="risk", value={"regime_filter_enabled": False}
+    )
+    # Test arm chiaramente migliore: mean ≈ +5 vs control mean ≈ -2.
+    # Con 20 trade per arm e bassa varianza, p-value << 0.05.
+    rng = random.Random(42)
+    control_positions = [
+        _position(
+            pnl=-2.0 + rng.uniform(-0.5, 0.5),
+            closed_at=activated + timedelta(minutes=i + 1),
+            arm="control",
+        )
+        for i in range(20)
+    ]
+    test_positions = [
+        _position(
+            pnl=5.0 + rng.uniform(-0.5, 0.5),
+            closed_at=activated + timedelta(minutes=i + 50),
+            arm="test",
+        )
+        for i in range(20)
+    ]
+    tuner = AutoTuner(analyzer=FakeAnalyzer(control_positions + test_positions))
+
+    result = tuner.run(db)
+
+    assert result["status"] == "promoted"
+    assert result["mode"] == "ab_test"
+    assert result["mean_test"] > result["mean_control"]
+    assert result["p_one_tailed"] < 0.05
+    # Promozione: il patch deve essere stato applicato a `risk`.
+    assert db.app_settings["risk"].value["regime_filter_enabled"] is True
+    history = db.app_settings["auto_tuner_state"].value["step_history"]
+    assert history[0]["status"] == "promoted"
+    assert history[0]["ab_test"]["n_control"] == 20
+    assert history[0]["ab_test"]["n_test"] == 20
+
+
+def test_ab_mode_rejects_when_not_significant() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(
+        ab_test_min_trades_per_arm=10, ab_test_significance_level=0.05
+    )
+    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "mode": "ab_test",
+            "activated_at": activated.isoformat(),
+            "trades_at_activation": 0,
+            "ab_test": {
+                "control_overlay": {"regime_filter_enabled": False},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 0.5,
+            },
+            "step_history": [],
+        },
+    )
+    db.app_settings["risk"] = AppSetting(
+        key="risk", value={"regime_filter_enabled": False}
+    )
+    # Test arm peggio del control → improvement < 0 → rejected (nessun apply).
+    rng = random.Random(7)
+    control_positions = [
+        _position(
+            pnl=3.0 + rng.uniform(-0.3, 0.3),
+            closed_at=activated + timedelta(minutes=i + 1),
+            arm="control",
+        )
+        for i in range(15)
+    ]
+    test_positions = [
+        _position(
+            pnl=-1.0 + rng.uniform(-0.3, 0.3),
+            closed_at=activated + timedelta(minutes=i + 50),
+            arm="test",
+        )
+        for i in range(15)
+    ]
+    tuner = AutoTuner(analyzer=FakeAnalyzer(control_positions + test_positions))
+
+    result = tuner.run(db)
+
+    assert result["status"] == "rejected"
+    # Rejected: `risk` non deve essere stato modificato.
+    assert db.app_settings["risk"].value["regime_filter_enabled"] is False
+    history = db.app_settings["auto_tuner_state"].value["step_history"]
+    assert history[0]["status"] == "rejected"
+
+
+def test_ab_mode_ignores_untagged_positions_in_partition() -> None:
+    """Posizioni senza `_auto_tuner` metadata (es. trade pre-attivazione o di
+    altri step) non devono essere conteggiate in nessun arm."""
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    positions = [
+        # Senza tag → escluso
+        _position(pnl=1.0, closed_at=activated + timedelta(minutes=1), arm=None),
+        # Step diverso → escluso
+        _position(
+            pnl=2.0,
+            closed_at=activated + timedelta(minutes=2),
+            arm="control",
+            step_key="other_step",
+        ),
+        # Step corretto, arm control → contato
+        _position(
+            pnl=3.0,
+            closed_at=activated + timedelta(minutes=3),
+            arm="control",
+        ),
+    ]
+
+    arms = tuner._partition_by_arm(positions, activated.isoformat(), "regime_filter")
+
+    assert len(arms["control"]) == 1
+    assert arms["control"][0].realized_pnl == Decimal("3.0")
+    assert len(arms["test"]) == 0
+
+
+def test_active_ab_overlay_returns_none_when_not_in_ab_mode() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _config(enabled=True)  # mode="sequential"
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "ab_test": {
+                "control_overlay": {},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 0.5,
+            },
+        },
+    )
+    assert active_ab_overlay(db) is None
+
+
+def test_active_ab_overlay_returns_arm_when_ab_active() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "mode": "ab_test",
+            "ab_test": {
+                "control_overlay": {"regime_filter_enabled": False},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 1.0,  # 100% test → deterministico
+            },
+        },
+    )
+
+    overlay = active_ab_overlay(db)
+
+    assert overlay is not None
+    assert overlay["step_key"] == "regime_filter"
+    assert overlay["arm"] == "test"
+    assert overlay["overlay"] == {"regime_filter_enabled": True}
+
+
+def test_active_ab_overlay_returns_control_when_allocation_zero() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "mode": "ab_test",
+            "ab_test": {
+                "control_overlay": {"regime_filter_enabled": False},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 0.0,  # 0% test → control deterministico
+            },
+        },
+    )
+
+    overlay = active_ab_overlay(db)
+
+    assert overlay is not None
+    assert overlay["arm"] == "control"
+    assert overlay["overlay"] == {"regime_filter_enabled": False}
+
+
+def test_ab_mode_rollback_does_not_revert_risk() -> None:
+    """In AB mode il patch non era stato applicato; rollback chiude solo lo step."""
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "mode": "ab_test",
+            "activated_at": "2026-05-14T12:00:00+00:00",
+            "trades_at_activation": 0,
+            "ab_test": {
+                "control_overlay": {"regime_filter_enabled": False},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 0.5,
+            },
+            "step_history": [],
+        },
+    )
+    # Stato "vero" su risk: regime_filter già attivato da altro flow.
+    db.app_settings["risk"] = AppSetting(
+        key="risk", value={"regime_filter_enabled": True}
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.rollback_current(db)
+
+    assert result["ok"] is True
+    # AB rollback NON deve aver fatto revert su risk (no-op sul setting).
+    assert db.app_settings["risk"].value["regime_filter_enabled"] is True
+    state = db.app_settings["auto_tuner_state"].value
+    assert state["ab_test"] is None
+    assert state["step_history"][0]["status"] == "reverted"
+    assert state["step_history"][0]["mode"] == "ab_test"
+
+
+def test_welch_t_test_returns_p_value_near_one_for_equal_means() -> None:
+    """Sanity check: due popolazioni con stessa media → p_one_tailed ≈ 0.5."""
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+    rng = random.Random(0)
+    control = [rng.gauss(0, 1) for _ in range(100)]
+    test = [rng.gauss(0, 1) for _ in range(100)]
+    stats = tuner._welch_t_test(control, test)
+    # Per popolazioni equivalenti il p-value one-tailed si distribuisce uniforme
+    # tra 0 e 1; con seed=0 verifichiamo che sia "non-significativo" (> 0.05).
+    assert stats["p_one_tailed"] > 0.05
+
+
+def test_welch_t_test_returns_small_p_when_test_clearly_better() -> None:
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+    # Piccolo rumore per evitare il branch SE=0 (che ritorna p=1.0 by design).
+    rng = random.Random(123)
+    control = [-1.0 + rng.uniform(-0.05, 0.05) for _ in range(30)]
+    test = [1.0 + rng.uniform(-0.05, 0.05) for _ in range(30)]
+    stats = tuner._welch_t_test(control, test)
+    # Separazione di ~2 unità con std ≈ 0.03 → p << 0.001
+    assert stats["p_one_tailed"] < 0.001
+    assert stats["mean_test"] > stats["mean_control"]
+
+
+def test_ab_mode_completes_after_all_steps() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": None,
+            "step_history": [
+                {"key": "regime_filter", "status": "promoted"},
+                {"key": "mtf_confluence", "status": "rejected"},
+            ],
+        },
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.run(db)
+
+    assert result["status"] == "completed"

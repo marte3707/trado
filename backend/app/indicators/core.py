@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from math import sqrt
+from math import log, sqrt
 from typing import cast, Any
 
 
@@ -510,6 +510,113 @@ def wyckoff_spring_upthrust(
         "resistance_level": round(resistance, 6) if resistance is not None else None,
         "volume_ratio": round(volume_ratio, 2),
     }
+
+
+def hurst_exponent(
+    values: Sequence[float],
+    *,
+    min_lag: int = 2,
+    max_lag: int = 20,
+) -> float | None:
+    """Stima dell'esponente di Hurst via Rescaled Range (R/S) analysis su log-prezzi.
+
+    H ≈ 0.5 → random walk; H > 0.5 → serie persistente (trending);
+    H < 0.5 → serie anti-persistente (mean-reverting).
+
+    Richiede almeno `max_lag * 4` campioni; ritorna None se la serie è troppo
+    corta o se i log non sono calcolabili (valori non positivi).
+    """
+    if min_lag < 2 or max_lag <= min_lag:
+        raise ValueError("require 2 <= min_lag < max_lag")
+    n = len(values)
+    if n < max_lag * 4:
+        return None
+    if any(v <= 0 for v in values):
+        return None
+    log_values = [log(v) for v in values]
+    returns = [log_values[i] - log_values[i - 1] for i in range(1, n)]
+    if not returns:
+        return None
+
+    lags: list[int] = []
+    rs_values: list[float] = []
+    for lag in range(min_lag, max_lag + 1):
+        if lag >= len(returns):
+            break
+        chunks = len(returns) // lag
+        if chunks < 1:
+            continue
+        rs_chunks: list[float] = []
+        for chunk_index in range(chunks):
+            chunk = returns[chunk_index * lag : (chunk_index + 1) * lag]
+            mean = sum(chunk) / lag
+            deviations = [r - mean for r in chunk]
+            cumulative = []
+            running = 0.0
+            for d in deviations:
+                running += d
+                cumulative.append(running)
+            r = max(cumulative) - min(cumulative)
+            variance = sum(d * d for d in deviations) / lag
+            s = sqrt(variance)
+            if s <= 1e-12:
+                continue
+            rs_chunks.append(r / s)
+        if not rs_chunks:
+            continue
+        lags.append(lag)
+        rs_values.append(sum(rs_chunks) / len(rs_chunks))
+
+    if len(lags) < 2:
+        return None
+    # Regressione lineare log-log: H è la pendenza di log(R/S) vs log(lag)
+    xs = [log(lag_value) for lag_value in lags]
+    ys = [log(rs) for rs in rs_values]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
+    denominator = sum((x - mean_x) ** 2 for x in xs)
+    if denominator <= 1e-12:
+        return None
+    return numerator / denominator
+
+
+def volatility_persistence(
+    values: Sequence[float],
+    *,
+    lag: int = 1,
+    window: int = 50,
+) -> float | None:
+    """Proxy GARCH-lite: autocorrelazione lag-k dei rendimenti al quadrato.
+
+    Misura il volatility clustering tipico dei modelli GARCH(1,1): valori
+    elevati (≳ 0.2) indicano regime di volatilità persistente (cluster), valori
+    vicini a zero indicano vol indipendente nel tempo (white-noise sui σ²).
+
+    Usa gli ultimi `window` log-rendimenti. Ritorna None se la serie è troppo
+    corta o se la varianza dei rendimenti al quadrato è degenere.
+    """
+    if lag < 1:
+        raise ValueError("lag must be >= 1")
+    if window < lag + 10:
+        raise ValueError("window must accommodate at least lag + 10 samples")
+    n = len(values)
+    if n < window + 1:
+        return None
+    if any(v <= 0 for v in values[-(window + 1) :]):
+        return None
+    log_values = [log(v) for v in values[-(window + 1) :]]
+    returns = [log_values[i] - log_values[i - 1] for i in range(1, len(log_values))]
+    squared = [r * r for r in returns]
+    if len(squared) <= lag:
+        return None
+    mean = sum(squared) / len(squared)
+    centered = [s - mean for s in squared]
+    numerator = sum(centered[i] * centered[i - lag] for i in range(lag, len(centered)))
+    denominator = sum(c * c for c in centered)
+    if denominator <= 1e-12:
+        return None
+    return numerator / denominator
 
 
 def _cluster_levels(levels: Sequence[float], tolerance_pct: float) -> list[float]:

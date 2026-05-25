@@ -473,7 +473,7 @@ class CoinMarketCapClient:
             usage = self._empty_usage(enabled=False)
             self._cmc_usage_cache = (now, usage)
             return usage
-        usage = self._fetch_key_usage()
+        usage = self._fetch_key_usage()  # type: ignore[assignment]
         if usage is None:
             usage = self._empty_usage(enabled=enabled)
         self._cmc_usage_cache = (now, usage)
@@ -577,6 +577,8 @@ class CoinMarketCapClient:
 
         payload = response.json()
         data = payload.get("data") if isinstance(payload, dict) else {}
+        if not isinstance(data, dict):
+            data = {}
         value = _as_float(data.get("value"))
         if value is None:
             return None
@@ -663,9 +665,12 @@ class CoinMarketCapClient:
             logger.warning("coinmarketcap_key_info_failed", error=str(exc))
             return None
 
-        data = response.json().get("data") or {}
-        plan = data.get("plan") if isinstance(data, dict) and isinstance(data.get("plan"), dict) else {}
-        usage = data.get("usage") if isinstance(data, dict) and isinstance(data.get("usage"), dict) else {}
+        raw_data = response.json().get("data") or {}
+        data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
+        plan_raw = data.get("plan")
+        plan: dict[str, Any] = plan_raw if isinstance(plan_raw, dict) else {}
+        usage_raw = data.get("usage")
+        usage: dict[str, Any] = usage_raw if isinstance(usage_raw, dict) else {}
         available = self._usage_has_credits(plan, usage)
         return CoinMarketCapUsage(
             enabled=bool(self.settings.coinmarketcap_enabled and self.settings.coinmarketcap_api_key),

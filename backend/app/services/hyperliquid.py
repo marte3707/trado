@@ -306,6 +306,11 @@ class HyperliquidTradingClient:
         result = info.open_orders(address or self._account_address())
         return result if isinstance(result, list) else []
 
+    def frontend_open_orders(self, address: str | None = None) -> list[dict[str, Any]]:
+        info = self._info()
+        result = info.frontend_open_orders(address or self._account_address())
+        return result if isinstance(result, list) else []
+
     def submit_market_order(
         self,
         coin: str,

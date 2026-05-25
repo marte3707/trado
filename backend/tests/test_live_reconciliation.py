@@ -1,3 +1,4 @@
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -6,7 +7,7 @@ from typing import Any
 import pytest
 
 from app.db.models import DecisionLog, Market, Order, Position
-from app.services.live_reconciliation import reconcile_live_positions
+from app.services.live_reconciliation import _close_companion_paper_position, reconcile_live_positions
 
 
 @dataclass
@@ -52,6 +53,17 @@ class FakeDb:
 
 
 @dataclass
+class SnapshotOrderDb(FakeDb):
+    """Simulate a session where a later Order query does not see pending in-memory
+    status updates unless the caller carries the fill data forward explicitly."""
+
+    def query(self, model: type[Any]) -> _Query:
+        if model is Order:
+            return _Query(rows=[copy.copy(order) for order in self.orders])
+        return super().query(model)
+
+
+@dataclass
 class _FakeOrderResult:
     oid: str | None
     status: str
@@ -66,6 +78,7 @@ class FakeTrading:
         remote_positions: list[dict[str, Any]],
         fills: list[dict[str, Any]] | None = None,
         open_order_oids: list[int] | None = None,
+        frontend_open_orders: list[dict[str, Any]] | None = None,
         resubmit_oid: str = "88888",
         resubmit_immediately_filled: bool = False,
     ) -> None:
@@ -73,6 +86,7 @@ class FakeTrading:
         self._fills = fills or []
         # oids of orders currently open on HL (for protection-order detection tests)
         self._open_order_oids: list[int] | None = open_order_oids
+        self._frontend_open_orders = frontend_open_orders or []
         self._resubmit_oid = resubmit_oid
         self._resubmit_immediately_filled = resubmit_immediately_filled
         self.resubmitted: list[dict[str, Any]] = []
@@ -87,6 +101,9 @@ class FakeTrading:
         if self._open_order_oids is None:
             raise AttributeError("open_orders not configured")
         return [{"oid": oid} for oid in self._open_order_oids]
+
+    def frontend_open_orders(self, _address: str) -> list[dict[str, Any]]:
+        return list(self._frontend_open_orders)
 
     def submit_trigger_order(
         self,
@@ -140,6 +157,13 @@ def _make_position(size: str = "1") -> Position:
         metadata_json={},
     )
     p.market = _make_market()
+    return p
+
+
+def _make_short_position(size: str = "1") -> Position:
+    p = _make_position(size=size)
+    p.side = "short"
+    p.entry_price = Decimal("100")
     return p
 
 
@@ -460,6 +484,35 @@ def test_reconciliation_matches_fill_by_oid_when_cloid_missing() -> None:
     assert position.realized_pnl == Decimal("5")
 
 
+def test_reconciliation_carries_exit_price_from_matched_close_fill() -> None:
+    position = _make_position(size="1.0")
+    stop_order = _make_sl_order(oid=8888)
+    stop_order.side = "sell"
+    stop_order.price = Decimal("95")
+    db = SnapshotOrderDb(positions=[position], orders=[stop_order])
+    trading = FakeTrading(
+        remote_positions=[],
+        fills=[
+            {
+                "coin": "BTC",
+                "oid": 8888,
+                "cloid": "0xslcloid",
+                "px": "95",
+                "sz": "1.0",
+                "closedPnl": "-5",
+                "time": 1700000000000,
+            }
+        ],
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert position.status == "closed"
+    assert position.realized_pnl == Decimal("-5")
+    assert position.metadata_json["exit_price"] == "95"
+    assert position.metadata_json["exit_reason"] == "stop_loss"
+
+
 def test_reconciliation_skips_already_filled_orders() -> None:
     position = _make_position(size="0.5")
     position.realized_pnl = Decimal("5")  # already accounted for
@@ -601,6 +654,57 @@ def test_resubmit_sl_order_with_correct_tpsl_flag() -> None:
     assert sl_order.hyperliquid_order_id == "66666"
 
 
+def test_no_resubmit_when_manual_stop_exists_in_frontend_open_orders() -> None:
+    position = _make_short_position(size="1.0")
+    position.stop_loss = Decimal("105")
+    sl_order = _make_sl_order(oid=8888)
+    sl_order.price = Decimal("105")
+    db = FakeDb(positions=[position], orders=[sl_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "-1.0", "entryPx": "100", "liquidationPx": "130"}],
+        open_order_oids=[],
+        frontend_open_orders=[
+            {
+                "coin": "BTC",
+                "oid": 123456,
+                "orderType": "Stop Market",
+                "isTrigger": True,
+                "reduceOnly": True,
+                "triggerPx": "103",
+                "sz": "1.0",
+            }
+        ],
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert trading.resubmitted == []
+    assert sl_order.hyperliquid_order_id == "123456"
+    assert sl_order.price == Decimal("103")
+    assert position.stop_loss == Decimal("103")
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_synced_from_frontend" in events
+
+
+def test_skip_resubmit_when_local_stop_is_beyond_liquidation() -> None:
+    position = _make_short_position(size="1.0")
+    position.stop_loss = Decimal("105")
+    sl_order = _make_sl_order(oid=8888)
+    sl_order.price = Decimal("105")
+    db = FakeDb(positions=[position], orders=[sl_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "-1.0", "entryPx": "100", "liquidationPx": "104"}],
+        open_order_oids=[],
+        frontend_open_orders=[],
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert trading.resubmitted == []
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_resubmit_skipped_liquidation_guard" in events
+
+
 def test_resubmit_tp1_status_open_when_resting() -> None:
     """After re-submit that lands as resting, order.status must be 'open' (not 'ok')."""
     position = _make_position(size="1.0")
@@ -640,3 +744,118 @@ def test_resubmit_tp1_immediately_filled_by_hl() -> None:
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_protection_order_resubmit_filled_immediately" in events
     assert "live_protection_order_resubmitted" not in events
+
+
+# ---------------------------------------------------------------------------
+# Tests for companion paper-position close on live reconciliation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _CompanionFakeQuery:
+    rows: list[Any]
+
+    def options(self, *_args, **_kwargs) -> "_CompanionFakeQuery":
+        return self
+
+    def filter(self, *_args, **_kwargs) -> "_CompanionFakeQuery":
+        return self
+
+    def order_by(self, *_args, **_kwargs) -> "_CompanionFakeQuery":
+        return self
+
+    def all(self) -> list[Any]:
+        return list(self.rows)
+
+    def first(self) -> Any | None:
+        return self.rows[0] if self.rows else None
+
+
+@dataclass
+class _CompanionDb:
+    paper_positions: list[Position]
+    added: list[Any] = field(default_factory=list)
+    committed: int = 0
+
+    def query(self, _model: type[Any]) -> _CompanionFakeQuery:
+        return _CompanionFakeQuery(rows=list(self.paper_positions))
+
+    def get(self, _model: type[Any], _key: Any) -> None:
+        return None
+
+    def add(self, row: Any) -> None:
+        self.added.append(row)
+
+    def commit(self) -> None:
+        self.committed += 1
+
+
+def _make_live_with_signal(signal_id: int = 42) -> Position:
+    p = _make_position()
+    p.metadata_json = {"source_signal_id": signal_id}
+    return p
+
+
+def _make_paper_with_signal(signal_id: int = 42, entry: str = "100") -> Position:
+    p = Position(
+        id=99,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal(entry),
+        size=Decimal("1"),
+        stop_loss=None,
+        take_profit=None,
+        status="open",
+        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        metadata_json={"source_signal_id": signal_id},
+    )
+    return p
+
+
+def test_companion_paper_closed_when_live_reconciled() -> None:
+    live = _make_live_with_signal(42)
+    paper = _make_paper_with_signal(42, entry="100")
+    now = datetime.now(timezone.utc)
+    db = _CompanionDb(paper_positions=[paper])
+
+    _close_companion_paper_position(db, live, exit_price=Decimal("110"), now=now)
+
+    assert paper.status == "closed"
+    assert paper.size == Decimal("0")
+    assert paper.realized_pnl == Decimal("10")  # (110-100)*1
+    assert paper.metadata_json["exit_price"] == "110"
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "paper_position_companion_closed" in events
+
+
+def test_companion_no_paper_position_is_noop() -> None:
+    live = _make_live_with_signal(42)
+    db = _CompanionDb(paper_positions=[])
+
+    _close_companion_paper_position(db, live, exit_price=Decimal("110"), now=datetime.now(timezone.utc))
+
+    assert db.added == []
+
+
+def test_companion_no_signal_id_is_noop() -> None:
+    live = _make_position()
+    live.metadata_json = {}
+    paper = _make_paper_with_signal(42)
+    db = _CompanionDb(paper_positions=[paper])
+
+    _close_companion_paper_position(db, live, exit_price=Decimal("110"), now=datetime.now(timezone.utc))
+
+    assert paper.status == "open"
+    assert db.added == []
+
+
+def test_companion_exit_price_none_uses_entry() -> None:
+    live = _make_live_with_signal(42)
+    paper = _make_paper_with_signal(42, entry="95")
+    db = _CompanionDb(paper_positions=[paper])
+
+    _close_companion_paper_position(db, live, exit_price=None, now=datetime.now(timezone.utc))
+
+    assert paper.status == "closed"
+    assert paper.realized_pnl == Decimal("0")  # exit at entry → zero PnL
+    assert paper.metadata_json["exit_price"] == "95"

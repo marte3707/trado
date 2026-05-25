@@ -4,11 +4,13 @@ from app.indicators.core import (
     bollinger_bands,
     ema,
     fibonacci_levels,
+    hurst_exponent,
     latest_candlestick_pattern,
     macd,
     rsi,
     supertrend,
     support_resistance_levels,
+    volatility_persistence,
     vwap,
 )
 
@@ -131,3 +133,103 @@ def test_adx_low_in_choppy_market() -> None:
 
     assert last is not None
     assert last < 30
+
+
+# ---------------------------------------------------------------------------
+# Robustness tests (added during §2.1 perf investigation — vedi doc per dettagli)
+# ---------------------------------------------------------------------------
+
+import math
+
+
+def test_atr_finite_for_diverse_series() -> None:
+    highs = [100 + i * 0.5 + math.sin(i / 4) * 2 for i in range(100)]
+    lows = [h - 1.0 - abs(math.cos(i / 5)) for i, h in enumerate(highs)]
+    closes = [(h + l) / 2 + math.sin(i / 6) * 0.3 for i, (h, l) in enumerate(zip(highs, lows))]
+
+    result = atr(highs, lows, closes, 14)
+    # I primi 13 sono None (warmup EMA), gli altri devono essere float positivi
+    assert all(v is None for v in result[:13])
+    assert all(v is not None and v > 0 for v in result[13:])
+
+
+def test_rsi_bounded_for_long_series() -> None:
+    values = [100.0 + math.sin(i / 5) * 10 + (i % 11) for i in range(200)]
+    result = rsi(values, 14)
+
+    valid = [v for v in result if v is not None]
+    assert len(valid) >= 180
+    for v in valid:
+        assert 0 <= v <= 100
+
+
+def test_adx_monotonic_in_trending_series() -> None:
+    # Trend forte: ADX dovrebbe crescere o restare alto
+    closes = [100.0 + i * 0.4 for i in range(100)]
+    highs = [c + 0.2 for c in closes]
+    lows = [c - 0.2 for c in closes]
+    result = adx(highs, lows, closes, 14)
+    final = result[-1]
+    assert final is not None
+    assert final > 40
+
+
+def test_hurst_exponent_persistent_returns_above_half() -> None:
+    # AR(1) sui log-returns con phi=0.7 → returns persistenti, H > 0.5
+    import math
+    import random
+
+    random.seed(42)
+    returns = [0.0]
+    for _ in range(300):
+        returns.append(0.7 * returns[-1] + random.gauss(0, 0.005))
+    closes = [100.0]
+    for r in returns[1:]:
+        closes.append(closes[-1] * math.exp(r))
+    h = hurst_exponent(closes, min_lag=2, max_lag=20)
+    assert h is not None
+    assert h > 0.6
+
+
+def test_hurst_exponent_mean_reverting_series_below_half() -> None:
+    # Oscillazione ad alta frequenza attorno a 100 → anti-persistente, H < 0.5
+    closes = [100.0 + ((-1) ** i) * 0.5 + (i % 3) * 0.1 for i in range(200)]
+    h = hurst_exponent(closes, min_lag=2, max_lag=20)
+    assert h is not None
+    assert h < 0.5
+
+
+def test_hurst_exponent_short_series_returns_none() -> None:
+    closes = [100.0 + i for i in range(20)]
+    assert hurst_exponent(closes, min_lag=2, max_lag=20) is None
+
+
+def test_hurst_exponent_non_positive_returns_none() -> None:
+    closes = [100.0] * 50 + [0.0]
+    assert hurst_exponent(closes, min_lag=2, max_lag=10) is None
+
+
+def test_volatility_persistence_constant_series_returns_none() -> None:
+    # Rendimenti tutti zero → varianza nulla → degenere
+    closes = [100.0] * 100
+    assert volatility_persistence(closes, window=50) is None
+
+
+def test_volatility_persistence_clustered_volatility_positive_autocorr() -> None:
+    # Costruzione di una serie con vol clustering esplicito: blocchi alternati
+    # di alta e bassa volatilità → autocorrelazione su squared returns positiva
+    closes = [100.0]
+    high_block = [0.04, -0.04, 0.04, -0.04, 0.04, -0.04, 0.04, -0.04, 0.04, -0.04]
+    low_block = [0.001, -0.001, 0.001, -0.001, 0.001, -0.001, 0.001, -0.001, 0.001, -0.001]
+    for _ in range(6):
+        for r in high_block + low_block:
+            closes.append(closes[-1] * (1 + r))
+    result = volatility_persistence(closes, lag=1, window=80)
+    assert result is not None
+    # I blocchi mantengono σ² persistente al loro interno → autocorr lag-1 > 0
+    assert result > 0.1
+
+
+def test_volatility_persistence_short_series_returns_none() -> None:
+    closes = [100.0 + i * 0.1 for i in range(30)]
+    assert volatility_persistence(closes, window=50) is None

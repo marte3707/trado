@@ -282,6 +282,23 @@ class TelegramNotifier:
             f"{defensive_line}"
         )
 
+    async def send_live_position_opened(self, position: Position) -> None:
+        symbol = position.market.symbol if position.market else "?"
+        side = position.side.upper()
+        icon = "📈" if side == "LONG" else "📉"
+        notional = float(position.size) * float(position.entry_price)
+        contract_lev = (position.metadata_json or {}).get("contract_leverage")
+        leverage = f"{int(contract_lev)}x" if contract_lev is not None else "—"
+        now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        await self._send_text(
+            f"{icon} <b>Posizione LIVE aperta</b>\n"
+            f"<code>{now_str}</code>\n\n"
+            f"🪙 <b>{symbol}</b>\n"
+            f"↕️ Side: <b>{side}</b>\n"
+            f"💰 Valore: <code>{notional:.2f} $</code>\n"
+            f"⚙️ Leva: <b>{leverage}</b> · Entry: <code>{float(position.entry_price):.4f}</code>"
+        )
+
     async def send_live_position_closed(
         self,
         *,

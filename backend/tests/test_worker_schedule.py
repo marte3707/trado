@@ -1,20 +1,43 @@
 from decimal import Decimal
 
 from app.core.enums import OperationMode, SignalStatus
-from app.db.models import Market, Signal
+from app.db.models import Market, Position, Signal
 from app.worker import main as worker
 
 
 class FakeDb:
-    def __init__(self) -> None:
+    def __init__(self, positions: list[Position] | None = None, signals: dict[int, Signal] | None = None) -> None:
         self.added: list[object] = []
         self.committed = 0
+        self.positions = positions or []
+        self.signals = signals or {}
 
     def add(self, row: object) -> None:
         self.added.append(row)
 
     def commit(self) -> None:
         self.committed += 1
+
+    def query(self, model: object) -> "FakeQuery":
+        if model is Position:
+            return FakeQuery(self.positions)
+        raise AssertionError(f"unexpected query model: {model}")
+
+    def get(self, model: object, key: int) -> Signal | None:
+        if model is Signal:
+            return self.signals.get(key)
+        raise AssertionError(f"unexpected get model: {model}")
+
+
+class FakeQuery:
+    def __init__(self, rows: list[Position]) -> None:
+        self.rows = rows
+
+    def filter(self, *args: object, **kwargs: object) -> "FakeQuery":
+        return self
+
+    def all(self) -> list[Position]:
+        return list(self.rows)
 
 
 class FakeExecutor:
@@ -87,6 +110,34 @@ def test_active_timeframes_do_not_run_unknown_timeframes() -> None:
     worker._LAST_TIMEFRAME_RUN_MS.clear()
 
     assert worker.active_timeframes_for_tick(["2m"], 0) == []
+
+
+def test_paper_management_timeframes_include_open_position_timeframes() -> None:
+    positions = [
+        Position(mode="paper", status="open", metadata_json={"source_timeframe": "30m"}),
+        Position(mode="paper", status="open", metadata_json={"source_timeframe": "1h"}),
+        Position(mode="paper", status="open", metadata_json={"source_timeframe": "2m"}),
+        Position(mode="paper", status="open", metadata_json={"source_timeframe": "30m"}),
+    ]
+
+    assert worker.paper_management_timeframes(FakeDb(positions=positions), ["5m", "15m"]) == [
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+    ]
+
+
+def test_paper_management_timeframes_fall_back_to_signal_timeframe() -> None:
+    positions = [
+        Position(mode="paper", status="open", metadata_json={"source_signal_id": "42"}),
+    ]
+    signals = {42: Signal(timeframe="4h")}
+
+    assert worker.paper_management_timeframes(
+        FakeDb(positions=positions, signals=signals),
+        ["5m"],
+    ) == ["5m", "4h"]
 
 
 def test_auto_trade_executes_paper_before_live() -> None:
