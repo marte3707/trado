@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from app.db.models import Position, Signal
+from app.db.models import AppSetting, DecisionLog, Position, Signal
 from app.engine.diagnostics import (
+    build_equity_slope_diagnostics,
     equity_slope,
     exit_reason_distribution,
     planned_stop_pct_summary,
@@ -51,6 +52,65 @@ def _signal(signal_id: int, *, entry: float, stop: float) -> Signal:
     signal.id = signal_id
     signal.stop_loss = Decimal(str(stop))
     return signal
+
+
+class FakeQuery:
+    def __init__(self, rows: list[DecisionLog]) -> None:
+        self.rows = rows
+
+    def filter(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        return self
+
+    def order_by(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        return self
+
+    def limit(self, value: int):
+        self.rows = self.rows[:value]
+        return self
+
+    def all(self):
+        return self.rows
+
+
+class FakeDiagnosticsDb:
+    def __init__(self, positions: list[Position], logs: list[DecisionLog]) -> None:
+        self.positions = positions
+        self.logs = logs
+        self.settings = {
+            "auto_calibration": AppSetting(
+                key="auto_calibration",
+                value={
+                    "deep_defensive_slope_threshold": -0.1,
+                    "recent_slope_exit_cycles": 3,
+                    "starvation_hard_cycles": 15,
+                },
+            ),
+            "auto_calibration_state": AppSetting(
+                key="auto_calibration_state",
+                value={
+                    "deep_defensive_active": True,
+                    "last_reason": "deep defensive mode",
+                    "deep_defensive_positive_streak": 1,
+                    "deep_defensive_recent_positive_streak": 0,
+                    "consecutive_zero_signal_cycles": 2,
+                    "deep_defensive_cooldown_remaining": 0,
+                },
+            ),
+            "auto_calibration_baseline": AppSetting(
+                key="auto_calibration_baseline",
+                value={"risk": {"min_signal_score": 60}},
+            ),
+            "risk": AppSetting(key="risk", value={"min_signal_score": 72}),
+        }
+
+    def get(self, model, key):  # noqa: ANN001
+        if model is AppSetting:
+            return self.settings.get(key)
+        return None
+
+    def query(self, model):  # noqa: ANN001
+        assert model is DecisionLog
+        return FakeQuery(self.logs)
 
 
 def test_exit_reason_distribution_groups_reasons_and_handles_missing() -> None:
@@ -132,3 +192,34 @@ def test_equity_slope_zero_when_insufficient_history() -> None:
     ]
 
     assert equity_slope(positions) == 0.0
+
+
+def test_build_equity_slope_diagnostics_exposes_status_and_time_stop_impact(monkeypatch) -> None:
+    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    positions = [
+        _position(pnl=-2.0, closed_at=base + timedelta(minutes=i))
+        for i in range(60)
+    ]
+    log = DecisionLog(
+        event_type="paper_position_time_stop_closed",
+        message="closed",
+        data={"realized_pnl": "-12.5"},
+    )
+    log.timestamp = datetime.now(timezone.utc)
+    db = FakeDiagnosticsDb(positions, [log])
+    monkeypatch.setattr(
+        "app.engine.diagnostics.SignalPerformanceAnalyzer.closed_paper_positions",
+        lambda self, db, limit=500, **kwargs: positions[:limit],
+    )
+
+    diagnostics = build_equity_slope_diagnostics(db, lookback=500)  # type: ignore[arg-type]
+
+    assert diagnostics["status"] == "declining"
+    assert diagnostics["threshold"] == -0.1
+    assert diagnostics["deep_defensive_active"] is True
+    assert diagnostics["recent_time_stop_impact"]["closed_count"] == 1
+    assert diagnostics["recent_time_stop_impact"]["realized_pnl"] == -12.5
+    assert diagnostics["baseline_vs_current"]["risk"]["min_signal_score"] == {
+        "baseline": 60,
+        "current": 72,
+    }

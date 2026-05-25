@@ -402,6 +402,67 @@ def test_deep_defensive_exits_via_recent_slope_before_full_slope_recovers() -> N
     assert state["deep_defensive_recent_positive_streak"] == 3
 
 
+def test_deep_defensive_cooldown_blocks_immediate_reentry() -> None:
+    db = FakeDb({"min_signal_score": 60, "min_risk_reward": 2.0, "max_risk_per_trade_pct": 1.0})
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={
+            "deep_defensive_active": False,
+            "deep_defensive_cooldown_remaining": 6,
+            "deep_defensive_cooldown_trade_count": 30,
+        },
+    )
+
+    changes = AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        stats(win_rate=0.30, pnl=-200, profit_factor=0.5),
+        {
+            **_risk_settings(),
+            "deep_defensive_cooldown_runs": 6,
+            "deep_defensive_cooldown_min_new_trades": 3,
+        },
+        equity_slope_value=-5.0,
+    )
+
+    risk = db.rows["risk"].value
+    state = db.rows["auto_calibration_state"].value
+    assert risk["min_signal_score"] == 60
+    assert risk["min_risk_reward"] == 2.0
+    assert risk["max_risk_per_trade_pct"] == 1.0
+    assert state["deep_defensive_active"] is False
+    assert state["deep_defensive_cooldown_remaining"] == 5
+    assert any(c.target == "calibration_state" and c.key == "deep_defensive_cooldown" for c in changes)
+
+
+def test_deep_defensive_cooldown_expires_after_new_trades() -> None:
+    db = FakeDb({"min_signal_score": 60, "min_risk_reward": 2.0, "max_risk_per_trade_pct": 1.0})
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={
+            "deep_defensive_active": False,
+            "deep_defensive_cooldown_remaining": 6,
+            "deep_defensive_cooldown_trade_count": 27,
+        },
+    )
+
+    AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        stats(win_rate=0.30, pnl=-200, profit_factor=0.5),
+        {
+            **_risk_settings(),
+            "deep_defensive_cooldown_runs": 6,
+            "deep_defensive_cooldown_min_new_trades": 3,
+        },
+        equity_slope_value=-5.0,
+    )
+
+    risk = db.rows["risk"].value
+    state = db.rows["auto_calibration_state"].value
+    assert state["deep_defensive_cooldown_remaining"] == 0
+    assert state["deep_defensive_active"] is True
+    assert risk["min_signal_score"] == 72
+
+
 def test_defensive_mode_exits_when_recent_profit_factor_above_one() -> None:
     """Se profit_factor recente > 1.0 usciamo dal defensive anche con storico negativo.
     Copre il caso 40% WR con RR 1:3: PF=2.0, sistema profittevole nonostante WR basso."""

@@ -17,6 +17,19 @@ Default iniziale:
 
 ```json
 {
+  "timeStop": {
+    "enabled": true,
+    "paperEnabled": true,
+    "liveMode": "alert",
+    "maxAgeHoursByTimeframe": {
+      "5m": 8,
+      "15m": 16,
+      "30m": 24,
+      "1h": 48,
+      "4h": 96,
+      "1d": 168
+    }
+  },
   "trailingStop": {
     "enabled": true,
     "activationR": 1.0,
@@ -50,7 +63,9 @@ Default iniziale:
 }
 ```
 
-In paper trading il worker simula TP parziali e aggiornamenti SL. In live trading gli aggiornamenti SL sono inviati solo quando la modalita' effettiva e' `AUTO_TRADE`, `enable_live_trading` e' true, le credenziali sono configurate e il kill switch e' spento. Ogni modifica dello stop e' registrata in `position_stop_updates` e nei `decision_logs`.
+In paper trading il worker simula TP parziali e aggiornamenti SL. Il `timeStop` chiude automaticamente solo posizioni paper oltre la soglia del timeframe usando il close dell'ultima candela disponibile e registra `paper_position_time_stop_closed`. In live trading `liveMode: "alert"` non chiude ordini: registra `live_position_time_stop_alert` e aggiorna `metadata.last_time_stop_alert_at` per evitare spam.
+
+In live trading gli aggiornamenti SL sono inviati solo quando la modalita' effettiva e' `AUTO_TRADE`, `enable_live_trading` e' true, le credenziali sono configurate e il kill switch e' spento. Ogni modifica dello stop e' registrata in `position_stop_updates` e nei `decision_logs`.
 
 ## Avvio locale passo per passo
 
@@ -383,11 +398,29 @@ curl -s <http://localhost:8000/api/auto-tuner/status> | jq
 §4.9 regime detection alternativo (Hurst, GARCH) -> **FATTO**
 §3.10 A/B testing auto-tuner -> **FATTO**
 
+## Cooldown deep defensive auto-calibration
+
+La calibrazione usa `deep_defensive_cooldown_runs` (default `6`) e
+`deep_defensive_cooldown_min_new_trades` (default `3`) per evitare oscillazioni
+immediate dopo una recovery da deep defensive/starvation. Durante il cooldown i
+parametri risk restano al baseline anche se lo slope storico e' ancora negativo.
+
+Lo stato e' salvato in `auto_calibration_state`:
+
+- `deep_defensive_cooldown_remaining`
+- `deep_defensive_cooldown_started_at`
+- `deep_defensive_cooldown_trade_count`
+- `deep_defensive_last_exit_reason`
+
+Quando il cooldown blocca un nuovo irrigidimento, il run registra una change
+`target: "calibration_state"`, `key: "deep_defensive_cooldown"` dentro
+`auto_calibration_applied`.
+
 ## A/B testing auto-tuner (§3.10)
 
 L'auto-tuner storico (`mode: "sequential"`, default) confronta i trade pre e post-attivazione del patch sulla stessa popolazione di mercato. Il problema noto: se le condizioni di regime cambiano fra finestra pre e post, il confronto è confuso da bias temporali.
 
-In `mode: "ab_test"` l'auto-tuner non modifica mai globalmente `risk` finché lo step non viene promosso. Per ogni nuovo segnale `SignalEngine.evaluate()` chiama `active_ab_overlay()`, sceglie randomicamente fra arm `control` (overlay = `step.revert`) e arm `test` (overlay = `step.patch`) con probabilità `ab_test_allocation`, e mergia l'overlay nel `risk_value` locale prima di derivare i filtri. La posizione che ne nasce viene taggata in `metadata_json["_auto_tuner"] = {"step_key", "arm"}` (sia paper sia live).
+In `mode: "ab_test"` l'auto-tuner non modifica mai globalmente `risk` finché lo step non viene promosso. Per ogni nuovo segnale `SignalEngine.evaluate()` chiama `active_ab_overlay()`, assegna deterministicamente l'arm via hash stabile di `step_key + market_id + timeframe + source_candle_open_time + ab_test_assignment_salt`, poi mergia l'overlay dell'arm nel `risk_value` locale prima di derivare i filtri. La posizione che ne nasce viene taggata in `metadata_json["_auto_tuner"] = {"step_key", "arm"}` (sia paper sia live).
 
 Quando entrambi gli arm hanno raccolto almeno `ab_test_min_trades_per_arm` posizioni chiuse post-attivazione, l'auto-tuner esegue un Welch's t-test sulla media del PnL realizzato e:
 
@@ -411,6 +444,7 @@ curl -X PATCH http://localhost:8000/api/settings \
         "ab_test_min_trades_per_arm": 30,
         "ab_test_significance_level": 0.05,
         "ab_test_allocation": 0.5,
+        "ab_test_assignment_salt": "trado-v1",
         "sequence": [
           {"key": "regime_filter", "label": "Regime filter (ADX)",
            "patch": {"regime_filter_enabled": true},
@@ -426,6 +460,7 @@ Parametri:
 - `ab_test_min_trades_per_arm` (default 30): minimo di trade chiusi per arm prima di valutare. Sotto questa soglia `run()` ritorna `status: "in_progress"`.
 - `ab_test_significance_level` (default 0.05): α one-tailed per promuovere il patch.
 - `ab_test_allocation` (default 0.5): P(test). 0.5 = 50/50; valori più bassi (es. 0.2) consentono di limitare l'esposizione al rischio della variante non testata.
+- `ab_test_assignment_salt` (default `"trado-v1"`): sale per l'assegnazione deterministica degli arm. Cambiarlo rimescola le assegnazioni future.
 
 Il p-value è calcolato con approssimazione normale del CDF di Student (sufficiente per n ≥ ~20 per arm). Per popolazioni più piccole o distribuzioni molto fat-tailed l'errore di approssimazione è conservativo (sotto-stima la significatività).
 
@@ -442,19 +477,45 @@ Il p-value è calcolato con approssimazione normale del CDF di Student (sufficie
   "ab_test_state": {
     "control_overlay": {"regime_filter_enabled": false},
     "test_overlay":    {"regime_filter_enabled": true},
-    "allocation": 0.5
+    "allocation": 0.5,
+    "assignment_method": "deterministic_hash"
   },
-  "ab_progress": {"trades_control": 18, "trades_test": 21, "trades_required_per_arm": 30}
+  "ab_progress": {
+    "trades_control": 18,
+    "trades_test": 21,
+    "trades_required_per_arm": 30,
+    "sample_balance": 0.86,
+    "mean_control": -1.2,
+    "mean_test": 0.4,
+    "mean_delta": 1.6,
+    "alpha": 0.05,
+    "assignment_method": "deterministic_hash",
+    "control_overlay": {"regime_filter_enabled": false},
+    "test_overlay": {"regime_filter_enabled": true},
+    "active_overlay": {"regime_filter_enabled": true}
+  }
 }
 ```
 
 `POST /api/auto-tuner/rollback` chiude lo step corrente senza alcuna modifica a `risk` (in AB mode il patch non era stato applicato). `POST /api/auto-tuner/reset` azzera anche la history.
 
+### Source test guidati
+
+Per evitare patch manuali su `auto_tuner_config`, la UI usa endpoint dedicati:
+
+- `GET /api/auto-tuner/source-tests` mostra i preset disponibili, lo step attivo e se l'avvio è bloccato.
+- `POST /api/auto-tuner/source-tests/whale_flow/start` avvia un A/B test che rimuove solo `whale_flow` da `disabled_signal_sources` nell'arm test.
+- `POST /api/auto-tuner/source-tests/fear_greed/start` fa lo stesso per `fear_greed`.
+
+Se esiste già uno step attivo, l'endpoint di start ritorna `409` con `recommended_actions: ["wait", "rollback", "reset"]`. I preset preservano le altre source già disabilitate e non modificano globalmente `risk` finché l'A/B non viene promosso.
+
 ### Limitazioni note
 
 - Gli overlay attualmente in `DEFAULT_SEQUENCE` (regime, MTF, volatility, participation ratio) toccano solo filtri di signal-generation. Patch che modifichino parametri di sizing/execution (es. `max_risk_per_trade_pct`) non sono pienamente A/B-isolati: `OrderExecutionEngine` legge `risk` direttamente al momento dell'apertura della posizione e userebbe il valore "globale" (= control), creando un sottile leak fra arm. Per quei casi servirebbe propagare anche `_auto_tuner` overlay all'esecuzione.
-- L'assegnazione arm è random per-segnale (`random.random()`), quindi non riproducibile fra worker tick. Per audit fine usare il tag `_auto_tuner.arm` persistito sulla `Position`.
+- L'assegnazione arm è deterministica quando il caller passa market/timeframe/candela. Il fallback random resta solo per chiamate isolate senza contesto di segnale.
 - L'auto-tuner valuta solo posizioni paper (`SignalPerformanceAnalyzer.closed_paper_positions`). Il tag viene comunque scritto anche su posizioni live per coerenza.
+
+`GET /api/analytics/equity-slope` espone la diagnostica dedicata della slope: finestre 50/100/500 trade, slope normalizzata, soglia deep defensive, stato interpretativo, cooldown, streak di uscita e impatto dei time-stop paper nelle ultime 24h.
 
 ## Regime detection alternativo
 

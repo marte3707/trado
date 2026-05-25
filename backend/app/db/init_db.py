@@ -120,6 +120,13 @@ def seed_defaults(db: Session) -> None:
                 value=DEFAULT_POSITION_MANAGEMENT_SETTINGS,
             )
         )
+    else:
+        existing_pm = db.get(AppSetting, "position_management")
+        if existing_pm is not None and isinstance(existing_pm.value, dict):
+            value = dict(existing_pm.value)
+            if "timeStop" not in value:
+                value["timeStop"] = DEFAULT_POSITION_MANAGEMENT_SETTINGS["timeStop"]
+                existing_pm.value = value
     if db.get(AppSetting, "timeframes") is None:
         db.add(AppSetting(key="timeframes", value={"enabled": settings.enabled_timeframes}))
     if db.get(AppSetting, "alerts") is None:
@@ -178,6 +185,12 @@ def seed_defaults(db: Session) -> None:
                 mutated = True
             if "auto_disable_retest_after_trades" not in updated:
                 updated["auto_disable_retest_after_trades"] = 200
+                mutated = True
+            if "deep_defensive_cooldown_runs" not in updated:
+                updated["deep_defensive_cooldown_runs"] = 6
+                mutated = True
+            if "deep_defensive_cooldown_min_new_trades" not in updated:
+                updated["deep_defensive_cooldown_min_new_trades"] = 3
                 mutated = True
             if mutated:
                 existing.value = updated

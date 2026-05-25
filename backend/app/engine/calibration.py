@@ -167,6 +167,8 @@ class AutoCalibrationEngine:
             "min_trades_for_slope": 10,
             "recent_window": 50,
             "recent_slope_exit_cycles": 3,
+            "deep_defensive_cooldown_runs": 6,
+            "deep_defensive_cooldown_min_new_trades": 3,
         }
         return {**defaults, **value}
 
@@ -498,6 +500,18 @@ class AutoCalibrationEngine:
         prev_in_deep = bool(state_value.get("deep_defensive_active", False))
         deep_threshold = float(settings.get("deep_defensive_slope_threshold", -2.0))
         recent_slope_exit_cycles = int(settings.get("recent_slope_exit_cycles", 3))
+        cooldown_runs = max(0, int(settings.get("deep_defensive_cooldown_runs", 6)))
+        cooldown_min_new_trades = max(
+            0, int(settings.get("deep_defensive_cooldown_min_new_trades", 3))
+        )
+        cooldown_remaining = max(
+            0, int(state_value.get("deep_defensive_cooldown_remaining", 0) or 0)
+        )
+        cooldown_trade_count_raw = state_value.get("deep_defensive_cooldown_trade_count")
+        try:
+            cooldown_trade_count = int(cooldown_trade_count_raw)
+        except (TypeError, ValueError):
+            cooldown_trade_count = overall.trades
 
         min_risk_floor = float(settings.get("min_risk_per_trade_pct", 0.25))
 
@@ -523,6 +537,7 @@ class AutoCalibrationEngine:
         if in_deep_defensive and new_recent_streak >= recent_slope_exit_cycles:
             in_deep_defensive = False
             new_streak = 0
+            state_value["deep_defensive_last_exit_reason"] = "recent_slope_recovery"
 
         # Starvation recovery: se troppi cicli consecutivi senza segnali il deep
         # defensive non sta proteggendo nulla — allentare progressivamente.
@@ -534,6 +549,7 @@ class AutoCalibrationEngine:
             in_deep_defensive = False
             new_streak = 0
             starvation_override = True
+            state_value["deep_defensive_last_exit_reason"] = "starvation_recovery"
 
         # Equity-slope "ambiguo": se la calibrazione è in deep defensive ma il numero
         # di trade chiusi nella finestra è troppo basso per stimare lo slope in modo
@@ -545,9 +561,35 @@ class AutoCalibrationEngine:
             in_deep_defensive = False
             new_streak = 0
             starvation_override = True
+            state_value["deep_defensive_last_exit_reason"] = "ambiguous_slope"
         state_value["consecutive_zero_signal_cycles"] = zero_cycles
         state_value["starvation_override_active"] = starvation_override
         state_value["ambiguous_slope_override"] = ambiguous_slope and starvation_override
+
+        cooldown_started = False
+        if prev_in_deep and not in_deep_defensive and cooldown_runs > 0:
+            cooldown_remaining = cooldown_runs
+            cooldown_trade_count = overall.trades
+            cooldown_started = True
+            state_value["deep_defensive_cooldown_started_at"] = datetime.now(
+                timezone.utc
+            ).isoformat()
+            state_value["deep_defensive_cooldown_trade_count"] = cooldown_trade_count
+
+        new_trades_since_cooldown = max(0, overall.trades - cooldown_trade_count)
+        cooldown_active = (
+            cooldown_remaining > 0
+            and new_trades_since_cooldown < cooldown_min_new_trades
+        )
+        next_cooldown_remaining = cooldown_remaining
+        if cooldown_active and not cooldown_started:
+            next_cooldown_remaining = max(0, cooldown_remaining - 1)
+        if new_trades_since_cooldown >= cooldown_min_new_trades:
+            cooldown_active = False
+            next_cooldown_remaining = 0
+
+        if cooldown_active:
+            in_deep_defensive = False
 
         # Trend recente positivo: profit_factor > 1 sugli ultimi N trade indica che
         # il sistema sta guadagnando più di quanto perde, indipendentemente dal win rate.
@@ -566,7 +608,16 @@ class AutoCalibrationEngine:
         rr_delta = 0.0
         risk_pct = base_risk
         reason = "historical performance near baseline"
-        if starvation_override and ambiguous_slope and overall.trades < min_slope_trades:
+        if cooldown_active:
+            score_delta = 0
+            rr_delta = 0.0
+            risk_pct = base_risk
+            reason = (
+                "deep defensive cooldown: baseline mantenuto "
+                f"({next_cooldown_remaining} run rimanenti, "
+                f"{new_trades_since_cooldown}/{cooldown_min_new_trades} nuovi trade)"
+            )
+        elif starvation_override and ambiguous_slope and overall.trades < min_slope_trades:
             score_delta = 0
             rr_delta = 0.0
             risk_pct = base_risk
@@ -634,6 +685,8 @@ class AutoCalibrationEngine:
         state_value["deep_defensive_active"] = in_deep_defensive
         state_value["deep_defensive_positive_streak"] = new_streak
         state_value["deep_defensive_recent_positive_streak"] = new_recent_streak
+        state_value["deep_defensive_cooldown_remaining"] = next_cooldown_remaining
+        state_value["deep_defensive_cooldown_trade_count"] = cooldown_trade_count
         state_value["last_equity_slope"] = equity_slope_value
         state_value["last_recent_slope"] = recent_slope_value
         state_setting_to_persist = state_setting or AppSetting(
@@ -658,6 +711,16 @@ class AutoCalibrationEngine:
         next_risk_pct = round(min(base_risk, risk_pct), 4)
 
         changes: list[CalibrationChange] = []
+        if cooldown_active:
+            changes.append(
+                CalibrationChange(
+                    target="calibration_state",
+                    key="deep_defensive_cooldown",
+                    before=cooldown_remaining,
+                    after=next_cooldown_remaining,
+                    reason=reason,
+                )
+            )
         for key, value in {
             "min_signal_score": next_score,
             "min_risk_reward": next_rr,

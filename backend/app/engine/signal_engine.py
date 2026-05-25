@@ -317,6 +317,7 @@ class SignalEngine:
             )
             self._record_skip("insufficient_candles")
             return None
+        latest_candle_open_time = rows[0].open_time
 
         risk_settings = db.get(AppSetting, "risk")
         min_signal_score = settings.min_signal_score
@@ -330,7 +331,12 @@ class SignalEngine:
         # AB testing auto-tuner (§3.10): in mode="ab_test" l'auto-tuner non modifica
         # `risk` globalmente — ogni segnale è assegnato a control o test e l'overlay
         # del relativo arm viene mergiato in `risk_value` prima di derivare i filtri.
-        ab_overlay_payload = active_ab_overlay(db)
+        ab_overlay_payload = active_ab_overlay(
+            db,
+            market_id=market.id,
+            timeframe=timeframe,
+            source_candle_open_time=latest_candle_open_time,
+        )
         ab_overlay: dict[str, Any] = (
             dict(ab_overlay_payload.get("overlay", {})) if ab_overlay_payload else {}
         )
@@ -432,7 +438,6 @@ class SignalEngine:
                 self._record_skip("low_liquidity")
                 return None
 
-        latest_candle_open_time = rows[0].open_time
         # Early-exit duplicate check: evita di pagare HTTP esterne (fundings, L2 book,
         # whale/altcoin/fear-greed) e l'esecuzione di tutte le strategie quando un
         # segnale per questa candela è già stato emesso. Era a metà funzione, dopo i
@@ -766,6 +771,7 @@ class SignalEngine:
             score.breakdown["_auto_tuner"] = {
                 "step_key": ab_overlay_payload["step_key"],
                 "arm": ab_overlay_payload["arm"],
+                "assignment_method": ab_overlay_payload.get("assignment_method"),
             }
         signal = Signal(
             market_id=market.id,

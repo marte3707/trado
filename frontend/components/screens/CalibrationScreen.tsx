@@ -4,11 +4,13 @@ import React, { useEffect, useMemo, useState } from "react";
 import { Icon, fmt } from "@/components/atoms";
 import {
   AppSettings,
+  AutoTunerSourceTests,
   AutoTunerStatus,
   Calibration,
   CalibrationChange,
   CalibrationHistoryEntry,
   DiagnosticReport,
+  EquitySlopeDiagnostics,
   SignalRejections,
   TunerStepHistory,
   WorkerCycle,
@@ -69,6 +71,10 @@ function valueText(value: unknown): string {
   return String(value);
 }
 
+function asFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 function changeTone(change: CalibrationChange) {
   if (change.target === "risk_setting") return "warn";
   if (change.target === "strategy_weight") return Number(change.after) > Number(change.before) ? "long" : "short";
@@ -97,15 +103,19 @@ function lastRunText(calibration: Calibration) {
 
 function tunerStepBadge(status: TunerStepHistory["status"]) {
   if (status === "success") return <span className="badge long">mantenuto</span>;
+  if (status === "promoted") return <span className="badge long">promosso</span>;
   if (status === "reverted") return <span className="badge short">ripristinato</span>;
+  if (status === "rejected") return <span className="badge short">respinto</span>;
   return <span className="badge muted">saltato</span>;
 }
 
 /* ── sub-components ───────────────────────────────────────────────────────── */
 
-function TunerStatusBanner({ tuner, onAction }: {
+function TunerStatusBanner({ tuner, sourceTests, onAction, onStartSourceTest }: {
   tuner: AutoTunerStatus;
+  sourceTests: AutoTunerSourceTests | null;
   onAction: (action: string) => Promise<void>;
+  onStartSourceTest: (source: string) => Promise<void>;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -114,11 +124,22 @@ function TunerStatusBanner({ tuner, onAction }: {
     try { await onAction(action); } finally { setBusy(null); }
   }
 
+  async function startSource(source: string) {
+    setBusy(`source:${source}`);
+    try { await onStartSourceTest(source); } finally { setBusy(null); }
+  }
+
   const currentStep = tuner.current_step_key;
   const progress = tuner.progress;
+  const ab = tuner.ab_progress ?? null;
+  const isAb = (tuner.current_step_mode ?? tuner.mode) === "ab_test";
   const progressPct = progress && progress.trades_required > 0
     ? Math.min(100, Math.round((progress.trades_done / progress.trades_required) * 100))
     : 0;
+  const abRequired = ab?.trades_required_per_arm ?? tuner.config.ab_test_min_trades_per_arm ?? 30;
+  const controlPct = abRequired > 0 ? Math.min(100, Math.round(((ab?.trades_control ?? 0) / abRequired) * 100)) : 0;
+  const testPct = abRequired > 0 ? Math.min(100, Math.round(((ab?.trades_test ?? 0) / abRequired) * 100)) : 0;
+  const sampleBalance = ab?.sample_balance ?? 0;
 
   return (
     <div style={{
@@ -138,7 +159,8 @@ function TunerStatusBanner({ tuner, onAction }: {
         {currentStep ? (
           <span style={{ color: "var(--fg)", fontSize: "var(--fz-sm)" }}>
             Testando: <strong>{currentStep}</strong>
-            {progress && (
+            {isAb && <span className="muted"> · A/B deterministico</span>}
+            {!isAb && progress && (
               <span className="muted"> · {progress.trades_done}/{progress.trades_required} trade</span>
             )}
           </span>
@@ -153,10 +175,14 @@ function TunerStatusBanner({ tuner, onAction }: {
         )}
 
         <span className="muted" style={{ fontSize: "var(--fz-sm)" }}>
-          {tuner.trades_now} trade chiusi · min {tuner.config.min_trades_per_step}/step
+          {tuner.trades_now} trade chiusi · modo {tuner.mode ?? "sequential"}
         </span>
 
         <div style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          <button className="btn ghost" style={{ fontSize: "var(--fz-xs)" }}
+            disabled={busy !== null} onClick={() => act("run")}>
+            {busy === "run" ? "…" : "Run tuner"}
+          </button>
           {tuner.enabled ? (
             <button className="btn ghost" style={{ fontSize: "var(--fz-xs)" }}
               disabled={busy !== null} onClick={() => act("pause")}>
@@ -188,6 +214,44 @@ function TunerStatusBanner({ tuner, onAction }: {
         </div>
       </div>
 
+      {currentStep && isAb && ab && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, paddingTop: 4 }}>
+          <div>
+            <div className="stat-label">Control arm</div>
+            <div className="mono" style={{ color: "var(--fg)", fontSize: "var(--fz-sm)" }}>
+              {ab.trades_control}/{abRequired} trade · mean {fmt.pnl(ab.mean_control ?? 0)}
+            </div>
+            <div style={{ height: 4, background: "var(--border)", borderRadius: 3, overflow: "hidden", marginTop: 6 }}>
+              <div style={{ width: `${controlPct}%`, height: "100%", background: "var(--fg-3)" }} />
+            </div>
+          </div>
+          <div>
+            <div className="stat-label">Test arm</div>
+            <div className="mono" style={{ color: "var(--fg)", fontSize: "var(--fz-sm)" }}>
+              {ab.trades_test}/{abRequired} trade · mean {fmt.pnl(ab.mean_test ?? 0)}
+            </div>
+            <div style={{ height: 4, background: "var(--border)", borderRadius: 3, overflow: "hidden", marginTop: 6 }}>
+              <div style={{ width: `${testPct}%`, height: "100%", background: "var(--long)" }} />
+            </div>
+          </div>
+          <div>
+            <div className="stat-label">Decisione</div>
+            <div className="mono" style={{ color: (ab.mean_delta ?? 0) >= 0 ? "var(--long)" : "var(--short)", fontSize: "var(--fz-sm)" }}>
+              Δ mean {fmt.pnl(ab.mean_delta ?? 0)}
+            </div>
+            <div className="muted" style={{ fontSize: "var(--fz-xs)", marginTop: 4 }}>
+              balance {pct(sampleBalance)} · α {num(ab.alpha, 3)} · {ab.assignment_method ?? "—"}
+            </div>
+          </div>
+          <div>
+            <div className="stat-label">Overlay test</div>
+            <div className="muted" style={{ fontSize: "var(--fz-xs)", lineHeight: 1.45 }}>
+              {valueText(ab.test_overlay ?? tuner.ab_test_state ?? {}) || "—"}
+            </div>
+          </div>
+        </div>
+      )}
+
       {currentStep && progress && (
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <div style={{ flex: 1, height: 4, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
@@ -204,6 +268,54 @@ function TunerStatusBanner({ tuner, onAction }: {
           </span>
         </div>
       )}
+
+      <div style={{
+        marginTop: 4,
+        padding: 12,
+        borderRadius: "var(--radius)",
+        border: "1px solid var(--border)",
+        background: "var(--bg)",
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 10 }}>
+          <div>
+            <div className="stat-label">Source test guidati</div>
+            <div className="muted" style={{ fontSize: "var(--fz-xs)", marginTop: 2 }}>
+              Avvia A/B controllati senza patch manuali e senza riabilitare globalmente la source.
+            </div>
+          </div>
+          {currentStep && (
+            <span className="badge warn">bloccato da step attivo</span>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {(sourceTests?.tests ?? []).map(test => {
+            const disabled = busy !== null || Boolean(currentStep) || !test.available;
+            return (
+              <button
+                key={test.key}
+                className="btn ghost"
+                style={{ fontSize: "var(--fz-xs)" }}
+                disabled={disabled}
+                onClick={() => {
+                  if (!window.confirm(`Avviare A/B test guidato su ${test.source}? Il tuner passerà in mode=ab_test e testerà solo questa source.`)) return;
+                  startSource(test.source);
+                }}
+              >
+                {busy === `source:${test.source}` ? "…" : `Test ${test.source}`}
+                {test.currently_disabled ? " · ora disabled" : " · ora enabled"}
+              </button>
+            );
+          })}
+          {(!sourceTests || sourceTests.tests.length === 0) && (
+            <span className="muted" style={{ fontSize: "var(--fz-sm)" }}>Preset source non disponibili.</span>
+          )}
+        </div>
+        {currentStep && (
+          <div className="muted" style={{ fontSize: "var(--fz-xs)", marginTop: 10 }}>
+            Per avviare un source test chiudi prima lo step corrente con attesa naturale, rollback o reset.
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -223,28 +335,46 @@ function TunerStepHistoryTable({ history }: { history: TunerStepHistory[] }) {
           <th>Step</th>
           <th>Esito</th>
           <th style={{ textAlign: "right" }}>Trade val.</th>
-          <th style={{ textAlign: "right" }}>WR prima</th>
-          <th style={{ textAlign: "right" }}>WR dopo</th>
+          <th style={{ textAlign: "right" }}>Mean prima</th>
+          <th style={{ textAlign: "right" }}>Mean dopo / Δ AB</th>
+          <th style={{ textAlign: "right" }}>A/B balance</th>
           <th>Valutato</th>
         </tr>
       </thead>
       <tbody>
-        {[...history].reverse().map((step, i) => (
-          <tr key={`${step.key}-${i}`}>
-            <td className="fg">
-              <div style={{ fontWeight: 500 }}>{step.label ?? step.key}</div>
-              <div className="muted" style={{ fontSize: "var(--fz-xs)" }}>{step.key}</div>
-            </td>
-            <td>
-              {tunerStepBadge(step.status)}
-              {step.manual && <span className="muted" style={{ fontSize: "var(--fz-xs)", marginLeft: 4 }}>manuale</span>}
-            </td>
-            <td className="num">{step.trades_evaluated}</td>
-            <td className="num">{pct(step.metrics_before?.win_rate)}</td>
-            <td className="num">{pct(step.metrics_after?.win_rate)}</td>
-            <td className="mono" style={{ fontSize: "var(--fz-xs)" }}>{fmt.relTime(step.evaluated_at)}</td>
-          </tr>
-        ))}
+        {[...history].reverse().map((step, i) => {
+          const ab = step.ab_test ?? {};
+          const nControl = asFiniteNumber(ab.n_control);
+          const nTest = asFiniteNumber(ab.n_test);
+          const meanDelta = asFiniteNumber(ab.mean_delta ?? ab.improvement);
+          const sampleBalance = asFiniteNumber(ab.sample_balance);
+          const pValue = asFiniteNumber(ab.p_one_tailed);
+          const trades = step.mode === "ab_test" && nControl != null && nTest != null
+            ? `${nControl}/${nTest}`
+            : String(step.trades_evaluated ?? "—");
+          return (
+            <tr key={`${step.key}-${i}`}>
+              <td className="fg">
+                <div style={{ fontWeight: 500 }}>{step.label ?? step.key}</div>
+                <div className="muted" style={{ fontSize: "var(--fz-xs)" }}>{step.key}</div>
+              </td>
+              <td>
+                {tunerStepBadge(step.status)}
+                {step.manual && <span className="muted" style={{ fontSize: "var(--fz-xs)", marginLeft: 4 }}>manuale</span>}
+                {step.mode === "ab_test" && <span className="badge info" style={{ fontSize: "var(--fz-xs)", marginLeft: 4 }}>A/B</span>}
+              </td>
+              <td className="num">{trades}</td>
+              <td className="num">{fmt.pnl(step.metrics_before?.mean_pnl ?? asFiniteNumber(ab.mean_control) ?? 0)}</td>
+              <td className="num" style={{ color: meanDelta != null && meanDelta >= 0 ? "var(--long)" : meanDelta != null ? "var(--short)" : undefined }}>
+                {step.mode === "ab_test"
+                  ? `${meanDelta != null ? fmt.pnl(meanDelta) : "—"}${pValue != null ? ` · p ${num(pValue, 3)}` : ""}`
+                  : fmt.pnl(step.metrics_after?.mean_pnl ?? 0)}
+              </td>
+              <td className="num">{sampleBalance != null ? pct(sampleBalance) : "—"}</td>
+              <td className="mono" style={{ fontSize: "var(--fz-xs)" }}>{fmt.relTime(step.evaluated_at)}</td>
+            </tr>
+          );
+        })}
       </tbody>
     </table>
   );
@@ -270,15 +400,18 @@ function slopeLabel(v: number) {
   return "forte declino";
 }
 
-function EquitySlopeCard({ calibration }: { calibration: Calibration }) {
+function EquitySlopeCard({ calibration, diagnostics }: { calibration: Calibration; diagnostics: EquitySlopeDiagnostics | null }) {
   const state = calibration.state ?? {};
-  const fullSlope = typeof state.last_equity_slope === "number" ? state.last_equity_slope : null;
-  const recentSlope = typeof state.last_recent_slope === "number" ? state.last_recent_slope : null;
+  const fullSlope = diagnostics?.normalized_slope ?? (typeof state.last_equity_slope === "number" ? state.last_equity_slope : null);
+  const recentSlope = diagnostics?.recent_normalized_slope ?? (typeof state.last_recent_slope === "number" ? state.last_recent_slope : null);
+  const threshold = diagnostics?.threshold ?? -0.1;
   const deepActive = state.deep_defensive_active === true;
   const fullStreak = typeof state.deep_defensive_positive_streak === "number" ? state.deep_defensive_positive_streak : 0;
   const recentStreak = typeof state.deep_defensive_recent_positive_streak === "number" ? state.deep_defensive_recent_positive_streak : 0;
   const zeroCycles = typeof state.consecutive_zero_signal_cycles === "number" ? state.consecutive_zero_signal_cycles : 0;
   const starvation = state.starvation_override_active === true;
+  const timeStopImpact = diagnostics?.recent_time_stop_impact;
+  const diagnosticStatus = diagnostics?.status ?? null;
 
   const rows: { label: string; value: string; color: string; sub?: string }[] = [];
 
@@ -307,7 +440,9 @@ function EquitySlopeCard({ calibration }: { calibration: Calibration }) {
           ? <span className="badge short">deep defensive</span>
           : starvation
             ? <span className="badge warn">starvation override</span>
-            : <span className="badge muted">normale</span>
+            : diagnosticStatus === "declining"
+              ? <span className="badge warn">slope in calo</span>
+              : <span className="badge muted">normale</span>
         }
       </div>
       <div className="card-body" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 20 }}>
@@ -327,6 +462,26 @@ function EquitySlopeCard({ calibration }: { calibration: Calibration }) {
               <div className="muted" style={{ fontSize: "var(--fz-xs)", marginTop: 2 }}>{r.sub}</div>
             </div>
           ))}
+          {diagnostics && (
+            <div>
+              <div className="stat-label" style={{ marginBottom: 6 }}>Finestre diagnostiche</div>
+              <table style={{ fontSize: "var(--fz-xs)", borderCollapse: "collapse", width: "100%" }}>
+                <tbody>
+                  {diagnostics.windows.map(window => (
+                    <tr key={window.window}>
+                      <td className="muted" style={{ padding: "3px 10px 3px 0" }}>{window.window} trade</td>
+                      <td className="mono" style={{ color: slopeColor(window.normalized_slope), padding: "3px 0", textAlign: "right" }}>
+                        {window.normalized_slope.toFixed(3)}
+                      </td>
+                      <td className="muted" style={{ padding: "3px 0 3px 10px", textAlign: "right" }}>
+                        n={window.sample_count}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
 
         {/* defensive status */}
@@ -334,6 +489,12 @@ function EquitySlopeCard({ calibration }: { calibration: Calibration }) {
           <div className="stat-label">Stato modalità difensiva</div>
           <table style={{ fontSize: "var(--fz-sm)", borderCollapse: "collapse", width: "100%" }}>
             <tbody>
+              <tr>
+                <td className="muted" style={{ paddingBottom: 6, paddingRight: 12 }}>Soglia deep defensive</td>
+                <td className="mono" style={{ color: "var(--fg-2)" }}>
+                  {threshold.toFixed(3)}
+                </td>
+              </tr>
               <tr>
                 <td className="muted" style={{ paddingBottom: 6, paddingRight: 12 }}>Deep defensive</td>
                 <td style={{ color: deepActive ? "var(--short)" : "var(--long)", fontWeight: 500 }}>
@@ -362,8 +523,35 @@ function EquitySlopeCard({ calibration }: { calibration: Calibration }) {
                   {zeroCycles >= 10 && zeroCycles < 15 && <span className="muted"> (starvation soft)</span>}
                 </td>
               </tr>
+              {diagnostics && (
+                <tr>
+                  <td className="muted" style={{ paddingTop: 6, paddingRight: 12 }}>Cooldown</td>
+                  <td style={{ fontVariantNumeric: "tabular-nums" }}>
+                    {diagnostics.cooldown_remaining} run
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
+          {diagnostics?.last_reason && (
+            <div style={{ fontSize: "var(--fz-sm)", color: "var(--fg-2)", lineHeight: 1.45 }}>
+              Motivo attuale: <strong style={{ color: "var(--fg)" }}>{diagnostics.last_reason}</strong>
+            </div>
+          )}
+          {timeStopImpact && timeStopImpact.closed_count > 0 && (
+            <div style={{
+              padding: "8px 10px",
+              borderRadius: "var(--radius)",
+              background: "var(--warn-soft, var(--card-bg))",
+              border: "1px solid var(--border)",
+              fontSize: "var(--fz-xs)",
+              color: "var(--fg-2)",
+              lineHeight: 1.45,
+            }}>
+              Negli ultimi {timeStopImpact.hours}h il time-stop ha chiuso {timeStopImpact.closed_count} paper
+              con PnL {fmt.pnl(timeStopImpact.realized_pnl)}. Lo slope recente può essere influenzato da questo batch.
+            </div>
+          )}
           <div className="muted" style={{ fontSize: "var(--fz-xs)", lineHeight: 1.5 }}>
             Lo slope è la pendenza della regressione lineare sulla curva del PnL cumulativo.
             Positivo = curva in salita. La versione recente usa solo gli ultimi 50 trade,
@@ -383,7 +571,7 @@ function ActiveStrategyCard({ calibration, tuner, settings }: { calibration: Cal
     : null;
 
   const activeFilters = tuner
-    ? tuner.step_history.filter(s => s.status === "success").map(s => s.label ?? s.key)
+    ? tuner.step_history.filter(s => s.status === "success" || s.status === "promoted").map(s => s.label ?? s.key)
     : [];
 
   const nextSequence = tuner?.next_step_key ?? null;
@@ -594,6 +782,8 @@ export function CalibrationScreen({
   const [localCalibration, setLocalCalibration] = useState(calibration);
   const [localHistory, setLocalHistory] = useState(history);
   const [localTuner, setLocalTuner] = useState(tunerStatus);
+  const [sourceTests, setSourceTests] = useState<AutoTunerSourceTests | null>(null);
+  const [equityDiagnostics, setEquityDiagnostics] = useState<EquitySlopeDiagnostics | null>(null);
   const [localCycles, setLocalCycles] = useState(workerCycles);
   const [localRejections, setLocalRejections] = useState(signalRejections);
   const [busy, setBusy] = useState(false);
@@ -609,6 +799,18 @@ export function CalibrationScreen({
   useEffect(() => setLocalTuner(tunerStatus), [tunerStatus]);
   useEffect(() => setLocalCycles(workerCycles), [workerCycles]);
   useEffect(() => setLocalRejections(signalRejections), [signalRejections]);
+  useEffect(() => {
+    let active = true;
+    Promise.all([
+      apiGet<AutoTunerSourceTests>("/api/auto-tuner/source-tests").catch(() => null),
+      apiGet<EquitySlopeDiagnostics>("/api/analytics/equity-slope").catch(() => null),
+    ]).then(([tests, slope]) => {
+      if (!active) return;
+      setSourceTests(tests);
+      setEquityDiagnostics(slope);
+    });
+    return () => { active = false; };
+  }, [calibration, tunerStatus]);
 
   const appliedCount = useMemo(
     () => localHistory.filter(entry => entry.event_type === "auto_calibration_applied").length,
@@ -631,6 +833,7 @@ export function CalibrationScreen({
       ]);
       setLocalCalibration(nextCalibration);
       setLocalHistory(nextHistory);
+      setEquityDiagnostics(await apiGet<EquitySlopeDiagnostics>("/api/analytics/equity-slope").catch(() => null));
       await onRefresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Errore calibrazione");
@@ -641,6 +844,7 @@ export function CalibrationScreen({
 
   async function tunerAction(action: string) {
     const endpoints: Record<string, string> = {
+      run: "/api/auto-tuner/run",
       pause: "/api/auto-tuner/pause",
       resume: "/api/auto-tuner/resume",
       rollback: "/api/auto-tuner/rollback",
@@ -649,9 +853,29 @@ export function CalibrationScreen({
     const url = endpoints[action];
     if (!url) return;
     await apiPost<unknown>(url);
-    const next = await apiGet<AutoTunerStatus>("/api/auto-tuner/status");
+    const [next, tests] = await Promise.all([
+      apiGet<AutoTunerStatus>("/api/auto-tuner/status"),
+      apiGet<AutoTunerSourceTests>("/api/auto-tuner/source-tests").catch(() => null),
+    ]);
     setLocalTuner(next);
+    setSourceTests(tests);
     await onRefresh();
+  }
+
+  async function startSourceTest(source: string) {
+    setError(null);
+    try {
+      await apiPost<unknown>(`/api/auto-tuner/source-tests/${encodeURIComponent(source)}/start`);
+      const [next, tests] = await Promise.all([
+        apiGet<AutoTunerStatus>("/api/auto-tuner/status"),
+        apiGet<AutoTunerSourceTests>("/api/auto-tuner/source-tests").catch(() => null),
+      ]);
+      setLocalTuner(next);
+      setSourceTests(tests);
+      await onRefresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Errore avvio source test");
+    }
   }
 
   async function sendReport() {
@@ -745,7 +969,7 @@ export function CalibrationScreen({
 
       {/* ── equity slope ─────────────────────────────────────────────────── */}
       <div style={{ marginBottom: "var(--gap)" }}>
-        <EquitySlopeCard calibration={localCalibration} />
+        <EquitySlopeCard calibration={localCalibration} diagnostics={equityDiagnostics} />
       </div>
 
       {/* ── auto-tuner section ────────────────────────────────────────────── */}
@@ -758,7 +982,12 @@ export function CalibrationScreen({
         </div>
         <div style={{ padding: "0 0 var(--gap)" }}>
           {localTuner ? (
-            <TunerStatusBanner tuner={localTuner} onAction={tunerAction} />
+            <TunerStatusBanner
+              tuner={localTuner}
+              sourceTests={sourceTests}
+              onAction={tunerAction}
+              onStartSourceTest={startSourceTest}
+            />
           ) : (
             <div className="card-body muted" style={{ fontSize: "var(--fz-sm)" }}>
               Stato tuner non disponibile.

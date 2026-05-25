@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import hashlib
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
@@ -39,6 +40,21 @@ DEFAULT_SEQUENCE: list[dict[str, Any]] = [
     },
 ]
 
+SOURCE_AB_SEQUENCE: list[dict[str, Any]] = [
+    {
+        "key": "whale_flow_source",
+        "label": "Whale flow source",
+        "patch": {"disabled_signal_sources": ["fear_greed"]},
+        "revert": {"disabled_signal_sources": ["whale_flow", "fear_greed"]},
+    },
+    {
+        "key": "fear_greed_source",
+        "label": "Fear & Greed source",
+        "patch": {"disabled_signal_sources": ["whale_flow"]},
+        "revert": {"disabled_signal_sources": ["whale_flow", "fear_greed"]},
+    },
+]
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
     # "sequential" = comportamento legacy before/after sulla stessa popolazione.
@@ -55,11 +71,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ab_test_significance_level": 0.05,
     # P(assegnazione arm "test"); 0.5 = 50/50.
     "ab_test_allocation": 0.5,
+    "ab_test_assignment_salt": "trado-v1",
     "sequence": DEFAULT_SEQUENCE,
 }
 
 
-def active_ab_overlay(db: Session) -> dict[str, Any] | None:
+def active_ab_overlay(
+    db: Session,
+    *,
+    market_id: int | None = None,
+    timeframe: str | None = None,
+    source_candle_open_time: Any | None = None,
+) -> dict[str, Any] | None:
     """Ritorna l'overlay AB da applicare al prossimo segnale, o None.
 
     Letta dal signal_engine ad ogni `evaluate()`: sceglie casualmente un arm e
@@ -86,7 +109,19 @@ def active_ab_overlay(db: Session) -> dict[str, Any] | None:
         return None
     allocation = float(ab_block.get("allocation", 0.5))
     allocation = max(0.0, min(1.0, allocation))
-    arm = "test" if random.random() < allocation else "control"
+    assignment_method = "random_fallback"
+    if market_id is not None and timeframe and source_candle_open_time is not None:
+        salt = str(config.get("ab_test_assignment_salt", "trado-v1"))
+        assignment_key = (
+            f"{salt}:{step_key}:{market_id}:{timeframe}:"
+            f"{source_candle_open_time.isoformat() if hasattr(source_candle_open_time, 'isoformat') else source_candle_open_time}"
+        )
+        digest = hashlib.sha256(assignment_key.encode("utf-8")).hexdigest()
+        ratio = int(digest[:16], 16) / float(16**16)
+        arm = "test" if ratio < allocation else "control"
+        assignment_method = "deterministic_hash"
+    else:
+        arm = "test" if random.random() < allocation else "control"
     overlay_raw = ab_block.get(f"{arm}_overlay") or {}
     if not isinstance(overlay_raw, dict):
         overlay_raw = {}
@@ -94,6 +129,7 @@ def active_ab_overlay(db: Session) -> dict[str, Any] | None:
         "step_key": str(step_key),
         "arm": arm,
         "overlay": dict(overlay_raw),
+        "assignment_method": assignment_method,
     }
 
 
@@ -381,6 +417,7 @@ class AutoTuner:
                     "control_overlay": control_overlay,
                     "test_overlay": test_overlay,
                     "allocation": allocation,
+                    "assignment_method": "deterministic_hash",
                 },
             }
         )
@@ -395,6 +432,7 @@ class AutoTuner:
                 "control_overlay": control_overlay,
                 "test_overlay": test_overlay,
                 "allocation": allocation,
+                "assignment_method": "deterministic_hash",
                 "min_trades_per_arm": int(config.get("ab_test_min_trades_per_arm", 30)),
             },
         )
@@ -432,6 +470,16 @@ class AutoTuner:
         # positiva *e* statisticamente significativa.
         improvement = stats["mean_test"] - stats["mean_control"]
         promoted = improvement > 0 and stats["p_one_tailed"] < alpha
+        sample_balance = (
+            min(len(control_pnls), len(test_pnls)) / max(len(control_pnls), len(test_pnls))
+            if control_pnls and test_pnls
+            else 0.0
+        )
+        assignment_method = str(
+            (state.get("ab_test") or {}).get("assignment_method", "deterministic_hash")
+            if isinstance(state.get("ab_test"), dict)
+            else "deterministic_hash"
+        )
 
         if promoted:
             self._apply_patch(db, dict(step.get("patch", {})))
@@ -458,6 +506,9 @@ class AutoTuner:
                     "p_one_tailed": stats["p_one_tailed"],
                     "alpha": alpha,
                     "improvement": improvement,
+                    "mean_delta": improvement,
+                    "sample_balance": sample_balance,
+                    "assignment_method": assignment_method,
                 },
                 "evaluated_at": evaluated_at,
             }
@@ -489,6 +540,9 @@ class AutoTuner:
                 "t_statistic": stats["t"],
                 "p_one_tailed": stats["p_one_tailed"],
                 "alpha": alpha,
+                "mean_delta": improvement,
+                "sample_balance": sample_balance,
+                "assignment_method": assignment_method,
             },
         )
         db.commit()
@@ -498,8 +552,11 @@ class AutoTuner:
             "step": step.get("key"),
             "mean_control": stats["mean_control"],
             "mean_test": stats["mean_test"],
+            "mean_delta": improvement,
             "p_one_tailed": stats["p_one_tailed"],
             "alpha": alpha,
+            "sample_balance": sample_balance,
+            "assignment_method": assignment_method,
         }
 
     def pause(self, db: Session) -> dict[str, Any]:
@@ -615,12 +672,43 @@ class AutoTuner:
             if str(state.get("mode", "")) == "ab_test":
                 step_key = str(state.get("current_step_key") or "")
                 arms = self._partition_by_arm(positions, state.get("activated_at"), step_key)
+                control_pnls = [
+                    float(p.realized_pnl)
+                    for p in arms["control"]
+                    if p.realized_pnl is not None
+                ]
+                test_pnls = [
+                    float(p.realized_pnl)
+                    for p in arms["test"]
+                    if p.realized_pnl is not None
+                ]
+                n_control = len(control_pnls)
+                n_test = len(test_pnls)
+                sample_balance = (
+                    min(n_control, n_test) / max(n_control, n_test)
+                    if n_control and n_test
+                    else 0.0
+                )
+                mean_control = sum(control_pnls) / n_control if n_control else 0.0
+                mean_test = sum(test_pnls) / n_test if n_test else 0.0
+                ab_state = state.get("ab_test") if isinstance(state.get("ab_test"), dict) else {}
                 ab_progress = {
-                    "trades_control": len(arms["control"]),
-                    "trades_test": len(arms["test"]),
+                    "trades_control": n_control,
+                    "trades_test": n_test,
                     "trades_required_per_arm": int(
                         config.get("ab_test_min_trades_per_arm", 30)
                     ),
+                    "sample_balance": sample_balance,
+                    "mean_control": mean_control,
+                    "mean_test": mean_test,
+                    "mean_delta": mean_test - mean_control,
+                    "alpha": float(config.get("ab_test_significance_level", 0.05)),
+                    "assignment_method": ab_state.get(
+                        "assignment_method", "deterministic_hash"
+                    ),
+                    "control_overlay": ab_state.get("control_overlay", {}),
+                    "test_overlay": ab_state.get("test_overlay", {}),
+                    "active_overlay": ab_state.get("test_overlay", {}),
                 }
             else:
                 trades_at_activation = int(state.get("trades_at_activation", trades_now))
@@ -654,7 +742,118 @@ class AutoTuner:
                     config.get("ab_test_significance_level", 0.05)
                 ),
                 "ab_test_allocation": float(config.get("ab_test_allocation", 0.5)),
+                "ab_test_assignment_salt": str(
+                    config.get("ab_test_assignment_salt", "trado-v1")
+                ),
             },
+            "available_source_ab_sequence": SOURCE_AB_SEQUENCE,
+        }
+
+    def source_tests(self, db: Session) -> dict[str, Any]:
+        config = self._load_config(db)
+        state = self._load_state(db)
+        disabled_sources = self._disabled_signal_sources(db)
+        active_key = state.get("current_step_key")
+        active_mode = state.get("mode") or config.get("mode")
+        tests = []
+        for step in SOURCE_AB_SEQUENCE:
+            key = str(step.get("key"))
+            source = key.replace("_source", "")
+            dynamic_step = self._source_test_step(source, disabled_sources)
+            tests.append(
+                {
+                    "source": source,
+                    "key": key,
+                    "label": step.get("label"),
+                    "control_overlay": dynamic_step.get("revert", {}),
+                    "test_overlay": dynamic_step.get("patch", {}),
+                    "currently_disabled": source in disabled_sources,
+                    "active": active_key == key,
+                    "available": active_key in (None, key),
+                }
+            )
+        return {
+            "enabled": bool(config.get("enabled", False)),
+            "mode": str(config.get("mode", "sequential")),
+            "active_step_key": active_key,
+            "active_mode": active_mode,
+            "blocked": active_key is not None,
+            "tests": tests,
+        }
+
+    def start_source_test(self, db: Session, source: str) -> dict[str, Any]:
+        normalized = source.strip().lower().replace("-", "_")
+        step = next(
+            (
+                item
+                for item in SOURCE_AB_SEQUENCE
+                if str(item.get("key")) == f"{normalized}_source"
+                or str(item.get("key")).replace("_source", "") == normalized
+            ),
+            None,
+        )
+        if step is None:
+            return {
+                "ok": False,
+                "status": "unknown_source",
+                "source": source,
+                "available_sources": [
+                    str(item.get("key", "")).replace("_source", "")
+                    for item in SOURCE_AB_SEQUENCE
+                ],
+            }
+
+        state = self._load_state(db)
+        active_key = state.get("current_step_key")
+        if active_key is not None:
+            return {
+                "ok": False,
+                "status": "conflict",
+                "active_step_key": active_key,
+                "requested_step_key": step.get("key"),
+                "recommended_actions": ["wait", "rollback", "reset"],
+            }
+
+        config = self._load_config(db)
+        disabled_sources = self._disabled_signal_sources(db)
+        dynamic_step = self._source_test_step(normalized, disabled_sources)
+        config.update(
+            {
+                "enabled": True,
+                "mode": "ab_test",
+                "sequence": [deepcopy(dynamic_step)],
+            }
+        )
+        self._persist_config(db, config)
+        result = self._start_ab_step(db, state, config, [dynamic_step], 0)
+        result.update({"ok": True, "source": normalized})
+        return result
+
+    def _disabled_signal_sources(self, db: Session) -> list[str]:
+        risk = self._snapshot_risk(db)
+        disabled_sources = risk.get("disabled_signal_sources", [])
+        if not isinstance(disabled_sources, list):
+            return []
+        return [str(item) for item in disabled_sources]
+
+    def _source_test_step(
+        self, source: str, disabled_sources: list[str]
+    ) -> dict[str, Any]:
+        template = next(
+            (
+                item
+                for item in SOURCE_AB_SEQUENCE
+                if str(item.get("key")).replace("_source", "") == source
+            ),
+            None,
+        )
+        control_sources = list(dict.fromkeys(disabled_sources))
+        test_sources = [item for item in control_sources if item != source]
+        return {
+            "key": f"{source}_source",
+            "label": template.get("label") if template else f"{source} source",
+            "patch": {"disabled_signal_sources": test_sources},
+            "revert": {"disabled_signal_sources": control_sources},
         }
 
     def _metrics_for(self, positions: list[Position]) -> dict[str, Any]:

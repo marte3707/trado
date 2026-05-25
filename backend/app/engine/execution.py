@@ -8,7 +8,11 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.core.enums import Direction, OrderMode, SignalStatus
-from app.core.runtime_settings import effective_live_execution_settings, effective_paper_equity
+from app.core.runtime_settings import (
+    effective_live_execution_settings,
+    effective_paper_equity,
+    effective_position_management_settings,
+)
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, Signal
 from app.engine.order_validation import LiveOrderPlan, OrderValidator
 from app.engine.position_management import PositionManagementEngine
@@ -683,6 +687,145 @@ class OrderExecutionEngine:
             commit=commit,
         )
 
+    def apply_time_stops(self, db: Session) -> dict[str, int]:
+        config = effective_position_management_settings(db).get("timeStop", {})
+        if not bool(config.get("enabled", True)):
+            return {"paper_closed": 0, "live_alerted": 0}
+        max_age_by_tf = config.get("maxAgeHoursByTimeframe")
+        if not isinstance(max_age_by_tf, dict):
+            return {"paper_closed": 0, "live_alerted": 0}
+
+        paper_closed = 0
+        live_alerted = 0
+        if bool(config.get("paperEnabled", True)):
+            paper_closed = self._close_paper_time_stops(db, max_age_by_tf)
+        if str(config.get("liveMode", "alert")) == "alert":
+            live_alerted = self._alert_live_time_stops(db, max_age_by_tf)
+        if paper_closed or live_alerted:
+            db.commit()
+        return {"paper_closed": paper_closed, "live_alerted": live_alerted}
+
+    def _close_paper_time_stops(self, db: Session, max_age_by_tf: dict[str, Any]) -> int:
+        positions = (
+            db.query(Position)
+            .filter(
+                Position.mode == OrderMode.PAPER.value,
+                Position.status == "open",
+            )
+            .all()
+        )
+        closed = 0
+        for position in positions:
+            timeframe = self._source_timeframe(db, position)
+            max_age_hours = _max_age_hours(max_age_by_tf, timeframe)
+            if max_age_hours is None or not _position_age_exceeded(position, max_age_hours):
+                continue
+            candle = self._latest_candle_after_open(db, position, timeframe)
+            if candle is None:
+                continue
+            self.close_position(
+                db,
+                position,
+                exit_price=candle.close,
+                reason="time_stop",
+                commit=False,
+            )
+            interval_ms = TIMEFRAME_MS.get(timeframe)
+            if interval_ms is not None:
+                position.closed_at = candle.open_time + timedelta(milliseconds=interval_ms)
+            metadata = dict(position.metadata_json or {})
+            metadata["time_stop_timeframe"] = timeframe
+            metadata["time_stop_max_age_hours"] = max_age_hours
+            position.metadata_json = metadata
+            db.add(position)
+            closed += 1
+        return closed
+
+    def _alert_live_time_stops(self, db: Session, max_age_by_tf: dict[str, Any]) -> int:
+        positions = (
+            db.query(Position)
+            .filter(
+                Position.mode == OrderMode.LIVE.value,
+                Position.status == "open",
+            )
+            .all()
+        )
+        now = datetime.now(timezone.utc)
+        alerted = 0
+        for position in positions:
+            timeframe = self._source_timeframe(db, position)
+            max_age_hours = _max_age_hours(max_age_by_tf, timeframe)
+            if max_age_hours is None or not _position_age_exceeded(position, max_age_hours):
+                continue
+            metadata = dict(position.metadata_json or {})
+            last_alert = _parse_dt(metadata.get("last_time_stop_alert_at"))
+            if last_alert is not None and now - last_alert < timedelta(hours=6):
+                continue
+            metadata["last_time_stop_alert_at"] = now.isoformat()
+            metadata["time_stop_timeframe"] = timeframe
+            metadata["time_stop_max_age_hours"] = max_age_hours
+            position.metadata_json = metadata
+            db.add(position)
+            db.add(
+                DecisionLog(
+                    event_type="live_position_time_stop_alert",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    signal_id=_signal_id_from_position(position),
+                    message="Live position exceeded configured time-stop age",
+                    data={
+                        "timeframe": timeframe,
+                        "max_age_hours": max_age_hours,
+                        "opened_at": position.opened_at.isoformat()
+                        if position.opened_at is not None
+                        else None,
+                    },
+                )
+            )
+            alerted += 1
+        return alerted
+
+    def _source_timeframe(self, db: Session, position: Position) -> str:
+        metadata = position.metadata_json or {}
+        source_timeframe = metadata.get("source_timeframe")
+        if isinstance(source_timeframe, str) and source_timeframe in TIMEFRAME_MS:
+            return source_timeframe
+        source_signal_id = metadata.get("source_signal_id")
+        try:
+            signal_id = int(source_signal_id)
+        except (TypeError, ValueError):
+            return "1d"
+        signal = db.get(Signal, signal_id)
+        if signal is not None and signal.timeframe in TIMEFRAME_MS:
+            return signal.timeframe
+        return "1d"
+
+    def _latest_candle_after_open(
+        self,
+        db: Session,
+        position: Position,
+        timeframe: str,
+    ) -> Candle | None:
+        interval_ms = TIMEFRAME_MS.get(timeframe)
+        if interval_ms is None or position.opened_at is None:
+            return None
+        earliest_open = position.opened_at - timedelta(milliseconds=interval_ms)
+        candles = (
+            db.query(Candle)
+            .filter(
+                Candle.market_id == position.market_id,
+                Candle.timeframe == timeframe,
+                Candle.open_time >= earliest_open,
+            )
+            .order_by(Candle.open_time.desc())
+            .all()
+        )
+        for candle in candles:
+            candle_close = candle.open_time + timedelta(milliseconds=interval_ms)
+            if candle_close > position.opened_at:
+                return candle
+        return None
+
     def close_live_position(
         self,
         db: Session,
@@ -848,6 +991,8 @@ class OrderExecutionEngine:
             db.commit()
 
     def _exit_event_type(self, reason: str, close_position: bool) -> str:
+        if reason == "time_stop":
+            return "paper_position_time_stop_closed"
         if reason == "stop_loss":
             return "paper_position_auto_closed"
         if reason in {"take_profit", "tp1", "tp2", "tp3"}:
@@ -1188,3 +1333,32 @@ def _signal_id_from_position(position: Position) -> int | None:
         return int(source_signal_id)
     except (TypeError, ValueError):
         return None
+
+
+def _max_age_hours(max_age_by_tf: dict[str, Any], timeframe: str) -> float | None:
+    try:
+        value = float(max_age_by_tf[timeframe])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _position_age_exceeded(position: Position, max_age_hours: float) -> bool:
+    opened_at = position.opened_at
+    if opened_at is None:
+        return False
+    if opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - opened_at >= timedelta(hours=max_age_hours)
+
+
+def _parse_dt(value: object | None) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed

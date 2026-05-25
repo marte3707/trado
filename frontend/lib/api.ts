@@ -353,6 +353,7 @@ export type TunerStepMetrics = {
   trades: number;
   win_rate: number;
   realized_pnl?: number;
+  mean_pnl?: number;
   profit_factor?: number;
   equity_slope: number;
 };
@@ -360,10 +361,12 @@ export type TunerStepMetrics = {
 export type TunerStepHistory = {
   key: string;
   label: string;
-  status: "success" | "reverted" | "skipped";
+  status: "success" | "reverted" | "skipped" | "promoted" | "rejected";
+  mode?: string;
+  ab_test?: Record<string, unknown>;
   metrics_before: TunerStepMetrics | null;
   metrics_after: TunerStepMetrics | null;
-  trades_evaluated: number;
+  trades_evaluated?: number;
   evaluated_at: string;
   manual?: boolean;
 };
@@ -373,20 +376,102 @@ export type TunerProgress = {
   trades_required: number;
 };
 
+export type AutoTunerAbProgress = {
+  trades_control: number;
+  trades_test: number;
+  trades_required_per_arm: number;
+  sample_balance?: number;
+  mean_control?: number;
+  mean_test?: number;
+  mean_delta?: number;
+  alpha?: number;
+  assignment_method?: string;
+  control_overlay?: Record<string, unknown>;
+  test_overlay?: Record<string, unknown>;
+  active_overlay?: Record<string, unknown>;
+};
+
+export type AutoTunerSourceTest = {
+  source: string;
+  key: string;
+  label: string;
+  control_overlay: Record<string, unknown>;
+  test_overlay: Record<string, unknown>;
+  currently_disabled: boolean;
+  active: boolean;
+  available: boolean;
+};
+
+export type AutoTunerSourceTests = {
+  enabled: boolean;
+  mode: string;
+  active_step_key: string | null;
+  active_mode?: string | null;
+  blocked: boolean;
+  tests: AutoTunerSourceTest[];
+};
+
 export type AutoTunerStatus = {
   enabled: boolean;
+  mode?: string;
   current_step_key: string | null;
   current_step_index: number | null;
+  current_step_mode?: string | null;
   activated_at: string | null;
   metrics_before: TunerStepMetrics | null;
+  ab_test_state?: Record<string, unknown> | null;
   next_step_key: string | null;
   trades_now: number;
   progress: TunerProgress | null;
+  ab_progress?: AutoTunerAbProgress | null;
   step_history: TunerStepHistory[];
   config: {
     min_trades_per_step: number;
     improvement_threshold: number;
+    mode?: string;
+    ab_test_min_trades_per_arm?: number;
+    ab_test_significance_level?: number;
+    ab_test_allocation?: number;
+    ab_test_assignment_salt?: string;
   };
+  available_source_ab_sequence?: Array<Record<string, unknown>>;
+};
+
+export type EquitySlopeDiagnostics = {
+  lookback: number;
+  sample_count: number;
+  status: "improving" | "neutral" | "declining";
+  threshold: number;
+  raw_slope: number;
+  normalized_slope: number;
+  recent_normalized_slope: number;
+  median_abs_pnl: number;
+  windows: Array<{
+    window: number;
+    sample_count: number;
+    raw_slope: number;
+    normalized_slope: number;
+    median_abs_pnl: number;
+  }>;
+  deep_defensive_active: boolean;
+  starvation_override_active: boolean;
+  last_reason?: string | null;
+  last_exit_reason?: string | null;
+  positive_streak: number;
+  recent_positive_streak: number;
+  cooldown_remaining: number;
+  consecutive_zero_signal_cycles: number;
+  exit_conditions: {
+    full_slope_non_negative_cycles: number;
+    recent_slope_non_negative_cycles: number;
+    starvation_hard_cycles: number;
+  };
+  recent_time_stop_impact: {
+    hours: number;
+    closed_count: number;
+    realized_pnl: number;
+  };
+  baseline_vs_current: Record<string, unknown>;
 };
 
 export type WorkerCycle = {

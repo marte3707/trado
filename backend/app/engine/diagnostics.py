@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -103,6 +104,143 @@ def equity_slope_normalized(positions: list[Position]) -> float:
     return raw_slope / median
 
 
+def _median_abs_pnl(positions: list[Position]) -> float:
+    values = sorted(
+        abs(float(position.realized_pnl))
+        for position in positions
+        if position.realized_pnl is not None
+    )
+    if not values:
+        return 0.0
+    return values[len(values) // 2]
+
+
+def build_equity_slope_diagnostics(
+    db: Session,
+    *,
+    lookback: int = 500,
+) -> dict[str, Any]:
+    analyzer = SignalPerformanceAnalyzer()
+    positions = analyzer.closed_paper_positions(db, limit=lookback)
+    calibration_setting = db.get(AppSetting, "auto_calibration")
+    calibration_state_setting = db.get(AppSetting, "auto_calibration_state")
+    baseline_setting = db.get(AppSetting, "auto_calibration_baseline")
+    risk_setting = db.get(AppSetting, "risk")
+
+    calibration_config = (
+        calibration_setting.value
+        if calibration_setting and isinstance(calibration_setting.value, dict)
+        else {}
+    )
+    calibration_state = (
+        calibration_state_setting.value
+        if calibration_state_setting and isinstance(calibration_state_setting.value, dict)
+        else {}
+    )
+    baseline_value = (
+        baseline_setting.value
+        if baseline_setting and isinstance(baseline_setting.value, dict)
+        else {}
+    )
+    baseline_risk = baseline_value.get("risk", {}) if isinstance(baseline_value.get("risk"), dict) else {}
+    risk_value = risk_setting.value if risk_setting and isinstance(risk_setting.value, dict) else {}
+
+    threshold = float(calibration_config.get("deep_defensive_slope_threshold", -0.1))
+    window_sizes = [50, 100, 500]
+    windows = []
+    for size in window_sizes:
+        sample = positions[: min(size, len(positions))]
+        raw = equity_slope(sample)
+        median_abs = _median_abs_pnl(sample)
+        normalized = raw / median_abs if median_abs > 0 else 0.0
+        windows.append(
+            {
+                "window": size,
+                "sample_count": len(sample),
+                "raw_slope": raw,
+                "normalized_slope": normalized,
+                "median_abs_pnl": median_abs,
+            }
+        )
+
+    full_normalized = equity_slope_normalized(positions)
+    recent_positions = positions[: min(50, len(positions))]
+    recent_normalized = equity_slope_normalized(recent_positions)
+    if recent_normalized < threshold or full_normalized < threshold:
+        status = "declining"
+    elif recent_normalized >= 0 and full_normalized >= 0:
+        status = "improving"
+    else:
+        status = "neutral"
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=24)
+    time_stop_rows = (
+        db.query(DecisionLog)
+        .filter(
+            DecisionLog.event_type == "paper_position_time_stop_closed",
+            DecisionLog.timestamp >= since,
+        )
+        .order_by(DecisionLog.timestamp.desc())
+        .limit(1000)
+        .all()
+    )
+    time_stop_pnl = 0.0
+    for row in time_stop_rows:
+        data = row.data if isinstance(row.data, dict) else {}
+        try:
+            time_stop_pnl += float(data.get("realized_pnl", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+
+    risk_keys = ("min_signal_score", "min_risk_reward", "max_risk_per_trade_pct")
+    return {
+        "lookback": lookback,
+        "sample_count": len(positions),
+        "status": status,
+        "threshold": threshold,
+        "raw_slope": equity_slope(positions),
+        "normalized_slope": full_normalized,
+        "recent_normalized_slope": recent_normalized,
+        "median_abs_pnl": _median_abs_pnl(positions),
+        "windows": windows,
+        "deep_defensive_active": calibration_state.get("deep_defensive_active") is True,
+        "starvation_override_active": calibration_state.get("starvation_override_active") is True,
+        "last_reason": calibration_state.get("last_reason"),
+        "last_exit_reason": calibration_state.get("deep_defensive_last_exit_reason"),
+        "positive_streak": calibration_state.get("deep_defensive_positive_streak", 0),
+        "recent_positive_streak": calibration_state.get(
+            "deep_defensive_recent_positive_streak", 0
+        ),
+        "cooldown_remaining": calibration_state.get(
+            "deep_defensive_cooldown_remaining", 0
+        ),
+        "consecutive_zero_signal_cycles": calibration_state.get(
+            "consecutive_zero_signal_cycles", 0
+        ),
+        "exit_conditions": {
+            "full_slope_non_negative_cycles": 2,
+            "recent_slope_non_negative_cycles": int(
+                calibration_config.get("recent_slope_exit_cycles", 3)
+            ),
+            "starvation_hard_cycles": int(
+                calibration_config.get("starvation_hard_cycles", 15)
+            ),
+        },
+        "recent_time_stop_impact": {
+            "hours": 24,
+            "closed_count": len(time_stop_rows),
+            "realized_pnl": time_stop_pnl,
+        },
+        "baseline_vs_current": {
+            "risk": {
+                key: {"baseline": baseline_risk.get(key), "current": risk_value.get(key)}
+                for key in risk_keys
+            }
+        },
+    }
+
+
 def build_diagnostics_report(
     db: Session,
     *,
@@ -156,6 +294,9 @@ def build_diagnostics_report(
         "exit_reason_distribution": exit_reason_distribution(positions),
         "planned_stop_pct": planned_stop_pct_summary(positions, signals_by_id),
         "equity_slope": equity_slope(positions),
+        "equity_slope_diagnostics": build_equity_slope_diagnostics(
+            db, lookback=min(max(lookback, 50), 500)
+        ),
         "by_timeframe": {
             timeframe: serialize_stats(analyzer.summarize_positions(positions_for_tf))
             for timeframe, positions_for_tf in sorted(by_timeframe.items())

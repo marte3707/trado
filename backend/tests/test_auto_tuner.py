@@ -637,6 +637,188 @@ def test_active_ab_overlay_returns_arm_when_ab_active() -> None:
     assert overlay["overlay"] == {"regime_filter_enabled": True}
 
 
+def test_active_ab_overlay_is_deterministic_with_signal_context() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(ab_test_assignment_salt="test-salt")
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "ab_test": {
+                "control_overlay": {"regime_filter_enabled": False},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 0.5,
+            },
+        },
+    )
+    candle_time = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+
+    first = active_ab_overlay(
+        db,
+        market_id=1,
+        timeframe="5m",
+        source_candle_open_time=candle_time,
+    )
+    second = active_ab_overlay(
+        db,
+        market_id=1,
+        timeframe="5m",
+        source_candle_open_time=candle_time,
+    )
+
+    assert first is not None
+    assert first == second
+    assert first["assignment_method"] == "deterministic_hash"
+
+
+def test_active_ab_overlay_hash_assignment_is_roughly_balanced() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(ab_test_assignment_salt="balance-test")
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "ab_test": {
+                "control_overlay": {},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 0.5,
+            },
+        },
+    )
+    base = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+
+    arms = [
+        active_ab_overlay(
+            db,
+            market_id=i,
+            timeframe="5m",
+            source_candle_open_time=base + timedelta(minutes=i),
+        )["arm"]  # type: ignore[index]
+        for i in range(200)
+    ]
+
+    test_ratio = arms.count("test") / len(arms)
+    assert 0.40 <= test_ratio <= 0.60
+
+
+def test_status_exposes_ab_assignment_method() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "mode": "ab_test",
+            "activated_at": activated.isoformat(),
+            "trades_at_activation": 0,
+            "ab_test": {
+                "control_overlay": {},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 0.5,
+                "assignment_method": "deterministic_hash",
+            },
+            "step_history": [],
+        },
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    status = tuner.status(db)
+
+    assert status["ab_progress"]["assignment_method"] == "deterministic_hash"
+    assert status["config"]["ab_test_assignment_salt"] == "trado-v1"
+
+
+def test_status_exposes_ab_progress_metrics() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(ab_test_min_trades_per_arm=10)
+    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "regime_filter",
+            "mode": "ab_test",
+            "activated_at": activated.isoformat(),
+            "trades_at_activation": 0,
+            "ab_test": {
+                "control_overlay": {"regime_filter_enabled": False},
+                "test_overlay": {"regime_filter_enabled": True},
+                "allocation": 0.5,
+                "assignment_method": "deterministic_hash",
+            },
+            "step_history": [],
+        },
+    )
+    positions = (
+        _tagged_positions(4, -1.0, activated + timedelta(minutes=1), "control")
+        + _tagged_positions(6, 2.0, activated + timedelta(minutes=20), "test")
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer(positions))
+
+    status = tuner.status(db)
+
+    progress = status["ab_progress"]
+    assert progress["trades_control"] == 4
+    assert progress["trades_test"] == 6
+    assert progress["mean_delta"] == 3.0
+    assert round(progress["sample_balance"], 3) == 0.667
+    assert progress["control_overlay"] == {"regime_filter_enabled": False}
+    assert progress["test_overlay"] == {"regime_filter_enabled": True}
+
+
+def test_start_source_test_creates_guided_ab_sequence_without_mutating_risk() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(enabled=False)
+    db.app_settings["risk"] = AppSetting(
+        key="risk", value={"disabled_signal_sources": ["whale_flow", "fear_greed"]}
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.start_source_test(db, "whale_flow")
+
+    assert result["ok"] is True
+    assert result["mode"] == "ab_test"
+    assert result["step"] == "whale_flow_source"
+    config = db.app_settings["auto_tuner_config"].value
+    assert config["enabled"] is True
+    assert config["mode"] == "ab_test"
+    assert config["sequence"][0]["key"] == "whale_flow_source"
+    assert db.app_settings["risk"].value["disabled_signal_sources"] == [
+        "whale_flow",
+        "fear_greed",
+    ]
+    state = db.app_settings["auto_tuner_state"].value
+    assert state["ab_test"]["control_overlay"] == {
+        "disabled_signal_sources": ["whale_flow", "fear_greed"]
+    }
+    assert state["ab_test"]["test_overlay"] == {"disabled_signal_sources": ["fear_greed"]}
+
+
+def test_start_source_test_returns_conflict_when_step_active() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "volatility_filter",
+            "mode": "ab_test",
+            "step_history": [],
+        },
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.start_source_test(db, "fear_greed")
+
+    assert result["ok"] is False
+    assert result["status"] == "conflict"
+    assert result["active_step_key"] == "volatility_filter"
+
+
 def test_active_ab_overlay_returns_control_when_allocation_zero() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _ab_config()

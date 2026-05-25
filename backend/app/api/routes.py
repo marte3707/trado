@@ -37,7 +37,7 @@ from app.db.models import (
 from app.db.session import get_db
 from app.engine.auto_tuner import AutoTuner
 from app.engine.calibration import AutoCalibrationEngine, serialize_calibration
-from app.engine.diagnostics import build_diagnostics_report
+from app.engine.diagnostics import build_diagnostics_report, build_equity_slope_diagnostics
 from app.engine.execution import OrderExecutionEngine
 from app.engine.performance import SignalPerformanceAnalyzer, serialize_stats
 from app.schemas import CandleOut, IndicatorOut, MarketOut, PushSubscribePayload, PushUnsubscribePayload, SettingsPatch, SignalOut, StrategyPatch
@@ -823,6 +823,14 @@ def analytics_diagnostics(
     return build_diagnostics_report(db, lookback=lookback, history_limit=history_limit)
 
 
+@router.get("/analytics/equity-slope")
+def analytics_equity_slope(
+    lookback: int = Query(500, ge=50, le=2000),
+    db: Session = Depends(get_db),
+) -> dict:
+    return build_equity_slope_diagnostics(db, lookback=lookback)
+
+
 @router.post("/analytics/report/send")
 async def send_diagnostic_report(
     lookback: int = Query(200, ge=10, le=2000),
@@ -856,6 +864,25 @@ def run_auto_calibration(db: Session = Depends(get_db)) -> dict:
 @router.get("/auto-tuner/status")
 def auto_tuner_status(db: Session = Depends(get_db)) -> dict:
     return AutoTuner().status(db)
+
+
+@router.get("/auto-tuner/source-tests")
+def auto_tuner_source_tests(db: Session = Depends(get_db)) -> dict:
+    return AutoTuner().source_tests(db)
+
+
+@router.post("/auto-tuner/source-tests/{source}/start")
+def auto_tuner_start_source_test(
+    source: str = Path(..., pattern="^(whale_flow|fear_greed)$"),
+    db: Session = Depends(get_db),
+) -> dict:
+    result = AutoTuner().start_source_test(db, source)
+    status = result.get("status")
+    if status == "unknown_source":
+        raise HTTPException(status_code=404, detail=result)
+    if status == "conflict":
+        raise HTTPException(status_code=409, detail=result)
+    return result
 
 
 @router.post("/auto-tuner/run")

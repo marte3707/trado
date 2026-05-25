@@ -459,6 +459,8 @@ async def run_once(
     closed = await asyncio.to_thread(
         reconcile_open_paper_positions, db, executor, managed_paper_timeframes
     )
+    time_stop_result = await asyncio.to_thread(executor.apply_time_stops, db)
+    closed += int(time_stop_result.get("paper_closed", 0))
     calibrated = False
     calibration_attempted = False
     if should_run_calibration(db, closed):
@@ -489,6 +491,8 @@ async def run_once(
                     "live_reconciled": live_reconciled,
                     "live_stop_updates": 0,
                     "btc_protection_updates": btc_protection_updates,
+                    "time_stop_paper_closed": time_stop_result.get("paper_closed", 0),
+                    "time_stop_live_alerted": time_stop_result.get("live_alerted", 0),
                     "calibrated": calibrated,
                     "active_timeframes": [],
                     "paper_active_timeframes": [],
@@ -610,6 +614,8 @@ async def run_once(
                     "live_reconciled": live_reconciled,
                     "live_stop_updates": live_stop_updates,
                     "btc_protection_updates": btc_protection_updates,
+                    "time_stop_paper_closed": time_stop_result.get("paper_closed", 0),
+                    "time_stop_live_alerted": time_stop_result.get("live_alerted", 0),
                     "calibrated": calibrated,
                     # Aggregato dei motivi per cui i segnali non sono stati emessi —
                     # in produzione gli eventi debug per skip sono filtrati, qui

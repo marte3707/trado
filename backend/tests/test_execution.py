@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from app.api.routes import _calculate_unrealized_pnl
@@ -14,8 +14,14 @@ class FakeQuery:
     def filter(self, *_args, **_kwargs) -> "FakeQuery":
         return self
 
+    def order_by(self, *_args, **_kwargs) -> "FakeQuery":
+        return self
+
     def first(self) -> object | None:
         return self.rows[0] if self.rows else None
+
+    def all(self) -> list[object]:
+        return list(self.rows)
 
 
 class FakeDb:
@@ -82,6 +88,41 @@ class FakePaperDb:
 
     def added_of(self, model: type[object]) -> list[object]:
         return [row for row in self.added if isinstance(row, model)]
+
+
+class FakeTimeStopDb:
+    def __init__(
+        self,
+        *,
+        positions: list[Position],
+        candles: list[Candle] | None = None,
+        position_management: dict | None = None,
+    ) -> None:
+        self.positions = positions
+        self.candles = candles or []
+        self.position_management = position_management or {}
+        self.added: list[object] = []
+        self.committed = 0
+
+    def get(self, model: type[object], key: object) -> object | None:
+        if model is AppSetting and key == "position_management":
+            return AppSetting(key="position_management", value=self.position_management)
+        if model is Signal:
+            return None
+        return None
+
+    def query(self, model: type[object], *_args, **_kwargs) -> FakeQuery:
+        if model is Position:
+            return FakeQuery(self.positions)
+        if model is Candle:
+            return FakeQuery(self.candles)
+        return FakeQuery([])
+
+    def add(self, row: object) -> None:
+        self.added.append(row)
+
+    def commit(self) -> None:
+        self.committed += 1
 
 
 def _paper_signal(signal_id: int = 42) -> Signal:
@@ -407,3 +448,203 @@ def test_take_profit_plan_can_fill_all_targets_in_one_candle() -> None:
     assert position.size == Decimal("0")
     assert position.realized_pnl == Decimal("85.00")
     assert [order.size for order in exit_orders] == [Decimal("5.00"), Decimal("3.00"), Decimal("2.00")]
+
+
+def test_time_stop_closes_stale_paper_position_at_latest_candle_close() -> None:
+    engine = OrderExecutionEngine(Settings())
+    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
+    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    position = Position(
+        id=10,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=opened_at,
+        metadata_json={"source_timeframe": "5m", "initial_size": "1"},
+    )
+    candle = Candle(
+        market_id=1,
+        timeframe="5m",
+        open_time=candle_open,
+        open=Decimal("100"),
+        high=Decimal("103"),
+        low=Decimal("99"),
+        close=Decimal("102"),
+        volume=Decimal("1"),
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        candles=[candle],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": True,
+                "liveMode": "off",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 1, "live_alerted": 0}
+    assert position.status == "closed"
+    assert position.closed_at == candle_open + timedelta(minutes=5)
+    assert position.realized_pnl == Decimal("2")
+    assert position.metadata_json["exit_reason"] == "time_stop"
+    assert any(
+        isinstance(row, DecisionLog) and row.event_type == "paper_position_time_stop_closed"
+        for row in db.added
+    )
+
+
+def test_time_stop_keeps_recent_paper_position_open() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=11,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        metadata_json={"source_timeframe": "5m"},
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": True,
+                "liveMode": "off",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "live_alerted": 0}
+    assert position.status == "open"
+
+
+def test_time_stop_does_not_close_without_candle_after_open() -> None:
+    engine = OrderExecutionEngine(Settings())
+    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
+    stale_candle_open = opened_at - timedelta(hours=1)
+    position = Position(
+        id=14,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=opened_at,
+        metadata_json={"source_timeframe": "5m"},
+    )
+    candle = Candle(
+        market_id=1,
+        timeframe="5m",
+        open_time=stale_candle_open,
+        open=Decimal("100"),
+        high=Decimal("103"),
+        low=Decimal("99"),
+        close=Decimal("102"),
+        volume=Decimal("1"),
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        candles=[candle],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": True,
+                "liveMode": "off",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "live_alerted": 0}
+    assert position.status == "open"
+    assert position.closed_at is None
+
+
+def test_time_stop_alerts_stale_live_position_without_closing() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=12,
+        market_id=1,
+        mode="live",
+        side="short",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=datetime.now(timezone.utc) - timedelta(hours=9),
+        metadata_json={"source_timeframe": "5m"},
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": False,
+                "liveMode": "alert",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "live_alerted": 1}
+    assert position.status == "open"
+    assert "last_time_stop_alert_at" in position.metadata_json
+    assert any(
+        isinstance(row, DecisionLog) and row.event_type == "live_position_time_stop_alert"
+        for row in db.added
+    )
+
+
+def test_time_stop_does_not_duplicate_recent_live_alert() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=13,
+        market_id=1,
+        mode="live",
+        side="short",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=datetime.now(timezone.utc) - timedelta(hours=9),
+        metadata_json={
+            "source_timeframe": "5m",
+            "last_time_stop_alert_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": False,
+                "liveMode": "alert",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "live_alerted": 0}
+    assert not any(
+        isinstance(row, DecisionLog) and row.event_type == "live_position_time_stop_alert"
+        for row in db.added
+    )
