@@ -11,6 +11,7 @@ from app.core.config import get_settings
 from app.core.enums import OrderMode, SignalStatus
 from app.core.runtime_settings import effective_live_execution_settings
 from app.db.models import DecisionLog, Market, Order, Position, Signal
+from app.engine.position_management import PositionManagementEngine, StopCandidate
 from app.services.hyperliquid import HyperliquidTradingClient
 
 logger = structlog.get_logger()
@@ -75,6 +76,96 @@ def _size_divergence(local: Decimal, remote_abs: Decimal) -> Decimal:
     if base == 0:
         return Decimal("0")
     return abs(local - remote_abs) / base
+
+
+def _initial_risk_per_unit(position: Position) -> Decimal | None:
+    metadata = position.metadata_json or {}
+    risk = _decimal(metadata.get("initial_risk_per_unit"))
+    if risk is not None and risk > 0:
+        return risk
+    initial_stop = _decimal(metadata.get("initial_stop_loss")) or position.stop_loss
+    if initial_stop is None:
+        return None
+    risk = abs(position.entry_price - initial_stop)
+    return risk if risk > 0 else None
+
+
+def _position_r_multiple(position: Position, price: Decimal) -> Decimal:
+    risk = _initial_risk_per_unit(position)
+    if risk is None or risk <= 0:
+        return Decimal("0")
+    if position.side.lower() == "short":
+        return (position.entry_price - price) / risk
+    return (price - position.entry_price) / risk
+
+
+def _needs_tp1_breakeven_stop(position: Position) -> bool:
+    metadata = position.metadata_json or {}
+    if not metadata.get("tp1_hit") or metadata.get("breakeven_triggered"):
+        return False
+    entry = position.entry_price
+    if entry is None or entry <= 0:
+        return False
+    stop = position.stop_loss
+    side = position.side.lower()
+    if side == "long":
+        return stop is None or stop < entry
+    if side == "short":
+        return stop is None or stop > entry
+    return False
+
+
+def _reference_price_for_tp1_breakeven(
+    position: Position,
+    remote_position: dict,
+    fill_match: _ExitFillMatch,
+) -> Decimal | None:
+    mark_px = _decimal(remote_position.get("markPx"))
+    if mark_px is not None and mark_px > 0:
+        return mark_px
+    if fill_match.last_exit_reason == "tp1":
+        return fill_match.last_exit_price
+    last_mark = _decimal((position.metadata_json or {}).get("last_mark_price"))
+    return last_mark if last_mark is not None and last_mark > 0 else None
+
+
+def _protect_stop_at_breakeven_after_tp1(
+    db: Session,
+    position: Position,
+    market: Market,
+    remote_position: dict,
+    fill_match: _ExitFillMatch,
+    trading: HyperliquidTradingClient,
+) -> bool:
+    if not _needs_tp1_breakeven_stop(position):
+        return False
+
+    reference_price = _reference_price_for_tp1_breakeven(position, remote_position, fill_match)
+    side = position.side.lower()
+    entry = position.entry_price
+    if reference_price is not None:
+        if side == "long" and reference_price <= entry:
+            return False
+        if side == "short" and reference_price >= entry:
+            return False
+
+    candidate = StopCandidate(
+        price=entry,
+        reason="breakeven_after_tp1",
+        indicators={
+            "current_price": str(reference_price) if reference_price is not None else None,
+            "source": "live_reconciliation",
+            "trigger": fill_match.last_exit_reason or "tp1_hit_metadata",
+        },
+        r_multiple=_position_r_multiple(position, reference_price or entry),
+    )
+    return PositionManagementEngine(get_settings()).replace_live_stop_order(
+        db,
+        market,
+        position,
+        candidate,
+        trading_client=trading,
+    )
 
 
 def _index_fills(fills: list[dict]) -> tuple[dict[str, list[dict]], dict[int, list[dict]]]:
@@ -717,26 +808,11 @@ def _close_companion_paper_position(
     now: datetime,
 ) -> None:
     """If a companion paper position exists for the same signal, close it at exit_price."""
-    source_signal_id = (live_position.metadata_json or {}).get("source_signal_id")
-    if source_signal_id is None:
-        return
-    try:
-        signal_id = int(source_signal_id)
-    except (TypeError, ValueError):
-        return
-    paper_position = (
-        db.query(Position)
-        .filter(
-            Position.market_id == live_position.market_id,
-            Position.mode == OrderMode.PAPER.value,
-            Position.status == "open",
-        )
-        .filter(
-            Position.metadata_json["source_signal_id"].astext == str(signal_id)
-        )
-        .first()
-    )
+    paper_position = _companion_paper_position(db, live_position)
     if paper_position is None:
+        return
+    signal_id = _source_signal_id(live_position)
+    if signal_id is None:
         return
     effective_exit = exit_price if exit_price is not None else paper_position.entry_price
     side = paper_position.side.lower()
@@ -775,6 +851,64 @@ def _close_companion_paper_position(
             },
         )
     )
+
+
+def _handle_companion_paper_after_live_reconcile(
+    db: Session,
+    live_position: Position,
+    exit_price: Decimal | None,
+    now: datetime,
+    *,
+    close_companion: bool,
+) -> None:
+    if close_companion:
+        _close_companion_paper_position(db, live_position, exit_price, now)
+        return
+
+    paper_position = _companion_paper_position(db, live_position)
+    if paper_position is None:
+        return
+    db.add(
+        DecisionLog(
+            event_type="live_companion_paper_left_open",
+            market_id=paper_position.market_id,
+            position_id=paper_position.id,
+            message="Paper companion left open after live position reconciliation",
+            data={
+                "live_position_id": live_position.id,
+                "live_exit_price": str(exit_price) if exit_price is not None else None,
+                "source_signal_id": (live_position.metadata_json or {}).get("source_signal_id"),
+            },
+        )
+    )
+
+
+def _companion_paper_position(db: Session, live_position: Position) -> Position | None:
+    signal_id = _source_signal_id(live_position)
+    if signal_id is None:
+        return None
+    return (
+        db.query(Position)
+        .filter(
+            Position.market_id == live_position.market_id,
+            Position.mode == OrderMode.PAPER.value,
+            Position.status == "open",
+        )
+        .filter(
+            Position.metadata_json["source_signal_id"].astext == str(signal_id)
+        )
+        .first()
+    )
+
+
+def _source_signal_id(live_position: Position) -> int | None:
+    source_signal_id = (live_position.metadata_json or {}).get("source_signal_id")
+    if source_signal_id is None:
+        return None
+    try:
+        return int(source_signal_id)
+    except (TypeError, ValueError):
+        return None
 
 
 def _index_fills_by_coin(raw_fills: list[dict]) -> dict[str, list[dict]]:
@@ -989,7 +1123,13 @@ def reconcile_live_positions(
             )
             exit_price_str = metadata.get("exit_price")
             companion_exit = _decimal(exit_price_str) if exit_price_str else None
-            _close_companion_paper_position(db, position, companion_exit, now)
+            _handle_companion_paper_after_live_reconcile(
+                db,
+                position,
+                companion_exit,
+                now,
+                close_companion=bool(live_settings["close_companion_paper_on_live_reconcile"]),
+            )
             updated += 1
             continue
 
@@ -1084,6 +1224,14 @@ def reconcile_live_positions(
         metadata["last_reconciled_at"] = now.isoformat()
         metadata["last_remote_position"] = remote
         position.metadata_json = metadata
+        _protect_stop_at_breakeven_after_tp1(
+            db,
+            position,
+            position.market,
+            remote,
+            fill_match,
+            trading,
+        )
         db.add(position)
         updated += 1
 

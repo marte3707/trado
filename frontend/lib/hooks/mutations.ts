@@ -1,0 +1,213 @@
+"use client";
+
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+
+import {
+  apiDelete,
+  apiPatch,
+  apiPost,
+  ApiError,
+  type AppSettings,
+  type Strategy,
+  type SystemService,
+  type SystemServiceAction,
+  type SystemServiceResult,
+} from "@/lib/api";
+import { qk } from "@/lib/hooks/queryKeys";
+
+function errorMessage(err: unknown): string {
+  if (err instanceof ApiError) return err.detail || err.message;
+  if (err instanceof Error) return err.message;
+  return "Errore sconosciuto";
+}
+
+/* ── Kill switch ─────────────────────────────────────────────────────── */
+
+export function useKillSwitch() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (enable: boolean) => {
+      return apiPost<unknown>(enable ? "/api/kill-switch/enable" : "/api/kill-switch/disable");
+    },
+    onSuccess: (_, enable) => {
+      toast.success(enable ? "Kill switch armato" : "Kill switch disarmato");
+      qc.invalidateQueries({ queryKey: qk.settings });
+      qc.invalidateQueries({ queryKey: qk.health });
+    },
+    onError: (err) => toast.error(`Kill switch fallito: ${errorMessage(err)}`),
+  });
+}
+
+/* ── Settings ────────────────────────────────────────────────────────── */
+
+export function useUpdateSettings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (patch: Partial<AppSettings>) => apiPatch<AppSettings>("/api/settings", patch),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.settings });
+      qc.invalidateQueries({ queryKey: qk.health });
+    },
+    onError: (err) => toast.error(`Salvataggio fallito: ${errorMessage(err)}`),
+  });
+}
+
+export function useUpdateScoreThreshold() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      threshold,
+      currentRisk,
+    }: {
+      threshold: number;
+      currentRisk: Record<string, unknown>;
+    }) => {
+      const nextRisk = { ...currentRisk, min_signal_score: threshold };
+      return apiPatch<AppSettings>("/api/settings", { risk: { value: nextRisk } });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.settings });
+    },
+    onError: (err) => toast.error(`Soglia score non salvata: ${errorMessage(err)}`),
+  });
+}
+
+/* ── Strategies ──────────────────────────────────────────────────────── */
+
+export function useUpdateStrategy() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      id,
+      patch,
+    }: {
+      id: number;
+      patch: Partial<Pick<Strategy, "enabled" | "weight" | "params">>;
+    }) => apiPatch<Strategy>(`/api/strategies/${id}`, patch),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.strategies });
+    },
+    onError: (err) => toast.error(`Strategia non aggiornata: ${errorMessage(err)}`),
+  });
+}
+
+/* ── Positions ───────────────────────────────────────────────────────── */
+
+export function useClosePosition() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (positionId: number) => apiPost<unknown>(`/api/positions/${positionId}/close`),
+    onSuccess: () => {
+      toast.success("Posizione chiusa");
+      qc.invalidateQueries({ queryKey: qk.positions });
+      qc.invalidateQueries({ queryKey: qk.orders });
+    },
+    onError: (err) => toast.error(`Chiusura fallita: ${errorMessage(err)}`),
+  });
+}
+
+export function useDeletePosition() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (positionId: number) => apiDelete<unknown>(`/api/positions/${positionId}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.positions });
+    },
+    onError: (err) => toast.error(`Eliminazione fallita: ${errorMessage(err)}`),
+  });
+}
+
+/* ── Signals ─────────────────────────────────────────────────────────── */
+
+export function useExecuteSignalPaper() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (signalId: number) =>
+      apiPost<unknown>(`/api/signals/${signalId}/execute-paper`),
+    onSuccess: () => {
+      toast.success("Segnale eseguito in paper");
+      qc.invalidateQueries({ queryKey: qk.signals() });
+      qc.invalidateQueries({ queryKey: qk.positions });
+    },
+    onError: (err) => toast.error(`Esecuzione paper fallita: ${errorMessage(err)}`),
+  });
+}
+
+export function useIgnoreSignal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (signalId: number) => apiPost<unknown>(`/api/signals/${signalId}/ignore`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.signals() });
+    },
+    onError: (err) => toast.error(`Operazione fallita: ${errorMessage(err)}`),
+  });
+}
+
+export function useReopenSignal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (signalId: number) => apiPost<unknown>(`/api/signals/${signalId}/reopen`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.signals() });
+    },
+    onError: (err) => toast.error(`Operazione fallita: ${errorMessage(err)}`),
+  });
+}
+
+export function useDeleteSignal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (signalId: number) => apiDelete<unknown>(`/api/signals/${signalId}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.signals() });
+    },
+    onError: (err) => toast.error(`Eliminazione fallita: ${errorMessage(err)}`),
+  });
+}
+
+/* ── Auto-tuner ──────────────────────────────────────────────────────── */
+
+type TunerAction = "run" | "pause" | "resume" | "rollback" | "reset";
+
+export function useAutoTuner() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (action: TunerAction) =>
+      apiPost<unknown>(`/api/auto-tuner/${action}`),
+    onSuccess: (_, action) => {
+      const labels: Record<TunerAction, string> = {
+        run: "Auto-tuner attivato",
+        pause: "Auto-tuner in pausa",
+        resume: "Auto-tuner ripreso",
+        rollback: "Rollback eseguito",
+        reset: "Auto-tuner resettato",
+      };
+      toast.success(labels[action]);
+      qc.invalidateQueries({ queryKey: qk.tunerStatus });
+      qc.invalidateQueries({ queryKey: qk.tunerSourceTests });
+    },
+    onError: (err) => toast.error(`Azione tuner fallita: ${errorMessage(err)}`),
+  });
+}
+
+/* ── System services ─────────────────────────────────────────────────── */
+
+export function useServiceAction() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      service,
+      action,
+    }: {
+      service: SystemService;
+      action: SystemServiceAction;
+    }) => apiPost<SystemServiceResult>(`/api/system/services/${service}/${action}`),
+    onSuccess: (data) => {
+      toast.success(`${data.label}: ${data.action}`);
+      qc.invalidateQueries({ queryKey: qk.health });
+    },
+    onError: (err) => toast.error(`Azione servizio fallita: ${errorMessage(err)}`),
+  });
+}

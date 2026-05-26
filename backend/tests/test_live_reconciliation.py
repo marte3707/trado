@@ -6,8 +6,13 @@ from typing import Any
 
 import pytest
 
-from app.db.models import DecisionLog, Market, Order, Position
-from app.services.live_reconciliation import _close_companion_paper_position, reconcile_live_positions
+from app.core.enums import OperationMode
+from app.db.models import DecisionLog, Market, Order, Position, PositionStopUpdate
+from app.services.live_reconciliation import (
+    _close_companion_paper_position,
+    _handle_companion_paper_after_live_reconcile,
+    reconcile_live_positions,
+)
 
 
 @dataclass
@@ -47,6 +52,9 @@ class FakeDb:
 
     def add(self, row: Any) -> None:
         self.added.append(row)
+
+    def flush(self) -> None:
+        return None
 
     def commit(self) -> None:
         self.committed += 1
@@ -90,6 +98,7 @@ class FakeTrading:
         self._resubmit_oid = resubmit_oid
         self._resubmit_immediately_filled = resubmit_immediately_filled
         self.resubmitted: list[dict[str, Any]] = []
+        self.canceled: list[dict[str, Any]] = []
 
     def user_state(self, _address: str) -> dict[str, Any]:
         return {"assetPositions": [{"position": p} for p in self._remote]}
@@ -127,6 +136,12 @@ class FakeTrading:
                 filled_size=size,
             )
         return _FakeOrderResult(oid=self._resubmit_oid, status="ok")
+
+    def cancel_order(self, coin: str, oid: int, expires_after_seconds: int) -> dict[str, Any]:
+        self.canceled.append(
+            {"coin": coin, "oid": oid, "expires_after_seconds": expires_after_seconds}
+        )
+        return {"status": "ok"}
 
 
 def _make_market() -> Market:
@@ -216,6 +231,81 @@ def test_reconciliation_stores_mark_px_when_remote_provides_it() -> None:
     reconcile_live_positions(db, trading_client=trading)
 
     assert position.metadata_json["last_mark_price"] == "105"
+
+
+def test_tp1_fill_moves_live_stop_to_breakeven(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.core import config
+
+    settings = config.get_settings()
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.AUTO_TRADE, raising=False)
+    monkeypatch.setattr(settings, "enable_live_trading", True, raising=False)
+
+    position = _make_position(size="1")
+    position.entry_price = Decimal("100")
+    position.stop_loss = Decimal("90")
+    position.metadata_json = {
+        "initial_stop_loss": "90",
+        "initial_risk_per_unit": "10",
+        "take_profit_plan": [
+            {"level": "tp1", "price": "110", "allocation": "0.3", "filled": False},
+            {"level": "tp2", "price": "120", "allocation": "0.3", "filled": False},
+            {"level": "runner", "price": "", "allocation": "0.4", "filled": False, "runner": True},
+        ],
+    }
+    stop_order = Order(
+        id=20,
+        position_id=position.id,
+        mode="live",
+        order_type="stop_loss",
+        side="sell",
+        price=Decimal("90"),
+        size=Decimal("1"),
+        status="ok",
+        reduce_only=True,
+        hyperliquid_order_id="111",
+        raw_response={},
+    )
+    tp1_order = Order(
+        id=21,
+        position_id=position.id,
+        mode="live",
+        order_type="tp1",
+        side="sell",
+        price=Decimal("110"),
+        size=Decimal("0.3"),
+        status="ok",
+        reduce_only=True,
+        hyperliquid_order_id="222",
+        raw_response={},
+    )
+    db = FakeDb(positions=[position], orders=[stop_order, tp1_order])
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "BTC", "szi": "0.7", "entryPx": "100", "markPx": "111"}
+        ],
+        fills=[{"oid": 222, "sz": "0.3", "px": "110", "closedPnl": "3"}],
+        open_order_oids=[111],
+        resubmit_oid="333",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert position.stop_loss == Decimal("100")
+    assert position.metadata_json["breakeven_triggered"] is True
+    assert position.metadata_json["last_stop_update_reason"] == "breakeven_after_tp1"
+    assert stop_order.status == "canceled"
+    assert trading.resubmitted[-1] == {
+        "coin": "BTC",
+        "is_buy": False,
+        "size": Decimal("0.7"),
+        "tpsl": "sl",
+    }
+    assert trading.canceled[-1]["oid"] == 111
+    assert any(isinstance(row, PositionStopUpdate) for row in db.added)
+    assert any(
+        isinstance(row, DecisionLog) and row.event_type == "position_stop_updated"
+        for row in db.added
+    )
 
 
 def test_reconciliation_flags_size_mismatch_on_first_tick() -> None:
@@ -824,6 +914,46 @@ def test_companion_paper_closed_when_live_reconciled() -> None:
     assert paper.size == Decimal("0")
     assert paper.realized_pnl == Decimal("10")  # (110-100)*1
     assert paper.metadata_json["exit_price"] == "110"
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "paper_position_companion_closed" in events
+
+
+def test_companion_paper_left_open_by_default_after_live_reconcile() -> None:
+    live = _make_live_with_signal(42)
+    paper = _make_paper_with_signal(42, entry="100")
+    db = _CompanionDb(paper_positions=[paper])
+
+    _handle_companion_paper_after_live_reconcile(
+        db,
+        live,
+        exit_price=Decimal("110"),
+        now=datetime.now(timezone.utc),
+        close_companion=False,
+    )
+
+    assert paper.status == "open"
+    assert paper.size == Decimal("1")
+    assert paper.realized_pnl is None
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_companion_paper_left_open" in events
+    assert "paper_position_companion_closed" not in events
+
+
+def test_companion_paper_can_still_mirror_live_reconcile_when_enabled() -> None:
+    live = _make_live_with_signal(42)
+    paper = _make_paper_with_signal(42, entry="100")
+    db = _CompanionDb(paper_positions=[paper])
+
+    _handle_companion_paper_after_live_reconcile(
+        db,
+        live,
+        exit_price=Decimal("110"),
+        now=datetime.now(timezone.utc),
+        close_companion=True,
+    )
+
+    assert paper.status == "closed"
+    assert paper.realized_pnl == Decimal("10")
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "paper_position_companion_closed" in events
 

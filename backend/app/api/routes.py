@@ -66,6 +66,9 @@ def _log_and_redact(event: str, exc: Exception) -> str:
 # recomputes it on the fly from the latest candle, instead of trusting the
 # worker-written value.
 PNL_STALENESS = timedelta(minutes=5)
+POSITION_HISTORY_LIMIT = 250
+ORDER_HISTORY_LIMIT = 250
+EXIT_ORDER_TYPES = ("tp1", "tp2", "tp3", "take_profit", "stop_loss", "manual")
 
 
 def market_data_client() -> CoinMarketCapClient:
@@ -578,7 +581,7 @@ def positions(db: Session = Depends(get_db)) -> list[dict]:
         db.query(Position)
         .options(joinedload(Position.market))
         .order_by(Position.opened_at.desc())
-        .limit(250)
+        .limit(POSITION_HISTORY_LIMIT)
         .all()
     )
     position_ids = [row.id for row in rows]
@@ -695,7 +698,29 @@ def delete_position(position_id: int, db: Session = Depends(get_db)) -> dict:
 
 @router.get("/orders")
 def orders(db: Session = Depends(get_db)) -> list[dict]:
-    rows = db.query(Order).order_by(Order.created_at.desc()).limit(250).all()
+    recent_rows = db.query(Order).order_by(Order.created_at.desc()).limit(ORDER_HISTORY_LIMIT).all()
+    rows_by_id = {row.id: row for row in recent_rows}
+
+    position_ids = [
+        row_id
+        for (row_id,) in db.query(Position.id)
+        .order_by(Position.opened_at.desc())
+        .limit(POSITION_HISTORY_LIMIT)
+        .all()
+    ]
+    if position_ids:
+        context_rows = (
+            db.query(Order)
+            .filter(
+                Order.position_id.in_(position_ids),
+                Order.order_type.in_(EXIT_ORDER_TYPES),
+                Order.status == "filled",
+            )
+            .all()
+        )
+        rows_by_id.update({row.id: row for row in context_rows})
+
+    rows = sorted(rows_by_id.values(), key=lambda row: row.created_at, reverse=True)
     signal_ids = {row.signal_id for row in rows if row.signal_id is not None}
     position_ids = {row.position_id for row in rows if row.position_id is not None}
     signals_by_id = (
@@ -1436,7 +1461,7 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
 @router.post("/account/orders/{oid}/cancel")
 def cancel_account_order(
     oid: int,
-    coin: str = Query(..., min_length=1, max_length=32, pattern=r"^[A-Z0-9._\-/]+$"),
+    coin: str = Query(..., min_length=1, max_length=32, pattern=r"^[A-Za-z0-9._\-/]+$"),
     db: Session = Depends(get_db),
 ) -> dict:
     settings = get_settings()
@@ -1462,7 +1487,7 @@ def cancel_account_order(
 
 @router.post("/account/positions/{coin}/close")
 def close_account_position(
-    coin: str = Path(..., min_length=1, max_length=32, pattern=r"^[A-Z0-9._\-/]+$"),
+    coin: str = Path(..., min_length=1, max_length=32, pattern=r"^[A-Za-z0-9._\-/]+$"),
     db: Session = Depends(get_db),
 ) -> dict:
     settings = get_settings()

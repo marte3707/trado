@@ -67,6 +67,8 @@ In paper trading il worker simula TP parziali e aggiornamenti SL. Il `timeStop` 
 
 In live trading gli aggiornamenti SL sono inviati solo quando la modalita' effettiva e' `AUTO_TRADE`, `enable_live_trading` e' true, le credenziali sono configurate e il kill switch e' spento. Ogni modifica dello stop e' registrata in `position_stop_updates` e nei `decision_logs`.
 
+Quando una posizione live viene riconciliata come chiusa su Hyperliquid, la posizione companion paper resta aperta di default per preservare le statistiche paper/auto-tuner. La reconciliation registra `live_companion_paper_left_open`. Per usare la paper come mirror operativo della live, impostare `live_execution.close_companion_paper_on_live_reconcile=true`.
+
 ## Avvio locale passo per passo
 
 ### 1. Prerequisiti

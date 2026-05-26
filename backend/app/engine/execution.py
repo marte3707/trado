@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
 import structlog
@@ -15,7 +15,7 @@ from app.core.runtime_settings import (
 )
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, Signal
 from app.engine.order_validation import LiveOrderPlan, OrderValidator
-from app.engine.position_management import PositionManagementEngine
+from app.engine.position_management import LiquidationGuardResult, PositionManagementEngine
 from app.engine.risk import calculate_position_size
 from app.services.hyperliquid import HyperliquidError, HyperliquidTradingClient
 
@@ -60,6 +60,11 @@ POSITION_DUST_THRESHOLD = Decimal("0.0000000001")
 # Minimum TP allocation that, when hit, also closes the rest of the position.
 # Matches the tp3 allocation by design so hitting tp3 sweeps the tail.
 TP_FINAL_CLOSE_ALLOCATION = Decimal("0.20")
+# Keep isolated liquidation comfortably beyond the planned stop. Hyperliquid's
+# exact liquidation price includes maintenance margin, so a multiplicative
+# buffer can still be too permissive for wider stops.
+LIQUIDATION_STOP_DISTANCE_ABSOLUTE_BUFFER = Decimal("0.10")
+LIQUIDATION_GUARD_RECOVERY_LEVERAGE = 1
 
 
 class OrderExecutionEngine:
@@ -287,7 +292,14 @@ class OrderExecutionEngine:
             db.commit()
             raise HyperliquidError("live order rejected by Hyperliquid")
         position = self._persist_live_position(
-            db, signal, plan, entry_result, order_size, account_value, market_cloid
+            db,
+            signal,
+            plan,
+            entry_result,
+            order_size,
+            account_value,
+            market_cloid,
+            safe_leverage,
         )
         db.commit()
         db.refresh(position)
@@ -347,6 +359,7 @@ class OrderExecutionEngine:
         requested_size: Decimal,
         account_value: Decimal,
         market_cloid: str,
+        contract_leverage: int,
     ) -> Position:
         filled_size = entry_result.filled_size or requested_size
         entry_price = entry_result.avg_price or signal.entry_price
@@ -356,7 +369,7 @@ class OrderExecutionEngine:
             "initial_size": str(filled_size),
             "remaining_size": str(filled_size),
             "account_value_at_entry": str(account_value),
-            "contract_leverage": plan.max_leverage,
+            "contract_leverage": contract_leverage,
             "entry_response": entry_result.raw_response,
             "take_profit_plan": self._build_take_profit_plan(db, signal),
             "funding_rate": (signal.strategy_breakdown or {}).get("_funding_rate"),
@@ -507,6 +520,15 @@ class OrderExecutionEngine:
             trading_client=trading,
             source="post_entry",
         )
+        if guard.failed:
+            guard = self._try_recover_liquidation_guard(
+                db,
+                trading,
+                position,
+                signal,
+                coin,
+                guard,
+            )
         if guard.failed:
             self.close_live_position(
                 db,
@@ -668,6 +690,72 @@ class OrderExecutionEngine:
             )
         )
         db.commit()
+
+    def _try_recover_liquidation_guard(
+        self,
+        db: Session,
+        trading: HyperliquidTradingClient,
+        position: Position,
+        signal: Signal,
+        coin: str,
+        guard: LiquidationGuardResult,
+    ) -> LiquidationGuardResult:
+        metadata = dict(position.metadata_json or {})
+        current_leverage = _metadata_int(metadata.get("contract_leverage"))
+        if current_leverage is not None and current_leverage <= LIQUIDATION_GUARD_RECOVERY_LEVERAGE:
+            return guard
+        try:
+            trading.set_leverage(coin, LIQUIDATION_GUARD_RECOVERY_LEVERAGE, is_cross=False)
+        except Exception as exc:
+            db.add(
+                DecisionLog(
+                    event_type="live_liquidation_guard_recovery_failed",
+                    market_id=position.market_id,
+                    signal_id=signal.id,
+                    position_id=position.id,
+                    message="Failed to reduce leverage after liquidation guard failure",
+                    data={
+                        "coin": coin,
+                        "target_leverage": LIQUIDATION_GUARD_RECOVERY_LEVERAGE,
+                        "error": str(exc),
+                    },
+                )
+            )
+            return guard
+
+        recovered = self.position_manager.check_liquidation_guard(
+            db,
+            position,
+            coin=coin,
+            trading_client=trading,
+            source="post_entry_recheck_after_leverage_reduce",
+        )
+        if recovered.failed:
+            return recovered
+
+        metadata = dict(position.metadata_json or {})
+        metadata["contract_leverage"] = LIQUIDATION_GUARD_RECOVERY_LEVERAGE
+        metadata["liquidation_guard_recovered"] = True
+        position.metadata_json = metadata
+        db.add(position)
+        db.add(
+            DecisionLog(
+                event_type="live_liquidation_guard_recovered",
+                market_id=position.market_id,
+                signal_id=signal.id,
+                position_id=position.id,
+                message="Reduced leverage after liquidation guard failure",
+                data={
+                    "coin": coin,
+                    "target_leverage": LIQUIDATION_GUARD_RECOVERY_LEVERAGE,
+                    "stop_loss": str(recovered.stop_loss) if recovered.stop_loss is not None else None,
+                    "liquidation_price": str(recovered.liquidation_price)
+                    if recovered.liquidation_price is not None
+                    else None,
+                },
+            )
+        )
+        return recovered
 
     def close_position(
         self,
@@ -1317,12 +1405,43 @@ def _round_size(size: Decimal, decimals: int) -> Decimal:
 
 
 def _target_leverage(signal: Signal, max_leverage: int) -> int:
-    """Scale leverage linearly with signal score; STRONG direction adds 20% bonus."""
+    """Scale leverage by score, capped by the stop distance for isolated margin."""
     score = float(signal.score or 0)
     factor = score / 100.0
     if signal.direction in {Direction.STRONG_LONG, Direction.STRONG_SHORT}:
         factor = min(1.0, factor * 1.2)
-    return max(1, min(max_leverage, round(max_leverage * factor)))
+    score_leverage = max(1, min(max_leverage, round(max_leverage * factor)))
+    stop_leverage = _stop_distance_leverage_cap(signal)
+    if stop_leverage is None:
+        return score_leverage
+    return max(1, min(score_leverage, stop_leverage))
+
+
+def _stop_distance_leverage_cap(signal: Signal) -> int | None:
+    if signal.entry_price is None or signal.stop_loss is None or signal.entry_price <= 0:
+        return None
+    entry = Decimal(signal.entry_price)
+    stop = Decimal(signal.stop_loss)
+    if signal.direction in {Direction.LONG.value, Direction.STRONG_LONG.value} and stop >= entry:
+        return None
+    if signal.direction in {Direction.SHORT.value, Direction.STRONG_SHORT.value} and stop <= entry:
+        return None
+    stop_distance_pct = abs(entry - stop) / entry
+    if stop_distance_pct <= 0:
+        return None
+    conservative_distance = stop_distance_pct + LIQUIDATION_STOP_DISTANCE_ABSOLUTE_BUFFER
+    if conservative_distance >= 1:
+        return 1
+    return max(1, int((Decimal("1") / conservative_distance).to_integral_value(rounding=ROUND_FLOOR)))
+
+
+def _metadata_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _signal_id_from_position(position: Position) -> int | None:

@@ -6,7 +6,7 @@ import pytest
 
 from app.core.config import Settings
 from app.db.models import AppSetting, DecisionLog, Market, Order, Position, Signal
-from app.engine.execution import OrderExecutionEngine
+from app.engine.execution import OrderExecutionEngine, _target_leverage
 from app.engine.order_validation import ValidationResult
 from app.services.hyperliquid import HyperliquidError, HyperliquidOrderResult
 
@@ -427,6 +427,94 @@ def test_execute_live_sets_leverage_before_submitting_order(monkeypatch: pytest.
 
     assert len(trading.leverage_calls) == 1
     assert trading.leverage_calls[0]["coin"] == "BTC"
+
+
+def test_execute_live_caps_leverage_when_stop_is_wide(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    signal.score = 74
+    signal.entry_price = Decimal("2.4054")
+    signal.stop_loss = Decimal("1.5835636328")
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient()
+
+    OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert _target_leverage(signal, 10) == 2
+    assert trading.leverage_calls[0]["leverage"] == 2
+
+
+def test_execute_live_recovers_liquidation_guard_by_reducing_leverage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    signal.score = 71
+    signal.entry_price = Decimal("5.5108000000")
+    signal.stop_loss = Decimal("4.6677655283")
+    signal.take_profit_1 = Decimal("6.3538344717")
+    signal.take_profit_2 = Decimal("7.1968689434")
+    signal.take_profit_3 = Decimal("8.8039034050")
+
+    class RecoveringTradingClient(FakeTradingClient):
+        def submit_market_order(
+            self,
+            coin: str,
+            is_buy: bool,
+            size: Decimal,
+            max_slippage_pct: float,
+            expires_after_seconds: int,
+            cloid: str | None = None,
+        ) -> HyperliquidOrderResult:
+            self.market_orders.append(
+                {
+                    "coin": coin,
+                    "is_buy": is_buy,
+                    "size": size,
+                    "max_slippage_pct": max_slippage_pct,
+                    "expires_after_seconds": expires_after_seconds,
+                    "cloid": cloid,
+                }
+            )
+            return HyperliquidOrderResult(
+                status="ok",
+                oid=f"mkt-{len(self.market_orders)}",
+                avg_price=Decimal("5.4572000000"),
+                filled_size=size,
+                raw_response={"status": "ok"},
+            )
+
+        def user_state(self, _address: str | None = None) -> dict[str, Any]:
+            liquidation_price = "4.8486638384" if len(self.leverage_calls) < 2 else "4.1000000000"
+            return {
+                "assetPositions": [
+                    {
+                        "position": {
+                            "coin": "BTC",
+                            "szi": "1",
+                            "liquidationPx": liquidation_price,
+                        }
+                    }
+                ]
+            }
+
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = RecoveringTradingClient()
+
+    position = OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert _target_leverage(signal, 10) == 3
+    assert [call["leverage"] for call in trading.leverage_calls] == [3, 1]
+    assert trading.close_orders == []
+    assert len(trading.trigger_orders) == 3
+    assert position.status == "open"
+    assert position.metadata_json["contract_leverage"] == 1
+    assert position.metadata_json["liquidation_guard_recovered"] is True
+    events = [row.event_type for row in db.added_of(DecisionLog)]
+    assert "live_position_liquidation_guard_failed" in events
+    assert "live_liquidation_guard_recovered" in events
 
 
 def test_execute_live_propagates_cloids_to_trading_client(monkeypatch: pytest.MonkeyPatch) -> None:

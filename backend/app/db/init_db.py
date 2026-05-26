@@ -94,9 +94,17 @@ def seed_defaults(db: Session) -> None:
                     "max_slippage_pct": settings.live_max_slippage_pct,
                     "order_expires_after_seconds": settings.live_order_expires_after_seconds,
                     "enable_mainnet_live_trading": settings.enable_mainnet_live_trading,
+                    "close_companion_paper_on_live_reconcile": False,
                 },
             )
         )
+    else:
+        live_execution = db.get(AppSetting, "live_execution")
+        if live_execution is not None and isinstance(live_execution.value, dict):
+            value = dict(live_execution.value)
+            if "close_companion_paper_on_live_reconcile" not in value:
+                value["close_companion_paper_on_live_reconcile"] = False
+                live_execution.value = value
     if db.get(AppSetting, "risk") is None:
         db.add(
             AppSetting(

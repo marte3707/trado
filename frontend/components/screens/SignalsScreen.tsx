@@ -1,12 +1,40 @@
 "use client";
 
-import React, {  useState } from "react";
+import { useMemo, useState } from "react";
+import { ArrowDown, ArrowUp, ChevronsUpDown, RefreshCw, Search } from "lucide-react";
+
 import {
-  Icon, ScoreChip, DirBadge, TfChip, MarketBadge, StratList, Kv, SectionLabel, fmt, StatusBadge, Seg
+  DirBadge,
+  MarketBadge,
+  ScoreChip,
+  StatusBadge,
+  StratList,
+  TfChip,
+  fmt,
 } from "@/components/atoms";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Card } from "@/components/ui/card";
 import {
-  Health, Market, Signal, Strategy, apiPost, apiDelete
-} from "@/lib/api";
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  ToggleGroup,
+  ToggleGroupItem,
+} from "@/components/ui/toggle-group";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Slider } from "@/components/ui/slider";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Badge } from "@/components/ui/badge";
+import { SignalAnatomyDrawer } from "@/components/signals/SignalAnatomyDrawer";
+import { usePositions } from "@/lib/hooks/queries";
+import { cn } from "@/lib/utils";
+import type { Health, Market, Signal, Strategy } from "@/lib/api";
 
 interface Props {
   signals: Signal[];
@@ -18,439 +46,375 @@ interface Props {
   onOpenChart: (signal: Signal) => void;
 }
 
-type SortKey = "symbol" | "timeframe" | "direction" | "score" | "entry" | "stopLoss" | "takeProfit" | "riskReward" | "strategies" | "createdAt" | "status";
-type SortDirection = "asc" | "desc";
-type SortConfig = { key: SortKey; direction: SortDirection } | null;
+type SortKey = "score" | "createdAt" | "rr" | "symbol" | "timeframe";
+type SortDir = "asc" | "desc";
 
-const SORT_DEFAULT_DIRECTION: Record<SortKey, SortDirection> = {
-  symbol: "asc",
-  timeframe: "asc",
-  direction: "asc",
-  score: "desc",
-  entry: "desc",
-  stopLoss: "desc",
-  takeProfit: "desc",
-  riskReward: "desc",
-  strategies: "asc",
-  createdAt: "desc",
-  status: "asc",
-};
-
-function sortableNumber(value: string | number | null | undefined): number | null {
-  if (value == null || value === "") return null;
-  const parsed = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
+function asNumber(v: string | number | null | undefined): number | null {
+  if (v == null || v === "") return null;
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-function sortableValue(signal: Signal, key: SortKey): string | number | null {
-  if (key === "symbol") return signal.market?.symbol ?? null;
-  if (key === "timeframe") return signal.timeframe;
-  if (key === "direction") return signal.direction;
-  if (key === "score") return signal.score;
-  if (key === "entry") return sortableNumber(signal.entry_price);
-  if (key === "stopLoss") return sortableNumber(signal.stop_loss);
-  if (key === "takeProfit") return sortableNumber(signal.take_profit_1);
-  if (key === "riskReward") return sortableNumber(signal.risk_reward);
-  if (key === "strategies") return Object.keys(signal.strategy_breakdown ?? {}).join(" ");
-  if (key === "createdAt") return new Date(signal.created_at).getTime();
-  return signal.status;
+function getSortValue(s: Signal, key: SortKey): number | string {
+  switch (key) {
+    case "score":
+      return s.score;
+    case "createdAt":
+      return new Date(s.created_at).getTime();
+    case "rr":
+      return asNumber(s.risk_reward) ?? -Infinity;
+    case "symbol":
+      return s.market?.symbol ?? "";
+    case "timeframe":
+      return s.timeframe;
+  }
 }
 
-function compareSignals(a: Signal, b: Signal, sort: Exclude<SortConfig, null>) {
-  const aValue = sortableValue(a, sort.key);
-  const bValue = sortableValue(b, sort.key);
-  const aEmpty = aValue == null || aValue === "";
-  const bEmpty = bValue == null || bValue === "";
-
-  if (aEmpty && bEmpty) return b.id - a.id;
-  if (aEmpty) return 1;
-  if (bEmpty) return -1;
-
-  const result = typeof aValue === "number" && typeof bValue === "number"
-    ? aValue - bValue
-    : String(aValue).localeCompare(String(bValue), undefined, { numeric: true, sensitivity: "base" });
-
-  if (result === 0) return b.id - a.id;
-  return sort.direction === "asc" ? result : -result;
-}
-
-export function SignalsScreen({ signals, strategies, health, threshold, onRefresh, onOpenChart }: Props) {
+export function SignalsScreen({
+  signals,
+  strategies,
+  threshold,
+  onRefresh,
+  onOpenChart,
+}: Props) {
   const [search, setSearch] = useState("");
-  const [market, setMarket] = useState("all");
-  const [dir, setDir] = useState("all");
-  const [tf, setTf] = useState("all");
-  const [stratFilter, setStratFilter] = useState("all");
-  const [statusFilter, setStatusFilter] = useState("all");
-  const [minScore, setMinScore] = useState(0);
-  const [sort, setSort] = useState<SortConfig>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [marketType, setMarketType] = useState<"all" | "spot" | "perp">("all");
+  const [dir, setDir] = useState<"all" | "LONG" | "SHORT">("all");
+  const [tfFilter, setTfFilter] = useState<string>("all");
+  const [statusFilter, setStatusFilter] = useState<"all" | "new" | "executed" | "ignored">("all");
+  const [strategyFilter, setStrategyFilter] = useState<string>("all");
+  const [scoreMin, setScoreMin] = useState<number>(threshold);
+  const [sortKey, setSortKey] = useState<SortKey>("createdAt");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
 
-  const OPEN_STATUSES = ["new", "active", "executed"];
-  const CLOSED_STATUSES = ["closed", "ignored", "invalidated"];
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const { data: allPositions = [] } = usePositions();
 
-  const query = search.trim().toLowerCase();
+  const timeframes = useMemo(
+    () => Array.from(new Set(signals.map((s) => s.timeframe))).sort(),
+    [signals],
+  );
 
-  const filtered = signals.filter(s => {
-    if (query) {
-      const strategyNames = Object.keys(s.strategy_breakdown ?? {});
-      const haystack = [
-        String(s.id),
-        s.market?.symbol,
-        s.market?.base,
-        s.market?.quote,
-        s.market?.market_type,
-        s.timeframe,
-        s.direction,
-        s.status,
-        s.confidence_label,
-        s.reason,
-        ...strategyNames,
-      ].filter(Boolean).join(" ").toLowerCase();
+  const strategyNames = useMemo(() => {
+    const set = new Set<string>();
+    strategies.forEach((s) => set.add(s.strategy_name));
+    signals.forEach((s) => Object.keys(s.strategy_breakdown ?? {}).forEach((k) => set.add(k)));
+    return Array.from(set).sort();
+  }, [strategies, signals]);
 
-      if (!haystack.includes(query)) return false;
-    }
-    if (s.score < minScore) return false;
-    if (statusFilter === "open" && !OPEN_STATUSES.includes(s.status)) return false;
-    if (statusFilter === "closed" && !CLOSED_STATUSES.includes(s.status)) return false;
-    if (market !== "all" && s.market?.market_type !== market) return false;
-    if (dir !== "all") {
-      if (dir === "LONG" && !s.direction.includes("LONG")) return false;
-      if (dir === "SHORT" && !s.direction.includes("SHORT")) return false;
-      if (dir === "NEUTRAL" && (s.direction.includes("LONG") || s.direction.includes("SHORT"))) return false;
-    }
-    if (tf !== "all" && s.timeframe !== tf) return false;
-    if (stratFilter !== "all" && !Object.keys(s.strategy_breakdown ?? {}).includes(stratFilter)) return false;
-    return true;
-  });
-
-  const strong = filtered.filter(s => s.score >= threshold).slice(0, 3);
-  const sortedSignals = sort ? [...filtered].sort((a, b) => compareSignals(a, b, sort)) : filtered;
-
-  const allTfs = Array.from(new Set([...strategies.map(s => s.timeframe), ...signals.map(s => s.timeframe)])).sort();
-  const allStrats = Array.from(new Set(strategies.map(s => s.strategy_name)));
-
-  function toggleSort(key: SortKey) {
-    setSort(current => {
-      if (current?.key !== key) return { key, direction: SORT_DEFAULT_DIRECTION[key] };
-      return { key, direction: current.direction === "asc" ? "desc" : "asc" };
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return signals.filter((s) => {
+      if (q) {
+        const haystack = `${s.market?.symbol ?? ""} ${s.market?.base ?? ""} ${s.market?.quote ?? ""} ${s.timeframe} ${s.direction} ${s.reason ?? ""}`.toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
+      if (marketType !== "all" && s.market?.market_type !== marketType) return false;
+      if (dir !== "all") {
+        const normalized = s.direction.includes("LONG") ? "LONG" : s.direction.includes("SHORT") ? "SHORT" : "NEUTRAL";
+        if (normalized !== dir) return false;
+      }
+      if (tfFilter !== "all" && s.timeframe !== tfFilter) return false;
+      if (statusFilter !== "all" && s.status !== statusFilter) return false;
+      if (s.score < scoreMin) return false;
+      if (strategyFilter !== "all") {
+        if (!Object.keys(s.strategy_breakdown ?? {}).includes(strategyFilter)) return false;
+      }
+      return true;
     });
-  }
+  }, [signals, search, marketType, dir, tfFilter, statusFilter, scoreMin, strategyFilter]);
 
-  function sortIcon(key: SortKey) {
-    if (sort?.key !== key) return <span style={{ width: 12, opacity: 0.35 }}>↕</span>;
-    return <Icon name={sort.direction === "asc" ? "up" : "down"} size={12} />;
-  }
+  const sorted = useMemo(() => {
+    const arr = [...filtered];
+    arr.sort((a, b) => {
+      const av = getSortValue(a, sortKey);
+      const bv = getSortValue(b, sortKey);
+      let cmp = 0;
+      if (typeof av === "number" && typeof bv === "number") cmp = av - bv;
+      else cmp = String(av).localeCompare(String(bv), undefined, { numeric: true });
+      if (cmp === 0) return b.id - a.id;
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return arr;
+  }, [filtered, sortKey, sortDir]);
 
-  function sortHeader(key: SortKey, label: string, align: "left" | "right" = "left") {
-    return (
-      <button
-        type="button"
-        onClick={() => toggleSort(key)}
-        aria-label={`Ordina per ${label}`}
-        style={{
-          all: "unset",
-          cursor: "pointer",
-          display: "inline-flex",
-          alignItems: "center",
-          justifyContent: align === "right" ? "flex-end" : "flex-start",
-          gap: 4,
-          width: "100%",
-          color: sort?.key === key ? "var(--fg)" : "inherit",
-        }}
-      >
-        <span>{label}</span>
-        {sortIcon(key)}
-      </button>
-    );
-  }
+  const selected = selectedId != null ? signals.find((s) => s.id === selectedId) ?? null : null;
 
-  async function action(id: number, label: string, path: string) {
-    setBusy(`${label}-${id}`);
-    setError(null);
-    try {
-      await apiPost<unknown>(path);
-      onRefresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Errore");
-    } finally {
-      setBusy(null);
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(key === "symbol" || key === "timeframe" ? "asc" : "desc");
     }
-  }
-
-  async function del(id: number) {
-    if (!confirm(`Eliminare il segnale #${id}?`)) return;
-    setBusy(`del-${id}`);
-    setError(null);
-    try {
-      await apiDelete<unknown>(`/api/signals/${id}`);
-      onRefresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Errore");
-    } finally {
-      setBusy(null);
-    }
-  }
+  };
 
   return (
-    <div className="page">
-      <div className="page-head">
+    <div className="space-y-4 p-6">
+      {/* Header */}
+      <div className="flex items-end justify-between gap-4">
         <div>
-          <h1 className="page-title">Segnali live</h1>
-          <div className="page-sub">{filtered.length} segnali · score ≥ {minScore} · {strong.length} strong</div>
+          <h1 className="text-xl font-semibold tracking-tight text-fg">Segnali live</h1>
+          <p className="mt-1 text-xs text-fg-3">
+            {sorted.length} di {signals.length} segnali · soglia globale ≥ {threshold}
+          </p>
         </div>
-        <div className="page-actions">
-          <button className="btn ghost" onClick={onRefresh}><Icon name="refresh" size={12} /></button>
-        </div>
+        <Button variant="outline" size="sm" onClick={onRefresh}>
+          <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+          Aggiorna
+        </Button>
       </div>
 
-      {error && (
-        <div style={{ padding: "8px 14px", marginBottom: "var(--gap)", background: "var(--short-soft)", border: "1px solid var(--short-border)", borderRadius: "var(--radius)", color: "var(--short)", fontSize: "var(--fz-sm)" }}>
-          {error} <button className="btn ghost sm" onClick={() => setError(null)} style={{ marginLeft: 8 }}><Icon name="x" size={11} /></button>
-        </div>
-      )}
-
-      {/* Filter bar */}
-      <div className="card" style={{ marginBottom: "var(--gap)", padding: "10px 14px", display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
-        <input
-          type="text"
-          placeholder="Cerca symbol, strategia..."
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          className="filter"
-          style={{ width: 190 }}
-        />
-        <Seg value={statusFilter} onChange={setStatusFilter} options={[["all","Tutti"],["open","Aperti"],["closed","Chiusi"]]} />
-        <Seg value={market} onChange={setMarket} options={[["all","All"],["spot","Spot"],["perp","Perp"]]} />
-        <Seg value={dir} onChange={setDir} options={[["all","All"],["LONG","Long"],["SHORT","Short"],["NEUTRAL","Neutral"]]} />
-        <Seg value={tf} onChange={setTf} options={[["all","All"], ...allTfs.map(t => [t, t] as [string, string])]} />
-        <select
-          value={stratFilter}
-          onChange={e => setStratFilter(e.target.value)}
-          className="filter"
-          style={{ height: 28, paddingLeft: 10, paddingRight: 26, fontSize: "var(--fz-sm)" }}
-        >
-          <option value="all">Strategia: tutte</option>
-          {allStrats.map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: "var(--fz-sm)", color: "var(--fg-3)", whiteSpace: "nowrap" }}>Score ≥ <span className="mono" style={{ color: "var(--fg)" }}>{minScore}</span></span>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            step={5}
-            value={minScore}
-            onChange={e => setMinScore(Number(e.target.value))}
-            style={{ width: 120, accentColor: "var(--accent)" }}
+      {/* Filtri */}
+      <Card className="flex flex-wrap items-center gap-3 p-3">
+        <div className="relative min-w-[220px] flex-1">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-fg-3" />
+          <Input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Cerca symbol, direction, reason..."
+            className="pl-8"
           />
         </div>
-        <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center", color: "var(--fg-3)", fontSize: "var(--fz-sm)" }}>
-          <span className="dot green" /> {filtered.length} matches
-        </div>
-      </div>
 
-      {/* Strong signal cards */}
-      {strong.length > 0 && (
-        <>
-          <SectionLabel>Strong signals</SectionLabel>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
-            {strong.map(s => (
-              <BigSignalCard
-                key={s.id}
-                sig={s}
-                health={health}
-                busy={busy}
-                onPaper={() => action(s.id, "paper", `/api/signals/${s.id}/execute-paper`)}
-                onIgnore={() => action(s.id, "ignore", `/api/signals/${s.id}/ignore`)}
-                onLive={() => action(s.id, "live", `/api/signals/${s.id}/execute-live`)}
-                onDelete={() => del(s.id)}
-                onOpenChart={() => onOpenChart(s)}
+        <ToggleGroup
+          type="single"
+          value={marketType}
+          onValueChange={(v: string) => v && setMarketType(v as "all" | "spot" | "perp")}
+          size="sm"
+        >
+          <ToggleGroupItem value="all">Tutti</ToggleGroupItem>
+          <ToggleGroupItem value="spot">Spot</ToggleGroupItem>
+          <ToggleGroupItem value="perp">Perp</ToggleGroupItem>
+        </ToggleGroup>
+
+        <ToggleGroup
+          type="single"
+          value={dir}
+          onValueChange={(v: string) => v && setDir(v as "all" | "LONG" | "SHORT")}
+          size="sm"
+        >
+          <ToggleGroupItem value="all">All dir</ToggleGroupItem>
+          <ToggleGroupItem value="LONG">Long</ToggleGroupItem>
+          <ToggleGroupItem value="SHORT">Short</ToggleGroupItem>
+        </ToggleGroup>
+
+        <Popover>
+          <PopoverTrigger asChild>
+            <Button variant="outline" size="sm">
+              Score ≥ {scoreMin}
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent align="end" className="w-64">
+            <div className="space-y-3">
+              <div className="text-xs font-medium text-fg-2">Score minimo</div>
+              <Slider
+                value={[scoreMin]}
+                onValueChange={(v: number[]) => setScoreMin(v[0])}
+                min={0}
+                max={100}
+                step={5}
               />
-            ))}
-          </div>
-        </>
-      )}
+              <div className="flex justify-between font-mono text-[10px] text-fg-4">
+                <span>0</span>
+                <span>{scoreMin}</span>
+                <span>100</span>
+              </div>
+            </div>
+          </PopoverContent>
+        </Popover>
 
-      {/* Filtered results table */}
-      <SectionLabel>{filtered.length} segnali filtrati</SectionLabel>
-      <div className="card">
-        <table className="tbl">
-          <thead>
-            <tr>
-              <th style={{ width: 20 }} />
-              <th>{sortHeader("symbol", "Symbol")}</th>
-              <th>{sortHeader("timeframe", "TF")}</th>
-              <th>{sortHeader("direction", "Dir")}</th>
-              <th>{sortHeader("score", "Score")}</th>
-              <th style={{ textAlign: "right" }}>{sortHeader("entry", "Entry", "right")}</th>
-              <th style={{ textAlign: "right" }}>{sortHeader("stopLoss", "SL", "right")}</th>
-              <th style={{ textAlign: "right" }}>{sortHeader("takeProfit", "TP1 · TP2 · TP3", "right")}</th>
-              <th style={{ textAlign: "right" }}>{sortHeader("riskReward", "R/R", "right")}</th>
-              <th>{sortHeader("strategies", "Strats")}</th>
-              <th>{sortHeader("createdAt", "Età")}</th>
-              <th>{sortHeader("status", "Status")}</th>
-              <th style={{ textAlign: "right" }} />
-            </tr>
-          </thead>
-          <tbody>
-            {sortedSignals.length === 0 && (
-              <tr><td colSpan={13} style={{ textAlign: "center", padding: "32px 0", color: "var(--fg-3)" }}>
-                Nessun segnale corrisponde ai filtri
-              </td></tr>
-            )}
-            {sortedSignals.map(s => (
-              <tr
-                key={s.id}
-                onClick={() => onOpenChart(s)}
-                style={{ cursor: s.market ? "pointer" : "default" }}
-                title={s.market ? `Apri grafico ${s.market.symbol}` : undefined}
-              >
-                <td>
-                  <span className={"dot " + (s.direction.includes("LONG") ? "green" : s.direction.includes("SHORT") ? "red" : "amber")} />
-                </td>
-                <td className="fg">
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <strong>{s.market?.symbol}</strong>
-                    <MarketBadge market={s.market?.market_type ?? "perp"} />
-                  </div>
-                </td>
-                <td><TfChip tf={s.timeframe} /></td>
-                <td><DirBadge dir={s.direction} /></td>
-                <td><ScoreChip score={s.score} dir={s.direction} /></td>
-                <td className="num fg">{fmt.price(s.entry_price)}</td>
-                <td className="num down">{fmt.price(s.stop_loss)}</td>
-                <td className="num up" style={{ whiteSpace: "nowrap" }}>
-                  {fmt.price(s.take_profit_1)} <span className="muted">·</span> {fmt.price(s.take_profit_2)} <span className="muted">·</span>{" "}
-                  {s.take_profit_3 ? fmt.price(s.take_profit_3) : <span className="dim">—</span>}
-                </td>
-                <td className="num">{s.risk_reward ?? "—"}</td>
-                <td><StratList strats={Object.keys(s.strategy_breakdown ?? {})} max={3} /></td>
-                <td className="muted mono">{fmt.relTime(s.created_at)}</td>
-                <td><StatusBadge status={s.status} /></td>
-                <td className="row-action" style={{ textAlign: "right" }}>
-                  <div style={{ display: "inline-flex", gap: 4 }}>
-                    <button
-                      className="btn ghost sm"
-                      disabled={s.status !== "new" || busy !== null}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        action(s.id, "paper", `/api/signals/${s.id}/execute-paper`);
-                      }}
-                      title="Paper trade"
-                    >Paper</button>
-                 {/*    <button
-                      className="btn ghost sm"
-                      disabled={s.status !== "new" || busy !== null}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        action(s.id, "ignore", `/api/signals/${s.id}/ignore`);
-                      }}
-                      title="Ignora"
+        <select
+          value={tfFilter}
+          onChange={(e) => setTfFilter(e.target.value)}
+          className="h-8 rounded-md border border-border bg-bg-1 px-2 text-xs text-fg-2"
+        >
+          <option value="all">Tutti i TF</option>
+          {timeframes.map((tf) => (
+            <option key={tf} value={tf}>
+              {tf}
+            </option>
+          ))}
+        </select>
+
+        <select
+          value={strategyFilter}
+          onChange={(e) => setStrategyFilter(e.target.value)}
+          className="h-8 rounded-md border border-border bg-bg-1 px-2 text-xs text-fg-2"
+        >
+          <option value="all">Tutte le strategie</option>
+          {strategyNames.map((sn) => (
+            <option key={sn} value={sn}>
+              {sn}
+            </option>
+          ))}
+        </select>
+
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value as "all" | "new" | "executed" | "ignored")}
+          className="h-8 rounded-md border border-border bg-bg-1 px-2 text-xs text-fg-2"
+        >
+          <option value="all">Tutti gli stati</option>
+          <option value="new">New</option>
+          <option value="executed">Executed</option>
+          <option value="ignored">Ignored</option>
+        </select>
+      </Card>
+
+      {/* Tabella */}
+      <Card className="flex h-[calc(100vh-240px)] flex-col overflow-hidden">
+        <ScrollArea className="flex-1">
+          <Table>
+            <TableHeader className="sticky top-0 z-10 bg-bg-1">
+              <TableRow>
+                <Th sortKey="symbol" current={sortKey} dir={sortDir} onClick={toggleSort}>
+                  Symbol
+                </Th>
+                <Th sortKey="timeframe" current={sortKey} dir={sortDir} onClick={toggleSort}>
+                  TF
+                </Th>
+                <TableHead>Dir</TableHead>
+                <Th sortKey="score" current={sortKey} dir={sortDir} onClick={toggleSort} className="text-right">
+                  Score
+                </Th>
+                <TableHead className="text-right">Entry</TableHead>
+                <TableHead className="text-right">SL</TableHead>
+                <TableHead className="text-right">TP1</TableHead>
+                <Th sortKey="rr" current={sortKey} dir={sortDir} onClick={toggleSort} className="text-right">
+                  R:R
+                </Th>
+                <TableHead>Strategie</TableHead>
+                <Th sortKey="createdAt" current={sortKey} dir={sortDir} onClick={toggleSort}>
+                  Età
+                </Th>
+                <TableHead>Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {sorted.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={11} className="py-12 text-center text-sm text-fg-3">
+                    Nessun segnale corrisponde ai filtri.
+                  </TableCell>
+                </TableRow>
+              ) : (
+                sorted.map((s) => {
+                  const isSelected = s.id === selectedId;
+                  return (
+                    <TableRow
+                      key={s.id}
+                      data-state={isSelected ? "selected" : undefined}
+                      className={cn(
+                        "cursor-pointer",
+                        isSelected && "border-l-2 border-l-success bg-bg-2",
+                      )}
+                      onClick={() => setSelectedId(s.id)}
                     >
-                      <Icon name="x" size={11} />
-                    </button> */}
-                    {health.live_trading_allowed && (
-                      <button
-                        className="btn sm"
-                        disabled={s.status !== "new" || busy !== null}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          action(s.id, "live", `/api/signals/${s.id}/execute-live`);
-                        }}
-                        title="Esegui live"
-                      >Live</button>
-                    )}
-                    <button
-                      className="btn ghost sm"
-                      disabled={busy !== null}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        del(s.id);
-                      }}
-                      title="Elimina segnale"
-                      style={{ color: "var(--short)" }}
-                    >
-                      <Icon name="x" size={11} />
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+                      <TableCell className="font-mono font-medium text-fg">
+                        <div className="flex items-center gap-1.5">
+                          {s.market?.symbol ?? "—"}
+                          {s.market && <MarketBadge market={s.market.market_type} />}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <TfChip tf={s.timeframe} />
+                      </TableCell>
+                      <TableCell>
+                        <DirBadge dir={s.direction} />
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <div className="inline-flex">
+                          <ScoreChip score={s.score} />
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-right font-mono tabular-nums">
+                        {fmt.price(s.entry_price)}
+                      </TableCell>
+                      <TableCell className="text-right font-mono tabular-nums text-danger">
+                        {fmt.price(s.stop_loss)}
+                      </TableCell>
+                      <TableCell className="text-right font-mono tabular-nums text-success">
+                        {fmt.price(s.take_profit_1)}
+                      </TableCell>
+                      <TableCell className="text-right font-mono tabular-nums">
+                        {asNumber(s.risk_reward)?.toFixed(2) ?? "—"}
+                      </TableCell>
+                      <TableCell>
+                        <StratList strats={Object.keys(s.strategy_breakdown ?? {})} max={2} />
+                      </TableCell>
+                      <TableCell className="font-mono text-xs text-fg-3">
+                        {fmt.relTime(s.created_at)}
+                      </TableCell>
+                      <TableCell>
+                        <StatusBadge status={s.status} />
+                      </TableCell>
+                    </TableRow>
+                  );
+                })
+              )}
+            </TableBody>
+          </Table>
+        </ScrollArea>
+        <div className="flex shrink-0 items-center justify-between border-t border-border px-4 py-2 text-xs text-fg-3">
+          <span>
+            <Badge variant="outline" className="mr-2 font-mono">
+              {sorted.length}
+            </Badge>
+            segnali filtrati · click su una riga per Signal Anatomy
+          </span>
+          <span className="font-mono">
+            Sort: {sortKey} {sortDir}
+          </span>
+        </div>
+      </Card>
+
+      <SignalAnatomyDrawer
+        signal={selected}
+        positions={allPositions}
+        onClose={() => setSelectedId(null)}
+        onOpenChart={onOpenChart}
+      />
     </div>
   );
 }
 
-/* ── Big signal card (strong signals) ─────────────────────────────────────── */
-function BigSignalCard({ sig, health, busy, onPaper, onIgnore, onLive, onDelete, onOpenChart }: {
-  sig: Signal;
-  health: Health;
-  busy: string | null;
-  onPaper: () => void;
-  onIgnore: () => void;
-  onLive: () => void;
-  onDelete: () => void;
-  onOpenChart: () => void;
+function Th({
+  sortKey,
+  current,
+  dir,
+  onClick,
+  children,
+  className,
+}: {
+  sortKey: SortKey;
+  current: SortKey;
+  dir: SortDir;
+  onClick: (k: SortKey) => void;
+  children: React.ReactNode;
+  className?: string;
 }) {
-  const isLong = sig.direction.includes("LONG");
+  const active = current === sortKey;
   return (
-    <div
-      className="card"
-      onClick={onOpenChart}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(event) => {
-        if (event.key === "Enter" || event.key === " ") onOpenChart();
-      }}
-      title={sig.market ? `Apri grafico ${sig.market.symbol}` : undefined}
-      style={{ borderColor: isLong ? "var(--long-border)" : "var(--short-border)", cursor: sig.market ? "pointer" : "default" }}
-    >
-      <div style={{ padding: 14, paddingBottom: 0, display: "flex", alignItems: "center", gap: 8 }}>
-        <strong style={{ fontSize: "var(--fz-xl)", letterSpacing: "-0.01em" }}>{sig.market?.symbol}</strong>
-        <MarketBadge market={sig.market?.market_type ?? "perp"} />
-        <TfChip tf={sig.timeframe} />
-        <div style={{ marginLeft: "auto" }}><ScoreChip score={sig.score} dir={sig.direction} /></div>
-      </div>
-      <div style={{ padding: "10px 14px 0", display: "flex", alignItems: "baseline", gap: 8 }}>
-        <DirBadge dir={sig.direction} />
-        <span className="muted mono" style={{ fontSize: "var(--fz-sm)" }}>· {fmt.relTime(sig.created_at)}</span>
-      </div>
-      <div style={{ padding: "12px 14px", display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
-        <Kv label="Entry" value={fmt.price(sig.entry_price)} />
-        <Kv label="SL" value={fmt.price(sig.stop_loss)} tone="short" />
-        <Kv label="R/R" value={sig.risk_reward ?? "—"} />
-        <Kv label="TP1" value={fmt.price(sig.take_profit_1)} tone="long" />
-        <Kv label="TP2" value={fmt.price(sig.take_profit_2)} tone="long" />
-        <Kv label="TP3" value={fmt.price(sig.take_profit_3)} tone={sig.take_profit_3 ? "long" : "muted"} />
-      </div>
-      <div style={{ padding: "0 14px 12px", fontSize: "var(--fz-sm)", color: "var(--fg-2)" }}>
-        {sig.reason?.slice(0, 120)}{(sig.reason?.length ?? 0) > 120 ? "…" : ""}
-      </div>
-      <div style={{ padding: "10px 14px", borderTop: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 6 }}>
-        <StratList strats={Object.keys(sig.strategy_breakdown ?? {})} max={5} />
-        <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
-          <button className="btn ghost sm" disabled={sig.status !== "new" || busy !== null} onClick={(event) => { event.stopPropagation(); onIgnore(); }}>Ignora</button>
-          <button className="btn sm" disabled={sig.status !== "new" || busy !== null} onClick={(event) => { event.stopPropagation(); onPaper(); }}>Paper</button>
-          {health.live_trading_allowed && (
-            <button className="btn primary sm" disabled={sig.status !== "new" || busy !== null} onClick={(event) => { event.stopPropagation(); onLive(); }}>Live</button>
-          )}
-          <button
-            className="btn ghost sm"
-            disabled={busy !== null}
-            onClick={(event) => {
-              event.stopPropagation();
-              onDelete();
-            }}
-            style={{ color: "var(--short)" }}
-            title="Elimina segnale"
-          >
-            <Icon name="x" size={11} />
-          </button>
-        </div>
-      </div>
-    </div>
+    <TableHead className={className}>
+      <button
+        onClick={() => onClick(sortKey)}
+        className={cn(
+          "inline-flex items-center gap-1 transition-colors hover:text-fg",
+          active && "text-fg",
+        )}
+      >
+        {children}
+        {active ? (
+          dir === "asc" ? (
+            <ArrowUp className="h-3 w-3" />
+          ) : (
+            <ArrowDown className="h-3 w-3" />
+          )
+        ) : (
+          <ChevronsUpDown className="h-3 w-3 opacity-40" />
+        )}
+      </button>
+    </TableHead>
   );
 }

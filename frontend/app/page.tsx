@@ -1,3 +1,5 @@
+import { dehydrate, HydrationBoundary } from "@tanstack/react-query";
+
 import { AppShell } from "@/components/AppShell";
 import {
   AppSettings,
@@ -14,9 +16,11 @@ import {
   SignalRejections,
   Strategy,
   WorkerCycle,
-  apiGet
+  apiGet,
 } from "@/lib/api";
 import { hydrateOpenPositionSourceSignals } from "@/lib/signalHydration";
+import { makeQueryClient } from "@/lib/query-client";
+import { qk } from "@/lib/hooks/queryKeys";
 
 export const dynamic = "force-dynamic";
 
@@ -65,7 +69,7 @@ async function loadDashboard() {
       fear_greed: null,
       altcoin_season: null,
       global_metrics: null,
-    } as MarketIntelligence))
+    } as MarketIntelligence)),
   ]);
   const hydratedSignals = await hydrateOpenPositionSourceSignals(signals, positions);
   const latestSignal = hydratedSignals[0];
@@ -77,8 +81,8 @@ async function loadDashboard() {
   const candles = chartMarket && chartTimeframe
     ? await apiGet<Candle[]>(
         `/api/candles?symbol=${encodeURIComponent(chartMarket.symbol)}&market_type=${encodeURIComponent(
-          chartMarket.market_type
-        )}&timeframe=${encodeURIComponent(chartTimeframe)}`
+          chartMarket.market_type,
+        )}&timeframe=${encodeURIComponent(chartTimeframe)}`,
       ).catch(() => [])
     : [];
   return {
@@ -100,11 +104,33 @@ async function loadDashboard() {
     tunerStatus,
     workerCycles,
     signalRejections,
-    marketIntelligence
+    marketIntelligence,
   };
 }
 
 export default async function Home() {
   const data = await loadDashboard();
-  return <AppShell initialData={data} />;
+
+  // Pre-popola la cache TanStack per gli hook usati dai nuovi shell components.
+  const queryClient = makeQueryClient();
+  queryClient.setQueryData(qk.health, data.health);
+  queryClient.setQueryData(qk.markets(""), data.markets);
+  queryClient.setQueryData(qk.signals("min_score=0"), data.signals);
+  queryClient.setQueryData(qk.positions, data.positions);
+  queryClient.setQueryData(qk.orders, data.orders);
+  queryClient.setQueryData(qk.settings, data.settings);
+  queryClient.setQueryData(qk.strategies, data.strategies);
+  queryClient.setQueryData(qk.logs, data.logs);
+  queryClient.setQueryData(qk.calibration, data.calibration);
+  queryClient.setQueryData(qk.calibrationHistory, data.calibrationHistory);
+  queryClient.setQueryData(qk.tunerStatus, data.tunerStatus);
+  queryClient.setQueryData(qk.workerCycles(20), data.workerCycles);
+  queryClient.setQueryData(qk.signalRejections(50), data.signalRejections);
+  queryClient.setQueryData(qk.marketIntelligence, data.marketIntelligence);
+
+  return (
+    <HydrationBoundary state={dehydrate(queryClient)}>
+      <AppShell initialData={data} />
+    </HydrationBoundary>
+  );
 }

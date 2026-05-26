@@ -496,6 +496,33 @@ export type SignalRejections = {
   recent: { id: number; timestamp: string; reasons: string[] }[];
 };
 
+export type CalibrationStabilityEntry = {
+  key: string;
+  timeframe: string;
+  strategy: string;
+  enabled: boolean;
+  weight: number;
+  trades: number;
+  factor_history: number[];
+  factor_stddev: number;
+  stable: boolean;
+  holdout: {
+    train: CalibrationStats;
+    test: CalibrationStats;
+    wr_delta: number;
+  } | null;
+};
+
+export type CalibrationStability = {
+  settings: {
+    walk_forward_train_ratio: number;
+    walk_forward_min_per_side: number;
+    factor_history_window: number;
+    factor_history_std_threshold: number;
+  };
+  by_strategy: CalibrationStabilityEntry[];
+};
+
 export type DiagnosticReport = {
   lookback: number;
   trade_count: number;
@@ -512,19 +539,69 @@ export type DiagnosticReport = {
   baseline_vs_current: Record<string, unknown>;
 };
 
+export class ApiError extends Error {
+  status: number;
+  detail: string;
+  path: string;
+
+  constructor(path: string, status: number, detail: string) {
+    super(`API ${path} failed: ${status}${detail ? ` ${detail}` : ""}`);
+    this.name = "ApiError";
+    this.path = path;
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+async function readErrorDetail(response: Response): Promise<string> {
+  try {
+    const text = await response.text();
+    if (!text) return "";
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object") {
+        const detail = (parsed as Record<string, unknown>).detail ?? (parsed as Record<string, unknown>).message;
+        if (typeof detail === "string") return detail;
+      }
+    } catch {
+      // fall through, return raw text
+    }
+    return text;
+  } catch {
+    return "";
+  }
+}
+
 export async function apiGet<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
   if (!response.ok) {
-    throw new Error(`API ${path} failed: ${response.status}`);
+    throw new ApiError(path, response.status, await readErrorDetail(response));
   }
   return response.json() as Promise<T>;
 }
 
-export async function apiPost<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, { method: "POST" });
+export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
+  const init: RequestInit = { method: "POST" };
+  if (body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const response = await fetch(`${API_BASE}${path}`, init);
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`API ${path} failed: ${response.status} ${detail}`);
+    throw new ApiError(path, response.status, await readErrorDetail(response));
+  }
+  return response.json() as Promise<T>;
+}
+
+export async function apiPut<T>(path: string, body?: unknown): Promise<T> {
+  const init: RequestInit = { method: "PUT" };
+  if (body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const response = await fetch(`${API_BASE}${path}`, init);
+  if (!response.ok) {
+    throw new ApiError(path, response.status, await readErrorDetail(response));
   }
   return response.json() as Promise<T>;
 }
@@ -532,8 +609,7 @@ export async function apiPost<T>(path: string): Promise<T> {
 export async function apiDelete<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, { method: "DELETE" });
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`API ${path} failed: ${response.status} ${detail}`);
+    throw new ApiError(path, response.status, await readErrorDetail(response));
   }
   return response.json() as Promise<T>;
 }
@@ -542,11 +618,10 @@ export async function apiPatch<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`API ${path} failed: ${response.status} ${detail}`);
+    throw new ApiError(path, response.status, await readErrorDetail(response));
   }
   return response.json() as Promise<T>;
 }

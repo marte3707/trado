@@ -123,6 +123,9 @@ def effective_live_execution_settings(db: Session, settings: Settings) -> dict:
         "enable_mainnet_live_trading": bool(
             value.get("enable_mainnet_live_trading", settings.enable_mainnet_live_trading)
         ),
+        "close_companion_paper_on_live_reconcile": bool(
+            value.get("close_companion_paper_on_live_reconcile", False)
+        ),
     }
 
 
