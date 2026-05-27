@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { ArrowDown, ArrowUp, ChevronsUpDown, Download, RefreshCw, Search } from "lucide-react";
 
 import {
@@ -77,15 +78,50 @@ export function SignalsScreen({
   onRefresh,
   onOpenChart,
 }: Props) {
-  const [search, setSearch] = useState("");
-  const [marketType, setMarketType] = useState<"all" | "spot" | "perp">("all");
-  const [dir, setDir] = useState<"all" | "LONG" | "SHORT">("all");
-  const [tfFilter, setTfFilter] = useState<string>("all");
-  const [statusFilter, setStatusFilter] = useState<"all" | "new" | "executed" | "ignored">("all");
-  const [strategyFilter, setStrategyFilter] = useState<string>("all");
-  const [scoreMin, setScoreMin] = useState<number>(threshold);
-  const [sortKey, setSortKey] = useState<SortKey>("createdAt");
-  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const searchParams = useSearchParams();
+  const router = useRouter();
+
+  function updateUrl(updates: Record<string, string | null>) {
+    const params = new URLSearchParams(searchParams.toString());
+    for (const [key, value] of Object.entries(updates)) {
+      if (value === null || value === "") params.delete(key);
+      else params.set(key, value);
+    }
+    router.replace(`?${params.toString()}`, { scroll: false } as Parameters<typeof router.replace>[1]);
+  }
+
+  const [search, setSearchRaw] = useState(() => searchParams.get("q") ?? "");
+  const [marketType, setMarketTypeRaw] = useState<"all" | "spot" | "perp">(
+    () => (searchParams.get("mt") as "all" | "spot" | "perp") ?? "all",
+  );
+  const [dir, setDirRaw] = useState<"all" | "LONG" | "SHORT">(
+    () => (searchParams.get("dir") as "all" | "LONG" | "SHORT") ?? "all",
+  );
+  const [tfFilter, setTfFilterRaw] = useState<string>(() => searchParams.get("tf") ?? "all");
+  const [statusFilter, setStatusFilterRaw] = useState<"all" | "new" | "executed" | "ignored">(
+    () => (searchParams.get("status") as "all" | "new" | "executed" | "ignored") ?? "all",
+  );
+  const [strategyFilter, setStrategyFilterRaw] = useState<string>(
+    () => searchParams.get("strat") ?? "all",
+  );
+  const [scoreMin, setScoreMinRaw] = useState<number>(() => {
+    const v = searchParams.get("score");
+    return v !== null ? Number(v) : threshold;
+  });
+  const [sortKey, setSortKeyRaw] = useState<SortKey>(
+    () => (searchParams.get("sort") as SortKey) ?? "createdAt",
+  );
+  const [sortDir, setSortDirRaw] = useState<SortDir>(
+    () => (searchParams.get("sortDir") as SortDir) ?? "desc",
+  );
+
+  function setSearch(v: string) { setSearchRaw(v); updateUrl({ q: v || null }); }
+  function setMarketType(v: "all" | "spot" | "perp") { setMarketTypeRaw(v); updateUrl({ mt: v === "all" ? null : v }); }
+  function setDir(v: "all" | "LONG" | "SHORT") { setDirRaw(v); updateUrl({ dir: v === "all" ? null : v }); }
+  function setTfFilter(v: string) { setTfFilterRaw(v); updateUrl({ tf: v === "all" ? null : v }); }
+  function setStatusFilter(v: "all" | "new" | "executed" | "ignored") { setStatusFilterRaw(v); updateUrl({ status: v === "all" ? null : v }); }
+  function setStrategyFilter(v: string) { setStrategyFilterRaw(v); updateUrl({ strat: v === "all" ? null : v }); }
+  function setScoreMin(v: number) { setScoreMinRaw(v); updateUrl({ score: v === threshold ? null : String(v) }); }
 
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const { data: allPositions = [] } = usePositions();
@@ -142,10 +178,14 @@ export function SignalsScreen({
 
   const toggleSort = (key: SortKey) => {
     if (sortKey === key) {
-      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+      const next: SortDir = sortDir === "asc" ? "desc" : "asc";
+      setSortDirRaw(next);
+      updateUrl({ sort: key === "createdAt" ? null : key, sortDir: next === "desc" ? null : next });
     } else {
-      setSortKey(key);
-      setSortDir(key === "symbol" || key === "timeframe" ? "asc" : "desc");
+      const next: SortDir = key === "symbol" || key === "timeframe" ? "asc" : "desc";
+      setSortKeyRaw(key);
+      setSortDirRaw(next);
+      updateUrl({ sort: key === "createdAt" ? null : key, sortDir: next === "desc" ? null : next });
     }
   };
 

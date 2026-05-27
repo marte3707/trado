@@ -11,7 +11,7 @@ interface Props {
   strategies: Strategy[];
 }
 
-type Tab = "ranking" | "segnale" | "confronto" | "combinazioni";
+type Tab = "ranking" | "segnale" | "confronto" | "combinazioni" | "heatmap";
 type SortKey = "wr" | "trades" | "avgR" | "pnl" | "pf" | "agreement";
 type SortDir = "desc" | "asc";
 
@@ -416,7 +416,7 @@ export function StrategyAnalysisScreen({ signals, positions, orders, strategies 
 
       {/* Tabs */}
       <div style={{ display: "flex", gap: 2, marginBottom: "var(--gap)", borderBottom: "1px solid var(--border)" }}>
-        {(["ranking", "segnale", "confronto", "combinazioni"] as Tab[]).map(t => (
+        {(["ranking", "segnale", "confronto", "combinazioni", "heatmap"] as Tab[]).map(t => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -432,7 +432,7 @@ export function StrategyAnalysisScreen({ signals, positions, orders, strategies 
               marginBottom: -1,
             }}
           >
-            {t === "ranking" ? "Ranking" : t === "segnale" ? "Segnale" : t === "confronto" ? "Confronto" : "Combinazioni"}
+            {t === "ranking" ? "Ranking" : t === "segnale" ? "Segnale" : t === "confronto" ? "Confronto" : t === "combinazioni" ? "Combinazioni" : "Heatmap"}
           </button>
         ))}
       </div>
@@ -441,6 +441,7 @@ export function StrategyAnalysisScreen({ signals, positions, orders, strategies 
       {tab === "segnale" && <SignaleTab signals={signals} strategies={strategies} tfFilter={tfFilter} />}
       {tab === "confronto" && <ConfrontoTab stats={stats} tfFilter={tfFilter} />}
       {tab === "combinazioni" && <CombinazioniTab signals={signals} positions={filteredPositions} orders={orders} tfFilter={tfFilter} totalSignals={signals.length} />}
+      {tab === "heatmap" && <HeatmapTab signals={signals} positions={filteredPositions} orders={orders} strategies={strategies} />}
     </div>
   );
 }
@@ -1345,6 +1346,247 @@ function CombinazioniTab({
             <div className="muted mono" style={{ padding: "18px 0", fontSize: "var(--fz-sm)" }}>Nessun dato disponibile.</div>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Heatmap tab ──────────────────────────────────────────────────────────── */
+type HeatCell = { trades: number; wins: number; wr: number; avgR: number | null };
+
+function computeHeatmap(
+  signals: Signal[],
+  positions: Position[],
+  orders: Order[],
+): Map<string, Map<string, HeatCell>> {
+  const sigMap = new Map<number, Signal>();
+  for (const s of signals) sigMap.set(s.id, s);
+
+  const acc = new Map<string, Map<string, { w: number; l: number; r: number; rc: number }>>();
+
+  for (const pos of positions) {
+    const sigId = srcSignalId(pos);
+    if (sigId === null) continue;
+    const sig = sigMap.get(sigId);
+    if (!sig) continue;
+    const exitOrds = exitOrdersFor(pos, orders);
+    const pnl = realizedPnl(pos, exitOrds);
+    const r = rMultiple(pos, exitOrds);
+    const bd = sig.strategy_breakdown as Record<string, Record<string, unknown>>;
+    const finalDir = sig.direction;
+    const tf = sig.timeframe;
+
+    for (const [name, info] of Object.entries(bd)) {
+      if (name.startsWith("_") || typeof info !== "object" || info === null) continue;
+      const dir = info.direction as string;
+      if (!dir || dir === "NEUTRAL") continue;
+      const agrees =
+        dir === finalDir ||
+        (dir.includes("LONG") && finalDir.includes("LONG")) ||
+        (dir.includes("SHORT") && finalDir.includes("SHORT"));
+      if (!agrees) continue;
+
+      if (!acc.has(name)) acc.set(name, new Map());
+      const tfMap = acc.get(name)!;
+      if (!tfMap.has(tf)) tfMap.set(tf, { w: 0, l: 0, r: 0, rc: 0 });
+      const cell = tfMap.get(tf)!;
+      if (pnl !== null) { if (pnl > 0) cell.w++; else cell.l++; }
+      if (r !== null) { cell.r += r; cell.rc++; }
+    }
+  }
+
+  const result = new Map<string, Map<string, HeatCell>>();
+  for (const [name, tfMap] of acc.entries()) {
+    const out = new Map<string, HeatCell>();
+    for (const [tf, a] of tfMap.entries()) {
+      const total = a.w + a.l;
+      out.set(tf, { trades: total, wins: a.w, wr: total > 0 ? (a.w / total) * 100 : 0, avgR: a.rc > 0 ? a.r / a.rc : null });
+    }
+    result.set(name, out);
+  }
+  return result;
+}
+
+function cellStyle(cell: HeatCell | undefined): { background: string; color: string } {
+  if (!cell || cell.trades === 0) return { background: "transparent", color: "var(--fg-4)" };
+  if (cell.wr >= 60) return { background: "rgba(var(--success-rgb,34,197,94),0.18)", color: "var(--success,#22c55e)" };
+  if (cell.wr >= 55) return { background: "rgba(var(--success-rgb,34,197,94),0.10)", color: "var(--success,#22c55e)" };
+  if (cell.wr >= 45) return { background: "rgba(var(--warn-rgb,234,179,8),0.12)", color: "var(--warn,#eab308)" };
+  return { background: "rgba(var(--danger-rgb,239,68,68),0.12)", color: "var(--danger,#ef4444)" };
+}
+
+type HeatMetric = "wr" | "avgR" | "trades";
+
+function HeatmapTab({
+  signals, positions, orders, strategies,
+}: {
+  signals: Signal[];
+  positions: Position[];
+  orders: Order[];
+  strategies: Strategy[];
+}) {
+  const [metric, setMetric] = useState<HeatMetric>("wr");
+  const [selectedCell, setSelectedCell] = useState<{ strat: string; tf: string } | null>(null);
+
+  const { tfs, stratNames, matrix } = useMemo(() => {
+    const hm = computeHeatmap(signals, positions, orders);
+    const tfSet = new Set<string>();
+    for (const s of strategies) tfSet.add(s.timeframe);
+    for (const tfMap of hm.values()) for (const tf of tfMap.keys()) tfSet.add(tf);
+    const sortedTfList = sortedTfs(Array.from(tfSet));
+    const names = Array.from(hm.keys()).sort();
+    return { tfs: sortedTfList, stratNames: names, matrix: hm };
+  }, [signals, positions, orders, strategies]);
+
+  const totalTrades = useMemo(() => {
+    let n = 0;
+    for (const tfMap of matrix.values()) for (const cell of tfMap.values()) n += cell.trades;
+    return n;
+  }, [matrix]);
+
+  if (stratNames.length === 0 || totalTrades === 0) {
+    return (
+      <div style={{ padding: 40, textAlign: "center", color: "var(--fg-3)" }}>
+        Nessun dato — servono posizioni chiuse collegate a segnali con breakdown strategia.
+      </div>
+    );
+  }
+
+  const selCell = selectedCell ? matrix.get(selectedCell.strat)?.get(selectedCell.tf) : null;
+
+  function cellLabel(cell: HeatCell | undefined): string {
+    if (!cell || cell.trades === 0) return "—";
+    if (metric === "wr") return `${cell.wr.toFixed(0)}%`;
+    if (metric === "avgR") return cell.avgR !== null ? `${cell.avgR >= 0 ? "+" : ""}${cell.avgR.toFixed(1)}R` : "—";
+    return String(cell.trades);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "var(--gap)" }}>
+      {/* Controls */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <span className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em" }}>Metrica:</span>
+        {(["wr", "avgR", "trades"] as HeatMetric[]).map(m => (
+          <button key={m} className={"btn sm " + (metric === m ? "primary" : "")} onClick={() => setMetric(m)}>
+            {m === "wr" ? "Win Rate" : m === "avgR" ? "Avg R" : "Trade"}
+          </button>
+        ))}
+        <span className="muted" style={{ fontSize: 10, marginLeft: 16 }}>
+          {stratNames.length} strategie · {tfs.length} timeframe · {totalTrades} trade totali
+        </span>
+      </div>
+
+      {/* Heatmap grid */}
+      <div className="card" style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "var(--fz-xs)" }}>
+          <thead>
+            <tr>
+              <th style={{ padding: "8px 14px", textAlign: "left", borderBottom: "1px solid var(--border)", fontWeight: 500, color: "var(--fg-3)", minWidth: 160 }}>
+                Strategia
+              </th>
+              {tfs.map(tf => (
+                <th key={tf} style={{ padding: "8px 8px", textAlign: "center", borderBottom: "1px solid var(--border)", fontWeight: 500, color: "var(--fg-2)", minWidth: 60 }}>
+                  {tf}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {stratNames.map(name => {
+              const tfMap = matrix.get(name);
+              return (
+                <tr key={name} style={{ borderBottom: "1px solid var(--border)" }}>
+                  <td style={{ padding: "6px 14px", fontWeight: 500, fontSize: "var(--fz-sm)", color: "var(--fg-2)", whiteSpace: "nowrap" }}>
+                    {name}
+                  </td>
+                  {tfs.map(tf => {
+                    const cell = tfMap?.get(tf);
+                    const { background, color } = cellStyle(cell);
+                    const isSelected = selectedCell?.strat === name && selectedCell?.tf === tf;
+                    return (
+                      <td
+                        key={tf}
+                        style={{
+                          padding: "6px 4px",
+                          textAlign: "center",
+                          cursor: cell && cell.trades > 0 ? "pointer" : "default",
+                          background: isSelected ? "var(--bg-3,var(--bg-2))" : background,
+                          outline: isSelected ? "2px solid var(--accent)" : "none",
+                          outlineOffset: -2,
+                        }}
+                        onClick={() => {
+                          if (!cell || cell.trades === 0) return;
+                          setSelectedCell(isSelected ? null : { strat: name, tf });
+                        }}
+                        title={cell && cell.trades > 0 ? `${name} · ${tf} · ${cell.wins}W/${cell.trades - cell.wins}L · ${cell.wr.toFixed(0)}% WR` : undefined}
+                      >
+                        <span className="mono" style={{ fontSize: 11, fontWeight: 600, color }}>
+                          {cellLabel(cell)}
+                        </span>
+                        {cell && cell.trades > 0 && (
+                          <div style={{ fontSize: 9, color: "var(--fg-4)", marginTop: 1 }}>
+                            {cell.trades}t
+                          </div>
+                        )}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Detail panel for selected cell */}
+      {selectedCell && selCell && selCell.trades > 0 && (
+        <div className="card" style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, padding: "14px 18px" }}>
+          <div>
+            <div style={{ fontSize: 10, textTransform: "uppercase", color: "var(--fg-3)", marginBottom: 3 }}>Strategia</div>
+            <div className="mono" style={{ fontSize: "var(--fz-sm)", fontWeight: 600 }}>{selectedCell.strat}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, textTransform: "uppercase", color: "var(--fg-3)", marginBottom: 3 }}>Timeframe</div>
+            <div className="mono" style={{ fontSize: "var(--fz-sm)", fontWeight: 600 }}>{selectedCell.tf}</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, textTransform: "uppercase", color: "var(--fg-3)", marginBottom: 3 }}>Trade</div>
+            <div className="mono" style={{ fontSize: "var(--fz-sm)" }}>{selCell.wins}W / {selCell.trades - selCell.wins}L</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, textTransform: "uppercase", color: "var(--fg-3)", marginBottom: 3 }}>Win Rate</div>
+            <div className="mono" style={{ fontSize: "var(--fz-sm)", color: selCell.wr >= 55 ? "var(--long)" : selCell.wr < 45 ? "var(--short)" : "var(--warn)" }}>
+              {selCell.wr.toFixed(1)}%
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, textTransform: "uppercase", color: "var(--fg-3)", marginBottom: 3 }}>Avg R</div>
+            <div className="mono" style={{ fontSize: "var(--fz-sm)", color: (selCell.avgR ?? 0) >= 0 ? "var(--long)" : "var(--short)" }}>
+              {selCell.avgR !== null ? `${selCell.avgR >= 0 ? "+" : ""}${selCell.avgR.toFixed(2)}R` : "—"}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Legend */}
+      <div style={{ fontSize: 10, color: "var(--fg-3)", display: "flex", gap: 16, flexWrap: "wrap" }}>
+        <span>
+          <span style={{ display: "inline-block", width: 10, height: 10, background: "rgba(34,197,94,0.18)", borderRadius: 2, marginRight: 4 }} />
+          WR ≥ 60%
+        </span>
+        <span>
+          <span style={{ display: "inline-block", width: 10, height: 10, background: "rgba(34,197,94,0.10)", borderRadius: 2, marginRight: 4 }} />
+          WR 55–60%
+        </span>
+        <span>
+          <span style={{ display: "inline-block", width: 10, height: 10, background: "rgba(234,179,8,0.12)", borderRadius: 2, marginRight: 4 }} />
+          WR 45–55%
+        </span>
+        <span>
+          <span style={{ display: "inline-block", width: 10, height: 10, background: "rgba(239,68,68,0.12)", borderRadius: 2, marginRight: 4 }} />
+          WR &lt; 45%
+        </span>
+        <span style={{ marginLeft: 8 }}>Click su una cella per il dettaglio · le celle vuote (—) non hanno trade nel periodo</span>
       </div>
     </div>
   );
