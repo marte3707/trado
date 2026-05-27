@@ -20,6 +20,7 @@ import { Topbar } from "@/components/shell/Topbar";
 import { CommandMenu } from "@/components/shell/CommandMenu";
 import type { Route } from "@/components/shell/routes";
 import type { TradingMode } from "@/components/shell/ModeBadge";
+import { buildNavBindings, useChordHotkey } from "@/lib/hotkeys";
 
 import {
   useCalibration,
@@ -164,6 +165,9 @@ export function AppShell({ initialData }: AppShellProps) {
     },
     [hydratedSignals, openMarket],
   );
+
+  /* ── nav hotkeys (g + tasto) ── */
+  useChordHotkey("g", buildNavBindings(setRoute));
 
   /* ── command menu ── */
   const [searchOpen, setSearchOpen] = useState(false);

@@ -1,8 +1,9 @@
 "use client";
 
-import { ArrowRight } from "lucide-react";
+import { Activity, ArrowRight } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
+import { EmptyState } from "@/components/ui/empty-state";
 import { DirBadge, MarketBadge, ScoreChip, TfChip, fmt } from "@/components/atoms";
 import { cn } from "@/lib/utils";
 import type { Signal } from "@/lib/api";
@@ -44,9 +45,12 @@ export function TopSignalsList({
       </div>
       <div className="flex-1 overflow-y-auto">
         {items.length === 0 ? (
-          <div className="grid h-32 place-items-center text-xs text-fg-3">
-            Nessun segnale sopra la soglia.
-          </div>
+          <EmptyState
+            variant="inline"
+            icon={Activity}
+            title="Nessun segnale sopra la soglia"
+            description={`Soglia score corrente: ${threshold}. Abbassala in topbar (Score ≥) per allargare il filtro.`}
+          />
         ) : (
           <ul className="divide-y divide-border">
             {items.map((s) => (

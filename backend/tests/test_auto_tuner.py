@@ -336,6 +336,47 @@ def test_status_returns_progress_when_step_active() -> None:
     assert status["progress"]["trades_required"] == 10
 
 
+def test_status_next_step_skips_active_step() -> None:
+    db = FakeDb()
+    sequence = [
+        {"key": "regime_filter", "patch": {}, "revert": {}},
+        {"key": "mtf_confluence", "patch": {}, "revert": {}},
+        {"key": "volatility_filter", "patch": {}, "revert": {}},
+        {"key": "participation_ratio_50", "patch": {}, "revert": {}},
+    ]
+    db.app_settings["auto_tuner_config"] = _config(
+        mode="ab_test",
+        sequence=sequence,
+        ab_test_min_trades_per_arm=30,
+    )
+    activated = datetime(2026, 5, 22, 15, 20, tzinfo=timezone.utc)
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 2,
+            "current_step_key": "volatility_filter",
+            "mode": "ab_test",
+            "activated_at": activated.isoformat(),
+            "trades_at_activation": 0,
+            "ab_test": {
+                "control_overlay": {"volatility_filter_enabled": False},
+                "test_overlay": {"volatility_filter_enabled": True},
+                "allocation": 0.5,
+            },
+            "step_history": [
+                {"key": "regime_filter", "status": "success"},
+                {"key": "mtf_confluence", "status": "reverted"},
+            ],
+        },
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    status = tuner.status(db)
+
+    assert status["current_step_key"] == "volatility_filter"
+    assert status["next_step_key"] == "participation_ratio_50"
+
+
 def test_positions_after_returns_empty_when_state_corrupt() -> None:
     """F-10: senza `activated_at` ritorniamo lista vuota, non l'intera collezione.
     Altrimenti `metrics_after` includerebbe le posizioni pre-attivazione."""
@@ -922,3 +963,104 @@ def test_ab_mode_completes_after_all_steps() -> None:
     result = tuner.run(db)
 
     assert result["status"] == "completed"
+
+
+# ---------------------------------------------------------------------------
+# target_setting + sequential_only tests
+# ---------------------------------------------------------------------------
+
+
+def test_default_sequence_contains_auto_reverse() -> None:
+    """Sanity check: lo step auto_reverse esiste nel DEFAULT_SEQUENCE e punta
+    a btc_macro_protection con sequential_only=True."""
+    from app.engine.auto_tuner import DEFAULT_SEQUENCE
+
+    keys = [step["key"] for step in DEFAULT_SEQUENCE]
+    assert "auto_reverse" in keys
+    step = next(s for s in DEFAULT_SEQUENCE if s["key"] == "auto_reverse")
+    assert step["target_setting"] == "btc_macro_protection"
+    assert step["sequential_only"] is True
+    assert step["patch"]["reverse_mode_enabled"] is True
+    assert step["revert"]["reverse_mode_enabled"] is False
+
+
+def test_step_with_custom_target_setting_applies_to_correct_setting() -> None:
+    """Uno step con target_setting='btc_macro_protection' applica il patch a
+    quella chiave, non a 'risk'."""
+    db = FakeDb()
+    sequence = [
+        {
+            "key": "auto_reverse",
+            "label": "Auto-reverse",
+            "target_setting": "btc_macro_protection",
+            "patch": {"enabled": True, "reverse_mode_enabled": True},
+            "revert": {"reverse_mode_enabled": False},
+            "sequential_only": True,
+        }
+    ]
+    db.app_settings["auto_tuner_config"] = AppSetting(
+        key="auto_tuner_config",
+        value={
+            "enabled": True,
+            "min_trades_per_step": 5,
+            "improvement_threshold": 0.0,
+            "sequence": sequence,
+        },
+    )
+    db.app_settings["btc_macro_protection"] = AppSetting(
+        key="btc_macro_protection",
+        value={"enabled": False, "reverse_mode_enabled": False, "timeframe": "5m"},
+    )
+    db.app_settings["risk"] = AppSetting(key="risk", value={"min_signal_score": 70})
+
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+    result = tuner.run(db)
+
+    assert result["status"] == "started"
+    # Il patch è stato applicato a btc_macro_protection, NON a risk
+    btc_value = db.app_settings["btc_macro_protection"].value
+    assert btc_value["enabled"] is True
+    assert btc_value["reverse_mode_enabled"] is True
+    # risk è rimasto invariato
+    risk_value = db.app_settings["risk"].value
+    assert "reverse_mode_enabled" not in risk_value
+    assert risk_value["min_signal_score"] == 70
+
+
+def test_ab_mode_skips_sequential_only_steps() -> None:
+    """In ab_test mode, gli step con sequential_only=True vengono saltati."""
+    db = FakeDb()
+    sequence = [
+        {
+            "key": "auto_reverse",
+            "label": "Auto-reverse",
+            "target_setting": "btc_macro_protection",
+            "patch": {"reverse_mode_enabled": True},
+            "revert": {"reverse_mode_enabled": False},
+            "sequential_only": True,
+        },
+        {
+            "key": "regime_filter",
+            "label": "Regime",
+            "patch": {"regime_filter_enabled": True},
+            "revert": {"regime_filter_enabled": False},
+        },
+    ]
+    db.app_settings["auto_tuner_config"] = AppSetting(
+        key="auto_tuner_config",
+        value={
+            "enabled": True,
+            "mode": "ab_test",
+            "ab_test_min_trades_per_arm": 5,
+            "ab_test_allocation": 0.5,
+            "sequence": sequence,
+        },
+    )
+    db.app_settings["risk"] = AppSetting(key="risk", value={"min_signal_score": 70})
+
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+    result = tuner.run(db)
+
+    # Deve partire con regime_filter, saltando auto_reverse (sequential_only)
+    assert result["status"] == "started"
+    assert result["step"] == "regime_filter"

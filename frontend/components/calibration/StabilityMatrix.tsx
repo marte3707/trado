@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { AlertTriangle, Info, Loader2 } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -11,13 +11,18 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { useCalibrationStability } from "@/lib/hooks/queries";
+import { useCalibrationStability, useEquitySlope } from "@/lib/hooks/queries";
 import { cn } from "@/lib/utils";
-import type { CalibrationStabilityEntry } from "@/lib/api";
+import type { CalibrationStabilityEntry, EquitySlopeDiagnostics } from "@/lib/api";
 
 function pct(value: number | null | undefined) {
   if (value == null || !Number.isFinite(value)) return "—";
   return `${(value * 100).toFixed(1)}%`;
+}
+
+function signedPct(value: number | null | undefined, digits = 0) {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return `${value >= 0 ? "+" : ""}${(value * 100).toFixed(digits)}%`;
 }
 
 function stddevTone(stddev: number, threshold: number): "success" | "warn" | "danger" | "muted" {
@@ -25,6 +30,21 @@ function stddevTone(stddev: number, threshold: number): "success" | "warn" | "da
   if (stddev <= threshold * 0.5) return "success";
   if (stddev <= threshold) return "warn";
   return "danger";
+}
+
+function compareTimeframes(a: string, b: string) {
+  return timeframeMinutes(a) - timeframeMinutes(b) || a.localeCompare(b);
+}
+
+function timeframeMinutes(timeframe: string) {
+  const match = /^(\d+)([mhdw])$/.exec(timeframe);
+  if (!match) return Number.MAX_SAFE_INTEGER;
+  const value = Number(match[1]);
+  const unit = match[2];
+  if (unit === "m") return value;
+  if (unit === "h") return value * 60;
+  if (unit === "d") return value * 60 * 24;
+  return value * 60 * 24 * 7;
 }
 
 const TONE_BG: Record<string, string> = {
@@ -36,8 +56,9 @@ const TONE_BG: Record<string, string> = {
 
 export function StabilityMatrix() {
   const { data, isLoading } = useCalibrationStability();
+  const { data: slopeDiagnostics } = useEquitySlope();
 
-  const { matrix, strategies, timeframes, threshold, candidates } = useMemo(() => {
+  const { matrix, strategies, timeframes, threshold, candidates, trackedCount, untrackedCount } = useMemo(() => {
     if (!data) {
       return {
         matrix: new Map<string, CalibrationStabilityEntry>(),
@@ -45,6 +66,8 @@ export function StabilityMatrix() {
         timeframes: [],
         threshold: 0.25,
         candidates: [],
+        trackedCount: 0,
+        untrackedCount: 0,
       };
     }
     const map = new Map<string, CalibrationStabilityEntry>();
@@ -59,12 +82,15 @@ export function StabilityMatrix() {
     const candidatesArr = data.by_strategy
       .filter((e) => e.factor_stddev > thr)
       .sort((a, b) => b.factor_stddev - a.factor_stddev);
+    const tracked = data.by_strategy.filter((e) => e.factor_history.length >= 2).length;
     return {
       matrix: map,
       strategies: Array.from(stratSet).sort(),
-      timeframes: Array.from(tfSet).sort(),
+      timeframes: Array.from(tfSet).sort(compareTimeframes),
       threshold: thr,
       candidates: candidatesArr,
+      trackedCount: tracked,
+      untrackedCount: data.by_strategy.length - tracked,
     };
   }, [data]);
 
@@ -108,54 +134,60 @@ export function StabilityMatrix() {
         </div>
       </Card>
 
-      {/* Matrix grid */}
-      <Card className="p-0 overflow-hidden">
-        <ScrollArea>
-          <div className="min-w-fit p-4">
-            <table className="w-full border-separate border-spacing-1">
-              <thead>
-                <tr>
-                  <th className="sticky left-0 z-10 bg-bg-1 text-left text-[10px] font-medium uppercase tracking-wider text-fg-3">
-                    Strategia
-                  </th>
-                  {timeframes.map((tf) => (
-                    <th
-                      key={tf}
-                      className="font-mono text-[10px] font-medium uppercase tracking-wider text-fg-3"
-                    >
-                      {tf}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_21rem]">
+        {/* Matrix grid */}
+        <Card className="p-0 overflow-hidden">
+          <ScrollArea className="w-full">
+            <div className="min-w-max p-5">
+              <div
+                className="grid gap-1.5"
+                style={{ gridTemplateColumns: `minmax(15rem, 18rem) repeat(${timeframes.length}, 5.75rem)` }}
+              >
+                <div className="sticky left-0 z-10 flex h-9 items-center bg-bg-1 pr-4 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+                  Strategia
+                </div>
+                {timeframes.map((tf) => (
+                  <div
+                    key={tf}
+                    className="flex h-9 w-[5.75rem] items-center justify-center rounded-md bg-bg-2 font-mono text-xs font-medium text-fg-2"
+                  >
+                    {tf}
+                  </div>
+                ))}
+
                 {strategies.map((strategy) => (
-                  <tr key={strategy}>
-                    <td className="sticky left-0 z-10 bg-bg-1 pr-3 font-mono text-xs text-fg-2">
+                  <div key={strategy} className="contents">
+                    <div className="sticky left-0 z-10 flex h-14 items-center truncate bg-bg-1 pr-4 font-mono text-sm text-fg-2">
                       {strategy}
-                    </td>
+                    </div>
                     {timeframes.map((tf) => {
                       const entry = matrix.get(`${tf}|${strategy}`);
                       if (!entry) {
                         return (
-                          <td key={tf} className="p-0">
-                            <div className="h-10 w-16 rounded-md border border-dashed border-border" />
-                          </td>
+                          <div
+                            key={tf}
+                            className="grid h-14 w-[5.75rem] place-items-center rounded-md border border-dashed border-border text-[10px] uppercase text-fg-3"
+                          >
+                            n/a
+                          </div>
                         );
                       }
-                      return (
-                        <td key={tf} className="p-0">
-                          <Cell entry={entry} threshold={threshold} />
-                        </td>
-                      );
+                      return <Cell key={tf} entry={entry} threshold={threshold} />;
                     })}
-                  </tr>
+                  </div>
                 ))}
-              </tbody>
-            </table>
-          </div>
-        </ScrollArea>
-      </Card>
+              </div>
+            </div>
+          </ScrollArea>
+        </Card>
+
+        <StabilityGuide
+          threshold={threshold}
+          trackedCount={trackedCount}
+          untrackedCount={untrackedCount}
+          slopeDiagnostics={slopeDiagnostics}
+        />
+      </div>
 
       {/* Overfitting candidates */}
       {candidates.length > 0 && (
@@ -197,8 +229,156 @@ export function StabilityMatrix() {
   );
 }
 
+function StabilityGuide({
+  threshold,
+  trackedCount,
+  untrackedCount,
+  slopeDiagnostics,
+}: {
+  threshold: number;
+  trackedCount: number;
+  untrackedCount: number;
+  slopeDiagnostics: EquitySlopeDiagnostics | null | undefined;
+}) {
+  return (
+    <Card className="self-start px-5 py-4">
+      <div className="flex items-center gap-2 border-b border-border pb-3">
+        <Info className="h-4 w-4 text-fg-3" />
+        <div>
+          <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+            Come leggere
+          </div>
+          <div className="mt-1 text-xs text-fg-2">
+            Stabilita dei factor per timeframe e strategia.
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2 border-b border-border py-3">
+        <GuideStat label="Soglia" value={threshold.toFixed(2)} />
+        <GuideStat label="Tracciate" value={trackedCount.toString()} />
+        <GuideStat label="Senza history" value={untrackedCount.toString()} />
+      </div>
+
+      <div className="space-y-3 pt-3">
+        <GuideItem
+          label="Cella"
+          value="std e la deviazione dei factor recenti. WR mostra la differenza win-rate test-train quando l'holdout e disponibile."
+        />
+        <GuideItem
+          label="Colori"
+          value={`Verde <= ${(threshold * 0.5).toFixed(2)}, giallo <= ${threshold.toFixed(2)}, rosso sopra soglia.`}
+        />
+        <GuideItem
+          label="Tratteggio"
+          value="Combinazione timeframe-strategia non configurata nella matrice."
+        />
+        <GuideItem
+          label="—"
+          value="Factor history assente o con un solo valore: la stddev non e ancora significativa."
+        />
+      </div>
+
+      <div className="mt-4 border-t border-border pt-3">
+        <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+          Runtime guards
+        </div>
+        {slopeDiagnostics ? (
+          <div className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              <GuardBadge
+                label={slopeDiagnostics.deep_defensive_active ? "Deep defensive" : "Normal"}
+                tone={slopeDiagnostics.deep_defensive_active ? "warn" : "success"}
+              />
+              <GuardBadge
+                label={slopeDiagnostics.starvation_override_active ? "Starvation override" : "No override"}
+                tone={slopeDiagnostics.starvation_override_active ? "warn" : "muted"}
+              />
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              <GuideStat
+                label="Zero cycles"
+                value={`${slopeDiagnostics.consecutive_zero_signal_cycles}/${slopeDiagnostics.exit_conditions.starvation_hard_cycles}`}
+              />
+              <GuideStat
+                label="Cooldown"
+                value={String(slopeDiagnostics.cooldown_remaining)}
+              />
+              <GuideStat
+                label="Recent +"
+                value={`${slopeDiagnostics.recent_positive_streak}/${slopeDiagnostics.exit_conditions.recent_slope_non_negative_cycles}`}
+              />
+            </div>
+            <GuideItem
+              label="Exit"
+              value={formatGuardReason(slopeDiagnostics.last_exit_reason)}
+            />
+          </div>
+        ) : (
+          <div className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-fg-3">
+            Stato starvation/deep defensive non disponibile.
+          </div>
+        )}
+      </div>
+
+      <div className="mt-4 border-t border-border pt-3">
+        <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+          Tooltip
+        </div>
+        <div className="space-y-2">
+          <GuideItem label="Trade / peso" value="Numero di posizioni nel lookback e peso strategia attuale." />
+          <GuideItem label="WR train/test" value="Win rate sulla parte piu vecchia e piu recente del campione." />
+          <GuideItem label="PF train/test" value="Profit factor: profitto lordo diviso perdita lorda." />
+          <GuideItem label="WR Delta" value="Test meno train; negativo indica degrado nell'holdout recente." />
+          <GuideItem label="Factor history" value="Factor decisi dalle ultime calibrazioni, dal piu recente al piu vecchio." />
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function GuardBadge({ label, tone }: { label: string; tone: "success" | "warn" | "muted" }) {
+  return (
+    <Badge
+      variant="outline"
+      className={cn(
+        "font-mono text-[10px] uppercase",
+        tone === "success" && "border-success/40 bg-success/10 text-success",
+        tone === "warn" && "border-warn/40 bg-warn/10 text-warn",
+        tone === "muted" && "border-border bg-bg-2 text-fg-3",
+      )}
+    >
+      {label}
+    </Badge>
+  );
+}
+
+function GuideStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider text-fg-3">{label}</div>
+      <div className="mt-1 font-mono text-sm font-medium tabular-nums text-fg">{value}</div>
+    </div>
+  );
+}
+
+function formatGuardReason(reason: string | null | undefined) {
+  if (!reason) return "Nessuna uscita registrata.";
+  return reason.replace(/_/g, " ");
+}
+
+function GuideItem({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-3 text-xs">
+      <div className="font-mono text-[11px] text-fg-2">{label}</div>
+      <div className="leading-relaxed text-fg-3">{value}</div>
+    </div>
+  );
+}
+
 function Cell({ entry, threshold }: { entry: CalibrationStabilityEntry; threshold: number }) {
-  const tone = stddevTone(entry.factor_stddev, threshold);
+  const hasEnoughHistory = entry.factor_history.length >= 2;
+  const tone = hasEnoughHistory ? stddevTone(entry.factor_stddev, threshold) : "muted";
   const wrDelta = entry.holdout?.wr_delta;
   const [open, setOpen] = useState(false);
 
@@ -207,18 +387,35 @@ function Cell({ entry, threshold }: { entry: CalibrationStabilityEntry; threshol
       <PopoverTrigger asChild>
         <button
           className={cn(
-            "flex h-10 w-16 flex-col items-center justify-center rounded-md border font-mono text-[10px] tabular-nums transition-colors",
+            "relative flex h-14 w-[5.75rem] flex-col justify-center rounded-md border px-2 py-1.5 font-mono tabular-nums transition-colors",
             TONE_BG[tone],
-            !entry.enabled && "opacity-40",
+            !entry.enabled && "opacity-60",
           )}
         >
-          <span>{entry.factor_stddev.toFixed(2)}</span>
-          {wrDelta != null && (
-            <span className="opacity-70">
-              {wrDelta >= 0 ? "+" : ""}
-              {(wrDelta * 100).toFixed(0)}%
+          {!entry.enabled && (
+            <span className="absolute right-1 top-1 rounded-sm border border-current/20 px-1 text-[8px] uppercase opacity-70">
+              off
             </span>
           )}
+          <span className="flex items-baseline justify-between gap-2">
+            <span className="text-[9px] uppercase opacity-70">std</span>
+            <span className="text-sm font-semibold">
+              {hasEnoughHistory ? entry.factor_stddev.toFixed(2) : "—"}
+            </span>
+          </span>
+          <span className="mt-1 flex items-baseline justify-between gap-2">
+            <span className="text-[9px] uppercase opacity-70">WR</span>
+            <span
+              className={cn(
+                "text-xs",
+                wrDelta == null && "opacity-50",
+                wrDelta != null && wrDelta < 0 && "text-danger",
+                wrDelta != null && wrDelta >= 0 && "text-success",
+              )}
+            >
+              {wrDelta != null ? signedPct(wrDelta) : "—"}
+            </span>
+          </span>
         </button>
       </PopoverTrigger>
       <PopoverContent align="center" className="w-72">
@@ -247,9 +444,7 @@ function Cell({ entry, threshold }: { entry: CalibrationStabilityEntry; threshol
               <KvLine
                 label="WR Δ"
                 value={
-                  entry.holdout.wr_delta != null
-                    ? (entry.holdout.wr_delta >= 0 ? "+" : "") + pct(entry.holdout.wr_delta)
-                    : "—"
+                  entry.holdout.wr_delta != null ? signedPct(entry.holdout.wr_delta, 1) : "—"
                 }
                 tone={
                   entry.holdout.wr_delta == null
@@ -281,7 +476,7 @@ function Cell({ entry, threshold }: { entry: CalibrationStabilityEntry; threshol
                   tone === "danger" && "text-danger",
                 )}
               >
-                {entry.factor_stddev.toFixed(3)}
+                {hasEnoughHistory ? entry.factor_stddev.toFixed(3) : "history insufficiente"}
               </span>
             </div>
           </div>

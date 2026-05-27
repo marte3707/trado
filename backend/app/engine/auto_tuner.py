@@ -38,6 +38,17 @@ DEFAULT_SEQUENCE: list[dict[str, Any]] = [
         "patch": {"participation_ratio": 0.50},
         "revert": {"participation_ratio": 0.35},
     },
+    {
+        # Auto-reverse posizioni su cambio regime BTC: vive in AppSetting
+        # "btc_macro_protection" (non in "risk"). Richiede sequential mode
+        # perché agisce sull'engine di protezione, non su un overlay per-segnale.
+        "key": "auto_reverse",
+        "label": "Auto-reverse on BTC regime change",
+        "target_setting": "btc_macro_protection",
+        "patch": {"enabled": True, "reverse_mode_enabled": True},
+        "revert": {"reverse_mode_enabled": False},
+        "sequential_only": True,
+    },
 ]
 
 SOURCE_AB_SEQUENCE: list[dict[str, Any]] = [
@@ -216,7 +227,9 @@ class AutoTuner:
         }
 
         if state.get("current_step_index") is None:
-            next_index = self._next_step_index(sequence, completed_keys)
+            next_index = self._next_step_index(
+                sequence, completed_keys, skip_sequential_only=True
+            )
             if next_index is None:
                 return self._finish(db, state, "completed", "all sequence steps completed")
             return self._start_ab_step(db, state, config, sequence, next_index)
@@ -245,10 +258,18 @@ class AutoTuner:
 
         return self._evaluate_ab_step(db, state, config, sequence, idx, arms, history)
 
-    def _next_step_index(self, sequence: list[dict[str, Any]], completed_keys: set) -> int | None:
+    def _next_step_index(
+        self,
+        sequence: list[dict[str, Any]],
+        completed_keys: set,
+        skip_sequential_only: bool = False,
+    ) -> int | None:
         for index, step in enumerate(sequence):
-            if step.get("key") not in completed_keys:
-                return index
+            if step.get("key") in completed_keys:
+                continue
+            if skip_sequential_only and bool(step.get("sequential_only", False)):
+                continue
+            return index
         return None
 
     def _start_step(
@@ -263,7 +284,8 @@ class AutoTuner:
         positions = self.analyzer.closed_paper_positions(db, limit=2000)
         metrics_before = self._metrics_for(positions[: int(config.get("min_trades_per_step", 50))])
         risk_snapshot = self._snapshot_risk(db)
-        self._apply_patch(db, dict(step.get("patch", {})))
+        target_setting = str(step.get("target_setting", "risk"))
+        self._apply_patch(db, dict(step.get("patch", {})), target_setting=target_setting)
         activated_at = datetime.now(timezone.utc).isoformat()
         new_state = dict(state)
         new_state.update(
@@ -332,7 +354,10 @@ class AutoTuner:
 
         outcome = "success" if improved else "reverted"
         if not improved:
-            self._apply_patch(db, dict(step.get("revert", {})))
+            target_setting = str(step.get("target_setting", "risk"))
+            self._apply_patch(
+                db, dict(step.get("revert", {})), target_setting=target_setting
+            )
 
         evaluated_at = datetime.now(timezone.utc).isoformat()
         history.append(
@@ -482,7 +507,10 @@ class AutoTuner:
         )
 
         if promoted:
-            self._apply_patch(db, dict(step.get("patch", {})))
+            target_setting = str(step.get("target_setting", "risk"))
+            self._apply_patch(
+                db, dict(step.get("patch", {})), target_setting=target_setting
+            )
             outcome = "promoted"
         else:
             outcome = "rejected"
@@ -600,7 +628,10 @@ class AutoTuner:
         # erano iniettati per-segnale via overlay. Quindi non c'è nulla da revertire
         # — basta chiudere lo step.
         if not is_ab:
-            self._apply_patch(db, dict(step.get("revert", {})))
+            target_setting = str(step.get("target_setting", "risk"))
+            self._apply_patch(
+                db, dict(step.get("revert", {})), target_setting=target_setting
+            )
         history: list[dict[str, Any]] = list(state.get("step_history", []))
         history.append(
             {
@@ -662,10 +693,15 @@ class AutoTuner:
             for entry in state.get("step_history", [])
             if entry.get("status") in {"success", "reverted", "skipped", "promoted", "rejected"}
         }
-        next_index = self._next_step_index(sequence, completed_keys)
+        current_step_index = state.get("current_step_index")
+        mode = str(config.get("mode", "sequential"))
+        next_index = self._next_step_index(
+            sequence, completed_keys, skip_sequential_only=(mode == "ab_test")
+        )
+        if current_step_index is not None:
+            next_index = int(current_step_index) + 1
         positions = self.analyzer.closed_paper_positions(db, limit=2000)
         trades_now = len(positions)
-        mode = str(config.get("mode", "sequential"))
         progress: dict[str, Any] | None = None
         ab_progress: dict[str, Any] | None = None
         if state.get("current_step_index") is not None:
@@ -976,12 +1012,19 @@ class AutoTuner:
                 result.append(position)
         return result
 
-    def _apply_patch(self, db: Session, patch: dict[str, Any]) -> None:
-        risk_setting = db.get(AppSetting, "risk") or AppSetting(key="risk", value={})
-        current = dict(risk_setting.value) if isinstance(risk_setting.value, dict) else {}
+    def _apply_patch(
+        self,
+        db: Session,
+        patch: dict[str, Any],
+        target_setting: str = "risk",
+    ) -> None:
+        setting = db.get(AppSetting, target_setting) or AppSetting(
+            key=target_setting, value={}
+        )
+        current = dict(setting.value) if isinstance(setting.value, dict) else {}
         current.update(patch)
-        risk_setting.value = current
-        db.add(risk_setting)
+        setting.value = current
+        db.add(setting)
 
     def _snapshot_risk(self, db: Session) -> dict[str, Any]:
         risk_setting = db.get(AppSetting, "risk")

@@ -220,9 +220,34 @@ def seed_defaults(db: Session) -> None:
                     "_last_btc_trend": "NEUTRAL",
                     "_last_directional_trend": "NEUTRAL",
                     "_last_reversal_at": None,
+                    "reverse_mode_enabled": False,
+                    "reverse_cooldown_minutes": 240,
+                    "reverse_max_per_day": 3,
+                    "reverse_signal_flip_max_age_minutes": 60,
+                    "reverse_signal_flip_min_score": 50,
+                    "_reverse_history": {},
                 },
             )
         )
+    else:
+        existing = db.get(AppSetting, "btc_macro_protection")
+        if existing is not None and isinstance(existing.value, dict):
+            updated = dict(existing.value)
+            mutated = False
+            reverse_defaults = {
+                "reverse_mode_enabled": False,
+                "reverse_cooldown_minutes": 240,
+                "reverse_max_per_day": 3,
+                "reverse_signal_flip_max_age_minutes": 60,
+                "reverse_signal_flip_min_score": 50,
+                "_reverse_history": {},
+            }
+            for key, default in reverse_defaults.items():
+                if key not in updated:
+                    updated[key] = default
+                    mutated = True
+            if mutated:
+                existing.value = updated
     for timeframe in settings.enabled_timeframes:
         seed_timeframe(db, timeframe)
     db.commit()

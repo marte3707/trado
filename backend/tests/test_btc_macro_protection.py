@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 from app.core.config import Settings
-from app.db.models import AppSetting, Candle, DecisionLog, Market, Position
+from app.db.models import AppSetting, Candle, DecisionLog, Market, Position, Signal
 from app.engine.btc_macro_protection import BtcMacroProtectionEngine, BtcTrendState
 from app.engine.position_management import StopCandidate
 
@@ -55,6 +55,7 @@ class FakeDb:
     btc_market: Market | None = None
     candles: list[Candle] = field(default_factory=list)
     positions: list[Position] = field(default_factory=list)
+    signals: list[Signal] = field(default_factory=list)
     markets_by_id: dict[int, Market] = field(default_factory=dict)
     added: list[Any] = field(default_factory=list)
     committed: int = 0
@@ -76,6 +77,8 @@ class FakeDb:
             return _Query(list(reversed(self.candles)))
         if model is Position:
             return _Query(self.positions)
+        if model is Signal:
+            return _Query(list(self.signals))
         return _Query([])
 
     def add(self, row: Any) -> None:
@@ -94,6 +97,11 @@ class FakeDb:
 class FakeExecutor:
     def __init__(self) -> None:
         self.closed: list[dict[str, Any]] = []
+        self.paper_closed: list[dict[str, Any]] = []
+        self.paper_opened: list[Signal] = []
+        self.live_opened: list[Signal] = []
+        self.next_paper_position_id = 100
+        self.next_live_position_id = 200
 
     def close_live_position(
         self,
@@ -103,6 +111,56 @@ class FakeExecutor:
         trading_client: Any = None,
     ) -> None:
         self.closed.append({"position_id": position.id, "reason": reason})
+
+    def close_position(
+        self,
+        db: Any,
+        position: Position,
+        exit_price: Any,
+        reason: str,
+        commit: bool = True,
+    ) -> None:
+        position.status = "closed"
+        self.paper_closed.append(
+            {"position_id": position.id, "reason": reason, "exit_price": exit_price}
+        )
+
+    def execute_paper(self, db: Any, signal: Signal) -> Position:
+        self.paper_opened.append(signal)
+        new_position = Position(
+            id=self.next_paper_position_id,
+            market_id=signal.market_id,
+            mode="paper",
+            side="long" if str(signal.direction).endswith("LONG") else "short",
+            entry_price=signal.entry_price,
+            size=Decimal("1"),
+            stop_loss=signal.stop_loss,
+            status="open",
+            metadata_json={"source_signal_id": signal.id},
+        )
+        self.next_paper_position_id += 1
+        return new_position
+
+    def execute_live(
+        self,
+        db: Any,
+        signal: Signal,
+        trading_client: Any = None,
+    ) -> Position:
+        self.live_opened.append(signal)
+        new_position = Position(
+            id=self.next_live_position_id,
+            market_id=signal.market_id,
+            mode="live",
+            side="long" if str(signal.direction).endswith("LONG") else "short",
+            entry_price=signal.entry_price,
+            size=Decimal("1"),
+            stop_loss=signal.stop_loss,
+            status="open",
+            metadata_json={"source_signal_id": signal.id},
+        )
+        self.next_live_position_id += 1
+        return new_position
 
 
 # ---------------------------------------------------------------------------
@@ -600,3 +658,287 @@ def test_decision_log_emitted_on_reversal() -> None:
 
     decision_logs = [x for x in db.added if isinstance(x, DecisionLog)]
     assert any(d.event_type == "btc_macro_reversal_detected" for d in decision_logs)
+
+
+# ---------------------------------------------------------------------------
+# Auto-reverse mode tests
+# ---------------------------------------------------------------------------
+
+
+def _reverse_config(
+    last_trend: str = "BEARISH",
+    cooldown_minutes: int = 240,
+    max_per_day: int = 3,
+    min_score: int = 50,
+    max_age_minutes: int = 60,
+    reverse_history: dict[str, Any] | None = None,
+) -> AppSetting:
+    return AppSetting(
+        key="btc_macro_protection",
+        value={
+            "enabled": True,
+            "timeframe": "5m",
+            "lookback_candles": 3,
+            "reversal_pct_threshold": 1.5,
+            "volume_multiplier": 1.2,
+            "breakeven_buffer_pct": 0.3,
+            "loss_exit_enabled": True,
+            "_last_btc_trend": last_trend,
+            "_last_directional_trend": last_trend,
+            "reverse_mode_enabled": True,
+            "reverse_cooldown_minutes": cooldown_minutes,
+            "reverse_max_per_day": max_per_day,
+            "reverse_signal_flip_max_age_minutes": max_age_minutes,
+            "reverse_signal_flip_min_score": min_score,
+            "_reverse_history": reverse_history or {},
+        },
+    )
+
+
+def _signal(
+    *,
+    direction: str = "LONG",
+    score: int = 75,
+    market_id: int = 2,
+    signal_id: int = 500,
+    created_at: datetime | None = None,
+    status: str = "new",
+    entry: str = "200",
+    stop: str | None = "190",
+) -> Signal:
+    return Signal(
+        id=signal_id,
+        market_id=market_id,
+        timeframe="5m",
+        direction=direction,
+        score=score,
+        confidence_label="forte",
+        entry_price=Decimal(entry),
+        stop_loss=Decimal(stop) if stop else None,
+        reason="test",
+        strategy_breakdown={},
+        status=status,
+        created_at=created_at or datetime.now(timezone.utc),
+    )
+
+
+def test_reverse_mode_triggers_on_combo_paper() -> None:
+    """BEARISH→BULLISH + position SHORT paper + signal LONG recente → close + open opposite."""
+    engine = BtcMacroProtectionEngine(_settings())
+    candles = _candles(10, base_close=100.0, last_close=102.0, last_volume=2000.0)
+
+    pos = _position(side="short", entry="200", stop="210", unrealized_pnl=-5.0, mode="paper")
+    market = _btc_market()
+    flip = _signal(direction="LONG", score=75, market_id=pos.market_id, signal_id=500)
+
+    db = FakeDb(
+        settings={"btc_macro_protection": _reverse_config(last_trend="BEARISH")},
+        btc_market=market,
+        candles=candles,
+        positions=[pos],
+        signals=[flip],
+        markets_by_id={1: market, 2: _alt_market(2)},
+    )
+    executor = FakeExecutor()
+    result = engine.run(db, executor)
+
+    assert result == 1
+    assert len(executor.paper_closed) == 1
+    assert executor.paper_closed[0]["reason"] == "btc_auto_reverse"
+    assert len(executor.paper_opened) == 1
+    assert executor.paper_opened[0].id == flip.id
+    assert executor.closed == []
+
+    decision_logs = [x for x in db.added if isinstance(x, DecisionLog)]
+    triggered = [d for d in decision_logs if d.event_type == "btc_auto_reverse_triggered"]
+    assert len(triggered) == 1
+    assert triggered[0].data["from_side"] == "short"
+    assert triggered[0].data["to_side"] == "long"
+    assert triggered[0].data["mode"] == "paper"
+
+
+def test_reverse_mode_triggers_on_combo_live() -> None:
+    """BULLISH→BEARISH + position LONG live + signal SHORT recente → close live + open opposite."""
+    engine = BtcMacroProtectionEngine(_settings())
+    candles = _candles(10, base_close=100.0, last_close=98.0, last_volume=2000.0)
+
+    pos = _position(side="long", entry="200", stop="190", unrealized_pnl=-5.0, mode="live")
+    market = _btc_market()
+    flip = _signal(direction="SHORT", score=80, market_id=pos.market_id, signal_id=501)
+
+    db = FakeDb(
+        settings={"btc_macro_protection": _reverse_config(last_trend="BULLISH")},
+        btc_market=market,
+        candles=candles,
+        positions=[pos],
+        signals=[flip],
+        markets_by_id={1: market, 2: _alt_market(2)},
+    )
+    executor = FakeExecutor()
+    result = engine.run(db, executor)
+
+    assert result == 1
+    assert len(executor.closed) == 1
+    assert executor.closed[0]["reason"] == "btc_auto_reverse"
+    assert len(executor.live_opened) == 1
+    assert executor.live_opened[0].id == flip.id
+    assert executor.paper_closed == []
+
+
+def test_reverse_skipped_without_signal_flip() -> None:
+    """Reversal + posizione opposta ma NESSUN signal flip → skipped, no close/open."""
+    engine = BtcMacroProtectionEngine(_settings())
+    candles = _candles(10, base_close=100.0, last_close=102.0, last_volume=2000.0)
+
+    pos = _position(side="short", entry="200", mode="paper")
+    market = _btc_market()
+
+    db = FakeDb(
+        settings={"btc_macro_protection": _reverse_config(last_trend="BEARISH")},
+        btc_market=market,
+        candles=candles,
+        positions=[pos],
+        signals=[],
+        markets_by_id={1: market, 2: _alt_market(2)},
+    )
+    executor = FakeExecutor()
+    result = engine.run(db, executor)
+
+    assert result == 0
+    assert executor.paper_closed == []
+    assert executor.paper_opened == []
+    decision_logs = [x for x in db.added if isinstance(x, DecisionLog)]
+    assert any(d.event_type == "btc_auto_reverse_skipped_no_signal_flip" for d in decision_logs)
+
+
+def test_reverse_respects_cooldown() -> None:
+    """Reverse recente (entro cooldown) → skipped."""
+    engine = BtcMacroProtectionEngine(_settings())
+    candles = _candles(10, base_close=100.0, last_close=102.0, last_volume=2000.0)
+
+    pos = _position(side="short", entry="200", mode="paper")
+    market = _btc_market()
+    flip = _signal(direction="LONG", market_id=pos.market_id, signal_id=510)
+    # Reverse fatto 10 minuti fa, cooldown 240 minuti → bloccato
+    recent = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    history = {str(pos.market_id): [{"reversed_at": recent, "from_side": "long", "to_side": "short"}]}
+
+    db = FakeDb(
+        settings={
+            "btc_macro_protection": _reverse_config(
+                last_trend="BEARISH", reverse_history=history
+            )
+        },
+        btc_market=market,
+        candles=candles,
+        positions=[pos],
+        signals=[flip],
+        markets_by_id={1: market, 2: _alt_market(2)},
+    )
+    executor = FakeExecutor()
+    result = engine.run(db, executor)
+
+    assert result == 0
+    assert executor.paper_opened == []
+    assert any(
+        d.event_type == "btc_auto_reverse_skipped_cooldown"
+        for d in db.added
+        if isinstance(d, DecisionLog)
+    )
+
+
+def test_reverse_respects_max_per_day() -> None:
+    """3 reverse nelle ultime 24h con cap=3 → 4° skipped."""
+    engine = BtcMacroProtectionEngine(_settings())
+    candles = _candles(10, base_close=100.0, last_close=102.0, last_volume=2000.0)
+
+    pos = _position(side="short", entry="200", mode="paper")
+    market = _btc_market()
+    flip = _signal(direction="LONG", market_id=pos.market_id, signal_id=520)
+    now = datetime.now(timezone.utc)
+    # 3 reverse nelle ultime 24h, ma il più recente è oltre il cooldown (>4h fa)
+    # così il blocco scatta solo per max_per_day, non per cooldown.
+    history = {
+        str(pos.market_id): [
+            {"reversed_at": (now - timedelta(hours=20)).isoformat(), "from_side": "long", "to_side": "short"},
+            {"reversed_at": (now - timedelta(hours=15)).isoformat(), "from_side": "short", "to_side": "long"},
+            {"reversed_at": (now - timedelta(hours=5)).isoformat(), "from_side": "long", "to_side": "short"},
+        ]
+    }
+
+    db = FakeDb(
+        settings={
+            "btc_macro_protection": _reverse_config(
+                last_trend="BEARISH", reverse_history=history, max_per_day=3, cooldown_minutes=60
+            )
+        },
+        btc_market=market,
+        candles=candles,
+        positions=[pos],
+        signals=[flip],
+        markets_by_id={1: market, 2: _alt_market(2)},
+    )
+    executor = FakeExecutor()
+    result = engine.run(db, executor)
+
+    assert result == 0
+    assert executor.paper_opened == []
+    assert any(
+        d.event_type == "btc_auto_reverse_skipped_max_per_day"
+        for d in db.added
+        if isinstance(d, DecisionLog)
+    )
+
+
+def test_reverse_history_persisted_to_appsetting() -> None:
+    """Dopo un reverse, _reverse_history nel setting deve contenere la nuova entry."""
+    engine = BtcMacroProtectionEngine(_settings())
+    candles = _candles(10, base_close=100.0, last_close=102.0, last_volume=2000.0)
+
+    pos = _position(side="short", entry="200", mode="paper")
+    market = _btc_market()
+    flip = _signal(direction="LONG", market_id=pos.market_id, signal_id=530)
+    setting = _reverse_config(last_trend="BEARISH")
+
+    db = FakeDb(
+        settings={"btc_macro_protection": setting},
+        btc_market=market,
+        candles=candles,
+        positions=[pos],
+        signals=[flip],
+        markets_by_id={1: market, 2: _alt_market(2)},
+    )
+    engine.run(db, FakeExecutor())
+
+    history = setting.value.get("_reverse_history", {})
+    market_key = str(pos.market_id)
+    assert market_key in history
+    assert len(history[market_key]) == 1
+    assert history[market_key][0]["from_side"] == "short"
+    assert history[market_key][0]["to_side"] == "long"
+
+
+def test_reverse_skipped_when_position_already_aligned() -> None:
+    """Reversal BULLISH + posizione LONG (già allineata col nuovo regime) → nessun reverse."""
+    engine = BtcMacroProtectionEngine(_settings())
+    candles = _candles(10, base_close=100.0, last_close=102.0, last_volume=2000.0)
+
+    pos = _position(side="long", entry="200", mode="paper")
+    market = _btc_market()
+    flip = _signal(direction="SHORT", market_id=pos.market_id, signal_id=540)
+
+    db = FakeDb(
+        settings={"btc_macro_protection": _reverse_config(last_trend="BEARISH")},
+        btc_market=market,
+        candles=candles,
+        positions=[pos],
+        signals=[flip],
+        markets_by_id={1: market, 2: _alt_market(2)},
+    )
+    executor = FakeExecutor()
+    result = engine.run(db, executor)
+
+    # La posizione LONG è già allineata al nuovo regime BULLISH: niente da fare.
+    assert result == 0
+    assert executor.paper_closed == []
+    assert executor.paper_opened == []

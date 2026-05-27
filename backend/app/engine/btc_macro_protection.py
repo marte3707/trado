@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any
@@ -9,8 +9,8 @@ import structlog
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.enums import OrderMode
-from app.db.models import AppSetting, Candle, DecisionLog, Market, Position
+from app.core.enums import Direction, OrderMode, SignalStatus
+from app.db.models import AppSetting, Candle, DecisionLog, Market, Position, Signal
 from app.engine.position_management import PositionManagementEngine, StopCandidate
 from app.indicators.core import ema
 
@@ -142,10 +142,19 @@ class BtcMacroProtectionEngine:
         )
         db.commit()
 
+        # In reverse_mode l'engine deve poter agire anche sulle posizioni paper:
+        # l'auto-tuner valuta su `closed_paper_positions` e senza paper non avrebbe
+        # mai trade da analizzare. Quando reverse_mode è OFF rimane live-only
+        # (comportamento storico close/breakeven invariato).
+        reverse_mode_enabled = bool(config.get("reverse_mode_enabled", False))
+        if reverse_mode_enabled:
+            allowed_modes = [OrderMode.LIVE.value, OrderMode.PAPER.value]
+        else:
+            allowed_modes = [OrderMode.LIVE.value]
         open_positions = (
             db.query(Position)
             .filter(
-                Position.mode == OrderMode.LIVE.value,
+                Position.mode.in_(allowed_modes),
                 Position.status == "open",
             )
             .all()
@@ -297,6 +306,15 @@ class BtcMacroProtectionEngine:
         config: dict[str, Any],
         trading_client: Any,
     ) -> bool:
+        # Reverse-mode è mutualmente esclusivo con close/breakeven: se attivo,
+        # gestisce direttamente la posizione (chiusura + apertura opposta) e non
+        # cade nei rami legacy. Le posizioni che non superano i filtri del reverse
+        # (no signal flip, cooldown, max/day) restano semplicemente intoccate.
+        if bool(config.get("reverse_mode_enabled", False)):
+            return self._try_reverse(
+                db, executor, position, reversal, delta_pct, vol_ratio, config, trading_client
+            )
+
         side = position.side.lower()
         in_profit = self._is_position_in_profit(db, position)
         loss_exit_enabled = bool(config.get("loss_exit_enabled", True))
@@ -411,6 +429,261 @@ class BtcMacroProtectionEngine:
             )
             db.flush()
             return False
+
+    # ------------------------------------------------------------------
+    # Auto-reverse mode
+    # ------------------------------------------------------------------
+
+    _LONG_DIRECTIONS = {Direction.LONG.value, Direction.STRONG_LONG.value}
+    _SHORT_DIRECTIONS = {Direction.SHORT.value, Direction.STRONG_SHORT.value}
+
+    def _try_reverse(
+        self,
+        db: Session,
+        executor: Any,
+        position: Position,
+        reversal: BtcTrendState,
+        delta_pct: float,
+        vol_ratio: float,
+        config: dict[str, Any],
+        trading_client: Any,
+    ) -> bool:
+        side = position.side.lower()
+        # 1. Direzione target = direzione del nuovo regime BTC. Deve essere
+        # opposta alla posizione corrente, altrimenti la posizione è già allineata
+        # al nuovo regime e non va invertita.
+        if reversal == BtcTrendState.BULLISH and side == "short":
+            target_side = "long"
+            target_directions = self._LONG_DIRECTIONS
+        elif reversal == BtcTrendState.BEARISH and side == "long":
+            target_side = "short"
+            target_directions = self._SHORT_DIRECTIONS
+        else:
+            return False
+
+        # 2. Cooldown e max/day per market.
+        history = self._reverse_history_for_market(config, position.market_id)
+        now = datetime.now(timezone.utc)
+        cooldown_minutes = int(config.get("reverse_cooldown_minutes", 240))
+        max_per_day = int(config.get("reverse_max_per_day", 3))
+        if history:
+            last_at = self._parse_iso(history[-1].get("reversed_at"))
+            if last_at is not None and (now - last_at) < timedelta(minutes=cooldown_minutes):
+                db.add(
+                    DecisionLog(
+                        event_type="btc_auto_reverse_skipped_cooldown",
+                        market_id=position.market_id,
+                        position_id=position.id,
+                        message="Auto-reverse skipped: cooldown active",
+                        data={
+                            "cooldown_minutes": cooldown_minutes,
+                            "last_reversed_at": history[-1].get("reversed_at"),
+                        },
+                    )
+                )
+                db.flush()
+                return False
+        last_24h = [
+            entry for entry in history
+            if (parsed := self._parse_iso(entry.get("reversed_at"))) is not None
+            and (now - parsed) < timedelta(hours=24)
+        ]
+        if len(last_24h) >= max_per_day:
+            db.add(
+                DecisionLog(
+                    event_type="btc_auto_reverse_skipped_max_per_day",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message="Auto-reverse skipped: daily cap reached",
+                    data={"max_per_day": max_per_day, "count_24h": len(last_24h)},
+                )
+            )
+            db.flush()
+            return False
+
+        # 3. Cerca un signal flip recente sullo stesso market nella direzione target.
+        max_age_minutes = int(config.get("reverse_signal_flip_max_age_minutes", 60))
+        min_score = int(config.get("reverse_signal_flip_min_score", 50))
+        cutoff = now - timedelta(minutes=max_age_minutes)
+        flip_signal = (
+            db.query(Signal)
+            .filter(
+                Signal.market_id == position.market_id,
+                Signal.direction.in_(list(target_directions)),
+                Signal.score >= min_score,
+                Signal.created_at >= cutoff,
+                Signal.status.notin_([SignalStatus.IGNORED.value, SignalStatus.INVALIDATED.value]),
+            )
+            .order_by(Signal.score.desc(), Signal.created_at.desc())
+            .first()
+        )
+        if flip_signal is None:
+            db.add(
+                DecisionLog(
+                    event_type="btc_auto_reverse_skipped_no_signal_flip",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message="Auto-reverse skipped: no recent opposite signal",
+                    data={
+                        "target_side": target_side,
+                        "min_score": min_score,
+                        "max_age_minutes": max_age_minutes,
+                    },
+                )
+            )
+            db.flush()
+            return False
+
+        # 4. Chiudi la posizione obsoleta (paper o live).
+        try:
+            if position.mode == OrderMode.PAPER.value:
+                self._close_paper_for_reverse(db, executor, position)
+            else:
+                executor.close_live_position(
+                    db,
+                    position,
+                    reason="btc_auto_reverse",
+                    trading_client=trading_client,
+                )
+        except Exception as exc:
+            db.add(
+                DecisionLog(
+                    event_type="btc_auto_reverse_close_failed",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message="Auto-reverse: close failed",
+                    data={"error": str(exc), "mode": position.mode},
+                )
+            )
+            db.flush()
+            return False
+
+        # 5. Apri la nuova posizione nella direzione opposta via flusso standard
+        # (RiskManager ricalcola size/SL/TP dal contesto attuale del signal flip).
+        new_position = None
+        try:
+            if position.mode == OrderMode.PAPER.value:
+                new_position = executor.execute_paper(db, flip_signal)
+            else:
+                new_position = executor.execute_live(
+                    db, flip_signal, trading_client=trading_client
+                )
+        except Exception as exc:
+            db.add(
+                DecisionLog(
+                    event_type="btc_auto_reverse_open_failed",
+                    market_id=position.market_id,
+                    signal_id=flip_signal.id,
+                    message="Auto-reverse: open failed",
+                    data={"error": str(exc), "mode": position.mode},
+                )
+            )
+            db.flush()
+            return False
+
+        # 6. Registra l'evento e aggiorna l'history per cooldown/max-per-day.
+        self._append_reverse_history(
+            db,
+            market_id=position.market_id,
+            reversed_at=now,
+            from_side=side,
+            to_side=target_side,
+        )
+        db.add(
+            DecisionLog(
+                event_type="btc_auto_reverse_triggered",
+                market_id=position.market_id,
+                signal_id=flip_signal.id,
+                position_id=new_position.id if new_position is not None else None,
+                message=f"Auto-reverse {side}→{target_side} on BTC {reversal.value}",
+                data={
+                    "from_side": side,
+                    "to_side": target_side,
+                    "closed_position_id": position.id,
+                    "new_position_id": new_position.id if new_position is not None else None,
+                    "flip_signal_id": flip_signal.id,
+                    "flip_signal_score": flip_signal.score,
+                    "btc_reversal": reversal.value,
+                    "btc_delta_pct": round(delta_pct, 4),
+                    "vol_ratio": round(vol_ratio, 4),
+                    "mode": position.mode,
+                },
+            )
+        )
+        db.flush()
+        return True
+
+    def _close_paper_for_reverse(
+        self,
+        db: Session,
+        executor: Any,
+        position: Position,
+    ) -> None:
+        """Chiude una posizione paper usando l'ultimo close disponibile come
+        exit price, in modo che il P&L realizzato rifletta la situazione di
+        mercato al momento del reverse (non l'entry, che azzererebbe il PnL)."""
+        last_close = self._latest_close(db, position.market_id)
+        exit_price = last_close if last_close is not None and last_close > 0 else position.entry_price
+        executor.close_position(
+            db,
+            position,
+            exit_price=exit_price,
+            reason="btc_auto_reverse",
+            commit=False,
+        )
+
+    def _reverse_history_for_market(
+        self, config: dict[str, Any], market_id: int
+    ) -> list[dict[str, Any]]:
+        raw = config.get("_reverse_history")
+        if not isinstance(raw, dict):
+            return []
+        entries = raw.get(str(market_id))
+        if not isinstance(entries, list):
+            return []
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    def _append_reverse_history(
+        self,
+        db: Session,
+        *,
+        market_id: int,
+        reversed_at: datetime,
+        from_side: str,
+        to_side: str,
+    ) -> None:
+        setting = db.get(AppSetting, _CONFIG_KEY)
+        if setting is None:
+            return
+        updated = dict(setting.value or {})
+        raw = updated.get("_reverse_history")
+        history: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+        market_key = str(market_id)
+        existing = list(history.get(market_key) or [])
+        existing.append(
+            {
+                "reversed_at": reversed_at.isoformat(),
+                "from_side": from_side,
+                "to_side": to_side,
+            }
+        )
+        # Trim: tieni solo le ultime 50 entry per market per non gonfiare il JSON.
+        history[market_key] = existing[-50:]
+        updated["_reverse_history"] = history
+        setting.value = updated
+        db.add(setting)
+
+    @staticmethod
+    def _parse_iso(value: Any) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
 
 
 def _decimal(value: object, default: Decimal | None) -> Decimal | None:

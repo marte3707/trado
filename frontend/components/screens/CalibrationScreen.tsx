@@ -11,6 +11,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { AutoTunerTab } from "@/components/calibration/AutoTunerTab";
 import { StabilityTab } from "@/components/calibration/StabilityTab";
+import { EquitySlopeTab } from "@/components/calibration/EquitySlopeTab";
 import { DiagnosticsTab } from "@/components/calibration/DiagnosticsTab";
 import { useSignals } from "@/lib/hooks/queries";
 import type {
@@ -62,6 +63,7 @@ export function CalibrationScreen({
         <TabsList>
           <TabsTrigger value="tuner">Auto-tuner</TabsTrigger>
           <TabsTrigger value="stability">Stability</TabsTrigger>
+          <TabsTrigger value="equity-slope">Equity slope</TabsTrigger>
           <TabsTrigger value="diagnostics">Diagnostics</TabsTrigger>
         </TabsList>
 
@@ -71,6 +73,10 @@ export function CalibrationScreen({
 
         <TabsContent value="stability" className="mt-5">
           <StabilityTab />
+        </TabsContent>
+
+        <TabsContent value="equity-slope" className="mt-5">
+          <EquitySlopeTab />
         </TabsContent>
 
         <TabsContent value="diagnostics" className="mt-5">

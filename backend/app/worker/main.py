@@ -468,12 +468,10 @@ async def run_once(
         calibration_attempted = True
     run_auto_tuner(db)
     btc_protection_updates = 0
-    if operation_mode == OperationMode.AUTO_TRADE and btc_protection is not None:
-        try:
-            btc_protection_updates = await asyncio.to_thread(btc_protection.run, db, executor)
-        except Exception as exc:
-            logger.exception("btc_macro_protection_failed", error=str(exc))
-            db.rollback()
+    # Nota: btc_protection.run() viene invocato DOPO il loop di generazione segnali
+    # (più sotto) — non qui — perché in reverse_mode deve poter agire sui signal flip
+    # generati nello stesso ciclo. La protezione legacy live-only era idempotente
+    # rispetto all'ordine; con reverse_mode l'ordine conta.
     if not active_timeframes and not paper_active_timeframes:
         try:
             db.add(DecisionLog(
@@ -595,6 +593,17 @@ async def run_once(
         if not calibration_attempted and should_run_calibration(db, closed):
             calibrated = run_calibration(db, calibration_engine)
             calibration_attempted = True
+        if btc_protection is not None and operation_mode in {
+            OperationMode.AUTO_TRADE,
+            OperationMode.PAPER_TRADING,
+        }:
+            try:
+                btc_protection_updates = await asyncio.to_thread(
+                    btc_protection.run, db, executor
+                )
+            except Exception as exc:
+                logger.exception("btc_macro_protection_failed", error=str(exc))
+                db.rollback()
         mark_timeframes_run(paper_active_timeframes, now_ms)
         db.add(
             DecisionLog(

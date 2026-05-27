@@ -1,7 +1,14 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
+import { RefreshCw, RotateCcw } from "lucide-react";
 import { Icon, fmt } from "@/components/atoms";
+import { Card } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { StatusDot, type DotStatus } from "@/components/shell/StatusDot";
+import { cn } from "@/lib/utils";
 import { AccountFunding, AccountMonitor, AccountOpenOrder, AccountPosition, AccountSpotBalance, Health, apiGet, apiPost } from "@/lib/api";
 
 type WsState = {
@@ -68,12 +75,6 @@ function fmtTime(ms: number | null | undefined): string {
   return new Intl.DateTimeFormat("it-IT", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" }).format(new Date(ms));
 }
 
-function statusClass(status: string) {
-  if (status === "ok" || status === "live") return "long";
-  if (status === "connecting") return "info";
-  if (status === "idle" || status === "closed") return "muted";
-  return "short";
-}
 
 function orderNumber(row: AccountOpenOrder, key: "sz" | "origSz" | "limitPx"): number | null {
   return asNumber(row[key]);
@@ -301,68 +302,184 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
     () => summarizeTrading(snapshot?.positions ?? [], snapshot?.open_orders ?? []),
     [snapshot]
   );
+  const accountValueNum = asNumber(
+    snapshot?.account.effective_account_value ?? snapshot?.account.account_value,
+  );
+  const marginUsedNum = asNumber(snapshot?.account.total_margin_used);
+  const marginRatio =
+    accountValueNum != null && accountValueNum > 0 && marginUsedNum != null
+      ? (marginUsedNum / accountValueNum) * 100
+      : null;
+
   return (
-    <div className="page">
-      <div className="page-head">
+    <div className="space-y-6 px-7 py-7">
+      {/* Header */}
+      <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
-          <h1 className="page-title">Account Monitor</h1>
-          <div className="page-sub">
-            {health.network} · {snapshot?.account.address ?? "account non configurato"} · {snapshot?.checked_at ? fmt.relTime(snapshot.checked_at) : "mai aggiornato"}
-          </div>
+          <h1 className="text-xl font-semibold tracking-tight text-fg">Account monitor</h1>
+          <p className="mt-1 flex flex-wrap items-center gap-2 text-xs text-fg-3">
+            <span className="font-mono uppercase">{health.network}</span>
+            <span className="text-fg-4">·</span>
+            <span className="font-mono">{snapshot?.account.address ?? "account non configurato"}</span>
+            <span className="text-fg-4">·</span>
+            <span>{snapshot?.checked_at ? fmt.relTime(snapshot.checked_at) : "mai aggiornato"}</span>
+          </p>
         </div>
-        <div className="page-actions">
-          <button className="btn ghost" onClick={reconcileExitData} disabled={action.key === "reconcile"} title="Riconcilia dati di uscita con lo storico HL">
-            <Icon name="refresh" size={12} /> {action.key === "reconcile" ? "Riconcilio..." : "Riconcilia storico"}
-          </button>
-          <button className="btn ghost" onClick={refresh} disabled={loading} title="Aggiorna">
-            <Icon name="refresh" size={12} /> {loading ? "Sync..." : "Refresh"}
-          </button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={reconcileExitData}
+            disabled={action.key === "reconcile"}
+            title="Riconcilia dati di uscita con lo storico HL"
+          >
+            <RotateCcw className="mr-1.5 h-3.5 w-3.5" />
+            {action.key === "reconcile" ? "Riconcilio..." : "Riconcilia storico"}
+          </Button>
+          <Button variant="outline" size="sm" onClick={refresh} disabled={loading}>
+            <RefreshCw className={cn("mr-1.5 h-3.5 w-3.5", loading && "animate-spin")} />
+            {loading ? "Sync..." : "Refresh"}
+          </Button>
         </div>
       </div>
 
-      {error && <div className="card" style={{ color: "var(--short)", padding: 14, marginBottom: "var(--gap)" }}>{error}</div>}
-      {action.error && <div className="card" style={{ color: "var(--short)", padding: 14, marginBottom: "var(--gap)" }}>{action.error}</div>}
-      {action.message && <div className="card" style={{ color: "var(--long)", padding: 14, marginBottom: "var(--gap)" }}>{action.message}</div>}
+      {/* Banner errori / messaggi */}
+      {error && (
+        <Card className="border-danger/40 bg-danger/5 p-4 text-sm text-danger">{error}</Card>
+      )}
+      {action.error && (
+        <Card className="border-danger/40 bg-danger/5 p-4 text-sm text-danger">{action.error}</Card>
+      )}
+      {action.message && (
+        <Card className="border-success/40 bg-success/5 p-4 text-sm text-success">
+          {action.message}
+        </Card>
+      )}
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
-        <StatusCard title="API" status={snapshot?.api.status ?? "loading"} detail={`${snapshot?.api.latency_ms ?? "-"} ms`} />
-        <StatusCard title="WebSocket" status={ws.status} detail={ws.lastMessageAt ? fmt.relTime(ws.lastMessageAt) : `${ws.messages} msg`} />
-        <StatusCard title="Account" status={snapshot?.account.configured ? (snapshot.account.error ? "error" : "ok") : "missing"} detail={snapshot?.account.address ?? "no address"} />
-        <StatusCard title="Funding" status={snapshot?.funding.status ?? "loading"} detail={`${snapshot?.funding.predicted.length ?? 0} mercati`} />
+      {/* 4 KPI cards principali */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <KpiTile
+          label="Equity"
+          value={fmtUsd(snapshot?.account.effective_account_value ?? snapshot?.account.account_value)}
+          hint={`Withdrawable ${fmtUsd(snapshot?.account.withdrawable)}`}
+        />
+        <KpiTile
+          label="Unrealized PnL"
+          value={fmtUsd(totalUnrealized)}
+          tone={(totalUnrealized ?? 0) >= 0 ? "success" : "danger"}
+          hint={`${tradingSummary.longPositions} long · ${tradingSummary.shortPositions} short`}
+        />
+        <KpiTile
+          label="Margin used"
+          value={fmtUsd(snapshot?.account.total_margin_used)}
+          hint={marginRatio != null ? `Ratio ${marginRatio.toFixed(1)}%` : "—"}
+          progress={marginRatio}
+          progressTone={
+            marginRatio == null
+              ? "muted"
+              : marginRatio > 80
+                ? "danger"
+                : marginRatio > 50
+                  ? "warn"
+                  : "success"
+          }
+        />
+        <KpiTile
+          label="Notional"
+          value={fmtUsd(snapshot?.account.total_notional_position)}
+          hint={`${snapshot?.account.open_orders ?? 0} ordini open`}
+        />
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
-        <div className="card">
-          <div className="card-head">
-            <span className="title">Saldo account</span>
-            <span className={"badge " + statusClass(snapshot?.status ?? "loading")}>{snapshot?.status ?? "loading"}</span>
+      {/* 4 status pill (API, WS, Account, Funding) */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <StatusPill
+          title="API"
+          status={snapshot?.api.status ?? "loading"}
+          detail={`${snapshot?.api.latency_ms ?? "-"} ms`}
+        />
+        <StatusPill
+          title="WebSocket"
+          status={ws.status}
+          detail={ws.lastMessageAt ? fmt.relTime(ws.lastMessageAt) : `${ws.messages} msg`}
+        />
+        <StatusPill
+          title="Account"
+          status={snapshot?.account.configured ? (snapshot.account.error ? "error" : "ok") : "missing"}
+          detail={snapshot?.account.address ?? "no address"}
+        />
+        <StatusPill
+          title="Funding"
+          status={snapshot?.funding.status ?? "loading"}
+          detail={`${snapshot?.funding.predicted.length ?? 0} mercati`}
+        />
+      </div>
+
+      {/* Riga: Saldo dettaglio + Connessioni */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1.1fr_0.9fr]">
+        <Card className="overflow-hidden">
+          <div className="flex items-center justify-between border-b border-border px-6 py-4">
+            <div>
+              <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+                Saldo account dettagliato
+              </div>
+            </div>
+            <Badge
+              variant="outline"
+              className={cn(
+                "font-mono uppercase",
+                snapshot?.status === "ok" || snapshot?.status === "live"
+                  ? "border-success/40 bg-success/10 text-success"
+                  : "border-warn/40 bg-warn/10 text-warn",
+              )}
+            >
+              {snapshot?.status ?? "loading"}
+            </Badge>
           </div>
-          <div className="card-body" style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 16 }}>
+          <div className="grid grid-cols-3 gap-5 p-6">
             <Metric label="Equity" value={fmtUsd(snapshot?.account.effective_account_value ?? snapshot?.account.account_value)} />
             <Metric label="Withdrawable" value={fmtUsd(snapshot?.account.withdrawable)} />
             <Metric label="Margin used" value={fmtUsd(snapshot?.account.total_margin_used)} />
             <Metric label="Notional" value={fmtUsd(snapshot?.account.total_notional_position)} />
-            <Metric label="Unrealized PnL" value={fmtUsd(totalUnrealized)} tone={(totalUnrealized ?? 0) >= 0 ? "long" : "short"} />
+            <Metric
+              label="Unrealized PnL"
+              value={fmtUsd(totalUnrealized)}
+              tone={(totalUnrealized ?? 0) >= 0 ? "long" : "short"}
+            />
             <Metric label="Open orders" value={String(snapshot?.account.open_orders ?? "-")} />
           </div>
           {(snapshot?.api.error || snapshot?.account.error) && (
-            <div style={{ borderTop: "1px solid var(--border)", padding: 14, color: "var(--short)", fontSize: "var(--fz-sm)" }}>
+            <div className="border-t border-border bg-danger/5 px-6 py-3 text-xs text-danger">
               {snapshot.api.error || snapshot.account.error}
             </div>
           )}
-        </div>
+        </Card>
 
-        <div className="card">
-          <div className="card-head">
-            <span className="title">Connessioni</span>
+        <Card className="overflow-hidden">
+          <div className="border-b border-border px-6 py-4">
+            <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+              Connessioni
+            </div>
           </div>
-          <div className="card-body" style={{ display: "grid", gap: 12 }}>
-            <ConnectionRow label="Info API" value={snapshot?.api.info_url ?? "-"} status={snapshot?.api.status ?? "loading"} />
-            <ConnectionRow label="WS API" value={snapshot?.api.ws_url ?? wsUrl(health.network)} status={ws.status} />
-            <ConnectionRow label="Markets" value={`${snapshot?.api.universe_count ?? "-"} universe · ${snapshot?.api.mids_count ?? "-"} mids`} status={snapshot?.api.status ?? "loading"} />
-            {ws.error && <div style={{ color: "var(--short)", fontSize: "var(--fz-sm)" }}>{ws.error}</div>}
+          <div className="space-y-3 p-6">
+            <ConnectionRow
+              label="Info API"
+              value={snapshot?.api.info_url ?? "-"}
+              status={snapshot?.api.status ?? "loading"}
+            />
+            <ConnectionRow
+              label="WS API"
+              value={snapshot?.api.ws_url ?? wsUrl(health.network)}
+              status={ws.status}
+            />
+            <ConnectionRow
+              label="Markets"
+              value={`${snapshot?.api.universe_count ?? "-"} universe · ${snapshot?.api.mids_count ?? "-"} mids`}
+              status={snapshot?.api.status ?? "loading"}
+            />
+            {ws.error && <div className="text-xs text-danger">{ws.error}</div>}
           </div>
-        </div>
+        </Card>
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
@@ -495,49 +612,116 @@ function UnifiedAccountCard({ account }: { account: AccountMonitor["account"] | 
   );
 }
 
-function StatusCard({ title, status, detail }: { title: string; status: string; detail: string }) {
+function statusToDot(status: string): DotStatus {
+  if (status === "ok" || status === "live") return "ok";
+  if (status === "connecting" || status === "loading") return "info";
+  if (status === "missing" || status === "closed" || status === "idle") return "muted";
+  if (status === "error") return "danger";
+  return "warn";
+}
+
+function KpiTile({
+  label,
+  value,
+  hint,
+  tone,
+  progress,
+  progressTone,
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+  tone?: "success" | "danger" | "warn" | "muted";
+  progress?: number | null;
+  progressTone?: "success" | "warn" | "danger" | "muted";
+}) {
   return (
-    <div className="card">
-      <div className="card-body" style={{ display: "grid", gap: 8 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
-          <span className="muted" style={{ fontSize: "var(--fz-xs)", textTransform: "uppercase" }}>{title}</span>
-          <span className={"badge " + statusClass(status)}>{status}</span>
-        </div>
-        <div className="mono" style={{ fontSize: "var(--fz-lg)", overflow: "hidden", textOverflow: "ellipsis" }}>{detail}</div>
+    <Card className="p-5">
+      <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">{label}</div>
+      <div
+        className={cn(
+          "mt-2 font-mono text-2xl font-semibold tabular-nums",
+          tone === "success" && "text-success",
+          tone === "danger" && "text-danger",
+          tone === "warn" && "text-warn",
+          (tone === "muted" || !tone) && "text-fg",
+        )}
+      >
+        {value}
       </div>
-    </div>
+      {hint && <div className="mt-1 text-[11px] text-fg-3">{hint}</div>}
+      {progress != null && (
+        <Progress
+          value={progress}
+          className="mt-3"
+          indicatorClassName={cn(
+            progressTone === "success" && "bg-success",
+            progressTone === "warn" && "bg-warn",
+            progressTone === "danger" && "bg-danger",
+            progressTone === "muted" && "bg-fg-3",
+          )}
+        />
+      )}
+    </Card>
+  );
+}
+
+function StatusPill({ title, status, detail }: { title: string; status: string; detail: string }) {
+  const dot = statusToDot(status);
+  return (
+    <Card className="p-4">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-fg-3">{title}</span>
+        <span className="inline-flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-fg-2">
+          <StatusDot status={dot} size={6} />
+          {status}
+        </span>
+      </div>
+      <div className="mt-2 truncate font-mono text-sm text-fg" title={detail}>
+        {detail}
+      </div>
+    </Card>
   );
 }
 
 function SummaryWidget({ title, value, detail, tone }: { title: string; value: string; detail: string; tone?: string }) {
-  return (
-    <div className="card">
-      <div className="card-body" style={{ display: "grid", gap: 8 }}>
-        <span className="muted" style={{ fontSize: "var(--fz-xs)", textTransform: "uppercase" }}>{title}</span>
-        <span className="mono" style={{ color: tone ? `var(--${tone})` : "var(--fg)", fontSize: "var(--fz-xl)", overflow: "hidden", textOverflow: "ellipsis" }}>
-          {value}
-        </span>
-        <span className="muted" style={{ fontSize: "var(--fz-xs)" }}>{detail}</span>
-      </div>
-    </div>
-  );
+  const mappedTone =
+    tone === "long" ? "success" : tone === "short" ? "danger" : tone === "warn" ? "warn" : undefined;
+  return <KpiTile label={title} value={value} hint={detail} tone={mappedTone} />;
 }
 
 function Metric({ label, value, tone }: { label: string; value: string; tone?: string }) {
   return (
-    <div style={{ display: "grid", gap: 4, minWidth: 0 }}>
-      <span className="muted" style={{ fontSize: 10, textTransform: "uppercase" }}>{label}</span>
-      <span className="mono" style={{ color: tone ? `var(--${tone})` : "var(--fg)", fontSize: "var(--fz-md)", overflow: "hidden", textOverflow: "ellipsis" }}>{value}</span>
+    <div className="min-w-0">
+      <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">{label}</div>
+      <div
+        className={cn(
+          "mt-1 truncate font-mono text-sm tabular-nums",
+          tone === "long" && "text-success",
+          tone === "short" && "text-danger",
+          tone === "warn" && "text-warn",
+          !tone && "text-fg",
+        )}
+        title={value}
+      >
+        {value}
+      </div>
     </div>
   );
 }
 
 function ConnectionRow({ label, value, status }: { label: string; value: string; status: string }) {
+  const dot = statusToDot(status);
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "100px 1fr auto", gap: 10, alignItems: "center" }}>
-      <span className="muted" style={{ fontSize: "var(--fz-xs)" }}>{label}</span>
-      <span className="mono" style={{ fontSize: "var(--fz-xs)", overflow: "hidden", textOverflow: "ellipsis" }}>{value}</span>
-      <span className={"badge " + statusClass(status)}>{status}</span>
+    <div className="grid items-center gap-3" style={{ gridTemplateColumns: "100px 1fr auto" }}>
+      <span className="text-[11px] uppercase tracking-wider text-fg-3">{label}</span>
+      <span className="truncate font-mono text-xs text-fg-2" title={value}>
+        {value}
+      </span>
+      <span className="inline-flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-fg-2">
+        <StatusDot status={dot} size={6} />
+        {status}
+      </span>
     </div>
   );
 }
