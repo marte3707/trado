@@ -811,6 +811,11 @@ class OrderExecutionEngine:
             candle = self._latest_candle_after_open(db, position, timeframe)
             if candle is None:
                 continue
+            pos_metadata = position.metadata_json or {}
+            if pos_metadata.get("tp1_hit") or pos_metadata.get("tp2_hit"):
+                continue
+            if _position_is_in_profit(position, candle):
+                continue
             self.close_position(
                 db,
                 position,
@@ -845,7 +850,13 @@ class OrderExecutionEngine:
             max_age_hours = _max_age_hours(max_age_by_tf, timeframe)
             if max_age_hours is None or not _position_age_exceeded(position, max_age_hours):
                 continue
-            metadata = dict(position.metadata_json or {})
+            pos_metadata = position.metadata_json or {}
+            if pos_metadata.get("tp1_hit") or pos_metadata.get("tp2_hit"):
+                continue
+            candle = self._latest_candle_after_open(db, position, timeframe)
+            if candle is not None and _position_is_in_profit(position, candle):
+                continue
+            metadata = dict(pos_metadata)
             last_alert = _parse_dt(metadata.get("last_time_stop_alert_at"))
             if last_alert is not None and now - last_alert < timedelta(hours=6):
                 continue
@@ -1148,10 +1159,21 @@ class OrderExecutionEngine:
                     break
                 if not self._candle_can_affect_position(position, candle, timeframe):
                     continue
+                candle_key = candle.open_time.isoformat()
+                last_checked = (position.metadata_json or {}).get("last_trigger_checked_candle_open_time")
+                if last_checked is not None and candle_key <= last_checked:
+                    if position.status == "open":
+                        self.position_manager.manage_paper_position_for_candle(
+                            db, market, position, candles, candle
+                        )
+                    continue
                 exit_count, closed_count = self._apply_paper_triggers_for_candle(db, position, candle)
                 exits += exit_count
                 closed += closed_count
                 if position.status == "open":
+                    metadata = dict(position.metadata_json or {})
+                    metadata["last_trigger_checked_candle_open_time"] = candle_key
+                    position.metadata_json = metadata
                     updated = self.position_manager.manage_paper_position_for_candle(
                         db, market, position, candles, candle
                     )
@@ -1390,6 +1412,7 @@ class OrderExecutionEngine:
                 elif reason == "tp2":
                     metadata["tp2_hit"] = True
                     metadata["runner_active"] = True
+                break
 
 
 def _sz_decimals(market: Market) -> int:
@@ -1452,6 +1475,20 @@ def _signal_id_from_position(position: Position) -> int | None:
         return int(source_signal_id)
     except (TypeError, ValueError):
         return None
+
+
+def _position_is_in_profit(position: Position, candle: "Candle") -> bool:
+    try:
+        entry = float(position.entry_price)
+        current = float(candle.close)
+    except (TypeError, ValueError):
+        return False
+    side = str(position.side or "").lower()
+    if side == "long":
+        return current > entry
+    if side == "short":
+        return current < entry
+    return False
 
 
 def _max_age_hours(max_age_by_tf: dict[str, Any], timeframe: str) -> float | None:

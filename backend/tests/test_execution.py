@@ -450,7 +450,7 @@ def test_take_profit_plan_can_fill_all_targets_in_one_candle() -> None:
     assert [order.size for order in exit_orders] == [Decimal("5.00"), Decimal("3.00"), Decimal("2.00")]
 
 
-def test_time_stop_closes_stale_paper_position_at_latest_candle_close() -> None:
+def test_time_stop_closes_stale_unprofitable_paper_position_at_latest_candle_close() -> None:
     engine = OrderExecutionEngine(Settings())
     opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
     candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
@@ -470,9 +470,9 @@ def test_time_stop_closes_stale_paper_position_at_latest_candle_close() -> None:
         timeframe="5m",
         open_time=candle_open,
         open=Decimal("100"),
-        high=Decimal("103"),
-        low=Decimal("99"),
-        close=Decimal("102"),
+        high=Decimal("101"),
+        low=Decimal("97"),
+        close=Decimal("98"),  # losing long — qualifies for time-stop
         volume=Decimal("1"),
     )
     db = FakeTimeStopDb(
@@ -493,10 +493,231 @@ def test_time_stop_closes_stale_paper_position_at_latest_candle_close() -> None:
     assert result == {"paper_closed": 1, "live_alerted": 0}
     assert position.status == "closed"
     assert position.closed_at == candle_open + timedelta(minutes=5)
-    assert position.realized_pnl == Decimal("2")
+    assert position.realized_pnl == Decimal("-2")
     assert position.metadata_json["exit_reason"] == "time_stop"
     assert any(
         isinstance(row, DecisionLog) and row.event_type == "paper_position_time_stop_closed"
+        for row in db.added
+    )
+
+
+def test_time_stop_skips_profitable_paper_position() -> None:
+    engine = OrderExecutionEngine(Settings())
+    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
+    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    position = Position(
+        id=20,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=opened_at,
+        metadata_json={"source_timeframe": "5m", "initial_size": "1"},
+    )
+    candle = Candle(
+        market_id=1,
+        timeframe="5m",
+        open_time=candle_open,
+        open=Decimal("100"),
+        high=Decimal("105"),
+        low=Decimal("100"),
+        close=Decimal("104"),  # profitable long — time-stop must be skipped
+        volume=Decimal("1"),
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        candles=[candle],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": True,
+                "liveMode": "off",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "live_alerted": 0}
+    assert position.status == "open"
+
+
+def test_time_stop_skips_paper_position_with_tp1_hit() -> None:
+    engine = OrderExecutionEngine(Settings())
+    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
+    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    position = Position(
+        id=21,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=opened_at,
+        metadata_json={"source_timeframe": "5m", "initial_size": "1", "tp1_hit": True},
+    )
+    candle = Candle(
+        market_id=1,
+        timeframe="5m",
+        open_time=candle_open,
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("97"),
+        close=Decimal("98"),  # currently losing, but TP1 was already taken
+        volume=Decimal("1"),
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        candles=[candle],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": True,
+                "liveMode": "off",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "live_alerted": 0}
+    assert position.status == "open"
+
+
+def test_time_stop_skips_paper_position_with_tp2_hit() -> None:
+    engine = OrderExecutionEngine(Settings())
+    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
+    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    position = Position(
+        id=22,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=opened_at,
+        metadata_json={
+            "source_timeframe": "5m",
+            "initial_size": "1",
+            "tp1_hit": True,
+            "tp2_hit": True,
+            "runner_active": True,
+        },
+    )
+    candle = Candle(
+        market_id=1,
+        timeframe="5m",
+        open_time=candle_open,
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("97"),
+        close=Decimal("97"),
+        volume=Decimal("1"),
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        candles=[candle],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": True,
+                "liveMode": "off",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "live_alerted": 0}
+    assert position.status == "open"
+
+
+def test_time_stop_skips_live_alert_when_tp1_hit() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=23,
+        market_id=1,
+        mode="live",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=datetime.now(timezone.utc) - timedelta(hours=9),
+        metadata_json={"source_timeframe": "5m", "tp1_hit": True},
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": False,
+                "liveMode": "alert",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "live_alerted": 0}
+    assert "last_time_stop_alert_at" not in (position.metadata_json or {})
+    assert not any(
+        isinstance(row, DecisionLog) and row.event_type == "live_position_time_stop_alert"
+        for row in db.added
+    )
+
+
+def test_time_stop_skips_live_alert_when_profitable() -> None:
+    engine = OrderExecutionEngine(Settings())
+    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
+    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    position = Position(
+        id=24,
+        market_id=1,
+        mode="live",
+        side="short",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=opened_at,
+        metadata_json={"source_timeframe": "5m"},
+    )
+    candle = Candle(
+        market_id=1,
+        timeframe="5m",
+        open_time=candle_open,
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("95"),
+        close=Decimal("96"),  # profitable short — alert must be skipped
+        volume=Decimal("1"),
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        candles=[candle],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": False,
+                "liveMode": "alert",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "live_alerted": 0}
+    assert "last_time_stop_alert_at" not in (position.metadata_json or {})
+    assert not any(
+        isinstance(row, DecisionLog) and row.event_type == "live_position_time_stop_alert"
         for row in db.added
     )
 

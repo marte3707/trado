@@ -396,6 +396,14 @@ class HyperliquidTradingClient:
             raise HyperliquidError("Hyperliquid cancel returned an invalid response")
         if response.get("status") == "err":
             raise HyperliquidError(str(response))
+        # HL returns status "ok" even when individual cancels fail — check inner statuses
+        try:
+            statuses = response["response"]["data"]["statuses"]
+            for status in statuses:
+                if isinstance(status, dict) and "error" in status:
+                    raise HyperliquidError(f"Cancel order {oid} failed: {status['error']}")
+        except (KeyError, TypeError):
+            pass
         return response
 
     def _account_address(self) -> str:

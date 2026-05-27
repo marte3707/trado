@@ -12,12 +12,12 @@ DEFAULT_POSITION_MANAGEMENT_SETTINGS: dict[str, Any] = {
         "paperEnabled": True,
         "liveMode": "alert",
         "maxAgeHoursByTimeframe": {
-            "5m": 8,
-            "15m": 16,
-            "30m": 24,
-            "1h": 48,
-            "4h": 96,
-            "1d": 168,
+            "5m": 12,
+            "15m": 24,
+            "30m": 48,
+            "1h": 96,
+            "4h": 192,
+            "1d": 336,
         },
     },
     "trailingStop": {

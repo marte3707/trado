@@ -263,6 +263,7 @@ class TelegramNotifier:
         candle_errors = stats.get("candle_errors", 0)
         cycle_failures = stats.get("cycle_failures", 0)
         period_min = stats.get("period_minutes", 60)
+        live_balance = stats.get("live_balance", "n/d")
 
         defensive_line = "\n⚠️ <b>Modalità difensiva attiva</b>" if defensive else ""
         positions_block = (
@@ -278,6 +279,7 @@ class TelegramNotifier:
             f"📈 Segnali generati: {signals}\n"
             f"⚠️ Errori candle sync: {candle_errors}"
             f"{positions_block}\n\n"
+            f"Saldo live: {live_balance} $ \n"
             f"⚙️ Modalità: <b>{mode}</b> · Score min: <b>{score}</b>"
             f"{defensive_line}"
         )

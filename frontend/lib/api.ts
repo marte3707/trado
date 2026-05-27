@@ -572,8 +572,13 @@ async function readErrorDetail(response: Response): Promise<string> {
   }
 }
 
+const API_TIMEOUT_MS = 15_000;
+
 export async function apiGet<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
+  const response = await fetch(`${API_BASE}${path}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+  });
   if (!response.ok) {
     throw new ApiError(path, response.status, await readErrorDetail(response));
   }
@@ -581,7 +586,7 @@ export async function apiGet<T>(path: string): Promise<T> {
 }
 
 export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
-  const init: RequestInit = { method: "POST" };
+  const init: RequestInit = { method: "POST", signal: AbortSignal.timeout(API_TIMEOUT_MS) };
   if (body !== undefined) {
     init.headers = { "Content-Type": "application/json" };
     init.body = JSON.stringify(body);
@@ -594,7 +599,7 @@ export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
 }
 
 export async function apiPut<T>(path: string, body?: unknown): Promise<T> {
-  const init: RequestInit = { method: "PUT" };
+  const init: RequestInit = { method: "PUT", signal: AbortSignal.timeout(API_TIMEOUT_MS) };
   if (body !== undefined) {
     init.headers = { "Content-Type": "application/json" };
     init.body = JSON.stringify(body);
@@ -607,7 +612,10 @@ export async function apiPut<T>(path: string, body?: unknown): Promise<T> {
 }
 
 export async function apiDelete<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, { method: "DELETE" });
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: "DELETE",
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
+  });
   if (!response.ok) {
     throw new ApiError(path, response.status, await readErrorDetail(response));
   }
@@ -619,6 +627,7 @@ export async function apiPatch<T>(path: string, body: unknown): Promise<T> {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(API_TIMEOUT_MS),
   });
   if (!response.ok) {
     throw new ApiError(path, response.status, await readErrorDetail(response));

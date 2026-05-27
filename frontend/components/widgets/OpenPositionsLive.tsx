@@ -36,6 +36,24 @@ function unrealized(position: Position): number | null {
   return (mark - entry) * Math.abs(size) * (position.side.toLowerCase() === "short" ? -1 : 1);
 }
 
+function timeInTrade(openedAt: string): string {
+  const ms = Date.now() - new Date(openedAt).getTime();
+  const mins = Math.floor(ms / 60_000);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ${mins % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}g ${hours % 24}h`;
+}
+
+function pctFromEntry(position: Position): number | null {
+  const entry = asNumber(position.entry_price);
+  const mark = asNumber(position.metadata_json?.last_mark_price);
+  if (entry == null || mark == null || entry === 0) return null;
+  const pct = ((mark - entry) / entry) * 100;
+  return position.side.toLowerCase() === "short" ? -pct : pct;
+}
+
 export function OpenPositionsLive({
   positions,
   className,
@@ -83,36 +101,62 @@ export function OpenPositionsLive({
               const sideLong = p.side.toLowerCase() === "long";
               const isLive = p.mode.toLowerCase() === "live";
               const tone = pnl == null ? "muted" : pnl >= 0 ? "up" : "down";
+              const ageStr = timeInTrade(p.opened_at);
+              const pct = pctFromEntry(p);
               return (
                 <li key={p.id}>
                   <button
-                    className="group flex w-full items-center gap-2.5 px-6 py-3 text-left transition-colors hover:bg-bg-2"
+                    className="group flex w-full items-start gap-2.5 px-6 py-3 text-left transition-colors hover:bg-bg-2"
                     onClick={() => onOpen?.(p)}
                   >
-                    <span
-                      className={cn(
-                        "inline-flex h-5 items-center rounded-md border px-1.5 font-mono text-[10px]",
-                        sideLong
-                          ? "border-success/30 bg-success/10 text-success"
-                          : "border-danger/30 bg-danger/10 text-danger",
-                      )}
-                    >
-                      {sideLong ? "LONG" : "SHORT"}
-                    </span>
-                    <span className="font-mono text-sm font-medium tabular-nums text-fg">
-                      {p.market?.symbol ?? "—"}
-                    </span>
-                    <span
-                      className={cn(
-                        "inline-flex h-5 items-center rounded-md border px-1.5 font-mono text-[10px] uppercase",
-                        isLive
-                          ? "border-danger/30 bg-danger/10 text-danger"
-                          : "border-warn/30 bg-warn/10 text-warn",
-                      )}
-                    >
-                      {p.mode}
-                    </span>
-                    <span className="ml-auto flex items-center gap-2">
+                    <div className="flex flex-col gap-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={cn(
+                            "inline-flex h-5 items-center rounded-md border px-1.5 font-mono text-[10px]",
+                            sideLong
+                              ? "border-success/30 bg-success/10 text-success"
+                              : "border-danger/30 bg-danger/10 text-danger",
+                          )}
+                        >
+                          {sideLong ? "LONG" : "SHORT"}
+                        </span>
+                        <span className="font-mono text-sm font-medium tabular-nums text-fg">
+                          {p.market?.symbol ?? "—"}
+                        </span>
+                        <span
+                          className={cn(
+                            "inline-flex h-5 items-center rounded-md border px-1.5 font-mono text-[10px] uppercase",
+                            isLive
+                              ? "border-danger/30 bg-danger/10 text-danger"
+                              : "border-warn/30 bg-warn/10 text-warn",
+                          )}
+                        >
+                          {p.mode}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 text-[10px] text-fg-3">
+                        <span title="Tempo in trade">{ageStr}</span>
+                        {pct != null && (
+                          <>
+                            <span className="text-fg-4">·</span>
+                            <span
+                              className={pct >= 0 ? "text-success" : "text-danger"}
+                              title="Variazione % dall'entry"
+                            >
+                              {pct >= 0 ? "+" : ""}{pct.toFixed(2)}%
+                            </span>
+                          </>
+                        )}
+                        {p.stop_loss && (
+                          <>
+                            <span className="text-fg-4">·</span>
+                            <span className="text-fg-3" title="Stop loss">SL {p.stop_loss}</span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    <span className="ml-auto flex items-center gap-2 pt-0.5 shrink-0">
                       <span
                         className={cn(
                           "font-mono text-sm tabular-nums",

@@ -168,6 +168,89 @@ def _protect_stop_at_breakeven_after_tp1(
     )
 
 
+def _needs_tp2_lock_profit_stop(position: Position) -> bool:
+    metadata = position.metadata_json or {}
+    if not metadata.get("tp2_hit"):
+        return False
+    risk = _initial_risk_per_unit(position)
+    if risk is None or risk <= 0:
+        return False
+    entry = position.entry_price
+    if entry is None or entry <= 0:
+        return False
+    config = metadata.get("position_management_config") or {}
+    trailing = config.get("trailingStop") or {} if isinstance(config, dict) else {}
+    lock_r = _decimal(trailing.get("lockProfitStopR")) or Decimal("1")
+    side = position.side.lower()
+    lock_price = entry + risk * lock_r if side == "long" else entry - risk * lock_r
+    stop = position.stop_loss
+    if side == "long":
+        return stop is None or stop < lock_price
+    if side == "short":
+        return stop is None or stop > lock_price
+    return False
+
+
+def _reference_price_for_tp2_lock_profit(
+    position: Position,
+    remote_position: dict,
+    fill_match: _ExitFillMatch,
+) -> Decimal | None:
+    mark_px = _decimal(remote_position.get("markPx"))
+    if mark_px is not None and mark_px > 0:
+        return mark_px
+    if fill_match.last_exit_reason == "tp2":
+        return fill_match.last_exit_price
+    last_mark = _decimal((position.metadata_json or {}).get("last_mark_price"))
+    return last_mark if last_mark is not None and last_mark > 0 else None
+
+
+def _protect_stop_lock_profit_after_tp2(
+    db: Session,
+    position: Position,
+    market: Market,
+    remote_position: dict,
+    fill_match: _ExitFillMatch,
+    trading: HyperliquidTradingClient,
+) -> bool:
+    if not _needs_tp2_lock_profit_stop(position):
+        return False
+    risk = _initial_risk_per_unit(position)
+    if risk is None:
+        return False
+    metadata = position.metadata_json or {}
+    config = metadata.get("position_management_config") or {}
+    trailing = config.get("trailingStop") or {} if isinstance(config, dict) else {}
+    lock_r = _decimal(trailing.get("lockProfitStopR")) or Decimal("1")
+    entry = position.entry_price
+    side = position.side.lower()
+    lock_price = entry + risk * lock_r if side == "long" else entry - risk * lock_r
+    reference_price = _reference_price_for_tp2_lock_profit(position, remote_position, fill_match)
+    if reference_price is not None:
+        if side == "long" and reference_price <= lock_price:
+            return False
+        if side == "short" and reference_price >= lock_price:
+            return False
+    candidate = StopCandidate(
+        price=lock_price,
+        reason="lock_profit_after_tp2",
+        indicators={
+            "current_price": str(reference_price) if reference_price is not None else None,
+            "lock_profit_stop_r": str(lock_r),
+            "source": "live_reconciliation",
+            "trigger": fill_match.last_exit_reason or "tp2_hit_metadata",
+        },
+        r_multiple=_position_r_multiple(position, reference_price or lock_price),
+    )
+    return PositionManagementEngine(get_settings()).replace_live_stop_order(
+        db,
+        market,
+        position,
+        candidate,
+        trading_client=trading,
+    )
+
+
 def _index_fills(fills: list[dict]) -> tuple[dict[str, list[dict]], dict[int, list[dict]]]:
     by_cloid: dict[str, list[dict]] = {}
     by_oid: dict[int, list[dict]] = {}
@@ -1225,6 +1308,14 @@ def reconcile_live_positions(
         metadata["last_remote_position"] = remote
         position.metadata_json = metadata
         _protect_stop_at_breakeven_after_tp1(
+            db,
+            position,
+            position.market,
+            remote,
+            fill_match,
+            trading,
+        )
+        _protect_stop_lock_profit_after_tp2(
             db,
             position,
             position.market,

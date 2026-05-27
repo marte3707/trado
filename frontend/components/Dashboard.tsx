@@ -1312,11 +1312,14 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
                         className={ICON_BTN_RED}
                         title="Esegui live"
                         disabled={!health.live_trading_allowed || killSwitchEnabled || sig.status !== "new"}
-                        onClick={() =>
+                        onClick={() => {
+                          const symbol = sig.market?.symbol ?? `#${sig.id}`;
+                          const dir = sig.direction.toUpperCase();
+                          if (!window.confirm(`Eseguire segnale LIVE ${dir} ${symbol}?\nQuesta operazione invierà un ordine reale su Hyperliquid.`)) return;
                           runAction(`live-${sig.id}`, () =>
                             apiPost(`/api/signals/${sig.id}/execute-live`).then(() => undefined)
-                          )
-                        }
+                          );
+                        }}
                       >
                         <Shield size={13} />
                       </button>
@@ -1413,11 +1416,16 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
                             className={`${ICON_BTN} w-7 h-7`}
                             title="Chiudi posizione"
                             disabled={pos.status !== "open"}
-                            onClick={() =>
+                            onClick={() => {
+                              const label = marketLabel(pos.market);
+                              const side = pos.side.toUpperCase();
+                              const pnl = asNumber(pos.unrealized_pnl ?? pos.realized_pnl);
+                              const pnlStr = pnl !== null ? ` (P/L: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} $)` : "";
+                              if (!window.confirm(`Chiudere ${side} ${label}${pnlStr}?\nVerrà inviato un ordine di chiusura a mercato.`)) return;
                               runAction(`close-${pos.id}`, () =>
                                 apiPost(`/api/positions/${pos.id}/close`).then(() => undefined)
-                              )
-                            }
+                              );
+                            }}
                           >
                             <Square size={12} />
                           </button>

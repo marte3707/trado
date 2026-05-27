@@ -110,6 +110,8 @@ class RiskManager:
             tp2 = min(tp2, entry - risk * risk_reward_floor)
             if tp2 >= tp1:
                 tp2 = entry - risk * max(risk_reward_floor, 2.0)
+            if tp2 >= tp1:
+                return None
             if tp2 <= 0:
                 return None
             if tp3 is not None and (tp3 >= tp2 or tp3 <= 0):
