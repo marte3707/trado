@@ -379,6 +379,41 @@ export function HistoryScreen({ positions, orders }: Props) {
   const sideShortSt = statsFor(visibleShort);
 
 
+  function handleExportCsv() {
+    const header = ["Data apertura","Data chiusura","Mode","Symbol","Side","Timeframe","Size iniziale","Entry","Exit","Return %","P&L $","R-multiple","Status"];
+    const csvRows = rows.map(p => {
+      const exitOrders = exitOrdersFor(p, orders);
+      const exitPrice = latestExitPrice(p, exitOrders);
+      const pnl = realizedPnl(p, exitOrders);
+      const pct = positionReturnPct(p, exitOrders);
+      const r = positionRMultiple(p, exitOrders);
+      const tf = typeof p.metadata_json?.source_timeframe === "string" ? p.metadata_json.source_timeframe : "";
+      return [
+        p.opened_at ? new Date(p.opened_at).toISOString() : "",
+        p.closed_at ? new Date(p.closed_at).toISOString() : "",
+        p.mode,
+        p.market?.symbol ?? "",
+        p.side,
+        tf,
+        displaySize(p),
+        p.entry_price ?? "",
+        exitPrice ?? "",
+        pct != null ? pct.toFixed(2) : "",
+        pnl != null ? pnl.toFixed(4) : "",
+        r != null ? r.toFixed(2) : "",
+        positionStatusLabel(p, exitOrders),
+      ];
+    });
+    const content = [header, ...csvRows].map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob(["﻿" + content], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `trado_history_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   function changeModeFilter(next: ModeFilter) {
     setModeFilter(next);
     setHistoryPage(1);
@@ -420,7 +455,7 @@ export function HistoryScreen({ positions, orders }: Props) {
         </div>
         <div className="page-actions">
           <Seg value={periodFilter} onChange={changePeriodFilter} options={[["1d","1d"],["7d","7d"],["30d","30d"],["all","All"]]} />
-          <button className="btn ghost"><Icon name="dl" size={12} /> Export</button>
+          <button className="btn ghost" onClick={handleExportCsv} title="Esporta come CSV"><Icon name="dl" size={12} /> Export CSV</button>
         </div>
       </div>
 

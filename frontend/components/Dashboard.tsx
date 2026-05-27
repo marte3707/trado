@@ -28,7 +28,7 @@ import {
   XCircle
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChartPanel } from "@/components/ChartPanel";
+import { ChartPanel, ChartOverlays } from "@/components/ChartPanel";
 import {
   AppSettings,
   AutoTunerStatus,
@@ -553,6 +553,10 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [chartSearch, setChartSearch] = useState("");
+  const [chartOverlays, setChartOverlays] = useState<ChartOverlays>({
+    ema: false, bollinger: false, vwap: false, supertrend: false,
+    levels: false, fibonacci: false, signals: true, rsi: false, macd: false, candlestick_patterns: false,
+  });
   const [signalSearch, setSignalSearch] = useState("");
   const [signalSort, setSignalSort] = useState<SignalSort>(null);
   const [activeView, setActiveView] = useState<DashboardView>("overview");
@@ -1080,24 +1084,28 @@ export function Dashboard({ initialData }: { initialData: DashboardData }) {
             </select>
           </div>
         </div>
+        <div className="flex items-center gap-1 px-5 py-2 border-b border-divider flex-wrap">
+          {(["signals","ema","bollinger","vwap","supertrend","rsi","macd"] as (keyof ChartOverlays)[]).map((key) => (
+            <button
+              key={key}
+              onClick={() => setChartOverlays(o => ({ ...o, [key]: !o[key] }))}
+              className={`px-2 py-0.5 rounded text-[10px] font-medium uppercase tracking-wide border transition-colors ${
+                chartOverlays[key]
+                  ? "bg-accent/20 border-accent/50 text-accent"
+                  : "bg-transparent border-divider text-muted hover:border-muted/50"
+              }`}
+            >
+              {key === "candlestick_patterns" ? "patterns" : key}
+            </button>
+          ))}
+        </div>
         <ChartPanel
           candles={candles}
           signals={chartSignals}
           market={chartMarket}
           timeframe={chartTimeframe}
           network={health.network}
-          overlays={{
-            ema: false,
-            bollinger: false,
-            vwap: false,
-            supertrend: false,
-            levels: false,
-            fibonacci: false,
-            signals: false,
-            rsi: false,
-            macd: false,
-            candlestick_patterns: false
-          }}
+          overlays={chartOverlays}
         />
       </section>
 

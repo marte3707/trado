@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, ChevronsUpDown, RefreshCw, Search } from "lucide-react";
+import { ArrowDown, ArrowUp, ChevronsUpDown, Download, RefreshCw, Search } from "lucide-react";
 
 import {
   DirBadge,
@@ -149,6 +149,32 @@ export function SignalsScreen({
     }
   };
 
+  function handleExportCsv() {
+    const header = ["Data","Symbol","Timeframe","Direzione","Score","Status","Entry","SL","TP1","TP2","TP3","R/R"];
+    const csvRows = sorted.map(s => [
+      new Date(s.created_at).toISOString(),
+      s.market?.symbol ?? "",
+      s.timeframe,
+      s.direction,
+      s.score,
+      s.status,
+      s.entry_price ?? "",
+      s.stop_loss ?? "",
+      s.take_profit_1 ?? "",
+      s.take_profit_2 ?? "",
+      s.take_profit_3 ?? "",
+      s.risk_reward ?? "",
+    ]);
+    const content = [header, ...csvRows].map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob(["﻿" + content], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `trado_signals_${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   return (
     <div className="space-y-4 p-6">
       {/* Header */}
@@ -159,10 +185,16 @@ export function SignalsScreen({
             {sorted.length} di {signals.length} segnali · soglia globale ≥ {threshold}
           </p>
         </div>
-        <Button variant="outline" size="sm" onClick={onRefresh}>
-          <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
-          Aggiorna
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" onClick={handleExportCsv} title="Esporta segnali filtrati come CSV">
+            <Download className="mr-1.5 h-3.5 w-3.5" />
+            Export CSV
+          </Button>
+          <Button variant="outline" size="sm" onClick={onRefresh}>
+            <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+            Aggiorna
+          </Button>
+        </div>
       </div>
 
       {/* Filtri */}
