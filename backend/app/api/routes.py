@@ -1664,7 +1664,23 @@ def patch_missing_exit_data(db: Session = Depends(get_db)) -> dict:
 
 
 @router.get("/logs")
-def logs(db: Session = Depends(get_db)) -> list[dict]:
+def logs(
+    db: Session = Depends(get_db),
+    signal_id: int | None = Query(None),
+    position_id: int | None = Query(None),
+    market_id: int | None = Query(None),
+    event_type: str | None = Query(None),
+    limit: int = Query(250, ge=1, le=1000),
+) -> list[dict]:
+    q = db.query(DecisionLog)
+    if signal_id is not None:
+        q = q.filter(DecisionLog.signal_id == signal_id)
+    if position_id is not None:
+        q = q.filter(DecisionLog.position_id == position_id)
+    if market_id is not None:
+        q = q.filter(DecisionLog.market_id == market_id)
+    if event_type is not None:
+        q = q.filter(DecisionLog.event_type == event_type)
     return [
         {
             "id": row.id,
@@ -1676,7 +1692,7 @@ def logs(db: Session = Depends(get_db)) -> list[dict]:
             "message": row.message,
             "data": row.data,
         }
-        for row in db.query(DecisionLog).order_by(DecisionLog.timestamp.desc()).limit(250).all()
+        for row in q.order_by(DecisionLog.timestamp.desc()).limit(limit).all()
     ]
 
 

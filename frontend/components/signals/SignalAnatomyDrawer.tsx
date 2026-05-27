@@ -21,6 +21,7 @@ import {
   useIgnoreSignal,
   useReopenSignal,
 } from "@/lib/hooks/mutations";
+import { useDecisionLogsFiltered } from "@/lib/hooks/queries";
 import { cn } from "@/lib/utils";
 import type { Position, Signal } from "@/lib/api";
 
@@ -44,6 +45,10 @@ export function SignalAnatomyDrawer({ signal, positions, onClose, onOpenChart }:
   const ignore = useIgnoreSignal();
   const reopen = useReopenSignal();
   const remove = useDeleteSignal();
+  const { data: signalLogs = [] } = useDecisionLogsFiltered(
+    { signal_id: signal?.id, limit: 20 },
+    { enabled: signal !== null },
+  );
 
   if (!signal) return null;
 
@@ -134,6 +139,29 @@ export function SignalAnatomyDrawer({ signal, positions, onClose, onOpenChart }:
                 />
               </div>
             </Section>
+
+            {/* Decision log */}
+            {signalLogs.length > 0 && (
+              <Section title={`Decision log (${signalLogs.length})`}>
+                <ul className="space-y-1.5">
+                  {signalLogs.map((log) => (
+                    <li key={log.id} className="rounded-md border border-border bg-bg-2 px-3 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-mono text-[10px] uppercase tracking-wide text-fg-3">
+                          {log.event_type.replace(/_/g, " ")}
+                        </span>
+                        <span className="font-mono text-[10px] text-fg-4">
+                          {fmt.relTime(log.timestamp)}
+                        </span>
+                      </div>
+                      {log.message && (
+                        <div className="mt-1 text-xs leading-relaxed text-fg-2">{log.message}</div>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </Section>
+            )}
 
             {/* Linked position */}
             {linkedPosition && (

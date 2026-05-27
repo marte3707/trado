@@ -1,6 +1,7 @@
 "use client";
 
-import { Activity, Globe, Lock, Unlock, Wifi, WifiOff } from "lucide-react";
+import { Activity, Globe, Lock, RefreshCw, Unlock, Wifi, WifiOff } from "lucide-react";
+import { useEffect, useState } from "react";
 
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Separator } from "@/components/ui/separator";
@@ -26,8 +27,22 @@ function formatRel(seconds: number | null | undefined): string {
   return `${Math.round(seconds / 3600)}h fa`;
 }
 
+function useRelTime(ts: number): string {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => tick((n) => n + 1), 10_000);
+    return () => clearInterval(id);
+  }, []);
+  const secs = Math.round((Date.now() - ts) / 1000);
+  if (secs < 10) return "ora";
+  if (secs < 60) return `${secs}s fa`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m fa`;
+  return `${Math.floor(secs / 3600)}h fa`;
+}
+
 export function TopbarStatus({ wsLive }: { wsLive: boolean }) {
-  const { data: health } = useHealth();
+  const { data: health, dataUpdatedAt } = useHealth();
+  const syncLabel = useRelTime(dataUpdatedAt || Date.now());
 
   const worker = workerStatus(health?.worker?.seconds_since_last_run);
   const liveAllowed = Boolean(health?.live_trading_allowed);
@@ -53,6 +68,9 @@ export function TopbarStatus({ wsLive }: { wsLive: boolean }) {
               ) : (
                 <Lock className="h-3.5 w-3.5 text-fg-3" />
               )}
+              <Separator orientation="vertical" className="h-3.5" />
+              <RefreshCw className="h-3 w-3 text-fg-4" />
+              <span className="font-mono text-[10px] text-fg-3">{syncLabel}</span>
             </button>
           </PopoverTrigger>
         </TooltipTrigger>

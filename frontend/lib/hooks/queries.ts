@@ -108,6 +108,30 @@ export function useDecisionLogs(opts?: QueryOpts<DecisionLog[]>) {
   });
 }
 
+export interface DecisionLogFilters {
+  signal_id?: number;
+  position_id?: number;
+  market_id?: number;
+  event_type?: string;
+  limit?: number;
+}
+
+export function useDecisionLogsFiltered(filters: DecisionLogFilters, opts?: QueryOpts<DecisionLog[]>) {
+  const params = new URLSearchParams();
+  if (filters.signal_id != null) params.set("signal_id", String(filters.signal_id));
+  if (filters.position_id != null) params.set("position_id", String(filters.position_id));
+  if (filters.market_id != null) params.set("market_id", String(filters.market_id));
+  if (filters.event_type) params.set("event_type", filters.event_type);
+  if (filters.limit != null) params.set("limit", String(filters.limit));
+  const qs = params.toString();
+  return useQuery({
+    queryKey: ["logs-filtered", qs],
+    queryFn: () => apiGet<DecisionLog[]>(`/api/logs${qs ? `?${qs}` : ""}`),
+    refetchInterval: 30_000,
+    ...opts,
+  });
+}
+
 export function useCalibration(opts?: QueryOpts<Calibration>) {
   return useQuery({
     queryKey: qk.calibration,

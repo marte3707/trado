@@ -1,6 +1,6 @@
 "use client";
 
-import { Search } from "lucide-react";
+import { HelpCircle, Search } from "lucide-react";
 
 import { ROUTE_MAP, type Route } from "@/components/shell/routes";
 import { ModeBadge, type TradingMode } from "@/components/shell/ModeBadge";
@@ -8,15 +8,17 @@ import { TopbarStatus } from "@/components/shell/TopbarStatus";
 import { KillSwitchButton } from "@/components/shell/KillSwitchButton";
 import { ThresholdMenu } from "@/components/shell/ThresholdMenu";
 import { Separator } from "@/components/ui/separator";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 export interface TopbarProps {
   route: Route;
   mode: TradingMode;
   wsLive: boolean;
   onOpenSearch: () => void;
+  onOpenHelp: () => void;
 }
 
-export function Topbar({ route, mode, wsLive, onOpenSearch }: TopbarProps) {
+export function Topbar({ route, mode, wsLive, onOpenSearch, onOpenHelp }: TopbarProps) {
   const meta = ROUTE_MAP[route];
 
   return (
@@ -37,7 +39,7 @@ export function Topbar({ route, mode, wsLive, onOpenSearch }: TopbarProps) {
       {/* Global search */}
       <button
         onClick={onOpenSearch}
-        className="ml-6 inline-flex h-8 min-w-[260px] items-center gap-2 rounded-md border border-border bg-bg-1 px-3 text-sm text-fg-3 transition-colors hover:bg-bg-2 hover:text-fg-2"
+        className="ml-6 inline-flex h-8 min-w-65 items-center gap-2 rounded-md border border-border bg-bg-1 px-3 text-sm text-fg-3 transition-colors hover:bg-bg-2 hover:text-fg-2"
         aria-label="Apri command menu"
       >
         <Search className="h-3.5 w-3.5" />
@@ -55,6 +57,18 @@ export function Topbar({ route, mode, wsLive, onOpenSearch }: TopbarProps) {
       <TopbarStatus wsLive={wsLive} />
       <ModeBadge mode={mode} />
       <KillSwitchButton />
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            onClick={onOpenHelp}
+            className="grid h-8 w-8 place-items-center rounded-md border border-border bg-bg-1 text-fg-3 transition-colors hover:bg-bg-2 hover:text-fg-2"
+            aria-label="Scorciatoie da tastiera"
+          >
+            <HelpCircle className="h-3.5 w-3.5" />
+          </button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Scorciatoie (⇧?)</TooltipContent>
+      </Tooltip>
     </header>
   );
 }

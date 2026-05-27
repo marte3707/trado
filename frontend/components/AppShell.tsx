@@ -18,6 +18,7 @@ import { StrategyAnalysisScreen } from "@/components/screens/StrategyAnalysisScr
 import { Sidebar } from "@/components/shell/Sidebar";
 import { Topbar } from "@/components/shell/Topbar";
 import { CommandMenu } from "@/components/shell/CommandMenu";
+import { HelpModal } from "@/components/shell/HelpModal";
 import type { Route } from "@/components/shell/routes";
 import type { TradingMode } from "@/components/shell/ModeBadge";
 import { buildNavBindings, useChordHotkey } from "@/lib/hotkeys";
@@ -181,6 +182,19 @@ export function AppShell({ initialData }: AppShellProps) {
     setSearchOpen(false);
   }, [searchOpen]);
 
+  /* ── help modal (?) ── */
+  const [helpOpen, setHelpOpen] = useState(false);
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (e.key !== "?" || e.metaKey || e.ctrlKey || e.altKey) return;
+      const t = e.target;
+      if (t instanceof HTMLElement && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      setHelpOpen((v) => !v);
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   return (
     <div
       className="grid h-screen overflow-hidden"
@@ -204,6 +218,7 @@ export function AppShell({ initialData }: AppShellProps) {
         mode={mode}
         wsLive={wsLive}
         onOpenSearch={() => setSearchOpen(true)}
+        onOpenHelp={() => setHelpOpen(true)}
       />
 
       <main className="main overflow-auto bg-bg" style={{ gridArea: "main" }}>
@@ -305,6 +320,7 @@ export function AppShell({ initialData }: AppShellProps) {
       </main>
 
       <CommandMenu setRoute={setRoute} onOpenMarket={openMarket} />
+      <HelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
   );
 }
