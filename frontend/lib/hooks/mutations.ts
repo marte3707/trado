@@ -192,6 +192,20 @@ export function useAutoTuner() {
   });
 }
 
+export function useStartSourceTest() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (source: string) =>
+      apiPost<unknown>(`/api/auto-tuner/source-tests/${source}/start`),
+    onSuccess: (_, source) => {
+      toast.success(`A/B test "${source}" avviato`);
+      qc.invalidateQueries({ queryKey: qk.tunerStatus });
+      qc.invalidateQueries({ queryKey: qk.tunerSourceTests });
+    },
+    onError: (err) => toast.error(`Avvio test fallito: ${errorMessage(err)}`),
+  });
+}
+
 /* ── System services ─────────────────────────────────────────────────── */
 
 export function useServiceAction() {

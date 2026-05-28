@@ -91,6 +91,8 @@
   --warn-soft:     #e0b34114;
   --info:          #7aa2f7;
   --info-soft:     #7aa2f714;
+  --success:       var(--long);
+  --danger:        var(--short);
 
   --accent:        var(--long);
   --accent-soft:   var(--long-soft);

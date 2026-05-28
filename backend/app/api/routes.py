@@ -641,6 +641,7 @@ def positions(db: Session = Depends(get_db)) -> list[dict]:
                 "closed_at": row.closed_at,
                 "realized_pnl": str(row.realized_pnl) if row.realized_pnl is not None else None,
                 "unrealized_pnl": str(unrealized_pnl) if unrealized_pnl is not None else None,
+                "cum_funding_since_open": str(row.cum_funding_since_open) if row.cum_funding_since_open is not None else None,
                 "initial_size": serialize_decimal(metrics.initial_size),
                 "notional": serialize_decimal(metrics.notional),
                 "initial_risk": serialize_decimal(metrics.initial_risk),
@@ -776,6 +777,7 @@ def orders(db: Session = Depends(get_db)) -> list[dict]:
                 "price": str(row.price) if row.price is not None else None,
                 "size": str(row.size),
                 "status": row.status,
+                "fee": str(row.fee) if row.fee is not None else None,
                 "created_at": row.created_at,
             }
         )

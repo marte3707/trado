@@ -704,6 +704,7 @@ class AutoTuner:
         trades_now = len(positions)
         progress: dict[str, Any] | None = None
         ab_progress: dict[str, Any] | None = None
+        metrics_now: dict[str, Any] | None = None
         if state.get("current_step_index") is not None:
             if str(state.get("mode", "")) == "ab_test":
                 step_key = str(state.get("current_step_key") or "")
@@ -753,6 +754,8 @@ class AutoTuner:
                     "trades_done": delta,
                     "trades_required": int(config.get("min_trades_per_step", 50)),
                 }
+                post_positions = self._positions_after(positions, state.get("activated_at"))
+                metrics_now = self._metrics_for(post_positions) if post_positions else None
         return {
             "enabled": bool(config.get("enabled", False)),
             "mode": mode,
@@ -761,6 +764,7 @@ class AutoTuner:
             "current_step_mode": state.get("mode"),
             "activated_at": state.get("activated_at"),
             "metrics_before": state.get("metrics_before"),
+            "metrics_now": metrics_now,
             "ab_test_state": state.get("ab_test"),
             "next_step_key": sequence[next_index]["key"] if next_index is not None and next_index < len(sequence) else None,
             "trades_now": trades_now,

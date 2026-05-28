@@ -258,6 +258,7 @@ export type Position = {
   closed_at: string | null;
   realized_pnl: string | null;
   unrealized_pnl: string | null;
+  cum_funding_since_open: string | null;
   initial_size: string | null;
   notional: string | null;
   initial_risk: string | null;
@@ -280,6 +281,7 @@ export type Order = {
   price: string | null;
   size: string;
   status: string;
+  fee: string | null;
   created_at: string;
 };
 
@@ -419,6 +421,7 @@ export type AutoTunerStatus = {
   current_step_mode?: string | null;
   activated_at: string | null;
   metrics_before: TunerStepMetrics | null;
+  metrics_now?: TunerStepMetrics | null;
   ab_test_state?: Record<string, unknown> | null;
   next_step_key: string | null;
   trades_now: number;

@@ -64,7 +64,9 @@ TP_FINAL_CLOSE_ALLOCATION = Decimal("0.20")
 # exact liquidation price includes maintenance margin, so a multiplicative
 # buffer can still be too permissive for wider stops.
 LIQUIDATION_STOP_DISTANCE_ABSOLUTE_BUFFER = Decimal("0.10")
-LIQUIDATION_GUARD_RECOVERY_LEVERAGE = 1
+# Buffer applicato allo stop aggiustato rispetto al liq price quando il guard fallisce:
+# lo stop viene posizionato a liq_price * (1 ± BUFFER) per restare sul lato sicuro.
+LIQUIDATION_GUARD_SL_SAFETY_BUFFER = Decimal("0.03")
 
 
 class OrderExecutionEngine:
@@ -249,6 +251,38 @@ class OrderExecutionEngine:
         existing_position = self._find_idempotent_position(db, signal, market_cloid)
         if existing_position is not None:
             return existing_position
+        # Pre-flight: se esiste già una posizione HL su questo coin, set_leverage
+        # non cambierà il leverage effettivo (HL lo mantiene per posizioni aperte).
+        # Meglio saltare il trade ora piuttosto che aprire al leverage sbagliato e
+        # innescare il guard failure post-apertura (con fee di apertura già pagata).
+        if self.settings.hyperliquid_account_address:
+            try:
+                hl_state = trading.user_state(self.settings.hyperliquid_account_address)
+                existing_hl_pos = _hl_open_position(hl_state, coin)
+                if existing_hl_pos is not None:
+                    db.add(
+                        DecisionLog(
+                            event_type="live_order_skipped_hl_position_exists",
+                            market_id=signal.market_id,
+                            signal_id=signal.id,
+                            message=f"Trade skippato: posizione HL esistente su {coin}",
+                            data={
+                                "coin": coin,
+                                "hl_szi": existing_hl_pos.get("szi"),
+                                "hl_liq_price": existing_hl_pos.get("liquidationPx"),
+                                "target_leverage": plan.max_leverage,
+                            },
+                        )
+                    )
+                    db.commit()
+                    raise PermissionError(
+                        f"existing HL position on {coin}; skipping to avoid leverage mismatch"
+                    )
+            except PermissionError:
+                raise
+            except Exception as exc:
+                logger.warning("live_preflight_hl_check_failed", coin=coin, error=str(exc))
+
         hl_max_lev = (market.metadata_json or {}).get("raw", {}).get("maxLeverage")
         safe_leverage = (
             min(plan.max_leverage, int(hl_max_lev))
@@ -540,7 +574,10 @@ class OrderExecutionEngine:
                 "stop loss is not before liquidation price; live position closed immediately"
             )
 
-        if signal.stop_loss is not None:
+        # Usa guard.stop_loss che può essere stato aggiustato dalla recovery
+        # (es. spostato prima del liq price) invece dello stop originale del segnale.
+        effective_sl = guard.stop_loss if guard.stop_loss is not None else signal.stop_loss
+        if effective_sl is not None:
             sl_cloid = make_cloid(signal.id, "sl")
             existing_sl = (
                 db.query(Order)
@@ -561,7 +598,7 @@ class OrderExecutionEngine:
                         coin=coin,
                         is_buy=close_is_buy,
                         size=sl_size,
-                        trigger_price=signal.stop_loss,
+                        trigger_price=effective_sl,
                         tpsl="sl",
                         expires_after_seconds=expires_after_seconds,
                         cloid=sl_cloid,
@@ -575,14 +612,14 @@ class OrderExecutionEngine:
                             mode=OrderMode.LIVE.value,
                             order_type="stop_loss",
                             side="buy" if close_is_buy else "sell",
-                            price=signal.stop_loss,
+                            price=effective_sl,
                             size=position.size,
                             status=stop_result.status,
                             reduce_only=True,
                             raw_response=stop_result.raw_response,
                         )
                     )
-                    submitted_parts.append(f"SL @ {signal.stop_loss} (size {sl_size})")
+                    submitted_parts.append(f"SL @ {effective_sl} (size {sl_size})")
                 except Exception as exc:
                     protection_errors.append(f"stop_loss: {exc}")
 
@@ -700,62 +737,120 @@ class OrderExecutionEngine:
         coin: str,
         guard: LiquidationGuardResult,
     ) -> LiquidationGuardResult:
+        """Tenta di recuperare un guard failure in due fasi:
+        1. Re-applica il leverage previsto (contract_leverage) — HL a volte non lo aggiorna
+           nonostante il set_leverage iniziale abbia risposto OK.
+        2. Se il guard non passa ancora, sposta lo stop loss appena prima del liq price
+           con un buffer di sicurezza (LIQUIDATION_GUARD_SL_SAFETY_BUFFER).
+        """
         metadata = dict(position.metadata_json or {})
-        current_leverage = _metadata_int(metadata.get("contract_leverage"))
-        if current_leverage is not None and current_leverage <= LIQUIDATION_GUARD_RECOVERY_LEVERAGE:
-            return guard
-        try:
-            trading.set_leverage(coin, LIQUIDATION_GUARD_RECOVERY_LEVERAGE, is_cross=False)
-        except Exception as exc:
-            db.add(
-                DecisionLog(
-                    event_type="live_liquidation_guard_recovery_failed",
-                    market_id=position.market_id,
-                    signal_id=signal.id,
-                    position_id=position.id,
-                    message="Failed to reduce leverage after liquidation guard failure",
-                    data={
-                        "coin": coin,
-                        "target_leverage": LIQUIDATION_GUARD_RECOVERY_LEVERAGE,
-                        "error": str(exc),
-                    },
+        intended_leverage = _metadata_int(metadata.get("contract_leverage"))
+
+        # Fase 1: prova a ri-settare il leverage al valore previsto.
+        # Ridurre di pochi step richiede meno margin libero che ridurre a 1x.
+        if intended_leverage is not None and intended_leverage >= 1:
+            try:
+                trading.set_leverage(coin, intended_leverage, is_cross=False)
+                recheck = self.position_manager.check_liquidation_guard(
+                    db,
+                    position,
+                    coin=coin,
+                    trading_client=trading,
+                    source="post_entry_recheck_after_leverage_reapply",
                 )
-            )
+                if not recheck.failed:
+                    metadata["liquidation_guard_recovered"] = True
+                    position.metadata_json = metadata
+                    db.add(position)
+                    db.add(
+                        DecisionLog(
+                            event_type="live_liquidation_guard_recovered",
+                            market_id=position.market_id,
+                            signal_id=signal.id,
+                            position_id=position.id,
+                            message="Leverage ri-applicato, guard superato",
+                            data={
+                                "coin": coin,
+                                "intended_leverage": intended_leverage,
+                                "stop_loss": str(recheck.stop_loss) if recheck.stop_loss is not None else None,
+                                "liquidation_price": str(recheck.liquidation_price)
+                                if recheck.liquidation_price is not None
+                                else None,
+                            },
+                        )
+                    )
+                    return recheck
+                # Il leverage è stato ri-settato ma il guard non passa ancora.
+                # Usa l'ultimo liq price noto (potenzialmente aggiornato dopo il recheck).
+                guard = recheck
+            except Exception as exc:
+                db.add(
+                    DecisionLog(
+                        event_type="live_liquidation_guard_recovery_failed",
+                        market_id=position.market_id,
+                        signal_id=signal.id,
+                        position_id=position.id,
+                        message="Failed to re-apply leverage after liquidation guard failure",
+                        data={
+                            "coin": coin,
+                            "intended_leverage": intended_leverage,
+                            "error": str(exc),
+                        },
+                    )
+                )
+
+        # Fase 2: aggiusta lo stop loss appena prima del liq price.
+        liq_price = guard.liquidation_price
+        if liq_price is None or liq_price <= 0:
+            return guard  # senza liq price non possiamo aggiustare lo stop
+
+        side = position.side.lower()
+        entry = position.entry_price
+        if side == "long":
+            safe_sl = liq_price * (1 + LIQUIDATION_GUARD_SL_SAFETY_BUFFER)
+            valid = entry is not None and safe_sl < entry
+        elif side == "short":
+            safe_sl = liq_price * (1 - LIQUIDATION_GUARD_SL_SAFETY_BUFFER)
+            valid = entry is not None and safe_sl > entry
+        else:
             return guard
 
-        recovered = self.position_manager.check_liquidation_guard(
-            db,
-            position,
-            coin=coin,
-            trading_client=trading,
-            source="post_entry_recheck_after_leverage_reduce",
-        )
-        if recovered.failed:
-            return recovered
+        if not valid:
+            # Il liq price è così vicino all'entry che non c'è spazio per uno stop utile.
+            return guard
 
+        position.stop_loss = safe_sl
         metadata = dict(position.metadata_json or {})
-        metadata["contract_leverage"] = LIQUIDATION_GUARD_RECOVERY_LEVERAGE
-        metadata["liquidation_guard_recovered"] = True
+        metadata["liquidation_guard_sl_adjusted"] = True
+        metadata["liquidation_guard_sl_original"] = str(guard.stop_loss) if guard.stop_loss is not None else None
         position.metadata_json = metadata
         db.add(position)
         db.add(
             DecisionLog(
-                event_type="live_liquidation_guard_recovered",
+                event_type="live_liquidation_guard_sl_adjusted",
                 market_id=position.market_id,
                 signal_id=signal.id,
                 position_id=position.id,
-                message="Reduced leverage after liquidation guard failure",
+                message="Stop loss aggiustato prima del liq price",
                 data={
                     "coin": coin,
-                    "target_leverage": LIQUIDATION_GUARD_RECOVERY_LEVERAGE,
-                    "stop_loss": str(recovered.stop_loss) if recovered.stop_loss is not None else None,
-                    "liquidation_price": str(recovered.liquidation_price)
-                    if recovered.liquidation_price is not None
-                    else None,
+                    "side": side,
+                    "original_stop": str(guard.stop_loss) if guard.stop_loss is not None else None,
+                    "adjusted_stop": str(safe_sl),
+                    "liquidation_price": str(liq_price),
+                    "safety_buffer_pct": str(LIQUIDATION_GUARD_SL_SAFETY_BUFFER * 100),
                 },
             )
         )
-        return recovered
+        # Restituisce un guard "ok" con lo stop aggiustato — il chiamante procederà
+        # a piazzare il SL usando guard.stop_loss.
+        return LiquidationGuardResult(
+            status="ok",
+            reason="stop_adjusted_before_liquidation",
+            liquidation_price=liq_price,
+            stop_loss=safe_sl,
+            coin=guard.coin,
+        )
 
     def close_position(
         self,
@@ -942,6 +1037,24 @@ class OrderExecutionEngine:
         live_settings = effective_live_execution_settings(db, self.settings)
         close_is_buy = position.side.lower() == "short"
         trading = trading_client or HyperliquidTradingClient(self.settings)
+
+        # Capture cumulative funding since open before submitting the close.
+        # Once closed, the position disappears from user_state so this is the last chance.
+        cum_funding_since_open: Decimal | None = None
+        try:
+            state = trading.user_state()
+            for item in state.get("assetPositions", []):
+                pos_data = item.get("position") if isinstance(item, dict) else None
+                if isinstance(pos_data, dict) and pos_data.get("coin") == coin:
+                    cf = pos_data.get("cumFunding")
+                    if isinstance(cf, dict) and cf.get("sinceOpen") is not None:
+                        # Negate: HL sinceOpen positive = paid (cost), negative = received (income).
+                        # Store as P&L impact (positive = earned, negative = paid).
+                        cum_funding_since_open = -Decimal(str(cf["sinceOpen"]))
+                    break
+        except Exception:
+            pass
+
         result = trading.submit_market_close(
             coin=coin,
             is_buy=close_is_buy,
@@ -973,6 +1086,8 @@ class OrderExecutionEngine:
             commit=False,
             record_order=False,
         )
+        if cum_funding_since_open is not None:
+            position.cum_funding_since_open = cum_funding_since_open
         db.add(
             Order(
                 position_id=position.id,
@@ -985,6 +1100,7 @@ class OrderExecutionEngine:
                 size=exit_size,
                 status="filled" if result.filled_size is not None else "submitted",
                 reduce_only=True,
+                fee=result.fee,
                 raw_response=result.raw_response,
             )
         )
@@ -1518,3 +1634,25 @@ def _parse_dt(value: object | None) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _hl_open_position(state: dict[str, Any], coin: str) -> dict[str, Any] | None:
+    """Ritorna i dati della posizione aperta su HL per `coin`, oppure None.
+
+    Usato nel pre-flight check: se HL mostra già una posizione su questo coin
+    con szi != 0, set_leverage non modificherà il leverage effettivo.
+    """
+    for item in state.get("assetPositions", []):
+        if not isinstance(item, dict):
+            continue
+        pos = item.get("position")
+        if not isinstance(pos, dict):
+            continue
+        if pos.get("coin") != coin:
+            continue
+        try:
+            if Decimal(str(pos.get("szi", "0"))) != 0:
+                return pos
+        except Exception:
+            pass
+    return None

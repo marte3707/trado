@@ -247,6 +247,7 @@ class HyperliquidOrderResult:
     avg_price: Decimal | None
     filled_size: Decimal | None
     raw_response: dict[str, Any]
+    fee: Decimal | None = None
 
 
 class HyperliquidTradingClient:
@@ -506,6 +507,7 @@ def parse_order_result(response: dict[str, Any]) -> HyperliquidOrderResult:
         .get("data", {})
         .get("statuses", [])
     )
+    fee: Decimal | None = None
     if statuses:
         first = statuses[0]
         if "filled" in first:
@@ -513,6 +515,7 @@ def parse_order_result(response: dict[str, Any]) -> HyperliquidOrderResult:
             oid = str(filled.get("oid")) if filled.get("oid") is not None else None
             avg_price = _decimal(filled.get("avgPx"))
             filled_size = _decimal(filled.get("totalSz"))
+            fee = _decimal(filled.get("fee"))
         elif "resting" in first:
             resting = first["resting"]
             oid = str(resting.get("oid")) if resting.get("oid") is not None else None
@@ -524,6 +527,7 @@ def parse_order_result(response: dict[str, Any]) -> HyperliquidOrderResult:
         avg_price=avg_price,
         filled_size=filled_size,
         raw_response=response,
+        fee=fee,
     )
 
 

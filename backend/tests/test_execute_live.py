@@ -107,11 +107,15 @@ class FakeTradingClient:
         market_status: str = "ok",
         trigger_failures: set[str] | None = None,
         user_state_positions: list[dict[str, Any]] | None = None,
+        pre_existing_positions: list[dict[str, Any]] | None = None,
     ) -> None:
         self._account_value = account_value
         self.market_status = market_status
         self.trigger_failures = trigger_failures or set()
         self.user_state_positions = user_state_positions or []
+        # Posizioni già presenti su HL PRIMA dell'apertura (pre-flight check).
+        # user_state_positions invece vengono incluse solo dopo il market order.
+        self.pre_existing_positions = pre_existing_positions or []
         self.market_orders: list[dict[str, Any]] = []
         self.close_orders: list[dict[str, Any]] = []
         self.trigger_orders: list[dict[str, Any]] = []
@@ -214,7 +218,13 @@ class FakeTradingClient:
         )
 
     def user_state(self, _address: str | None = None) -> dict[str, Any]:
-        return {"assetPositions": [{"position": row} for row in self.user_state_positions]}
+        # Pre-existing positions sempre visibili (simulano posizioni aperte manualmente su HL).
+        # user_state_positions visibili solo dopo che il market order è stato piazzato,
+        # rispecchiando il comportamento reale di HL dove la posizione appare dopo il fill.
+        positions = list(self.pre_existing_positions)
+        if self.market_orders:
+            positions.extend(self.user_state_positions)
+        return {"assetPositions": [{"position": row} for row in positions]}
 
 
 def _build_settings() -> Settings:
@@ -368,9 +378,12 @@ def test_execute_live_records_partial_failure_when_trigger_fails(monkeypatch: py
     assert "live_protection_orders_partial_failure" in events
 
 
-def test_execute_live_closes_position_when_stop_is_beyond_liquidation(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_live_adjusts_sl_when_stop_is_beyond_liquidation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Quando il guard fallisce (stop oltre il liq price), il recovery aggiusta lo stop
+    appena prima del liq price e la posizione rimane aperta."""
     _force_validator_ok(monkeypatch)
     settings = _build_settings()
+    # SHORT: entry=100, stop=105; liq=104 → 105 > 104 → guard fallisce
     signal = _build_short_signal()
     db = FakeDb(signal=signal, market=_build_market())
     trading = FakeTradingClient(
@@ -379,6 +392,43 @@ def test_execute_live_closes_position_when_stop_is_beyond_liquidation(monkeypatc
                 "coin": "BTC",
                 "szi": "-1",
                 "liquidationPx": "104",
+            }
+        ]
+    )
+
+    position = OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    # La posizione non viene chiusa: lo stop è stato aggiustato
+    assert trading.close_orders == []
+    assert position.status == "open"
+    # Stop aggiustato tra entry (100) e liq (104)
+    assert position.stop_loss is not None
+    assert position.stop_loss > Decimal("100")  # sopra entry per short
+    assert position.stop_loss < Decimal("104")   # prima del liq price
+    # Evento di aggiustamento loggato
+    events = [row.event_type for row in db.added_of(DecisionLog)]
+    assert "live_position_liquidation_guard_failed" in events
+    assert "live_liquidation_guard_sl_adjusted" in events
+    # Il trigger SL è stato piazzato al prezzo aggiustato
+    sl_orders = [o for o in trading.trigger_orders if o["tpsl"] == "sl"]
+    assert len(sl_orders) == 1
+    assert sl_orders[0]["trigger_price"] < Decimal("104")
+
+
+def test_execute_live_closes_position_when_sl_adjustment_is_impossible(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Quando il guard fallisce E il liq price è così vicino all'entry che nemmeno
+    lo stop aggiustato può essere posizionato in modo valido, la posizione viene chiusa."""
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    # SHORT: entry=100, stop=105; liq=101.5 → safe_sl = 101.5*0.97 = 98.455 < entry(100) → invalido
+    signal = _build_short_signal()
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient(
+        user_state_positions=[
+            {
+                "coin": "BTC",
+                "szi": "-1",
+                "liquidationPx": "101.5",
             }
         ]
     )
@@ -487,6 +537,9 @@ def test_execute_live_recovers_liquidation_guard_by_reducing_leverage(
             )
 
         def user_state(self, _address: str | None = None) -> dict[str, Any]:
+            # Prima del market order: nessuna posizione su HL (pre-flight check).
+            if not self.market_orders:
+                return {"assetPositions": []}
             liquidation_price = "4.8486638384" if len(self.leverage_calls) < 2 else "4.1000000000"
             return {
                 "assetPositions": [
@@ -506,11 +559,13 @@ def test_execute_live_recovers_liquidation_guard_by_reducing_leverage(
     position = OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
 
     assert _target_leverage(signal, 10) == 3
-    assert [call["leverage"] for call in trading.leverage_calls] == [3, 1]
+    # Il recovery ri-applica il leverage previsto (3x), non lo riduce a 1x
+    assert [call["leverage"] for call in trading.leverage_calls] == [3, 3]
     assert trading.close_orders == []
     assert len(trading.trigger_orders) == 3
     assert position.status == "open"
-    assert position.metadata_json["contract_leverage"] == 1
+    # contract_leverage rimane invariato (3), solo il flag di recovery viene settato
+    assert position.metadata_json["contract_leverage"] == 3
     assert position.metadata_json["liquidation_guard_recovered"] is True
     events = [row.event_type for row in db.added_of(DecisionLog)]
     assert "live_position_liquidation_guard_failed" in events
@@ -594,3 +649,30 @@ def test_execute_live_is_idempotent_when_market_order_already_recorded(monkeypat
     assert returned is pre_position
     assert trading.market_orders == []
     assert trading.trigger_orders == []
+
+
+def test_execute_live_skips_when_hl_position_already_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Quando esiste già una posizione aperta su HL per la stessa coin, il trade viene
+    saltato prima del set_leverage e viene loggato live_order_skipped_hl_position_exists."""
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient(
+        pre_existing_positions=[
+            {
+                "coin": "BTC",
+                "szi": "0.5",
+                "liquidationPx": "90",
+            }
+        ]
+    )
+
+    with pytest.raises(PermissionError, match="existing HL position"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    # Nessun ordine deve essere stato inviato
+    assert trading.market_orders == []
+    assert trading.leverage_calls == []
+    events = [row.event_type for row in db.added_of(DecisionLog)]
+    assert "live_order_skipped_hl_position_exists" in events

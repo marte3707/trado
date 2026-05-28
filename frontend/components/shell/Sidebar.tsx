@@ -29,12 +29,17 @@ export function Sidebar({ route, setRoute, counts, collapsed, onToggleCollapsed 
       style={{ gridArea: "side" }}
     >
       {/* Brand */}
-      <div className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-3">
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-bg-1">
-          <Hexagon className="h-4 w-4 text-success" strokeWidth={2.2} />
-        </div>
+      <div
+        className={cn(
+          "flex h-14 shrink-0 items-center gap-2 border-b border-border",
+          collapsed ? "justify-center px-0" : "px-3",
+        )}
+      >
         {!collapsed && (
           <>
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-bg-1">
+              <Hexagon className="h-4 w-4 text-success" strokeWidth={2.2} />
+            </div>
             <div className="flex min-w-0 flex-col leading-tight">
               <span className="text-sm font-semibold tracking-tight text-fg">Trado</span>
               <span className="font-mono text-[10px] uppercase tracking-wide text-fg-3">
@@ -52,7 +57,7 @@ export function Sidebar({ route, setRoute, counts, collapsed, onToggleCollapsed 
         )}
         {collapsed && (
           <button
-            className="ml-auto inline-flex h-6 w-6 items-center justify-center rounded-md border border-border text-fg-3 transition-colors hover:bg-bg-2 hover:text-fg"
+            className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-border text-fg-3 transition-colors hover:bg-bg-2 hover:text-fg"
             onClick={onToggleCollapsed}
             aria-label="Espandi menu"
           >

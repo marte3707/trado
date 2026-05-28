@@ -1,25 +1,16 @@
 "use client";
 
-import { useEffect } from "react";
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { NAV_HOTKEY_TO_ROUTE } from "@/lib/hotkeys";
-import type { Route } from "@/components/shell/routes";
-import { ROUTE_MAP } from "@/components/shell/routes";
 
 interface Props {
   open: boolean;
   onClose: () => void;
 }
-
-const NAV_ROWS = Object.entries(NAV_HOTKEY_TO_ROUTE).map(([key, route]) => ({
-  keys: ["g", key.toUpperCase()],
-  label: ROUTE_MAP[route as Route]?.label ?? route,
-}));
 
 const GLOBAL_SHORTCUTS = [
   { keys: ["⌘", "K"], label: "Apri Command Menu" },

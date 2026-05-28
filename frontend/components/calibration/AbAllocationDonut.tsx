@@ -3,6 +3,11 @@
 import * as Recharts from "recharts";
 
 import { Card } from "@/components/ui/card";
+import {
+  Tooltip as UITooltip,
+  TooltipContent as UITooltipContent,
+  TooltipTrigger as UITooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { AutoTunerAbProgress } from "@/lib/api";
 
@@ -188,6 +193,14 @@ function LegendRow({
   );
 }
 
+const METRIC_TOOLTIPS: Record<string, string> = {
+  Lift: "Variazione % del PnL medio del braccio test rispetto al controllo. Positivo = il test ha performato meglio.",
+  "Mean delta":
+    "Differenza assoluta del PnL medio tra braccio test e controllo (test − control).",
+  "Alpha (p-value)":
+    "Probabilità di osservare questa differenza per puro caso (test di Mann-Whitney). Sotto 0.05 il risultato è considerato statisticamente significativo.",
+};
+
 function Metric({
   label,
   value,
@@ -199,9 +212,19 @@ function Metric({
   tone: "success" | "danger" | "muted";
   hint?: string;
 }) {
+  const tooltipText = METRIC_TOOLTIPS[label];
   return (
     <div>
-      <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">{label}</div>
+      <UITooltip>
+        <UITooltipTrigger asChild>
+          <div className="cursor-help text-[10px] font-medium uppercase tracking-wider text-fg-3 underline decoration-dotted underline-offset-2">
+            {label}
+          </div>
+        </UITooltipTrigger>
+        {tooltipText && (
+          <UITooltipContent className="max-w-60">{tooltipText}</UITooltipContent>
+        )}
+      </UITooltip>
       <div
         className={cn(
           "mt-1 font-mono text-base font-semibold tabular-nums",

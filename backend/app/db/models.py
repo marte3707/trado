@@ -135,6 +135,7 @@ class Position(Base):
     pnl_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    cum_funding_since_open: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
     metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
 
     market: Mapped[Market] = relationship()
@@ -177,6 +178,7 @@ class Order(Base):
     size: Mapped[Decimal] = mapped_column(Numeric(28, 10))
     status: Mapped[str] = mapped_column(String(32), index=True)
     reduce_only: Mapped[bool] = mapped_column(Boolean, default=False)
+    fee: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
     raw_response: Mapped[dict] = mapped_column(JSONB, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(

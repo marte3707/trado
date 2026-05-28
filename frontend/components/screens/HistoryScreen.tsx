@@ -76,6 +76,13 @@ function fmtSize(value: string | null | undefined): string {
   return n.toLocaleString("en-US", { maximumFractionDigits: maxDigits });
 }
 
+function fmtUsdPrecise(value: number | null | undefined): string {
+  if (value == null) return "—";
+  const abs = Math.abs(value);
+  const digits = abs < 0.01 ? 4 : abs < 1 ? 3 : 2;
+  return value.toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
 function displaySize(position: Position): string {
   if (position.initial_size != null) return position.initial_size;
   const initialSize = position.metadata_json?.initial_size;
@@ -134,6 +141,19 @@ function realizedPnl(position: Position, exitOrders: Order[] = []): number | nul
   const exitPnls = exitOrders.map((order) => exitPnl(position, order)).filter((value): value is number => value !== null);
   if (exitPnls.length === 0) return null;
   return exitPnls.reduce((sum, value) => sum + value, 0);
+}
+
+function totalExitFees(exitOrders: Order[]): number | null {
+  const fees = exitOrders.map(o => asNumber(o.fee)).filter((v): v is number => v !== null);
+  return fees.length > 0 ? fees.reduce((s, v) => s + v, 0) : null;
+}
+
+function netPnl(position: Position, exitOrders: Order[]): number | null {
+  const pnl = realizedPnl(position, exitOrders);
+  const funding = asNumber(position.cum_funding_since_open);
+  const fees = totalExitFees(exitOrders);
+  if (funding == null && fees == null) return null;
+  return (pnl ?? 0) + (funding ?? 0) - (fees ?? 0);
 }
 
 function positionReturnPct(position: Position, exitOrders: Order[] = []): number | null {
@@ -699,10 +719,12 @@ export function HistoryScreen({ positions, orders }: Props) {
                 const exitOrders = exitOrdersFor(p, orders);
                 const exitPrice = latestExitPrice(p, exitOrders);
                 const pnl = realizedPnl(p, exitOrders);
+                const netPnlVal = netPnl(p, exitOrders);
                 const pct = positionReturnPct(p, exitOrders);
                 const r = positionRMultiple(p, exitOrders);
                 const notional = positionNotional(p);
                 const tone = pnlTone(pnl);
+                const netTone = pnlTone(netPnlVal);
                 const status = positionStatusLabel(p, exitOrders);
                 const expanded = expandedPositionId === p.id;
                 return (
@@ -747,7 +769,14 @@ export function HistoryScreen({ positions, orders }: Props) {
                       <td className="num" style={{ whiteSpace: "nowrap" }}>
                         <ReturnCell pnl={pnl} pct={pct} r={r} isLive={isLive} />
                       </td>
-                      <td className={"num " + tone}>{pnl !== null ? fmt.pnl(pnl) : "—"}</td>
+                      <td className={"num " + tone}>
+                        {pnl !== null ? fmt.pnl(pnl) : "—"}
+                        {netPnlVal !== null && (
+                          <div className={"mono " + netTone} style={{ fontSize: 10, marginTop: 1, opacity: 0.85 }}>
+                            {fmtUsdPrecise(netPnlVal)} <span className="muted">netto</span>
+                          </div>
+                        )}
+                      </td>
                       <td>
                         <span className={"badge " + (status === "partial" ? "warn" : "muted")}>{status}</span>
                       </td>
@@ -985,6 +1014,9 @@ function PositionDetails({ position, orders }: { position: Position; orders: Ord
   const plan = takeProfitPlan(position);
   const realized = asNumber(position.realized_pnl);
   const initialSize = displaySize(position);
+  const hasAnyFee = orders.some(o => asNumber(o.fee) !== null);
+  const cumFunding = asNumber(position.cum_funding_since_open);
+  const feesTotal = totalExitFees(orders);
   return (
     <div style={{ padding: "14px 18px 16px", borderBottom: "1px solid var(--border)", display: "grid", gridTemplateColumns: "minmax(260px, 0.8fr) minmax(360px, 1.2fr)", gap: 18 }}>
       <div>
@@ -1015,6 +1047,27 @@ function PositionDetails({ position, orders }: { position: Position; orders: Ord
           <DetailMetric label="SL" value={fmt.price(position.stop_loss)} />
           <DetailMetric label="P&L real." value={fmt.pnl(realized)} tone={pnlTone(realized) || undefined} />
         </div>
+        {(cumFunding !== null || feesTotal !== null) && (
+          <div style={{ marginTop: 12 }}>
+            <div className="muted" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>Funding & Fees</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              {cumFunding !== null && (
+                <DetailMetric
+                  label="Funding acc."
+                  value={fmtUsdPrecise(cumFunding)}
+                  tone={pnlTone(cumFunding) || undefined}
+                />
+              )}
+              {feesTotal !== null && (
+                <DetailMetric
+                  label="Fees totali"
+                  value={fmtUsdPrecise(-feesTotal)}
+                  tone="down"
+                />
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       <div>
@@ -1031,6 +1084,7 @@ function PositionDetails({ position, orders }: { position: Position; orders: Ord
                 <th style={{ textAlign: "right" }}>Size</th>
                 <th style={{ textAlign: "right" }}>P&L</th>
                 <th style={{ textAlign: "right" }}>R</th>
+                {hasAnyFee && <th style={{ textAlign: "right" }}>Fee</th>}
               </tr>
             </thead>
             <tbody>
@@ -1038,6 +1092,7 @@ function PositionDetails({ position, orders }: { position: Position; orders: Ord
                 const pnl = exitPnl(position, order);
                 const r = exitRContribution(position, order);
                 const tone = pnlTone(pnl);
+                const fee = asNumber(order.fee);
                 return (
                   <tr key={order.id}>
                     <td><span className={"badge " + (order.order_type === "stop_loss" ? "short" : "long")}>{exitLabel(order.order_type)}</span></td>
@@ -1046,6 +1101,7 @@ function PositionDetails({ position, orders }: { position: Position; orders: Ord
                     <td className="num fg">{fmtSize(order.size)}</td>
                     <td className={"num " + tone}>{fmt.pnl(pnl)}</td>
                     <td className={"num " + tone}>{r != null ? `${r >= 0 ? "+" : ""}${r.toFixed(2)}R` : "—"}</td>
+                    {hasAnyFee && <td className="num down">{fee !== null ? fmtUsdPrecise(-fee) : "—"}</td>}
                   </tr>
                 );
               })}

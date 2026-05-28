@@ -73,6 +73,7 @@ La modalità effettiva viene letta da `AppSetting("operation_mode")` nel DB (run
 ### Guardrail live trading
 
 Il live trading su Hyperliquid è bloccato da più livelli:
+
 1. `ENABLE_LIVE_TRADING=true` in env
 2. `OPERATION_MODE=AUTO_TRADE`
 3. `KILL_SWITCH_ENABLED=false`
