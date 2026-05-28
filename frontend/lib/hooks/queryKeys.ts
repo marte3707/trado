@@ -23,6 +23,7 @@ export const qk = {
   workerCycles: (limit: number) => ["worker", "cycles", limit] as const,
   signalRejections: (limit: number) => ["signal-rejections", limit] as const,
   marketIntelligence: ["market-intelligence"] as const,
+  marketDashboard: ["market-intelligence", "dashboard"] as const,
   equitySlope: ["equity-slope"] as const,
   diagnostics: ["diagnostics"] as const,
   accountMonitor: ["account", "snapshot"] as const,

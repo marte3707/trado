@@ -19,8 +19,9 @@ import { SignalFunnel } from "@/components/widgets/SignalFunnel";
 import { TopSignalsList } from "@/components/widgets/TopSignalsList";
 import { OpenPositionsLive } from "@/components/widgets/OpenPositionsLive";
 import { MarketIntelligenceStrip } from "@/components/widgets/MarketIntelligenceStrip";
+import { BitcoinNewsCard } from "@/components/widgets/BitcoinNewsCard";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { useSignalRejections } from "@/lib/hooks/queries";
+import { useMarketDashboardSnapshot, useSignalRejections } from "@/lib/hooks/queries";
 
 type ModeFilter = "all" | "paper" | "live";
 
@@ -161,6 +162,7 @@ export function DashboardScreen({
     [filteredPositions],
   );
   const { data: rejections } = useSignalRejections(50);
+  const { data: marketDashboard } = useMarketDashboardSnapshot();
   const paperEquity = asNumber(settings.paper?.equity) ?? 10_000;
 
   useEffect(() => {
@@ -316,8 +318,13 @@ export function DashboardScreen({
         />
       </div>
 
-      {/* Row 4 — Market intelligence strip (12) */}
-      <MarketIntelligenceStrip data={marketIntelligence} settings={settings} />
+      {/* Row 4 — Market intelligence + latest news */}
+      <MarketIntelligenceStrip
+        data={marketIntelligence}
+        settings={settings}
+        snapshot={marketDashboard}
+      />
+      <BitcoinNewsCard snapshot={marketDashboard} />
     </div>
   );
 }

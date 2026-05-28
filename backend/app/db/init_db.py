@@ -4,6 +4,7 @@ from app.core.config import get_settings
 from app.core.runtime_settings import DEFAULT_POSITION_MANAGEMENT_SETTINGS
 from app.db.models import AppSetting, Base, StrategyConfig
 from app.db.session import engine
+from app.services.unified_account_ratio import DEFAULT_UAR_RISK_SETTINGS
 
 
 DEFAULT_STRATEGIES = {
@@ -118,9 +119,21 @@ def seed_defaults(db: Session) -> None:
                     "max_open_positions": settings.max_open_positions,
                     "max_total_exposure_pct": settings.max_total_exposure_pct,
                     "max_leverage": settings.max_leverage,
+                    **DEFAULT_UAR_RISK_SETTINGS,
                 },
             )
         )
+    else:
+        risk_setting = db.get(AppSetting, "risk")
+        if risk_setting is not None and isinstance(risk_setting.value, dict):
+            value = dict(risk_setting.value)
+            mutated = False
+            for key, default in DEFAULT_UAR_RISK_SETTINGS.items():
+                if key not in value:
+                    value[key] = default
+                    mutated = True
+            if mutated:
+                risk_setting.value = value
     if db.get(AppSetting, "position_management") is None:
         db.add(
             AppSetting(

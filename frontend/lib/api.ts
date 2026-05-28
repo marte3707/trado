@@ -66,6 +66,60 @@ export type MarketIntelligence = {
   } | null;
 };
 
+export type MarketDashboardMover = {
+  symbol: string;
+  name: string;
+  price_usd: number | null;
+  price_change_24h_pct: number;
+};
+
+export type MarketDashboardNewsItem = {
+  title: string;
+  url: string;
+  source: string | null;
+  published_at: string | null;
+  excerpt: string | null;
+};
+
+export type MarketDashboardSnapshot = {
+  generated_at: string;
+  source_url: string;
+  cache: {
+    hit: boolean;
+    age_seconds: number;
+    max_age_seconds: number;
+    expires_at: string;
+  };
+  metrics: {
+    btc_price_usd: number | null;
+    btc_price_change_1h_pct: number | null;
+    btc_price_change_24h_pct: number | null;
+    btc_price_change_7d_pct: number | null;
+    total_market_cap_usd: number | null;
+    total_market_cap_ex_top10_usd: number | null;
+    total_volume_24h_usd: number | null;
+    btc_dominance_pct: number | null;
+    market_cap_change_24h_pct: number | null;
+    last_updated: string | null;
+    source: string;
+    top_gainers_24h: MarketDashboardMover[];
+    top_losers_24h: MarketDashboardMover[];
+  } | null;
+  fear_greed: {
+    value: number;
+    classification: string | null;
+    timestamp: string | null;
+    source: string;
+  } | null;
+  altcoin_season: {
+    altcoin_index: number;
+    snapshot_time: string | null;
+    source: string;
+  } | null;
+  news: MarketDashboardNewsItem[];
+  errors: string[];
+};
+
 export type CoinMarketCapUsage = {
   enabled: boolean;
   available: boolean;
@@ -129,6 +183,12 @@ export type AccountMonitor = {
     cross_account_value: string | null;
     cross_margin_used: string | null;
     cross_maintenance_margin_used: string | null;
+    unified_account_ratio_pct: string | null;
+    unified_account_ratio_status: string;
+    unified_account_ratio_source: string;
+    unified_account_ratio_threshold_pct: string | null;
+    unified_account_ratio_numerator: string | null;
+    unified_account_ratio_denominator: string | null;
     open_positions: number;
     open_orders: number;
     error: string | null;

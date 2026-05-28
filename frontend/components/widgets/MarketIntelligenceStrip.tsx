@@ -1,11 +1,11 @@
 "use client";
 
-import { Activity, BarChart3, Bitcoin, Flame } from "lucide-react";
+import { Activity, BarChart3, Bitcoin, Clock3, Flame } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
 import { fmt } from "@/components/atoms";
 import { cn } from "@/lib/utils";
-import type { AppSettings, MarketIntelligence } from "@/lib/api";
+import type { AppSettings, MarketDashboardSnapshot, MarketIntelligence } from "@/lib/api";
 
 function fearGreedTone(value: number | null | undefined): "danger" | "warn" | "muted" | "success" {
   if (value == null) return "muted";
@@ -54,6 +54,11 @@ function trendTone(value: string | null, enabled: boolean): Tone {
   return "muted";
 }
 
+function pctTone(value: number | null | undefined): Tone {
+  if (value == null) return "muted";
+  return value >= 0 ? "success" : "danger";
+}
+
 function readBtcMacro(settings: AppSettings | null | undefined) {
   const btc = (settings?.btc_macro_protection ?? {}) as Record<string, unknown>;
   return {
@@ -70,84 +75,118 @@ function readBtcMacro(settings: AppSettings | null | undefined) {
 export function MarketIntelligenceStrip({
   data,
   settings,
+  snapshot,
 }: {
   data: MarketIntelligence | null | undefined;
   settings?: AppSettings | null;
+  snapshot?: MarketDashboardSnapshot | null;
 }) {
-  const fg = data?.fear_greed?.value ?? null;
-  const fgClass = data?.fear_greed?.classification ?? "—";
+  const fg = snapshot?.fear_greed?.value ?? data?.fear_greed?.value ?? null;
+  const fgClass = snapshot?.fear_greed?.classification ?? data?.fear_greed?.classification ?? "—";
   const fgTone = fearGreedTone(fg);
 
-  const altIndex = data?.altcoin_season?.altcoin_index ?? null;
-  const btcDom = data?.global_metrics?.btc_dominance_pct ?? null;
-  const mcap = data?.global_metrics?.total_market_cap_usd ?? null;
-  const mcapDelta = data?.global_metrics?.market_cap_change_24h_pct ?? null;
-  const btcPrice = data?.global_metrics?.btc_price_usd ?? null;
-  const btcChange = data?.global_metrics?.btc_price_change_24h_pct ?? null;
+  const updatedAt = snapshot?.generated_at ?? data?.global_metrics?.last_updated ?? null;
+  const staleText = snapshot
+    ? `Agg. ${fmt.relTime(snapshot.generated_at)} · cache ${Math.round(snapshot.cache.max_age_seconds / 60)}m`
+    : `Agg. ${fmt.relTime(updatedAt)}`;
+  const altIndex = snapshot?.altcoin_season?.altcoin_index ?? data?.altcoin_season?.altcoin_index ?? null;
+  const btcDom = snapshot?.metrics?.btc_dominance_pct ?? data?.global_metrics?.btc_dominance_pct ?? null;
+  const mcap = snapshot?.metrics?.total_market_cap_usd ?? data?.global_metrics?.total_market_cap_usd ?? null;
+  const mcapDelta =
+    snapshot?.metrics?.market_cap_change_24h_pct ?? data?.global_metrics?.market_cap_change_24h_pct ?? null;
+  const btcPrice = snapshot?.metrics?.btc_price_usd ?? data?.global_metrics?.btc_price_usd ?? null;
+  const btcChange =
+    snapshot?.metrics?.btc_price_change_24h_pct ?? data?.global_metrics?.btc_price_change_24h_pct ?? null;
   const btcMacro = readBtcMacro(settings);
   const btcMacroTone = trendTone(btcMacro.trend, btcMacro.enabled);
 
   return (
-    <Card className="grid grid-cols-1 divide-y divide-border md:grid-cols-4 md:divide-x md:divide-y-0">
-      <Cell
-        icon={<Flame className="h-3.5 w-3.5" />}
-        label="Fear & Greed"
-        value={fg != null ? String(fg) : "—"}
-        sub={fgClass}
-        tone={fgTone}
-        gauge={fg != null ? { value: fg, max: 100, tone: fgTone } : undefined}
-      />
-      <Cell
-        icon={<Activity className="h-3.5 w-3.5" />}
-        label="Altseason Index"
-        value={altIndex != null ? String(Math.round(altIndex)) : "—"}
-        sub={altIndex != null ? (altIndex > 75 ? "Altseason" : altIndex > 50 ? "Mixed" : "Bitcoin season") : "—"}
-        gauge={altIndex != null ? { value: altIndex, max: 100, tone: "muted" } : undefined}
-      />
-      <Cell
-        icon={<Bitcoin className="h-3.5 w-3.5" />}
-        label="BTC"
-        value={btcPrice ? `$${btcPrice.toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "—"}
-        sub={`Dom. ${btcDom != null ? btcDom.toFixed(1) + "%" : "—"} · Macro ${btcMacro.timeframe}`}
-        delta={btcChange != null ? { value: fmt.pct(btcChange), tone: btcChange >= 0 ? "up" : "down" } : null}
-        details={
-          <div className="mt-1.5 space-y-2">
-            <div className="grid grid-cols-2 gap-1.5">
-              <MiniMetric
-                label="Macro"
-                value={btcMacro.enabled ? normalizeTrend(btcMacro.trend) : "Off"}
-                tone={btcMacroTone}
-              />
-              <MiniMetric
-                label="Dir"
-                value={normalizeTrend(btcMacro.directionalTrend)}
-                tone={trendTone(btcMacro.directionalTrend, btcMacro.enabled)}
-              />
-              <MiniMetric
-                label="Delta"
-                value={btcMacro.deltaPct != null ? fmt.pct(btcMacro.deltaPct) : "—"}
-                tone={btcMacro.deltaPct == null ? "muted" : btcMacro.deltaPct >= 0 ? "success" : "danger"}
-              />
-              <MiniMetric
-                label="Vol"
-                value={btcMacro.volRatio != null ? `${btcMacro.volRatio.toFixed(2)}x` : "—"}
-                tone={btcMacro.volRatio != null && btcMacro.volRatio >= 1 ? "warn" : "muted"}
-              />
+    <section className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-semibold text-fg">Market snapshot</h2>
+          <p className="mt-0.5 text-xs text-fg-3">BTC, breadth e liquidita globali</p>
+        </div>
+        <div className="flex items-center gap-1.5 rounded-md border border-border bg-bg-2 px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+          <Clock3 className="h-3 w-3" />
+          {staleText}
+        </div>
+      </div>
+      <Card className="grid grid-cols-1 divide-y divide-border md:grid-cols-4 md:divide-x md:divide-y-0">
+        <Cell
+          icon={<Flame className="h-3.5 w-3.5" />}
+          label="Fear & Greed"
+          value={fg != null ? String(fg) : "—"}
+          sub={fgClass}
+          tone={fgTone}
+          gauge={fg != null ? { value: fg, max: 100, tone: fgTone } : undefined}
+        />
+        <Cell
+          icon={<Activity className="h-3.5 w-3.5" />}
+          label="Altseason Index"
+          value={altIndex != null ? String(Math.round(altIndex)) : "—"}
+          sub={altIndex != null ? (altIndex > 75 ? "Altseason" : altIndex > 50 ? "Mixed" : "Bitcoin season") : "—"}
+          gauge={altIndex != null ? { value: altIndex, max: 100, tone: "muted" } : undefined}
+          details={
+            <MoverRow
+              label="Top 24h"
+              movers={snapshot?.metrics?.top_gainers_24h ?? []}
+              tone="success"
+            />
+          }
+        />
+        <Cell
+          icon={<Bitcoin className="h-3.5 w-3.5" />}
+          label="BTC"
+          value={btcPrice ? `$${btcPrice.toLocaleString("en-US", { maximumFractionDigits: 0 })}` : "—"}
+          sub={`Dom. ${btcDom != null ? btcDom.toFixed(1) + "%" : "—"} · Macro ${btcMacro.timeframe}`}
+          delta={btcChange != null ? { value: fmt.pct(btcChange), tone: btcChange >= 0 ? "up" : "down" } : null}
+          details={
+            <div className="mt-1.5 space-y-2">
+              <div className="grid grid-cols-2 gap-1.5">
+                <MiniMetric
+                  label="1h"
+                  value={fmt.pct(snapshot?.metrics?.btc_price_change_1h_pct ?? null)}
+                  tone={pctTone(snapshot?.metrics?.btc_price_change_1h_pct)}
+                />
+                <MiniMetric
+                  label="7d"
+                  value={fmt.pct(snapshot?.metrics?.btc_price_change_7d_pct ?? null)}
+                  tone={pctTone(snapshot?.metrics?.btc_price_change_7d_pct)}
+                />
+                <MiniMetric
+                  label="Macro"
+                  value={btcMacro.enabled ? normalizeTrend(btcMacro.trend) : "Off"}
+                  tone={btcMacroTone}
+                />
+                <MiniMetric
+                  label="Vol"
+                  value={btcMacro.volRatio != null ? `${btcMacro.volRatio.toFixed(2)}x` : "—"}
+                  tone={btcMacro.volRatio != null && btcMacro.volRatio >= 1 ? "warn" : "muted"}
+                />
+              </div>
+              <div className="truncate text-[10px] text-fg-4">
+                Macro check {fmt.relTime(btcMacro.checkedAt)}
+              </div>
             </div>
-            <div className="truncate text-[10px] text-fg-4">
-              Check {fmt.relTime(btcMacro.checkedAt)}
-            </div>
-          </div>
-        }
-      />
-      <Cell
-        icon={<BarChart3 className="h-3.5 w-3.5" />}
-        label="Market cap"
-        value={compactUsd(mcap)}
-        sub={`Vol 24h ${compactUsd(data?.global_metrics?.total_volume_24h_usd)}`}
-        delta={mcapDelta != null ? { value: fmt.pct(mcapDelta), tone: mcapDelta >= 0 ? "up" : "down" } : null}
-      />
-    </Card>
+          }
+        />
+        <Cell
+          icon={<BarChart3 className="h-3.5 w-3.5" />}
+          label="Market cap"
+          value={compactUsd(mcap)}
+          sub={`Vol 24h ${compactUsd(snapshot?.metrics?.total_volume_24h_usd ?? data?.global_metrics?.total_volume_24h_usd)}`}
+          delta={mcapDelta != null ? { value: fmt.pct(mcapDelta), tone: mcapDelta >= 0 ? "up" : "down" } : null}
+          details={
+            <MoverRow
+              label="Worst 24h"
+              movers={snapshot?.metrics?.top_losers_24h ?? []}
+              tone="danger"
+            />
+          }
+        />
+      </Card>
+    </section>
   );
 }
 
@@ -242,6 +281,34 @@ function MiniMetric({
       <div className="text-[9px] font-medium uppercase tracking-wider text-fg-4">{label}</div>
       <div className={cn("truncate font-mono text-[11px] tabular-nums", toneClass[tone])}>
         {value}
+      </div>
+    </div>
+  );
+}
+
+function MoverRow({
+  label,
+  movers,
+  tone,
+}: {
+  label: string;
+  movers: { symbol: string; price_change_24h_pct: number }[];
+  tone: "success" | "danger";
+}) {
+  if (!movers.length) return null;
+  const toneClass = tone === "success" ? "text-success" : "text-danger";
+  return (
+    <div className="mt-2 min-w-0">
+      <div className="mb-1 text-[9px] font-medium uppercase tracking-wider text-fg-4">{label}</div>
+      <div className="flex flex-wrap gap-1.5">
+        {movers.map((mover) => (
+          <span
+            key={`${label}-${mover.symbol}`}
+            className="rounded-md border border-border bg-bg-2 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-fg-2"
+          >
+            {mover.symbol} <span className={toneClass}>{fmt.pct(mover.price_change_24h_pct)}</span>
+          </span>
+        ))}
       </div>
     </div>
   );

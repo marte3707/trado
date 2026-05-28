@@ -44,14 +44,22 @@ from app.schemas import CandleOut, IndicatorOut, MarketOut, PushSubscribePayload
 from app.services.candle_sync import TIMEFRAME_MS
 from app.services.coinmarketcap import CoinMarketCapClient
 from app.services.hyperliquid import HyperliquidClient, HyperliquidError, HyperliquidTradingClient, parse_hl_candle
+from app.services.market_dashboard import MarketDashboardService
 from app.services.market_sync import MarketSyncService
 from app.services.position_pnl import calculate_unrealized_pnl as _calculate_unrealized_pnl
 from app.services.trade_metrics import build_trade_metrics
+from app.services.unified_account_ratio import (
+    DEFAULT_UAR_RISK_SETTINGS,
+    calculate_unified_account_ratio,
+    decimal_or_none,
+    quantized_decimal,
+)
 from app.strategies.base import CandleInput, StrategyContext
 from app.strategies.registry import strategy_registry
 
 router = APIRouter(prefix="/api")
 _market_data_client: CoinMarketCapClient | None = None
+_market_dashboard_service: MarketDashboardService | None = None
 _logger = structlog.get_logger()
 
 
@@ -76,6 +84,13 @@ def market_data_client() -> CoinMarketCapClient:
     if _market_data_client is None:
         _market_data_client = CoinMarketCapClient(get_settings())
     return _market_data_client
+
+
+def market_dashboard_service() -> MarketDashboardService:
+    global _market_dashboard_service
+    if _market_dashboard_service is None:
+        _market_dashboard_service = MarketDashboardService(get_settings())
+    return _market_dashboard_service
 
 
 def _source_timeframe(position: Position) -> str | None:
@@ -343,6 +358,11 @@ def market_intelligence() -> dict:
         if global_market
         else None,
     }
+
+
+@router.get("/market-intelligence/dashboard")
+def market_dashboard_snapshot() -> dict:
+    return market_dashboard_service().snapshot()
 
 
 @router.get("/market-intelligence/coinmarketcap-usage")
@@ -1230,6 +1250,11 @@ def _string_decimal(value: object | None) -> str | None:
     return str(parsed) if parsed is not None else None
 
 
+def _uar_setting_decimal(risk: dict, key: str) -> Decimal:
+    default = DEFAULT_UAR_RISK_SETTINGS[key]
+    return decimal_or_none(risk.get(key, default)) or Decimal(str(default))
+
+
 def _redact_address(address: str | None) -> str | None:
     if not address:
         return None
@@ -1399,6 +1424,15 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
             free_spot_usdc = max(Decimal("0"), total_usdc - hold_usdc)
             break
     effective_account_value = (total_equity or Decimal("0")) + free_spot_usdc
+    risk_setting = db.get(AppSetting, "risk")
+    risk_value = risk_setting.value if risk_setting is not None and isinstance(risk_setting.value, dict) else {}
+    uar = calculate_unified_account_ratio(
+        user_state,
+        free_spot_usdc=free_spot_usdc,
+        warn_pct=_uar_setting_decimal(risk_value, "unified_account_ratio_warn_pct"),
+        block_pct=_uar_setting_decimal(risk_value, "unified_account_ratio_block_pct"),
+        derisk_pct=_uar_setting_decimal(risk_value, "unified_account_ratio_derisk_pct"),
+    )
     if user_state is not None:
         db.add(
             AccountSnapshot(
@@ -1443,6 +1477,12 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
             "cross_account_value": _string_decimal(cross_margin.get("accountValue")),
             "cross_margin_used": _string_decimal(cross_margin.get("totalMarginUsed")),
             "cross_maintenance_margin_used": _string_decimal((user_state or {}).get("crossMaintenanceMarginUsed")),
+            "unified_account_ratio_pct": quantized_decimal(uar.pct),
+            "unified_account_ratio_status": uar.status,
+            "unified_account_ratio_source": uar.source,
+            "unified_account_ratio_threshold_pct": quantized_decimal(uar.threshold_pct),
+            "unified_account_ratio_numerator": quantized_decimal(uar.numerator),
+            "unified_account_ratio_denominator": quantized_decimal(uar.denominator),
             "open_positions": len(positions),
             "open_orders": len(open_orders),
             "error": account_error,

@@ -18,6 +18,7 @@ import {
   type EquitySlopeDiagnostics,
   type Health,
   type Market,
+  type MarketDashboardSnapshot,
   type MarketIntelligence,
   type Order,
   type Position,
@@ -208,6 +209,16 @@ export function useMarketIntelligence(opts?: QueryOpts<MarketIntelligence>) {
         () => ({ fear_greed: null, altcoin_season: null, global_metrics: null }) as MarketIntelligence,
       ),
     refetchInterval: 60_000,
+    ...opts,
+  });
+}
+
+export function useMarketDashboardSnapshot(opts?: QueryOpts<MarketDashboardSnapshot | null>) {
+  return useQuery({
+    queryKey: qk.marketDashboard,
+    queryFn: () =>
+      apiGet<MarketDashboardSnapshot>("/api/market-intelligence/dashboard").catch(() => null),
+    refetchInterval: 5 * 60_000,
     ...opts,
   });
 }

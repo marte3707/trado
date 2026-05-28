@@ -118,6 +118,22 @@ function fmtPct(value: string | number | null | undefined, digits = 2): string {
   return `${parsed.toFixed(digits)}%`;
 }
 
+function accountRatioTone(status: string | null | undefined, pct: number | null): "success" | "warn" | "danger" | "muted" {
+  if (pct == null || status === "unavailable") return "muted";
+  if (status === "liquidation_risk" || status === "critical" || pct >= 90) return "danger";
+  if (status === "warning" || pct >= 80) return "warn";
+  return "success";
+}
+
+function accountRatioHint(status: string | null | undefined, threshold: string | number | null | undefined): string {
+  const thresholdText = fmtPct(threshold);
+  if (status === "liquidation_risk") return `Liquidation risk · soglia ${thresholdText}`;
+  if (status === "critical") return `Blocco nuove aperture · soglia ${thresholdText}`;
+  if (status === "warning") return `Warning · soglia ${thresholdText}`;
+  if (status === "ok") return `OK · liq risk ${thresholdText}`;
+  return "Non disponibile";
+}
+
 function fmtTime(ms: number | null | undefined): string {
   if (!ms) return "-";
   return new Intl.DateTimeFormat("it-IT", {
@@ -396,6 +412,11 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
     accountValueNum != null && accountValueNum > 0 && marginUsedNum != null
       ? (marginUsedNum / accountValueNum) * 100
       : null;
+  const unifiedAccountRatio = asNumber(snapshot?.account.unified_account_ratio_pct);
+  const unifiedAccountRatioTone = accountRatioTone(
+    snapshot?.account.unified_account_ratio_status,
+    unifiedAccountRatio,
+  );
 
   const fundingByCoin = useMemo(() => {
     const map = new Map<string, AccountFunding>();
@@ -504,8 +525,8 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
 
       {!isInitialLoading && (
         <>
-          {/* 4 KPI cards */}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {/* KPI cards */}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
             <KpiTile
               label="Equity"
               value={fmtUsd(snapshot?.account.effective_account_value ?? snapshot?.account.account_value)}
@@ -520,11 +541,23 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
             <KpiTile
               label="Margin used"
               value={fmtUsd(snapshot?.account.total_margin_used)}
-              hint={marginRatio != null ? `Ratio ${marginRatio.toFixed(1)}%` : "—"}
+              hint={marginRatio != null ? `Utilization ${marginRatio.toFixed(1)}%` : "—"}
               progress={marginRatio}
               progressTone={
                 marginRatio == null ? "muted" : marginRatio > 80 ? "danger" : marginRatio > 50 ? "warn" : "success"
               }
+            />
+            <KpiTile
+              label="Unified Account Ratio"
+              value={fmtPct(snapshot?.account.unified_account_ratio_pct)}
+              tone={unifiedAccountRatioTone}
+              hint={accountRatioHint(
+                snapshot?.account.unified_account_ratio_status,
+                snapshot?.account.unified_account_ratio_threshold_pct,
+              )}
+              tooltip="HL indica rischio liquidazione oltre 95%; a 90% Trado blocca nuove aperture, a 95% avvia de-risk."
+              progress={unifiedAccountRatio}
+              progressTone={unifiedAccountRatioTone}
             />
             <KpiTile
               label="Notional"
@@ -640,18 +673,11 @@ function CrossMarginHealth({ account }: { account: AccountMonitor["account"] | n
   const crossMaintMargin = asNumber(account?.cross_maintenance_margin_used);
   const crossMarginUsed = asNumber(account?.cross_margin_used);
   const crossNtlPos = asNumber(account?.cross_ntl_pos);
-  const freeSpotUsdc = asNumber(account?.free_spot_usdc);
-  const accountValue = asNumber(account?.effective_account_value ?? account?.account_value);
+  const unifiedAccountRatio = asNumber(account?.unified_account_ratio_pct);
 
   const crossBuffer =
     crossAccountValue != null && crossMaintMargin != null && crossAccountValue > 0
       ? Math.max(0, Math.min(100, ((crossAccountValue - crossMaintMargin) / crossAccountValue) * 100))
-      : null;
-
-  const uarDenom = crossAccountValue != null ? crossAccountValue + (freeSpotUsdc ?? 0) : accountValue;
-  const uar =
-    crossMaintMargin != null && uarDenom != null && uarDenom > 0
-      ? (crossMaintMargin / uarDenom) * 100
       : null;
 
   const crossLeverage =
@@ -724,9 +750,9 @@ function CrossMarginHealth({ account }: { account: AccountMonitor["account"] | n
           />
           <Metric label="Cross margin" value={fmtUsd(crossMarginUsed)} />
           <Metric
-            label="UAR"
-            value={uar != null ? fmtPct(uar) : "-"}
-            tone={uar != null && uar > 80 ? "short" : uar != null && uar > 50 ? "warn" : undefined}
+            label="Unified ratio"
+            value={fmtPct(account?.unified_account_ratio_pct)}
+            tone={unifiedAccountRatio != null && unifiedAccountRatio >= 90 ? "short" : unifiedAccountRatio != null && unifiedAccountRatio >= 80 ? "warn" : undefined}
           />
           <Metric label="Withdrawable" value={fmtUsd(account?.withdrawable)} />
         </div>
@@ -792,17 +818,18 @@ function PnlFundingPanel({
 // ── Shared sub-components ─────────────────────────────────────────────────────
 
 function KpiTile({
-  label, value, hint, tone, progress, progressTone,
+  label, value, hint, tooltip, tone, progress, progressTone,
 }: {
   label: string;
   value: string;
   hint?: string;
+  tooltip?: string;
   tone?: "success" | "danger" | "warn" | "muted";
   progress?: number | null;
   progressTone?: "success" | "warn" | "danger" | "muted";
 }) {
   return (
-    <Card className="p-5">
+    <Card className="p-5" title={tooltip}>
       <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">{label}</div>
       <div
         className={cn(
@@ -818,7 +845,7 @@ function KpiTile({
       {hint && <div className="mt-1 text-[11px] text-fg-3">{hint}</div>}
       {progress != null && (
         <Progress
-          value={progress}
+          value={Math.max(0, Math.min(100, progress))}
           className="mt-3"
           indicatorClassName={cn(
             progressTone === "success" && "bg-success",

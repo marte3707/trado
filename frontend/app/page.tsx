@@ -9,6 +9,7 @@ import {
   DecisionLog,
   Health,
   Market,
+  MarketDashboardSnapshot,
   MarketIntelligence,
   Order,
   Position,
@@ -50,6 +51,7 @@ async function loadDashboard() {
     workerCycles,
     signalRejections,
     marketIntelligence,
+    marketDashboard,
   ] = await Promise.all([
     apiGet<Health>("/api/health"),
     apiGet<Market[]>("/api/markets"),
@@ -70,6 +72,7 @@ async function loadDashboard() {
       altcoin_season: null,
       global_metrics: null,
     } as MarketIntelligence)),
+    apiGet<MarketDashboardSnapshot>("/api/market-intelligence/dashboard").catch(() => null),
   ]);
   const hydratedSignals = await hydrateOpenPositionSourceSignals(signals, positions);
   const latestSignal = hydratedSignals[0];
@@ -105,6 +108,7 @@ async function loadDashboard() {
     workerCycles,
     signalRejections,
     marketIntelligence,
+    marketDashboard,
   };
 }
 
@@ -127,6 +131,7 @@ export default async function Home() {
   queryClient.setQueryData(qk.workerCycles(20), data.workerCycles);
   queryClient.setQueryData(qk.signalRejections(50), data.signalRejections);
   queryClient.setQueryData(qk.marketIntelligence, data.marketIntelligence);
+  queryClient.setQueryData(qk.marketDashboard, data.marketDashboard);
 
   return (
     <HydrationBoundary state={dehydrate(queryClient)}>
