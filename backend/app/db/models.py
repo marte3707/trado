@@ -228,6 +228,8 @@ class AccountSnapshot(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     total_equity: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    effective_account_value: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    free_spot_usdc: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
     available_balance: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
     margin_used: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
     unrealized_pnl: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)

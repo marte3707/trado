@@ -256,6 +256,15 @@ class AutoCalibrationEngine:
             else {}
         )
         disabled_at: dict[str, int] = dict(state_value.get("auto_disabled_at_trade_count") or {})
+        # Backfill: strategie disabilitate prima che il tracking venisse introdotto
+        # non hanno entry in disabled_at — senza di essa il retest non scatterebbe mai.
+        # Le aggiungiamo con il trade count attuale così il retest si attiva dopo
+        # `retest_after_trades` nuovi trade chiusi a partire da ora.
+        for strategy in strategies:
+            if not strategy.enabled:
+                key = f"{strategy.timeframe}:{strategy.strategy_name}"
+                if key not in disabled_at:
+                    disabled_at[key] = int(total_closed)
         for strategy in strategies:
             if strategy.enabled:
                 continue

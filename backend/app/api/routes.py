@@ -631,7 +631,18 @@ def positions(db: Session = Depends(get_db)) -> list[dict]:
             row.pnl_updated_at is None
             or (now_utc - row.pnl_updated_at) > PNL_STALENESS
         )
-        if row.status == "open" and (unrealized_pnl is None or is_stale):
+        if row.status == "open" and row.mode == "live":
+            # For live positions the authoritative P&L comes from Hyperliquid
+            # (written by reconcile_live_positions). Never override it with a
+            # candle-based estimate — stale candles give wrong sign and magnitude.
+            if unrealized_pnl is None:
+                mark_str = (row.metadata_json or {}).get("last_mark_price")
+                if mark_str:
+                    try:
+                        unrealized_pnl = _calculate_unrealized_pnl(row, Decimal(str(mark_str)))
+                    except Exception:
+                        pass
+        elif row.status == "open" and (unrealized_pnl is None or is_stale):
             latest_candle = _latest_candle_for_position(db, row)
             unrealized_pnl = _calculate_unrealized_pnl(row, latest_candle.close if latest_candle else None)
         metrics = build_trade_metrics(row, orders_by_position.get(row.id, []), unrealized_pnl=unrealized_pnl)
@@ -1376,6 +1387,113 @@ async def _fetch_predicted_fundings(client: HyperliquidClient) -> tuple[list[dic
         return [], _log_and_redact("account_snapshot_predicted_error", exc)
 
 
+def _hl_period_for_days(days: int) -> str:
+    """Map a day-count to the most appropriate HL portfolio period key."""
+    if days <= 1:
+        return "day"
+    if days <= 7:
+        return "week"
+    return "allTime"
+
+
+def _hl_best_hist(period_map: dict, days: int) -> list:
+    """Return the accountValueHistory list that best covers the requested window.
+
+    For windows > 7 days we use allTime (full coverage, ~38 pts).
+    For ≤ 7 days we prefer week (higher resolution, ~60 pts) and fall back to allTime.
+    For ≤ 1 day we prefer day, then week, then allTime.
+    """
+    for period in (["day", "week", "allTime"] if days <= 1 else (["week", "allTime"] if days <= 7 else ["allTime", "week"])):
+        hist = period_map.get(period, {}).get("accountValueHistory", [])
+        if hist:
+            return hist
+    return []
+
+
+def _compute_equity_points(raw_pairs: list[tuple[float, float]]) -> list[dict]:
+    """Given [(ts_ms, equity), ...] sorted ascending, return point dicts with drawdown."""
+    points = []
+    peak: float | None = None
+    for ts_ms, equity in raw_pairs:
+        if equity <= 0:
+            continue
+        if peak is None or equity > peak:
+            peak = equity
+        dd = ((peak - equity) / peak * 100) if peak and peak > 0 else 0.0
+        ts_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        points.append({"ts": ts_dt.isoformat(), "equity": round(equity, 4), "drawdown_pct": round(dd, 4)})
+    return points
+
+
+@router.get("/account/equity-history")
+async def account_equity_history(
+    days: int = Query(default=30, ge=1, le=365),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return account equity history.
+
+    Primary source: HL portfolio endpoint (authoritative, covers full account value incl. spot).
+    Supplementary: local account_snapshots with effective_account_value for recent high-res data.
+    """
+    settings = get_settings()
+    address = settings.hyperliquid_account_address
+    since_ms = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
+
+    # ── Fetch from HL ──────────────────────────────────────────────────────────
+    hl_pairs: list[tuple[float, float]] = []
+    hl_error: str | None = None
+    if address:
+        try:
+            client = HyperliquidClient(settings)
+            period = _hl_period_for_days(days)
+            portfolio_data = await client.portfolio(address)
+            period_map: dict[str, list] = {item[0]: item[1] for item in portfolio_data if isinstance(item, list) and len(item) == 2}
+            hist = _hl_best_hist(period_map, days)
+            hl_pairs = [
+                (float(ts), float(val))
+                for ts, val in hist
+                if float(ts) >= since_ms and float(val) > 0
+            ]
+            hl_pairs.sort(key=lambda x: x[0])
+        except Exception as exc:
+            hl_error = str(exc)
+
+    # ── Fallback: local snapshots (new records with effective_account_value) ──
+    local_pairs: list[tuple[float, float]] = []
+    if not hl_pairs:
+        since_dt = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc)
+        rows = (
+            db.query(AccountSnapshot)
+            .filter(
+                AccountSnapshot.timestamp >= since_dt,
+                AccountSnapshot.effective_account_value.isnot(None),
+            )
+            .order_by(AccountSnapshot.timestamp.asc())
+            .all()
+        )
+        local_pairs = [
+            (row.timestamp.timestamp() * 1000, float(row.effective_account_value))
+            for row in rows
+            if row.effective_account_value is not None
+        ]
+
+    raw_pairs = hl_pairs if hl_pairs else local_pairs
+    points = _compute_equity_points(raw_pairs)
+
+    current_equity = points[-1]["equity"] if points else None
+    peak_equity = max((p["equity"] for p in points), default=None)
+    max_drawdown_pct = max((p["drawdown_pct"] for p in points), default=0.0)
+    return {
+        "points": points,
+        "current_equity": current_equity,
+        "peak_equity": peak_equity,
+        "max_drawdown_pct": round(max_drawdown_pct, 4),
+        "days": days,
+        "source": "hyperliquid" if hl_pairs else "local",
+        "hl_error": hl_error,
+    }
+
+
 @router.get("/account/snapshot")
 async def account_snapshot(db: Session = Depends(get_db)) -> dict:
     settings = get_settings()
@@ -1438,6 +1556,8 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
             AccountSnapshot(
                 timestamp=checked_at,
                 total_equity=total_equity,
+                effective_account_value=effective_account_value,
+                free_spot_usdc=free_spot_usdc,
                 available_balance=available_balance,
                 margin_used=margin_used,
                 unrealized_pnl=unrealized_pnl,

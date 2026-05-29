@@ -4,6 +4,7 @@ import { useQuery, type UseQueryOptions } from "@tanstack/react-query";
 
 import {
   apiGet,
+  type AccountEquityHistory,
   type AccountMonitor,
   type AppSettings,
   type AutoTunerSourceTests,
@@ -246,6 +247,16 @@ export function useAccountMonitor(opts?: QueryOpts<AccountMonitor | null>) {
     queryKey: qk.accountMonitor,
     queryFn: () => apiGet<AccountMonitor>("/api/account/snapshot").catch(() => null),
     refetchInterval: 5_000,
+    ...opts,
+  });
+}
+
+export function useAccountEquityHistory(days = 30, opts?: QueryOpts<AccountEquityHistory | null>) {
+  return useQuery({
+    queryKey: qk.accountEquityHistory(days),
+    queryFn: () =>
+      apiGet<AccountEquityHistory>(`/api/account/equity-history?days=${days}`).catch(() => null),
+    refetchInterval: 60_000,
     ...opts,
   });
 }

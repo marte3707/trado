@@ -27,6 +27,7 @@ export const qk = {
   equitySlope: ["equity-slope"] as const,
   diagnostics: ["diagnostics"] as const,
   accountMonitor: ["account", "snapshot"] as const,
+  accountEquityHistory: (days: number) => ["account", "equity-history", days] as const,
   coinMarketCapUsage: ["market-intelligence", "cmc-usage"] as const,
   coinGeckoUsage: ["market-intelligence", "cg-usage"] as const,
 } as const;

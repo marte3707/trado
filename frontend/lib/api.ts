@@ -157,6 +157,22 @@ export type SystemErrorLog = {
 
 export type SystemErrorLogs = Record<SystemService, SystemErrorLog>;
 
+export type AccountEquityPoint = {
+  ts: string;
+  equity: number;
+  drawdown_pct: number;
+};
+
+export type AccountEquityHistory = {
+  points: AccountEquityPoint[];
+  current_equity: number | null;
+  peak_equity: number | null;
+  max_drawdown_pct: number;
+  days: number;
+  source: "hyperliquid" | "local";
+  hl_error: string | null;
+};
+
 export type AccountMonitor = {
   status: string;
   network: string;

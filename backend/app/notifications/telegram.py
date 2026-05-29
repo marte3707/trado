@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -206,24 +207,39 @@ class TelegramNotifier:
         )
 
     async def send_hourly_recap(self, db: Session, stats: dict) -> None:
-        now = datetime.now(timezone.utc)
-        now_str = now.strftime("%H:%M UTC")
+        _rome = ZoneInfo("Europe/Rome")
+        now_str = datetime.now(_rome).strftime("%d/%m/%Y %H:%M (Roma)")
 
-        # posizioni aperte
+        # posizioni live aperte: long/short, profitto/perdita, nuove nel periodo
+        live_long = live_short = live_profit = live_loss = new_positions = 0
+        live_pnl = None
         try:
-            paper_count = (
+            live_long = (
                 db.query(func.count(Position.id))
-                .filter(Position.mode == "paper", Position.status == "open")
+                .filter(Position.mode == "live", Position.status == "open", Position.side == "long")
                 .scalar() or 0
             )
-            paper_pnl = (
-                db.query(func.sum(Position.unrealized_pnl))
-                .filter(Position.mode == "paper", Position.status == "open")
-                .scalar()
-            )
-            live_count = (
+            live_short = (
                 db.query(func.count(Position.id))
-                .filter(Position.mode == "live", Position.status == "open")
+                .filter(Position.mode == "live", Position.status == "open", Position.side == "short")
+                .scalar() or 0
+            )
+            live_profit = (
+                db.query(func.count(Position.id))
+                .filter(
+                    Position.mode == "live",
+                    Position.status == "open",
+                    Position.unrealized_pnl >= 0,
+                )
+                .scalar() or 0
+            )
+            live_loss = (
+                db.query(func.count(Position.id))
+                .filter(
+                    Position.mode == "live",
+                    Position.status == "open",
+                    Position.unrealized_pnl < 0,
+                )
                 .scalar() or 0
             )
             live_pnl = (
@@ -231,21 +247,26 @@ class TelegramNotifier:
                 .filter(Position.mode == "live", Position.status == "open")
                 .scalar()
             )
+            period_start_ts = stats.get("period_start")
+            if period_start_ts is not None:
+                period_start_dt = datetime.fromtimestamp(period_start_ts, tz=timezone.utc)
+                new_positions = (
+                    db.query(func.count(Position.id))
+                    .filter(
+                        Position.mode == "live",
+                        Position.opened_at >= period_start_dt,
+                    )
+                    .scalar() or 0
+                )
         except Exception:
-            paper_count = live_count = 0
-            paper_pnl = live_pnl = None
+            pass
 
-        # impostazioni correnti
         mode = "—"
-        score = "—"
         defensive = False
         try:
             mode_setting = db.get(AppSetting, "operation_mode")
             if mode_setting:
                 mode = mode_setting.value.get("mode", "—")
-            risk_setting = db.get(AppSetting, "risk")
-            if risk_setting:
-                score = risk_setting.value.get("min_signal_score", "—")
             cal_state = db.get(AppSetting, "auto_calibration_state")
             if cal_state:
                 defensive = bool(cal_state.value.get("deep_defensive_active", False))
@@ -258,29 +279,22 @@ class TelegramNotifier:
             sign = "+" if float(v) >= 0 else ""
             return f"{sign}{float(v):.2f} $"
 
-        cycles = stats.get("cycles", 0)
-        signals = stats.get("signals_generated", 0)
-        candle_errors = stats.get("candle_errors", 0)
-        cycle_failures = stats.get("cycle_failures", 0)
         period_min = stats.get("period_minutes", 60)
-        live_balance = stats.get("live_balance", "n/d")
-
-        defensive_line = "\n⚠️ <b>Modalità difensiva attiva</b>" if defensive else ""
-        positions_block = (
-            f"\n\n📌 <b>Posizioni aperte</b>\n"
-            f"  Paper: {paper_count} | PnL: <code>{_pnl(paper_pnl)}</code>\n"
-            f"  Live:  {live_count} | PnL: <code>{_pnl(live_pnl)}</code>"
-        )
+        raw_balance = stats.get("live_balance")
+        balance_str = f"{float(raw_balance):,.2f} $" if raw_balance is not None else "n/d"
+        live_total = live_long + live_short
+        defensive_line = "\n\n⚠️ <b>Modalità difensiva attiva</b>" if defensive else ""
 
         await self._send_text(
             f"📊 <b>Trado — Recap {period_min} min</b>\n"
             f"<code>{now_str}</code>\n\n"
-            f"📡 Cicli: {cycles} | Errori ciclo: {cycle_failures}\n"
-            f"📈 Segnali generati: {signals}\n"
-            f"⚠️ Errori candle sync: {candle_errors}"
-            f"{positions_block}\n\n"
-            f"Saldo live: {live_balance} $ \n"
-            f"⚙️ Modalità: <b>{mode}</b> · Score min: <b>{score}</b>"
+            f"💰 Saldo HL: <b>{balance_str}</b>\n"
+            f"⚙️ Modalità: <b>{mode}</b>\n\n"
+            f"📌 <b>Posizioni live aperte: {live_total}</b>\n"
+            f"  📈 Long: {live_long}  |  📉 Short: {live_short}\n"
+            f"  ✅ Profitto: {live_profit}  |  🔴 Perdita: {live_loss}\n"
+            f"  PnL: <code>{_pnl(live_pnl)}</code>\n\n"
+            f"🆕 Aperte nel periodo: {new_positions}"
             f"{defensive_line}"
         )
 

@@ -982,6 +982,13 @@ async def main() -> None:
         if now >= _next_recap_at:
             _next_recap_at = now + _RECAP_INTERVAL_SECONDS
             period_min = round((now - stats.period_start) / 60)
+            live_balance = None
+            try:
+                live_balance = await asyncio.to_thread(
+                    HyperliquidTradingClient(settings).account_value
+                )
+            except Exception:
+                logger.warning("recap_live_balance_fetch_failed")
             recap_db = SessionLocal()
             try:
                 await notifier.send_hourly_recap(recap_db, {
@@ -990,6 +997,8 @@ async def main() -> None:
                     "candle_errors": stats.candle_errors,
                     "cycle_failures": stats.cycle_failures,
                     "period_minutes": period_min,
+                    "period_start": stats.period_start,
+                    "live_balance": live_balance,
                 })
             except Exception:
                 logger.exception("telegram_recap_failed")

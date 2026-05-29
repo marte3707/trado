@@ -193,6 +193,13 @@ class HyperliquidClient:
     async def predicted_fundings(self) -> list[Any]:
         return await self._post_info({"type": "predictedFundings"})
 
+    async def portfolio(self, address: str) -> list[Any]:
+        """Returns portfolio history per period (day/week/month/allTime + perp variants).
+
+        Each item is [period_name, {accountValueHistory: [[ts_ms, value], ...], pnlHistory: [...], vlm: ...}].
+        """
+        return await self._post_info({"type": "portfolio", "user": address})
+
     async def user_funding(self, address: str, start_ms: int, end_ms: int | None = None) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"type": "userFunding", "user": address, "startTime": start_ms}
         if end_ms is not None:

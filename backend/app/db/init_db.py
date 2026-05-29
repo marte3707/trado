@@ -47,12 +47,14 @@ DEFAULT_STRATEGY_WEIGHTS = {
     "bollinger_bands": 8,
     "vwap": 8,
     "candlestick_patterns": 5,
-    "wyckoff_spring_upthrust": 12,
-    "oi_trend": 10,
-    # Weight conservativi per le strategie nuove: il sistema le promuoverà via
-    # Wilson-based calibration se mostrano edge reale dopo ≥ min_strategy_trades (20).
-    "cvd_divergence": 8,
-    "liquidation_cascade": 10,
+    # wyckoff: WR ~54% nei dati storici — peso aumentato da 12
+    "wyckoff_spring_upthrust": 15,
+    # oi_trend: WR 25%, PF 0.21 — peso ridotto da 10
+    "oi_trend": 4,
+    # cvd_divergence: WR 50% — peso aumentato da 8
+    "cvd_divergence": 10,
+    # liquidation_cascade: segnale raro, pochi dati — peso ridotto da 10
+    "liquidation_cascade": 5,
     "volume_profile": 9,
 }
 
