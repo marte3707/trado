@@ -110,7 +110,7 @@ def paper_management_timeframes(db, enabled_timeframes: list[str]) -> list[str]:
         metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
         source_timeframe = metadata.get("source_timeframe")
         if not isinstance(source_timeframe, str) or not source_timeframe:
-            source_signal_id = metadata.get("source_signal_id")
+            source_signal_id = metadata.get("source_signal_id", 0)
             try:
                 signal_id = int(source_signal_id)
             except (TypeError, ValueError):

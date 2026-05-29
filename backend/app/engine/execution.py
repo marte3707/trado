@@ -984,7 +984,7 @@ class OrderExecutionEngine:
         source_timeframe = metadata.get("source_timeframe")
         if isinstance(source_timeframe, str) and source_timeframe in TIMEFRAME_MS:
             return source_timeframe
-        source_signal_id = metadata.get("source_signal_id")
+        source_signal_id = metadata.get("source_signal_id", 0)
         try:
             signal_id = int(source_signal_id)
         except (TypeError, ValueError):

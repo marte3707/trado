@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
 import structlog
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import get_settings
@@ -38,6 +39,11 @@ _TPSL_BY_ORDER_TYPE: dict[str, str] = {
 # After this many consecutive failed re-submissions we stop retrying to avoid
 # infinite resubmit loops when HL persistently rejects the order.
 _MAX_RESUBMIT_ATTEMPTS = 3
+# Successful re-submissions can also loop if HL keeps omitting the new order from
+# openOrders. Cap total attempts and cool down successful retries before trying
+# again so one missing TP cannot churn orders every reconciliation cycle.
+_MAX_RESUBMIT_TOTAL_ATTEMPTS = 3
+_RESUBMIT_RETRY_COOLDOWN_SECONDS = 15 * 60
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,28 @@ def _decimal(value: str | int | float | Decimal | None) -> Decimal | None:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _set_order_raw_response(order: Order, raw: dict) -> None:
+    order.raw_response = raw
+    try:
+        flag_modified(order, "raw_response")
+    except Exception:
+        # Test doubles and detached ORM objects do not always have an instrumented
+        # attribute state. Assignment above is still enough for those cases.
+        pass
+
+
+def _parse_iso(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _coin_for_market(market: Market) -> str:
@@ -348,7 +376,7 @@ def _reconcile_exit_fills(
                 order.hyperliquid_order_id = str(oid_val)
         raw = dict(order.raw_response or {})
         raw["fills"] = matched
-        order.raw_response = raw
+        _set_order_raw_response(order, raw)
         db.add(order)
 
         if plan_mut is not None and order.order_type in {"tp1", "tp2", "tp3"}:
@@ -535,7 +563,7 @@ def _sync_order_from_frontend_open_order(
         "new_price": str(order.price) if order.price is not None else None,
         "frontend_order_type": frontend_order.get("orderType"),
     }
-    order.raw_response = raw
+    _set_order_raw_response(order, raw)
     db.add(order)
     db.add(
         DecisionLog(
@@ -619,7 +647,10 @@ def _resubmit_missing_protection_orders(
             continue
 
         raw = dict(order.raw_response or {})
-        resubmits: list[dict] = raw.get("resubmits") or []
+        raw_resubmits = raw.get("resubmits")
+        resubmits: list[dict] = [
+            item for item in raw_resubmits if isinstance(item, dict)
+        ] if isinstance(raw_resubmits, list) else []
         failed_attempts = sum(1 for r in resubmits if r.get("status") != "ok")
         if failed_attempts >= _MAX_RESUBMIT_ATTEMPTS:
             continue
@@ -650,6 +681,68 @@ def _resubmit_missing_protection_orders(
         if tpsl is None:
             continue
 
+        now = datetime.now(timezone.utc)
+        if len(resubmits) >= _MAX_RESUBMIT_TOTAL_ATTEMPTS:
+            raw["resubmit_blocked"] = {
+                "reason": "max_total_attempts",
+                "blocked_at": now.isoformat(),
+                "attempts": len(resubmits),
+                "max_attempts": _MAX_RESUBMIT_TOTAL_ATTEMPTS,
+            }
+            _set_order_raw_response(order, raw)
+            db.add(order)
+            db.add(
+                DecisionLog(
+                    event_type="live_protection_order_resubmit_skipped_retry_cap",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message=(
+                        f"Protection order {order.order_type} re-submit skipped: "
+                        "retry cap reached"
+                    ),
+                    data={
+                        "coin": coin,
+                        "order_id": order.id,
+                        "order_type": order.order_type,
+                        "attempts": len(resubmits),
+                        "max_attempts": _MAX_RESUBMIT_TOTAL_ATTEMPTS,
+                    },
+                )
+            )
+            continue
+
+        last_resubmit = resubmits[-1] if resubmits else None
+        last_attempted_at = (
+            _parse_iso(last_resubmit.get("attempted_at")) if last_resubmit else None
+        )
+        if (
+            last_resubmit is not None
+            and last_resubmit.get("status") == "ok"
+            and str(last_resubmit.get("new_oid") or "") == str(order.hyperliquid_order_id or "")
+            and last_attempted_at is not None
+            and (now - last_attempted_at).total_seconds() < _RESUBMIT_RETRY_COOLDOWN_SECONDS
+        ):
+            db.add(
+                DecisionLog(
+                    event_type="live_protection_order_resubmit_skipped_cooldown",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message=(
+                        f"Protection order {order.order_type} re-submit skipped: "
+                        "recent successful retry still in cooldown"
+                    ),
+                    data={
+                        "coin": coin,
+                        "order_id": order.id,
+                        "order_type": order.order_type,
+                        "last_new_oid": last_resubmit.get("new_oid"),
+                        "last_attempted_at": last_resubmit.get("attempted_at"),
+                        "cooldown_seconds": _RESUBMIT_RETRY_COOLDOWN_SECONDS,
+                    },
+                )
+            )
+            continue
+
         if order.order_type == "stop_loss" and _violates_liquidation_guard(
             position,
             order.price,
@@ -658,6 +751,7 @@ def _resubmit_missing_protection_orders(
             raw["resubmits"] = [
                 *resubmits,
                 {
+                    "attempted_at": now.isoformat(),
                     "old_oid": order.hyperliquid_order_id,
                     "status": "skipped_liquidation_guard",
                     "trigger_price": str(order.price),
@@ -666,7 +760,7 @@ def _resubmit_missing_protection_orders(
                     else None,
                 },
             ]
-            order.raw_response = raw
+            _set_order_raw_response(order, raw)
             db.add(order)
             db.add(
                 DecisionLog(
@@ -745,6 +839,7 @@ def _resubmit_missing_protection_orders(
             )
             old_oid = order.hyperliquid_order_id
             resubmit_entry: dict = {
+                "attempted_at": now.isoformat(),
                 "old_oid": old_oid,
                 "new_oid": result.oid,
                 "status": result.status,
@@ -755,7 +850,7 @@ def _resubmit_missing_protection_orders(
             raw["resubmits"] = resubmits
 
             if result.status != "ok":
-                order.raw_response = raw
+                _set_order_raw_response(order, raw)
                 db.add(order)
                 db.add(
                     DecisionLog(
@@ -787,7 +882,7 @@ def _resubmit_missing_protection_orders(
             order.hyperliquid_order_id = result.oid
             order.status = "filled" if immediately_filled else "open"
             order.size = submit_size
-            order.raw_response = raw
+            _set_order_raw_response(order, raw)
             db.add(order)
             if immediately_filled:
                 db.add(
@@ -828,10 +923,15 @@ def _resubmit_missing_protection_orders(
                 )
         except Exception as exc:
             resubmits.append(
-                {"old_oid": order.hyperliquid_order_id, "status": "error", "error": str(exc)}
+                {
+                    "attempted_at": datetime.now(timezone.utc).isoformat(),
+                    "old_oid": order.hyperliquid_order_id,
+                    "status": "error",
+                    "error": str(exc),
+                }
             )
             raw["resubmits"] = resubmits
-            order.raw_response = raw
+            _set_order_raw_response(order, raw)
             db.add(order)
             logger.warning(
                 "live_protection_order_resubmit_failed",
@@ -867,7 +967,7 @@ def _resize_local_stop_orders(
             "old_size": str(previous_size),
             "new_size": str(remote_size),
         }
-        order.raw_response = raw
+        _set_order_raw_response(order, raw)
         db.add(order)
         db.add(
             DecisionLog(

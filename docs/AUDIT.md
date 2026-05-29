@@ -7,6 +7,15 @@
 
 ---
 
+## Aggiornamento operativo — 2026-05-29
+
+- `mtf_confluence` è stato verificato nello stato AutoTuner come `reverted`: dopo l'attivazione ha prodotto WR 22.2%, PnL `-4224.1587` e PF `0.2840`, contro baseline WR 58%, PnL `+4052.5030` e PF `2.5292`.
+- La configurazione runtime deve tenerlo disattivato globalmente (`risk.mtf_confluence_enabled=false`) salvo nuovo test A/B isolato.
+- L'aggressività live è intenzionale e non è un finding: non ridurre leva, esposizione, cap posizioni, `operation_mode` o `enable_live_trading` in remediation automatiche.
+- Risolti i blocchi statici emersi dall'audit (`ruff`/`mypy`) e aggiunta protezione contro loop di re-submit sugli ordini live di protezione: ogni ordine mantiene storico persistente `raw_response.resubmits`, cooldown su retry riusciti recenti e cap totale di tentativi.
+
+---
+
 ## Executive Summary
 
 Lo stato corrente del sistema mostra un anomalia operativa: dal 16/05/2026 il deep defensive è attivo, il min_signal_score è salito a 72 e da diversi cicli non viene generato alcun segnale. L'auto-tuner è abilitato ma non riesce a completare alcuno step perché aspetta posizioni chiuse che non arrivano.

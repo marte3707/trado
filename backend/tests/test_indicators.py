@@ -1,3 +1,5 @@
+import math
+
 from app.indicators.core import (
     adx,
     atr,
@@ -139,13 +141,14 @@ def test_adx_low_in_choppy_market() -> None:
 # Robustness tests (added during §2.1 perf investigation — vedi doc per dettagli)
 # ---------------------------------------------------------------------------
 
-import math
-
 
 def test_atr_finite_for_diverse_series() -> None:
     highs = [100 + i * 0.5 + math.sin(i / 4) * 2 for i in range(100)]
     lows = [h - 1.0 - abs(math.cos(i / 5)) for i, h in enumerate(highs)]
-    closes = [(h + l) / 2 + math.sin(i / 6) * 0.3 for i, (h, l) in enumerate(zip(highs, lows))]
+    closes = [
+        (high + low) / 2 + math.sin(i / 6) * 0.3
+        for i, (high, low) in enumerate(zip(highs, lows))
+    ]
 
     result = atr(highs, lows, closes, 14)
     # I primi 13 sono None (warmup EMA), gli altri devono essere float positivi

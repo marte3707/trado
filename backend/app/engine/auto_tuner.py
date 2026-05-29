@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import math
-import random
 import hashlib
+import random
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
@@ -728,7 +728,8 @@ class AutoTuner:
                 )
                 mean_control = sum(control_pnls) / n_control if n_control else 0.0
                 mean_test = sum(test_pnls) / n_test if n_test else 0.0
-                ab_state = state.get("ab_test") if isinstance(state.get("ab_test"), dict) else {}
+                raw_ab_state = state.get("ab_test")
+                ab_state: dict[str, Any] = raw_ab_state if isinstance(raw_ab_state, dict) else {}
                 ab_progress = {
                     "trades_control": n_control,
                     "trades_test": n_test,
@@ -748,7 +749,11 @@ class AutoTuner:
                     "active_overlay": ab_state.get("test_overlay", {}),
                 }
             else:
-                trades_at_activation = int(state.get("trades_at_activation", trades_now))
+                raw_trades_at_activation = state.get("trades_at_activation", trades_now)
+                try:
+                    trades_at_activation = int(raw_trades_at_activation)
+                except (TypeError, ValueError):
+                    trades_at_activation = trades_now
                 delta = max(0, trades_now - trades_at_activation)
                 progress = {
                     "trades_done": delta,

@@ -516,7 +516,10 @@ class AutoCalibrationEngine:
         cooldown_remaining = max(
             0, int(state_value.get("deep_defensive_cooldown_remaining", 0) or 0)
         )
-        cooldown_trade_count_raw = state_value.get("deep_defensive_cooldown_trade_count")
+        cooldown_trade_count_raw = state_value.get(
+            "deep_defensive_cooldown_trade_count",
+            overall.trades,
+        )
         try:
             cooldown_trade_count = int(cooldown_trade_count_raw)
         except (TypeError, ValueError):

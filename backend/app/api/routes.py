@@ -1,7 +1,7 @@
-import uuid
 import os
 import shlex
 import subprocess
+import uuid
 from collections import deque
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -13,6 +13,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from sqlalchemy.orm import Session, joinedload
+
 from app.core.config import get_settings
 from app.core.runtime_settings import (
     effective_live_execution_settings,
@@ -259,7 +260,7 @@ def _service_script(service: str, action: str) -> str:
     config = SYSTEM_SERVICES[service]
     domain = f"gui/{os.getuid()}"
     target = f"{domain}/{config['label']}"
-    plist = FilePath(config["plist"])
+    plist = FilePath(str(config["plist"]))
     if action in {"start", "reboot"} and not plist.exists():
         raise HTTPException(status_code=404, detail=f"LaunchAgent plist not found: {plist}")
 
@@ -754,7 +755,7 @@ def orders(db: Session = Depends(get_db)) -> list[dict]:
 
     rows = sorted(rows_by_id.values(), key=lambda row: row.created_at, reverse=True)
     signal_ids = {row.signal_id for row in rows if row.signal_id is not None}
-    position_ids = {row.position_id for row in rows if row.position_id is not None}
+    order_position_ids = {row.position_id for row in rows if row.position_id is not None}
     signals_by_id = (
         {
             row.id: row
@@ -771,10 +772,10 @@ def orders(db: Session = Depends(get_db)) -> list[dict]:
             row.id: row
             for row in db.query(Position)
             .options(joinedload(Position.market))
-            .filter(Position.id.in_(position_ids))
+            .filter(Position.id.in_(order_position_ids))
             .all()
         }
-        if position_ids
+        if order_position_ids
         else {}
     )
 
@@ -1143,7 +1144,7 @@ def system_service_action(
 @router.get("/system/error-logs")
 def system_error_logs(limit: int = Query(20, ge=1, le=200)) -> dict:
     return {
-        service: _tail_error_log(FilePath(config["error_log"]), limit)
+        service: _tail_error_log(FilePath(str(config["error_log"])), limit)
         for service, config in SYSTEM_SERVICES.items()
     }
 
@@ -1445,7 +1446,6 @@ async def account_equity_history(
     if address:
         try:
             client = HyperliquidClient(settings)
-            period = _hl_period_for_days(days)
             portfolio_data = await client.portfolio(address)
             period_map: dict[str, list] = {item[0]: item[1] for item in portfolio_data if isinstance(item, list) and len(item) == 2}
             hist = _hl_best_hist(period_map, days)

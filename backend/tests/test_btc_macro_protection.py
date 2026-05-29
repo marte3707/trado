@@ -4,11 +4,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from app.core.config import Settings
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Position, Signal
-from app.engine.btc_macro_protection import BtcMacroProtectionEngine, BtcTrendState
+from app.engine.btc_macro_protection import BtcMacroProtectionEngine
 from app.engine.position_management import StopCandidate
 
 

@@ -1,6 +1,6 @@
 import copy
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -675,6 +675,68 @@ def test_resubmit_missing_tp1_when_not_in_hl_open_orders() -> None:
     assert tp1_order.hyperliquid_order_id == "77777"
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_protection_order_resubmitted" in events
+
+
+def test_resubmit_missing_tp1_skips_recent_successful_retry_cooldown() -> None:
+    position = _make_position(size="1.0")
+    tp1_order = _make_tp_order(oid_str="77777")
+    tp1_order.raw_response = {
+        "resubmits": [
+            {
+                "attempted_at": datetime.now(timezone.utc).isoformat(),
+                "old_oid": "9999",
+                "new_oid": "77777",
+                "status": "ok",
+                "size": "0.5",
+            }
+        ]
+    }
+    db = FakeDb(positions=[position], orders=[tp1_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        open_order_oids=[],
+        resubmit_oid="88888",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert trading.resubmitted == []
+    assert tp1_order.hyperliquid_order_id == "77777"
+    assert len(tp1_order.raw_response["resubmits"]) == 1
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_resubmit_skipped_cooldown" in events
+
+
+def test_resubmit_missing_tp1_stops_after_total_retry_cap() -> None:
+    old_attempt = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    position = _make_position(size="1.0")
+    tp1_order = _make_tp_order(oid_str="33333")
+    tp1_order.raw_response = {
+        "resubmits": [
+            {
+                "attempted_at": old_attempt,
+                "old_oid": str(i),
+                "new_oid": str(i + 1),
+                "status": "ok",
+                "size": "0.5",
+            }
+            for i in range(3)
+        ]
+    }
+    db = FakeDb(positions=[position], orders=[tp1_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        open_order_oids=[],
+        resubmit_oid="44444",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert trading.resubmitted == []
+    assert tp1_order.hyperliquid_order_id == "33333"
+    assert tp1_order.raw_response["resubmit_blocked"]["reason"] == "max_total_attempts"
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_resubmit_skipped_retry_cap" in events
 
 
 def test_no_resubmit_when_tp1_present_in_hl_open_orders() -> None:

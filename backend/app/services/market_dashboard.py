@@ -156,14 +156,19 @@ class MarketDashboardService:
         total_volume = _as_float((global_data.get("total_volume") or {}).get("usd"))
         updated_at = _as_float(global_data.get("updated_at"))
 
-        movers = [
-            _coin_mover(coin)
-            for coin in coins
-            if isinstance(coin, dict)
-            and str(coin.get("symbol", "")).upper() not in _STABLECOIN_SYMBOLS
-            and _as_float(coin.get("price_change_percentage_24h")) is not None
-        ]
-        movers = [m for m in movers if m is not None]
+        movers: list[dict[str, Any]] = []
+        for coin in coins:
+            if (
+                isinstance(coin, dict)
+                and str(coin.get("symbol", "")).upper() not in _STABLECOIN_SYMBOLS
+                and _as_float(coin.get("price_change_percentage_24h")) is not None
+            ):
+                mover = _coin_mover(coin)
+                if mover is not None:
+                    movers.append(mover)
+
+        def mover_change(mover: dict[str, Any]) -> float:
+            return float(mover["price_change_24h_pct"])
 
         return {
             "metrics": {
@@ -196,10 +201,10 @@ class MarketDashboardService:
                 "source": "coingecko",
                 "top_gainers_24h": sorted(
                     movers,
-                    key=lambda m: m["price_change_24h_pct"],
+                    key=mover_change,
                     reverse=True,
                 )[:3],
-                "top_losers_24h": sorted(movers, key=lambda m: m["price_change_24h_pct"])[:3],
+                "top_losers_24h": sorted(movers, key=mover_change)[:3],
             },
             "altcoin_season": self._compute_altcoin_season(coins),
         }
