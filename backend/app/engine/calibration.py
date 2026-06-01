@@ -10,6 +10,10 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.db.models import AppSetting, DecisionLog, Position, StrategyConfig
 from app.engine.diagnostics import equity_slope_normalized
+from app.engine.edge_profile import (
+    DEFAULT_MAX_COMBINED_SCORE_ADJUSTMENT,
+    compute_edge_adjustments,
+)
 from app.engine.performance import PerformanceStats, SignalPerformanceAnalyzer, serialize_stats
 
 
@@ -108,6 +112,7 @@ class AutoCalibrationEngine:
                 recent_slope_value=recent_slope,
             )
         )
+        changes.extend(self._calibrate_edge_adjustments(db, settings))
         strategy_changes = {
             change.key: {
                 "target": change.target,
@@ -753,6 +758,66 @@ class AutoCalibrationEngine:
             )
         risk_setting.value = risk
         db.add(risk_setting)
+        return changes
+
+    def _calibrate_edge_adjustments(
+        self,
+        db: Session,
+        settings: dict[str, Any],
+    ) -> list[CalibrationChange]:
+        risk_setting = db.get(AppSetting, "risk") or AppSetting(key="risk", value={})
+        risk = dict(risk_setting.value if isinstance(risk_setting.value, dict) else {})
+        lookback = int(settings.get("lookback_trades", 500))
+        edge_adjustments = compute_edge_adjustments(
+            db,
+            lookback=lookback,
+            analyzer=self.analyzer,
+        )
+
+        defaults: dict[str, Any] = {
+            "directional_score_adjustments": {},
+            "score_bucket_adjustments": {},
+            "market_score_adjustments": {},
+            "timeframe_score_adjustments": {},
+            "allow_ob_imbalance_only_signals": False,
+            "entry_quality_filter_enabled": True,
+            "entry_quality_ema_period": 21,
+            "entry_quality_long_ob_imbalance_min": 0.05,
+            "entry_quality_short_ob_imbalance_max": 0.0,
+            "max_combined_score_adjustment": DEFAULT_MAX_COMBINED_SCORE_ADJUSTMENT,
+        }
+        changes: list[CalibrationChange] = []
+        for key, default in defaults.items():
+            if key not in risk:
+                risk[key] = default
+                changes.append(
+                    CalibrationChange(
+                        target="risk_setting",
+                        key=key,
+                        before=None,
+                        after=default,
+                        reason="edge calibration defaults initialized",
+                    )
+                )
+
+        for key, value in edge_adjustments.items():
+            before = risk.get(key)
+            if before == value:
+                continue
+            risk[key] = value
+            changes.append(
+                CalibrationChange(
+                    target="risk_setting",
+                    key=key,
+                    before=before if isinstance(before, dict) else None,
+                    after=value,
+                    reason="edge calibration from closed paper outcomes",
+                )
+            )
+
+        if changes:
+            risk_setting.value = risk
+            db.add(risk_setting)
         return changes
 
     def _strategy_factor(self, stats: PerformanceStats) -> tuple[float, str]:

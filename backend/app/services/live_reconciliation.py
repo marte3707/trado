@@ -12,6 +12,7 @@ from app.core.config import get_settings
 from app.core.enums import OrderMode, SignalStatus
 from app.core.runtime_settings import effective_live_execution_settings
 from app.db.models import DecisionLog, Market, Order, Position, Signal
+from app.engine.execution import make_cloid
 from app.engine.position_management import PositionManagementEngine, StopCandidate
 from app.services.hyperliquid import HyperliquidTradingClient
 
@@ -70,6 +71,28 @@ def _set_order_raw_response(order: Order, raw: dict) -> None:
         # Test doubles and detached ORM objects do not always have an instrumented
         # attribute state. Assignment above is still enough for those cases.
         pass
+
+
+def _price_match_tolerance(raw_price: object) -> Decimal:
+    if isinstance(raw_price, str) and "." in raw_price:
+        decimals = len(raw_price.partition(".")[2])
+        if decimals > 0:
+            return Decimal(10) ** -decimals
+    value = _decimal(raw_price)
+    if value is None:
+        return Decimal("0")
+    exponent = value.as_tuple().exponent
+    if exponent >= 0:
+        return Decimal("1")
+    return Decimal(10) ** exponent
+
+
+def _prices_match(expected: Decimal | None, actual: Decimal | None, raw_actual: object) -> bool:
+    if expected is None or actual is None:
+        return False
+    if expected == actual:
+        return True
+    return abs(expected - actual) <= _price_match_tolerance(raw_actual)
 
 
 def _parse_iso(value: object) -> datetime | None:
@@ -505,6 +528,16 @@ def _match_frontend_protection_order(
     if desired_tpsl is None:
         return None
 
+    local_oid = int(order.hyperliquid_order_id) if str(order.hyperliquid_order_id or "").isdigit() else None
+    local_cloid = str(order.cloid or "").lower().removeprefix("0x")
+    for item in frontend_orders:
+        frontend_oid = item.get("oid")
+        frontend_cloid = str(item.get("cloid") or "").lower().removeprefix("0x")
+        if local_oid is not None and frontend_oid == local_oid:
+            return item
+        if local_cloid and frontend_cloid and frontend_cloid == local_cloid:
+            return item
+
     matches: list[dict] = [
         item
         for item in frontend_orders
@@ -515,15 +548,17 @@ def _match_frontend_protection_order(
 
     if desired_tpsl == "tp" and order.price is not None:
         for item in matches:
-            trigger_px = _decimal(item.get("triggerPx"))
-            if trigger_px == order.price:
+            trigger_raw = item.get("triggerPx")
+            trigger_px = _decimal(trigger_raw)
+            if _prices_match(order.price, trigger_px, trigger_raw):
                 return item
         return None
 
     if desired_tpsl == "sl" and order.price is not None:
         for item in matches:
-            trigger_px = _decimal(item.get("triggerPx"))
-            if trigger_px == order.price:
+            trigger_raw = item.get("triggerPx")
+            trigger_px = _decimal(trigger_raw)
+            if _prices_match(order.price, trigger_px, trigger_raw):
                 return item
 
     return matches[0]
@@ -554,6 +589,12 @@ def _sync_order_from_frontend_open_order(
     if isinstance(frontend_cloid, str) and frontend_cloid:
         order.cloid = frontend_cloid.lower().removeprefix("0x")
     order.status = "open"
+    if order.order_type == "stop_loss":
+        metadata = dict(position.metadata_json or {})
+        metadata["stop_replacement_attempts"] = 0
+        metadata.pop("last_stop_replacement_failure", None)
+        position.metadata_json = metadata
+        db.add(position)
     raw = dict(order.raw_response or {})
     raw["frontend_open_order_sync"] = {
         "synced_at": datetime.now(timezone.utc).isoformat(),
@@ -586,6 +627,272 @@ def _sync_order_from_frontend_open_order(
     )
 
 
+def _expected_protection_order_types(position: Position) -> list[str]:
+    expected = ["stop_loss"]
+    plan = (position.metadata_json or {}).get("take_profit_plan") or []
+    for entry in plan:
+        if not isinstance(entry, dict) or entry.get("runner") or bool(entry.get("filled")):
+            continue
+        level = str(entry.get("level", ""))
+        if level in {"tp1", "tp2", "tp3"}:
+            expected.append(level)
+    return expected
+
+
+def _planned_protection_price(position: Position, order_type: str) -> Decimal | None:
+    if order_type == "stop_loss":
+        return position.stop_loss
+    plan = (position.metadata_json or {}).get("take_profit_plan") or []
+    for entry in plan:
+        if not isinstance(entry, dict) or entry.get("runner"):
+            continue
+        if str(entry.get("level", "")) != order_type:
+            continue
+        return _decimal(entry.get("price"))
+    return None
+
+
+def _planned_protection_allocation(position: Position, order_type: str) -> Decimal | None:
+    if order_type == "stop_loss":
+        return Decimal("1")
+    plan = (position.metadata_json or {}).get("take_profit_plan") or []
+    for entry in plan:
+        if not isinstance(entry, dict) or entry.get("runner"):
+            continue
+        if str(entry.get("level", "")) != order_type:
+            continue
+        return _decimal(entry.get("allocation"))
+    return None
+
+
+def _match_frontend_order_for_missing(
+    frontend_orders: list[dict],
+    position: Position,
+    order_type: str,
+    price: Decimal,
+) -> dict | None:
+    desired_tpsl = _TPSL_BY_ORDER_TYPE.get(order_type)
+    if desired_tpsl is None:
+        return None
+    for item in frontend_orders:
+        if _frontend_order_tpsl(item, position) != desired_tpsl:
+            continue
+        trigger_raw = item.get("triggerPx")
+        trigger_px = _decimal(trigger_raw)
+        if _prices_match(price, trigger_px, trigger_raw):
+            return item
+    return None
+
+
+def _repair_order_cloid(db: Session, position: Position, order_type: str) -> str | None:
+    signal_id = _source_signal_id(position)
+    if signal_id is None:
+        return None
+    cloid = make_cloid(signal_id, "sl" if order_type == "stop_loss" else order_type)
+    existing = db.query(Order).filter(Order.cloid == cloid).first()
+    return None if existing is not None else cloid
+
+
+def _create_missing_protection_orders(
+    db: Session,
+    position: Position,
+    coin: str,
+    frontend_orders: list[dict],
+    trading: HyperliquidTradingClient,
+    expires_after_seconds: int,
+    sz_decimals: int,
+    remote_size: Decimal | None,
+) -> None:
+    expected_types = _expected_protection_order_types(position)
+    existing_orders = (
+        db.query(Order)
+        .filter(
+            Order.position_id == position.id,
+            Order.mode == OrderMode.LIVE.value,
+            Order.order_type.in_(_RECONCILED_EXIT_TYPES),
+        )
+        .all()
+    )
+    existing_types = {order.order_type for order in existing_orders}
+    close_is_buy = position.side.lower() == "short"
+    signal_id = _source_signal_id(position)
+
+    for order_type in expected_types:
+        if order_type in existing_types:
+            continue
+        price = _planned_protection_price(position, order_type)
+        if price is None:
+            continue
+        frontend_match = _match_frontend_order_for_missing(frontend_orders, position, order_type, price)
+        if frontend_match is not None:
+            size = _decimal(frontend_match.get("sz")) or _decimal(frontend_match.get("origSz")) or Decimal("0")
+            recreated = Order(
+                position_id=position.id,
+                signal_id=signal_id,
+                hyperliquid_order_id=str(frontend_match.get("oid")) if frontend_match.get("oid") is not None else None,
+                cloid=str(frontend_match.get("cloid")).lower().removeprefix("0x")
+                if frontend_match.get("cloid")
+                else None,
+                mode=OrderMode.LIVE.value,
+                order_type=order_type,
+                side="buy" if close_is_buy else "sell",
+                price=price,
+                size=size,
+                status="open",
+                reduce_only=True,
+                raw_response={"recreated_from_frontend_open_order": True, "frontend_order": frontend_match},
+            )
+            db.add(recreated)
+            db.add(
+                DecisionLog(
+                    event_type="live_protection_order_recreated_from_frontend",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message=f"Protection order {order_type} recreated locally from frontend open order",
+                    data={"coin": coin, "order_type": order_type, "price": str(price), "size": str(size)},
+                )
+            )
+            continue
+        if remote_size is None or remote_size <= 0:
+            continue
+        allocation = _planned_protection_allocation(position, order_type)
+        if allocation is None or allocation <= 0:
+            continue
+        submit_size = _round_size(remote_size * allocation, sz_decimals)
+        if submit_size <= 0:
+            continue
+        cloid = _repair_order_cloid(db, position, order_type)
+        result = trading.submit_trigger_order(
+            coin=coin,
+            is_buy=close_is_buy,
+            size=submit_size,
+            trigger_price=price,
+            tpsl=_TPSL_BY_ORDER_TYPE[order_type],
+            expires_after_seconds=expires_after_seconds,
+            cloid=cloid,
+        )
+        recreated = Order(
+            position_id=position.id,
+            signal_id=signal_id,
+            hyperliquid_order_id=result.oid,
+            cloid=cloid,
+            mode=OrderMode.LIVE.value,
+            order_type=order_type,
+            side="buy" if close_is_buy else "sell",
+            price=price,
+            size=submit_size,
+            status="filled" if result.filled_size is not None else result.status,
+            reduce_only=True,
+            raw_response={**(result.raw_response or {}), "repair_created": True},
+        )
+        db.add(recreated)
+        db.add(
+            DecisionLog(
+                event_type="live_protection_order_recreated",
+                market_id=position.market_id,
+                position_id=position.id,
+                message=f"Protection order {order_type} recreated on Hyperliquid",
+                data={
+                    "coin": coin,
+                    "order_type": order_type,
+                    "price": str(price),
+                    "size": str(submit_size),
+                    "oid": result.oid,
+                    "status": result.status,
+                },
+            )
+        )
+
+
+def protection_state_for_live_position(
+    db: Session,
+    position: Position,
+    frontend_orders: list[dict],
+) -> dict[str, Any]:
+    expected_types = _expected_protection_order_types(position)
+    orders = (
+        db.query(Order)
+        .filter(
+            Order.position_id == position.id,
+            Order.mode == OrderMode.LIVE.value,
+            Order.order_type.in_(_RECONCILED_EXIT_TYPES),
+        )
+        .all()
+    )
+    latest_by_type: dict[str, Order] = {}
+    for order in orders:
+        current = latest_by_type.get(order.order_type)
+        if current is None or (order.id or 0) > (current.id or 0):
+            latest_by_type[order.order_type] = order
+
+    missing: list[str] = []
+    rejected: list[str] = []
+    active: list[str] = []
+
+    for order_type in expected_types:
+        order = latest_by_type.get(order_type)
+        if order is None:
+            missing.append(order_type)
+            continue
+        match = _match_frontend_protection_order(frontend_orders, order, position)
+        if match is not None:
+            active.append(order_type)
+            continue
+        raw = dict(order.raw_response or {})
+        resubmits = raw.get("resubmits")
+        last_resubmit = resubmits[-1] if isinstance(resubmits, list) and resubmits else None
+        is_rejected = (
+            order.status == "error"
+            or raw.get("resubmit_blocked") is not None
+            or (isinstance(last_resubmit, dict) and last_resubmit.get("status") not in {None, "ok"})
+        )
+        if is_rejected:
+            rejected.append(order_type)
+        else:
+            missing.append(order_type)
+
+    metadata = dict(position.metadata_json or {})
+    stop_failure = metadata.get("last_stop_replacement_failure")
+    stop_attempts = int(metadata.get("stop_replacement_attempts") or 0)
+    if "stop_loss" in active and "stop_loss" not in missing and "stop_loss" not in rejected:
+        stop_failure = None
+        stop_attempts = 0
+    issues: list[str] = []
+    if missing:
+        issues.extend([f"missing:{item}" for item in missing])
+    if rejected:
+        issues.extend([f"rejected:{item}" for item in rejected])
+    if stop_failure:
+        issues.append("stop_update_failed")
+    needs_intervention = bool(issues)
+    if needs_intervention:
+        summary_parts: list[str] = []
+        if missing:
+            summary_parts.append("Missing " + ", ".join(missing))
+        if rejected:
+            summary_parts.append("Rejected " + ", ".join(rejected))
+        if stop_failure:
+            summary_parts.append("stop update failed")
+        summary = " | ".join(summary_parts)
+    else:
+        summary = "All expected protection orders are present"
+
+    return {
+        "status": "intervention_required" if needs_intervention else "ok",
+        "needs_intervention": needs_intervention,
+        "repairable": True,
+        "expected_orders": expected_types,
+        "active_orders": active,
+        "missing_orders": missing,
+        "rejected_orders": rejected,
+        "issues": issues,
+        "summary": summary,
+        "local_position_id": position.id,
+        "stop_update_failed": bool(stop_failure),
+        "stop_replacement_attempts": stop_attempts,
+    }
+
+
 def _violates_liquidation_guard(position: Position, stop_price: Decimal, remote_position: dict | None) -> bool:
     if order_side := position.side.lower():
         liquidation_price = _decimal(remote_position.get("liquidationPx")) if isinstance(remote_position, dict) else None
@@ -610,6 +917,7 @@ def _resubmit_missing_protection_orders(
     sz_decimals: int,
     remote_position: dict | None = None,
     remote_size: Decimal | None = None,
+    force_repair: bool = False,
 ) -> None:
     """Detect protection orders that have disappeared from HL and re-submit them.
 
@@ -638,6 +946,12 @@ def _resubmit_missing_protection_orders(
     )
     if not pending_orders:
         return
+    latest_by_type: dict[str, Order] = {}
+    for order in pending_orders:
+        current = latest_by_type.get(order.order_type)
+        if current is None or (order.id or 0) > (current.id or 0):
+            latest_by_type[order.order_type] = order
+    pending_orders = list(latest_by_type.values())
 
     close_is_buy = position.side.lower() == "short"
     allocation_map = _tp_allocation_map(position)
@@ -652,7 +966,7 @@ def _resubmit_missing_protection_orders(
             item for item in raw_resubmits if isinstance(item, dict)
         ] if isinstance(raw_resubmits, list) else []
         failed_attempts = sum(1 for r in resubmits if r.get("status") != "ok")
-        if failed_attempts >= _MAX_RESUBMIT_ATTEMPTS:
+        if not force_repair and failed_attempts >= _MAX_RESUBMIT_ATTEMPTS:
             continue
 
         oid_int: int | None = None
@@ -682,7 +996,7 @@ def _resubmit_missing_protection_orders(
             continue
 
         now = datetime.now(timezone.utc)
-        if len(resubmits) >= _MAX_RESUBMIT_TOTAL_ATTEMPTS:
+        if not force_repair and len(resubmits) >= _MAX_RESUBMIT_TOTAL_ATTEMPTS:
             raw["resubmit_blocked"] = {
                 "reason": "max_total_attempts",
                 "blocked_at": now.isoformat(),
@@ -716,6 +1030,8 @@ def _resubmit_missing_protection_orders(
             _parse_iso(last_resubmit.get("attempted_at")) if last_resubmit else None
         )
         if (
+            not force_repair
+            and
             last_resubmit is not None
             and last_resubmit.get("status") == "ok"
             and str(last_resubmit.get("new_oid") or "") == str(order.hyperliquid_order_id or "")
@@ -1133,9 +1449,106 @@ def _find_close_fill(
     return best
 
 
+def _round_size(size: Decimal, decimals: int) -> Decimal:
+    quantizer = Decimal(10) ** -decimals
+    return size.quantize(quantizer)
+
+
+def _tp_reference_price(
+    position: Position,
+    remote_position: dict,
+    close_fill: dict | None,
+) -> Decimal | None:
+    fill_px = _decimal(close_fill.get("px")) if isinstance(close_fill, dict) else None
+    if fill_px is not None and fill_px > 0:
+        return fill_px
+    mark_px = _decimal(remote_position.get("markPx"))
+    if mark_px is not None and mark_px > 0:
+        return mark_px
+    last_mark = _decimal((position.metadata_json or {}).get("last_mark_price"))
+    return last_mark if last_mark is not None and last_mark > 0 else None
+
+
+def _tp_price_reached(position: Position, reference_price: Decimal, target_price: Decimal) -> bool:
+    if position.side.lower() == "short":
+        return reference_price <= target_price
+    return reference_price >= target_price
+
+
+def _infer_missing_tp_fills_from_open_position(
+    position: Position,
+    remote_position: dict,
+    remote_abs: Decimal,
+    close_fill: dict | None,
+) -> list[str]:
+    metadata = dict(position.metadata_json or {})
+    plan = metadata.get("take_profit_plan")
+    if not isinstance(plan, list) or not plan:
+        return []
+    initial_size = _decimal(metadata.get("initial_size")) or position.size
+    if initial_size is None or initial_size <= 0:
+        return []
+    reference_price = _tp_reference_price(position, remote_position, close_fill)
+    if reference_price is None:
+        return []
+    sz_decimals = _sz_decimals(position.market)
+    tolerance = (Decimal(10) ** -sz_decimals) * 2
+    cumulative_allocation = Decimal("0")
+    partial_exit_count = int(metadata.get("partial_exit_count") or 0)
+    inferred_levels: list[str] = []
+
+    for item in plan:
+        if not isinstance(item, dict) or item.get("runner"):
+            continue
+        level = str(item.get("level", ""))
+        if level not in {"tp1", "tp2", "tp3"}:
+            continue
+        allocation = _decimal(item.get("allocation"))
+        if allocation is None or allocation <= 0:
+            continue
+        if bool(item.get("filled")):
+            cumulative_allocation += allocation
+            if level == "tp1":
+                metadata["tp1_hit"] = True
+            elif level == "tp2":
+                metadata["tp2_hit"] = True
+                metadata["runner_active"] = True
+            continue
+        target_price = _decimal(item.get("price"))
+        if target_price is None or not _tp_price_reached(position, reference_price, target_price):
+            break
+        expected_remaining = _round_size(
+            initial_size * (Decimal("1") - (cumulative_allocation + allocation)),
+            sz_decimals,
+        )
+        if remote_abs > expected_remaining + tolerance:
+            break
+        item["filled"] = True
+        item["filled_price"] = str(reference_price)
+        item["filled_size"] = str(_round_size(initial_size * allocation, sz_decimals))
+        partial_exit_count += 1
+        metadata["partial_exit_count"] = partial_exit_count
+        metadata["remaining_size"] = str(remote_abs)
+        metadata["last_exit_price"] = str(reference_price)
+        metadata["last_exit_reason"] = level
+        if level == "tp1":
+            metadata["tp1_hit"] = True
+        elif level == "tp2":
+            metadata["tp2_hit"] = True
+            metadata["runner_active"] = True
+        inferred_levels.append(level)
+        cumulative_allocation += allocation
+
+    if inferred_levels:
+        position.metadata_json = metadata
+    return inferred_levels
+
+
 def reconcile_live_positions(
     db: Session,
     trading_client: HyperliquidTradingClient | None = None,
+    coins: set[str] | None = None,
+    force_repair: bool = False,
 ) -> int:
     positions = (
         db.query(Position)
@@ -1185,6 +1598,8 @@ def reconcile_live_positions(
         if position.market is None:
             continue
         coin = _coin_for_market(position.market)
+        if coins is not None and coin not in coins:
+            continue
         remote = remote_positions.get(coin)
         metadata = dict(position.metadata_json or {})
         position.metadata_json = metadata
@@ -1320,8 +1735,49 @@ def reconcile_live_positions(
         # use the actual HL position size to derive correct TP/SL sizes.
         remote_size_raw = _decimal(remote.get("szi"))
         remote_abs: Decimal | None = abs(remote_size_raw) if remote_size_raw is not None else None
+        close_fill = (
+            _find_close_fill(coin, position.opened_at, fills_by_coin)
+            if remote_abs is not None
+            else None
+        )
+        inferred_levels: list[str] = []
+        if remote_abs is not None:
+            inferred_levels = _infer_missing_tp_fills_from_open_position(
+                position,
+                remote,
+                remote_abs,
+                close_fill,
+            )
+            if inferred_levels:
+                metadata = dict(position.metadata_json or {})
+                position.metadata_json = metadata
+                for level in inferred_levels:
+                    db.add(
+                        DecisionLog(
+                            event_type=f"live_reconciliation_{level}_inferred",
+                            market_id=position.market_id,
+                            position_id=position.id,
+                            message=f"Inferred {level} from remote size and price state",
+                            data={
+                                "coin": coin,
+                                "remote_size": str(remote_abs),
+                                "reference_price": metadata.get("last_exit_price"),
+                                "reason": "size_and_price_inference",
+                            },
+                        )
+                    )
 
         if open_orders_available:
+            _create_missing_protection_orders(
+                db,
+                position,
+                coin,
+                frontend_open_orders_by_coin.get(coin, []),
+                trading,
+                expires_after_seconds,
+                _sz_decimals(position.market),
+                remote_abs,
+            )
             _resubmit_missing_protection_orders(
                 db,
                 position,
@@ -1334,6 +1790,7 @@ def reconcile_live_positions(
                 _sz_decimals(position.market),
                 remote_position=remote,
                 remote_size=remote_abs,
+                force_repair=force_repair,
             )
 
         remote_size = remote_size_raw
@@ -1345,7 +1802,7 @@ def reconcile_live_positions(
             # If we just reconciled exit fills, the local/remote size delta is
             # explained by those fills — apply remote_size directly without
             # raising a mismatch warning.
-            if realized_delta != 0:
+            if realized_delta != 0 or inferred_levels:
                 divergence = Decimal("0")
             if divergence > SIZE_DIVERGENCE_TOLERANCE and prev_mismatch is None:
                 # First time we see this divergence: log + skip the overwrite. If

@@ -44,6 +44,17 @@ function pct(value: number | undefined | null): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
+function num(value: unknown, digits = 2): string {
+  return typeof value === "number" && Number.isFinite(value) ? value.toFixed(digits) : "—";
+}
+
+function abMetric(step: TunerStepHistory, key: string): number | null {
+  const payload = step.ab_test;
+  if (!payload || typeof payload !== "object") return null;
+  const value = payload[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 export function SequenceRoadmap({ status }: Props) {
   if (!status) return null;
 
@@ -73,6 +84,7 @@ export function SequenceRoadmap({ status }: Props) {
               step.metrics_before && step.metrics_after
                 ? step.metrics_after.win_rate - step.metrics_before.win_rate
                 : null;
+            const abMeanDelta = abMetric(step, "mean_delta");
             return (
               <Tooltip key={`${step.key}-${idx}`}>
                 <TooltipTrigger asChild>
@@ -105,6 +117,24 @@ export function SequenceRoadmap({ status }: Props) {
                         </span>
                       </div>
                     )}
+                    {abMeanDelta != null && (
+                      <div className="text-[11px] text-fg-3">
+                        Mean Δ{" "}
+                        <span
+                          className={cn(
+                            "font-mono",
+                            abMeanDelta > 0
+                              ? "text-success"
+                              : abMeanDelta < 0
+                                ? "text-danger"
+                                : "text-fg-3",
+                          )}
+                        >
+                          {abMeanDelta > 0 ? "+" : ""}
+                          {num(abMeanDelta)}
+                        </span>
+                      </div>
+                    )}
                   </div>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" className="max-w-xs">
@@ -123,6 +153,26 @@ export function SequenceRoadmap({ status }: Props) {
                           ? step.metrics_after.realized_pnl.toFixed(2)
                           : "—"}
                       </span>
+                      {step.mode === "ab_test" && (
+                        <>
+                          <span className="text-fg-3">Control/Test</span>
+                          <span className="font-mono text-right">
+                            {num(abMetric(step, "n_control"), 0)}/{num(abMetric(step, "n_test"), 0)}
+                          </span>
+                          <span className="text-fg-3">Mean C/T</span>
+                          <span className="font-mono text-right">
+                            {num(abMetric(step, "mean_control"))}/{num(abMetric(step, "mean_test"))}
+                          </span>
+                          <span className="text-fg-3">Mean delta</span>
+                          <span className="font-mono text-right">
+                            {num(abMetric(step, "mean_delta"))}
+                          </span>
+                          <span className="text-fg-3">p-value</span>
+                          <span className="font-mono text-right">
+                            {num(abMetric(step, "p_one_tailed"), 3)}
+                          </span>
+                        </>
+                      )}
                     </div>
                     {step.manual && (
                       <div className="text-[10px] uppercase tracking-wider text-fg-3">

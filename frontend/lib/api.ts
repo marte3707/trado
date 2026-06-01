@@ -239,6 +239,22 @@ export type AccountPosition = {
   margin_used: string | null;
   leverage: Record<string, unknown> | null;
   cum_funding: Record<string, unknown> | null;
+  protection?: AccountPositionProtection | null;
+};
+
+export type AccountPositionProtection = {
+  status: "ok" | "intervention_required" | "untracked";
+  needs_intervention: boolean;
+  repairable: boolean;
+  expected_orders: string[];
+  active_orders: string[];
+  missing_orders: string[];
+  rejected_orders: string[];
+  issues: string[];
+  summary: string;
+  local_position_ids: number[];
+  stop_update_failed: boolean;
+  stop_replacement_attempts: number;
 };
 
 export type AccountSpotBalance = {
@@ -412,6 +428,18 @@ export type Calibration = {
   settings: Record<string, unknown>;
   state?: Record<string, unknown>;
   baseline?: Record<string, unknown>;
+};
+
+export type OutcomeProfile = {
+  filters: { lookback: number };
+  overall: CalibrationStats;
+  by_mode: Record<string, CalibrationStats>;
+  by_direction: Record<string, CalibrationStats>;
+  by_timeframe: Record<string, CalibrationStats>;
+  by_score_bucket: Record<string, CalibrationStats>;
+  by_market: Record<string, CalibrationStats>;
+  by_exit_reason: Record<string, CalibrationStats>;
+  by_tp_state: Record<string, CalibrationStats>;
 };
 
 export type CalibrationHistoryEntry = {

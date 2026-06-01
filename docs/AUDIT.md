@@ -481,3 +481,18 @@ Sequence lineare con 4 step. Multi-armed bandit (es. Thompson sampling) permette
    - Verificare che `auto_calibration_state.deep_defensive_active` non resti True senza motivo.
 4. **Snapshot pre/post:** `app_settings`, ultimi 50 `signals`, ultime 100 `decision_logs` salvati in `/tmp/audit-pre.json` e `/tmp/audit-post.json` per confronto.
 5. **Lint/type check:** `ruff check backend/ && mypy backend/app/` (se configurato).
+
+---
+
+## Nota operativa 2026-05-29: edge calibration v1
+
+Implementata selezione segnali direction-aware senza modificare aggressività live:
+
+- `mtf_confluence_enabled` resta `false` perché lo step AutoTuner è `reverted`.
+- La live resta intenzionalmente aggressiva: nessun cambio a leva, esposizione, cap posizioni o modalità operativa.
+- AutoCalibration ora scrive penalità reversibili in `risk.directional_score_adjustments`, `risk.score_bucket_adjustments`, `risk.market_score_adjustments` e `risk.timeframe_score_adjustments`.
+- SignalEngine applica le penalità alla soglia effettiva, non allo score raw, con cap `risk.max_combined_score_adjustment=15`.
+- Nuovo `entry_quality_filter_enabled` richiede almeno una conferma entry coerente con direzione, EMA breve o order book.
+- Nuovo endpoint `GET /api/analytics/outcome-profile?lookback=500` espone outcome per direzione, timeframe, bucket score, market, exit reason e stato TP.
+
+Obiettivo: penalizzare pattern storicamente tossici, soprattutto LONG/timeframe/market deboli, senza hard-disable permanente e senza ridurre sizing live.

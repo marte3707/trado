@@ -22,6 +22,7 @@ import {
   type MarketDashboardSnapshot,
   type MarketIntelligence,
   type Order,
+  type OutcomeProfile,
   type Position,
   type Signal,
   type SignalRejections,
@@ -157,6 +158,18 @@ export function useCalibrationStability(opts?: QueryOpts<CalibrationStability | 
     queryKey: qk.calibrationStability,
     queryFn: () =>
       apiGet<CalibrationStability>("/api/analytics/calibration/stability").catch(() => null),
+    refetchInterval: 60_000,
+    ...opts,
+  });
+}
+
+export function useOutcomeProfile(lookback = 500, opts?: QueryOpts<OutcomeProfile | null>) {
+  return useQuery({
+    queryKey: qk.outcomeProfile(lookback),
+    queryFn: () =>
+      apiGet<OutcomeProfile>(`/api/analytics/outcome-profile?lookback=${lookback}`).catch(
+        () => null,
+      ),
     refetchInterval: 60_000,
     ...opts,
   });

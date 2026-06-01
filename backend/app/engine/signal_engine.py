@@ -9,6 +9,7 @@ from app.core.config import get_settings
 from app.core.enums import Direction, SignalStatus
 from app.db.models import AppSetting, Candle, Indicator, Market, Signal, StrategyConfig
 from app.engine.auto_tuner import active_ab_overlay
+from app.engine.edge_profile import signal_threshold_adjustment
 from app.engine.mtf import check_mtf_confluence, higher_timeframe
 from app.engine.orderbook import OrderBookAnalysis, analyze_order_book, ob_imbalance_result
 from app.engine.performance import SignalPerformanceAnalyzer
@@ -16,6 +17,7 @@ from app.engine.regime import apply_regime_filter
 from app.engine.risk import RiskManager
 from app.engine.scoring import SignalScoringEngine
 from app.engine.volatility import evaluate_volatility
+from app.indicators.core import ema
 from app.services.coinmarketcap import (
     AltcoinSeasonIndex,
     CoinMarketCapClient,
@@ -79,11 +81,81 @@ class SignalEngine:
         self._cycle_skip_counts[reason] = self._cycle_skip_counts.get(reason, 0) + 1
 
     @staticmethod
+    def _is_ob_imbalance_only_signal(breakdown: dict[str, Any], direction: Direction) -> bool:
+        if direction in {Direction.NEUTRAL}:
+            return False
+        aligned_directions = (
+            {Direction.LONG.value, Direction.STRONG_LONG.value}
+            if direction in {Direction.LONG, Direction.STRONG_LONG}
+            else {Direction.SHORT.value, Direction.STRONG_SHORT.value}
+        )
+        aligned_sources: set[str] = set()
+        for strategy_name, payload in breakdown.items():
+            if strategy_name.startswith("_") or not isinstance(payload, dict):
+                continue
+            if str(payload.get("direction")) not in aligned_directions:
+                continue
+            try:
+                contribution = float(payload.get("contribution", 0))
+            except (TypeError, ValueError):
+                contribution = 0.0
+            if contribution <= 0:
+                continue
+            aligned_sources.add(strategy_name)
+        return aligned_sources == {"ob_imbalance"}
+
+    @staticmethod
     def _average_quote_volume(candles: list[CandleInput], window: int = 20) -> float:
         if not candles:
             return 0.0
         recent = candles[-window:]
         return sum(candle.close * candle.volume for candle in recent) / len(recent)
+
+    @staticmethod
+    def _entry_quality_result(
+        candles: list[CandleInput],
+        direction: Direction,
+        risk_value: dict[str, Any],
+        ob_analysis: OrderBookAnalysis | None,
+    ) -> tuple[bool, dict[str, Any]]:
+        if direction == Direction.NEUTRAL or not candles:
+            return True, {"enabled": False, "reason": "neutral_or_missing_candles"}
+
+        latest = candles[-1]
+        candle_midpoint = (latest.high + latest.low) / 2
+        ema_period = int(risk_value.get("entry_quality_ema_period", 21))
+        ema_value = ema([candle.close for candle in candles], ema_period)[-1]
+        obi = ob_analysis.obi if ob_analysis is not None else None
+
+        long_direction = direction in {Direction.LONG, Direction.STRONG_LONG}
+        if long_direction:
+            close_location_passed = latest.close >= candle_midpoint
+            ema_passed = ema_value is not None and latest.close >= ema_value
+            ob_min = float(risk_value.get("entry_quality_long_ob_imbalance_min", 0.05))
+            orderbook_passed = obi is not None and obi >= ob_min
+        else:
+            close_location_passed = latest.close <= candle_midpoint
+            ema_passed = ema_value is not None and latest.close <= ema_value
+            ob_max = float(risk_value.get("entry_quality_short_ob_imbalance_max", 0.0))
+            orderbook_passed = obi is not None and obi <= ob_max
+
+        confirmations = {
+            "close_location": close_location_passed,
+            "ema": ema_passed,
+            "orderbook": orderbook_passed,
+        }
+        passed = any(confirmations.values())
+        return passed, {
+            "enabled": True,
+            "passed": passed,
+            "direction": "LONG" if long_direction else "SHORT",
+            "close": latest.close,
+            "candle_midpoint": candle_midpoint,
+            "ema_period": ema_period,
+            "ema": ema_value,
+            "orderbook_obi": obi,
+            "confirmations": confirmations,
+        }
 
     def _fear_greed_result(
         self,
@@ -693,7 +765,56 @@ class SignalEngine:
             self._record_skip("whale_contra_flow")
             db.commit()
             return None
-        if score.direction == Direction.NEUTRAL or score.score < min_signal_score:
+        edge_adjustment = signal_threshold_adjustment(
+            risk_value,
+            market_id=market.id,
+            timeframe=timeframe,
+            direction=score.direction,
+            score=score.score,
+        )
+        effective_min_signal_score = min_signal_score + int(edge_adjustment["total"])
+        if int(edge_adjustment["total"]) > 0:
+            direction_family = edge_adjustment.get("direction")
+            score_bucket = edge_adjustment.get("score_bucket")
+            directional_key = f"{direction_family}:{timeframe}"
+            score_bucket_key = f"{direction_family}:{score_bucket}"
+            components = edge_adjustment.get("components", {})
+            score.breakdown["_edge_calibration"] = {
+                **edge_adjustment,
+                "base_min_signal_score": min_signal_score,
+                "effective_min_signal_score": effective_min_signal_score,
+            }
+            score.breakdown["_directional_calibration"] = {
+                "key": directional_key,
+                "adjustment": components.get("directional", 0) if isinstance(components, dict) else 0,
+                "payload": risk_value.get("directional_score_adjustments", {}).get(directional_key)
+                if isinstance(risk_value.get("directional_score_adjustments"), dict)
+                else None,
+                "effective_min_signal_score": effective_min_signal_score,
+            }
+            score.breakdown["_score_reliability"] = {
+                "key": score_bucket_key,
+                "adjustment": components.get("score_bucket", 0) if isinstance(components, dict) else 0,
+                "payload": risk_value.get("score_bucket_adjustments", {}).get(score_bucket_key)
+                if isinstance(risk_value.get("score_bucket_adjustments"), dict)
+                else None,
+                "effective_min_signal_score": effective_min_signal_score,
+            }
+            score.breakdown["_market_timeframe_probation"] = {
+                "market_id": market.id,
+                "timeframe": timeframe,
+                "market_adjustment": components.get("market", 0) if isinstance(components, dict) else 0,
+                "timeframe_adjustment": components.get("timeframe", 0) if isinstance(components, dict) else 0,
+            }
+        if score.direction == Direction.NEUTRAL or score.score < effective_min_signal_score:
+            components = edge_adjustment.get("components", {})
+            skip_reason = "low_score"
+            if isinstance(components, dict) and int(components.get("directional", 0)) > 0:
+                skip_reason = "directional_score_filter"
+            elif isinstance(components, dict) and int(components.get("score_bucket", 0)) > 0:
+                skip_reason = "score_reliability_filter"
+            elif int(edge_adjustment["total"]) > 0:
+                skip_reason = "edge_probation_filter"
             logger.debug(
                 "signal_skipped_low_score",
                 market=market.symbol,
@@ -701,11 +822,52 @@ class SignalEngine:
                 direction=score.direction.value,
                 score=score.score,
                 min_score=min_signal_score,
+                effective_min_score=effective_min_signal_score,
+                edge_calibration=edge_adjustment,
                 reason=score.reason,
             )
-            self._record_skip("low_score")
+            self._record_skip(skip_reason)
             db.commit()
             return None
+        if (
+            not bool(risk_value.get("allow_ob_imbalance_only_signals", False))
+            and self._is_ob_imbalance_only_signal(score.breakdown, score.direction)
+        ):
+            score.breakdown["_single_source_guardrail"] = {
+                "reason": "ob_imbalance_only_signal_blocked",
+                "allow_ob_imbalance_only_signals": False,
+            }
+            logger.debug(
+                "signal_skipped_ob_imbalance_only",
+                market=market.symbol,
+                timeframe=timeframe,
+                direction=score.direction.value,
+                score=score.score,
+                reason=score.reason,
+            )
+            self._record_skip("ob_imbalance_only")
+            db.commit()
+            return None
+        if bool(risk_value.get("entry_quality_filter_enabled", True)):
+            entry_quality_passed, entry_quality_info = self._entry_quality_result(
+                candles,
+                score.direction,
+                risk_value,
+                ob_analysis,
+            )
+            score.breakdown["_entry_quality"] = entry_quality_info
+            if not entry_quality_passed:
+                logger.debug(
+                    "signal_skipped_entry_quality_filter",
+                    market=market.symbol,
+                    timeframe=timeframe,
+                    direction=score.direction.value,
+                    score=score.score,
+                    entry_quality=entry_quality_info,
+                )
+                self._record_skip("entry_quality_filter")
+                db.commit()
+                return None
         if mtf_confluence_enabled:
             higher_tf = higher_timeframe(timeframe)
             if higher_tf is not None:

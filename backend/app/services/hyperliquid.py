@@ -366,7 +366,7 @@ class HyperliquidTradingClient:
         cloid: str | None = None,
     ) -> HyperliquidOrderResult:
         exchange = self._exchange(expires_after_seconds)
-        rounded_price = _round_price(trigger_price)
+        rounded_price = _round_price_for_coin(trigger_price, coin, getattr(exchange, "info", None))
         order_kwargs: dict[str, Any] = {
             "order_type": {
                 "trigger": {
@@ -502,6 +502,33 @@ def _round_price(price: Decimal, sig_figs: int = 5, max_decimals: int = 6) -> fl
         return 0.0
     # Mirror HL SDK _slippage_price: 5 significant figures then cap decimal places
     return round(float(f"{f:.{sig_figs}g}"), max_decimals)
+
+
+def _price_decimals_for_coin(coin: str, info: Any | None) -> int | None:
+    if info is None:
+        return None
+    try:
+        name_to_coin = getattr(info, "name_to_coin", {})
+        coin_to_asset = getattr(info, "coin_to_asset", {})
+        asset_to_sz_decimals = getattr(info, "asset_to_sz_decimals", {})
+        canonical_coin = name_to_coin.get(coin, coin)
+        asset = coin_to_asset.get(canonical_coin)
+        if asset is None:
+            return None
+        sz_decimals = asset_to_sz_decimals.get(asset)
+        if not isinstance(sz_decimals, int):
+            return None
+        is_spot = asset >= 10_000
+        return max(0, (8 if is_spot else 6) - sz_decimals)
+    except Exception:
+        return None
+
+
+def _round_price_for_coin(price: Decimal, coin: str, info: Any | None, sig_figs: int = 5) -> float:
+    max_decimals = _price_decimals_for_coin(coin, info)
+    if max_decimals is None:
+        return _round_price(price, sig_figs=sig_figs)
+    return _round_price(price, sig_figs=sig_figs, max_decimals=max_decimals)
 
 
 def parse_order_result(response: dict[str, Any]) -> HyperliquidOrderResult:

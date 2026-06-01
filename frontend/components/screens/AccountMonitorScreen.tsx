@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
-import { RefreshCw, RotateCcw, ChevronDown, ChevronUp } from "lucide-react";
+import { AlertTriangle, RefreshCw, RotateCcw, ChevronDown, ChevronUp } from "lucide-react";
 import { Icon, fmt } from "@/components/atoms";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -152,6 +152,18 @@ function fmtTime(ms: number | null | undefined): string {
     day: "2-digit",
     month: "2-digit",
   }).format(new Date(ms));
+}
+
+function protectionTone(protection: AccountPosition["protection"]): "ok" | "warn" | "muted" {
+  if (!protection || protection.status === "untracked") return "muted";
+  if (protection.needs_intervention) return "warn";
+  return "ok";
+}
+
+function protectionLabel(protection: AccountPosition["protection"]): string {
+  if (!protection || protection.status === "untracked") return "Untracked";
+  if (protection.needs_intervention) return "Needs repair";
+  return "OK";
 }
 
 function orderTriggerPx(row: AccountOpenOrder): number | null {
@@ -370,6 +382,23 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
     }
   }
 
+  async function repairProtection(coin: string) {
+    setAction({ key: `repair-protection-${coin}`, message: null, error: null });
+    try {
+      const result = await apiPost<{ coin: string; updated_positions: number; protection: AccountPosition["protection"] }>(
+        `/api/account/positions/${encodeURIComponent(coin)}/repair-protection`,
+      );
+      setAction({
+        key: null,
+        message: `Repair ${coin}: ${result.updated_positions} posizioni rivalutate — ${result.protection?.summary ?? "completato"}`,
+        error: null,
+      });
+      await refetch();
+    } catch (exc) {
+      setAction({ key: null, message: null, error: exc instanceof Error ? exc.message : "Repair non riuscito" });
+    }
+  }
+
   useEffect(() => {
     const socket = new WebSocket(wsUrl(health.network));
     let active = true;
@@ -417,6 +446,10 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
   const tradingSummary = useMemo(
     () => summarizeTrading(snapshot?.positions ?? [], snapshot?.open_orders ?? []),
     [snapshot],
+  );
+  const positionsNeedingIntervention = useMemo(
+    () => (snapshot?.positions ?? []).filter((position) => position.protection?.needs_intervention),
+    [snapshot?.positions],
   );
   const accountValueNum = asNumber(snapshot?.account.effective_account_value ?? snapshot?.account.account_value);
   const marginUsedNum = asNumber(snapshot?.account.total_margin_used);
@@ -530,6 +563,23 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
           {snapshot?.api.error || snapshot?.account.error}
         </Card>
       )}
+      {positionsNeedingIntervention.length > 0 && (
+        <Card className="border-warn/40 bg-warn/5 p-4 text-sm text-warn">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <div className="space-y-1">
+              <div className="font-medium">
+                {positionsNeedingIntervention.length} posizioni richiedono intervento sulle protezioni
+              </div>
+              <div className="text-xs text-warn/90">
+                {positionsNeedingIntervention
+                  .map((position) => `${position.coin}: ${position.protection?.summary ?? "repair richiesto"}`)
+                  .join(" • ")}
+              </div>
+            </div>
+          </div>
+        </Card>
+      )}
 
       {isInitialLoading && (
         <Card className="p-8 text-center text-sm text-fg-3">Caricamento dati account…</Card>
@@ -599,6 +649,7 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
             actionKey={action.key}
             selectedCoin={selectedCoin}
             onSelectCoin={(coin) => setSelectedCoin((prev) => (prev === coin ? null : coin))}
+            onRepair={repairProtection}
             onClose={(coin, pnlInfo) =>
               openConfirm(
                 `Chiudere posizione ${coin}?`,
@@ -1187,6 +1238,7 @@ function UnifiedPositionsTable({
   actionKey,
   selectedCoin,
   onSelectCoin,
+  onRepair,
   onClose,
 }: {
   positions: AccountPosition[];
@@ -1195,6 +1247,7 @@ function UnifiedPositionsTable({
   actionKey: string | null;
   selectedCoin: string | null;
   onSelectCoin: (coin: string) => void;
+  onRepair: (coin: string) => void;
   onClose: (coin: string, pnlInfo: string | null) => void;
 }) {
   const [sortKey, setSortKey] = useState<PositionSortKey>("pnl");
@@ -1239,6 +1292,7 @@ function UnifiedPositionsTable({
               <th style={{ whiteSpace: "nowrap" }}>FR 8h</th>
               <th style={{ whiteSpace: "nowrap" }}>FR/giorno</th>
               <th style={{ whiteSpace: "nowrap" }}>Fund. acc.</th>
+              <th style={{ whiteSpace: "nowrap" }}>Protect</th>
               <th />
             </tr>
           </thead>
@@ -1255,6 +1309,9 @@ function UnifiedPositionsTable({
               const frDaily = dailyFundingPnl(row, frRate);
               const cumFunding = cumFundingSinceOpen(row);
               const pnlInfo = pnl != null ? `PnL attuale: ${fmtUsd(pnl)}` : null;
+              const protection = row.protection ?? null;
+              const repairRunning = actionKey === `repair-protection-${coin}`;
+              const repairTone = protectionTone(protection);
 
               // Bar fill: more fill = closer to liq (more dangerous). Caps at 30% distance = safe.
               const liqBarFill = liqDist != null ? Math.max(0, Math.min(100, (1 - liqDist / 30) * 100)) : null;
@@ -1331,22 +1388,56 @@ function UnifiedPositionsTable({
                   >
                     {cumFunding != null ? fmtUsdPrecise(cumFunding) : "—"}
                   </td>
+                  <td style={{ minWidth: 170 }}>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                      <span
+                        className="mono"
+                        style={{
+                          fontSize: 11,
+                          color:
+                            repairTone === "warn" ? "var(--warn)"
+                            : repairTone === "ok" ? "var(--success)"
+                            : "var(--fg-3)",
+                        }}
+                        title={protection?.summary ?? "No local Trado live position linked"}
+                      >
+                        {protectionLabel(protection)}
+                      </span>
+                      <span className="muted" style={{ fontSize: 11, lineHeight: 1.3 }}>
+                        {protection?.summary ?? "Nessuna posizione Trado collegata"}
+                      </span>
+                    </div>
+                  </td>
                   <td style={{ textAlign: "right" }} onClick={(e) => e.stopPropagation()}>
-                    <button
-                      className="btn ghost"
-                      disabled={!coin || running}
-                      title="Chiudi posizione market"
-                      onClick={() => onClose(coin, pnlInfo)}
-                      style={{ minHeight: 26, padding: "0 8px" }}
-                    >
-                      <Icon name="x" size={12} /> {running ? "..." : "Chiudi"}
-                    </button>
+                    <div style={{ display: "flex", justifyContent: "flex-end", gap: 6 }}>
+                      {protection?.needs_intervention && protection.repairable && (
+                        <button
+                          className="btn ghost"
+                          disabled={!coin || repairRunning}
+                          title="Prova a ripristinare gli ordini protettivi mancanti"
+                          onClick={() => onRepair(coin)}
+                          style={{ minHeight: 26, padding: "0 8px" }}
+                        >
+                          <RotateCcw className={cn("h-3.5 w-3.5", repairRunning && "animate-spin")} />
+                          <span>{repairRunning ? "..." : "Repair"}</span>
+                        </button>
+                      )}
+                      <button
+                        className="btn ghost"
+                        disabled={!coin || running}
+                        title="Chiudi posizione market"
+                        onClick={() => onClose(coin, pnlInfo)}
+                        style={{ minHeight: 26, padding: "0 8px" }}
+                      >
+                        <Icon name="x" size={12} /> {running ? "..." : "Chiudi"}
+                      </button>
+                    </div>
                   </td>
                 </tr>
               );
             })}
             {positions.length === 0 && (
-              <tr><td colSpan={13} className="muted">Nessuna posizione perp aperta.</td></tr>
+              <tr><td colSpan={15} className="muted">Nessuna posizione perp aperta.</td></tr>
             )}
           </tbody>
         </table>

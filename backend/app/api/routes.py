@@ -39,6 +39,7 @@ from app.db.session import get_db
 from app.engine.auto_tuner import AutoTuner
 from app.engine.calibration import AutoCalibrationEngine, serialize_calibration
 from app.engine.diagnostics import build_diagnostics_report, build_equity_slope_diagnostics
+from app.engine.edge_profile import build_outcome_profile
 from app.engine.execution import OrderExecutionEngine
 from app.engine.performance import SignalPerformanceAnalyzer, serialize_stats
 from app.schemas import CandleOut, IndicatorOut, MarketOut, PushSubscribePayload, PushUnsubscribePayload, SettingsPatch, SignalOut, StrategyPatch
@@ -890,6 +891,14 @@ def analytics_equity_slope(
     return build_equity_slope_diagnostics(db, lookback=lookback)
 
 
+@router.get("/analytics/outcome-profile")
+def analytics_outcome_profile(
+    lookback: int = Query(500, ge=50, le=2000),
+    db: Session = Depends(get_db),
+) -> dict:
+    return build_outcome_profile(db, lookback=lookback)
+
+
 @router.post("/analytics/report/send")
 async def send_diagnostic_report(
     lookback: int = Query(200, ge=10, le=2000),
@@ -1275,9 +1284,9 @@ def _redact_address(address: str | None) -> str | None:
     return f"{address[:6]}...{address[-4:]}"
 
 
-def _position_payload(position: dict[str, Any]) -> dict:
+def _position_payload(position: dict[str, Any], protection: dict[str, Any] | None = None) -> dict:
     size = _decimal(position.get("szi"))
-    return {
+    payload = {
         "coin": position.get("coin"),
         "side": "long" if size is not None and size > 0 else "short" if size is not None and size < 0 else None,
         "size": str(abs(size)) if size is not None else None,
@@ -1289,6 +1298,57 @@ def _position_payload(position: dict[str, Any]) -> dict:
         "margin_used": _string_decimal(position.get("marginUsed")),
         "leverage": position.get("leverage"),
         "cum_funding": position.get("cumFunding"),
+    }
+    if protection is not None:
+        payload["protection"] = protection
+    return payload
+
+
+def _merge_protection_states(states: list[dict[str, Any]]) -> dict[str, Any]:
+    if not states:
+        return {
+            "status": "untracked",
+            "needs_intervention": False,
+            "repairable": False,
+            "expected_orders": [],
+            "active_orders": [],
+            "missing_orders": [],
+            "rejected_orders": [],
+            "issues": [],
+            "summary": "No Trado live position linked to this Hyperliquid position",
+            "local_position_ids": [],
+            "stop_update_failed": False,
+            "stop_replacement_attempts": 0,
+        }
+    expected = sorted({item for state in states for item in state.get("expected_orders", [])})
+    active = sorted({item for state in states for item in state.get("active_orders", [])})
+    missing = sorted({item for state in states for item in state.get("missing_orders", [])})
+    rejected = sorted({item for state in states for item in state.get("rejected_orders", [])})
+    issues = [issue for state in states for issue in state.get("issues", [])]
+    position_ids = [int(state["local_position_id"]) for state in states if state.get("local_position_id") is not None]
+    stop_update_failed = any(bool(state.get("stop_update_failed")) for state in states)
+    stop_attempts = max((int(state.get("stop_replacement_attempts") or 0) for state in states), default=0)
+    needs_intervention = bool(missing or rejected or stop_update_failed)
+    summary_parts: list[str] = []
+    if missing:
+        summary_parts.append("Missing " + ", ".join(missing))
+    if rejected:
+        summary_parts.append("Rejected " + ", ".join(rejected))
+    if stop_update_failed:
+        summary_parts.append("stop update failed")
+    return {
+        "status": "intervention_required" if needs_intervention else "ok",
+        "needs_intervention": needs_intervention,
+        "repairable": True,
+        "expected_orders": expected,
+        "active_orders": active,
+        "missing_orders": missing,
+        "rejected_orders": rejected,
+        "issues": issues,
+        "summary": " | ".join(summary_parts) if summary_parts else "All expected protection orders are present",
+        "local_position_ids": position_ids,
+        "stop_update_failed": stop_update_failed,
+        "stop_replacement_attempts": stop_attempts,
     }
 
 
@@ -1512,8 +1572,41 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
     margin = (user_state or {}).get("marginSummary", {})
     cross_margin = (user_state or {}).get("crossMarginSummary", {})
     withdrawable = (user_state or {}).get("withdrawable")
+    from app.engine.execution import coin_for_market
+    from app.services.live_reconciliation import (
+        _index_frontend_open_orders,
+        protection_state_for_live_position,
+    )
+    local_live_positions = (
+        db.query(Position)
+        .options(joinedload(Position.market))
+        .filter(Position.mode == "live", Position.status == "open")
+        .all()
+    )
+    local_positions_by_coin: dict[str, list[Position]] = {}
+    for local_position in local_live_positions:
+        if local_position.market is None:
+            continue
+        try:
+            coin = coin_for_market(local_position.market)
+        except ValueError:
+            continue
+        local_positions_by_coin.setdefault(coin, []).append(local_position)
+    frontend_open_orders_by_coin = _index_frontend_open_orders(open_orders)
     positions = [
-        _position_payload(item.get("position", {}))
+        _position_payload(
+            item.get("position", {}),
+            protection=_merge_protection_states(
+                [
+                    protection_state_for_live_position(
+                        db,
+                        local_position,
+                        frontend_open_orders_by_coin.get(str(item.get("position", {}).get("coin") or ""), []),
+                    )
+                    for local_position in local_positions_by_coin.get(str(item.get("position", {}).get("coin") or ""), [])
+                ]
+            ),
+        )
         for item in (user_state or {}).get("assetPositions", [])
         if isinstance(item, dict)
     ]
@@ -1823,6 +1916,71 @@ def patch_missing_exit_data(db: Session = Depends(get_db)) -> dict:
                             "was_wrong_data": False})
     db.commit()
     return {"patched": len(patched), "positions": patched}
+
+
+@router.post("/account/positions/{coin}/repair-protection")
+def repair_position_protection(
+    coin: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    settings = get_settings()
+    address = settings.hyperliquid_account_address
+    if not address:
+        raise HTTPException(status_code=400, detail="HYPERLIQUID_ACCOUNT_ADDRESS is required")
+    trading = HyperliquidTradingClient(settings)
+    from app.services.live_reconciliation import (
+        _index_frontend_open_orders,
+        protection_state_for_live_position,
+        reconcile_live_positions,
+    )
+
+    updated = reconcile_live_positions(db, trading_client=trading, coins={coin}, force_repair=True)
+    local_positions = (
+        db.query(Position)
+        .join(Position.market)
+        .options(joinedload(Position.market))
+        .filter(
+            Position.mode == "live",
+            Position.status == "open",
+            (Market.symbol == coin) | (Market.metadata_json["hl_coin"].astext == coin),
+        )
+        .all()
+    )
+    if not local_positions:
+        raise HTTPException(status_code=404, detail=f"No open Trado live position found for {coin}")
+    try:
+        frontend_open_orders = trading.frontend_open_orders(address)
+    except HyperliquidError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    frontend_by_coin = _index_frontend_open_orders(frontend_open_orders)
+    states = [
+        protection_state_for_live_position(
+            db,
+            position,
+            frontend_by_coin.get(coin, []),
+        )
+        for position in local_positions
+    ]
+    aggregated = _merge_protection_states(states)
+    db.add(
+        DecisionLog(
+            event_type="live_protection_manual_repair_requested",
+            message="Manual protection repair requested from account monitor",
+            data={
+                "coin": coin,
+                "updated_positions": updated,
+                "position_ids": aggregated.get("local_position_ids", []),
+                "status": aggregated.get("status"),
+                "issues": aggregated.get("issues", []),
+            },
+        )
+    )
+    db.commit()
+    return {
+        "coin": coin,
+        "updated_positions": updated,
+        "protection": aggregated,
+    }
 
 
 @router.get("/logs")

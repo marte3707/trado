@@ -10,6 +10,7 @@ DEFAULT_POSITION_MANAGEMENT_SETTINGS: dict[str, Any] = {
     "timeStop": {
         "enabled": True,
         "paperEnabled": True,
+        "closeLosingPaperPositions": False,
         "liveMode": "alert",
         "maxAgeHoursByTimeframe": {
             "5m": 12,

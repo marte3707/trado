@@ -11,6 +11,7 @@ from app.db.models import DecisionLog, Market, Order, Position, PositionStopUpda
 from app.services.live_reconciliation import (
     _close_companion_paper_position,
     _handle_companion_paper_after_live_reconcile,
+    protection_state_for_live_position,
     reconcile_live_positions,
 )
 
@@ -426,6 +427,78 @@ def test_reconciliation_marks_tp1_filled_from_hl_fills() -> None:
     assert "live_reconciliation_tp1_filled" in events
 
 
+def test_reconciliation_infers_tp1_from_remote_size_and_moves_stop_to_breakeven(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.core import config
+
+    settings = config.get_settings()
+    monkeypatch.setattr(settings, "operation_mode", OperationMode.AUTO_TRADE, raising=False)
+    monkeypatch.setattr(settings, "enable_live_trading", True, raising=False)
+
+    position = _make_short_position(size="1.0")
+    position.stop_loss = Decimal("110")
+    position.metadata_json = {
+        "initial_size": "1.0",
+        "initial_stop_loss": "110",
+        "initial_risk_per_unit": "10",
+        "take_profit_plan": [
+            {"level": "tp1", "price": "90", "allocation": "0.3", "filled": False},
+            {"level": "tp2", "price": "80", "allocation": "0.3", "filled": False},
+            {"level": "runner", "price": "", "allocation": "0.4", "filled": False, "runner": True},
+        ],
+    }
+    stop_order = Order(
+        id=77,
+        position_id=position.id,
+        mode="live",
+        order_type="stop_loss",
+        side="buy",
+        price=Decimal("110"),
+        size=Decimal("1.0"),
+        status="error",
+        reduce_only=True,
+        raw_response={},
+    )
+    tp1_order = Order(
+        id=78,
+        position_id=position.id,
+        mode="live",
+        order_type="tp1",
+        side="buy",
+        price=Decimal("90"),
+        size=Decimal("0.3"),
+        status="error",
+        reduce_only=True,
+        raw_response={},
+    )
+    db = FakeDb(positions=[position], orders=[stop_order, tp1_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "-0.7", "entryPx": "100", "markPx": "89"}],
+        open_order_oids=None,
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    plan = position.metadata_json["take_profit_plan"]
+    assert plan[0]["filled"] is True
+    assert position.metadata_json["tp1_hit"] is True
+    assert position.metadata_json["partial_exit_count"] == 1
+    assert position.size == Decimal("0.7")
+    assert position.stop_loss == Decimal("100")
+    assert position.metadata_json["breakeven_triggered"] is True
+    assert position.metadata_json["last_stop_update_reason"] == "breakeven_after_tp1"
+    assert trading.resubmitted[-1] == {
+        "coin": "BTC",
+        "is_buy": True,
+        "size": Decimal("0.7"),
+        "tpsl": "sl",
+    }
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_reconciliation_tp1_inferred" in events
+    assert "live_reconciliation_size_mismatch" not in events
+
+
 def test_reconciliation_sets_runner_active_when_tp2_fills() -> None:
     """Quando tp2 si filla, tp2_hit e runner_active devono essere impostati
     in modo che il trailing stop attivi la modalità runner al ciclo successivo."""
@@ -677,6 +750,34 @@ def test_resubmit_missing_tp1_when_not_in_hl_open_orders() -> None:
     assert "live_protection_order_resubmitted" in events
 
 
+def test_recreate_missing_tp1_when_no_local_order_exists() -> None:
+    position = _make_position(size="1.0")
+    position.metadata_json = {
+        "source_signal_id": 42,
+        "take_profit_plan": [
+            {"level": "tp1", "price": "110", "allocation": "0.3", "filled": False},
+            {"level": "tp2", "price": "120", "allocation": "0.3", "filled": False},
+            {"level": "runner", "price": "", "allocation": "0.4", "filled": False, "runner": True},
+        ],
+    }
+    sl_order = _make_sl_order(oid=8888)
+    db = FakeDb(positions=[position], orders=[sl_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        open_order_oids=[8888],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    recreated = [row for row in db.added if isinstance(row, Order) and row.order_type == "tp1"]
+    assert recreated
+    assert recreated[-1].hyperliquid_order_id == "77777"
+    assert recreated[-1].size == Decimal("0.3")
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_recreated" in events
+
+
 def test_resubmit_missing_tp1_skips_recent_successful_retry_cooldown() -> None:
     position = _make_position(size="1.0")
     tp1_order = _make_tp_order(oid_str="77777")
@@ -737,6 +838,38 @@ def test_resubmit_missing_tp1_stops_after_total_retry_cap() -> None:
     assert tp1_order.raw_response["resubmit_blocked"]["reason"] == "max_total_attempts"
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_protection_order_resubmit_skipped_retry_cap" in events
+
+
+def test_force_repair_bypasses_total_retry_cap() -> None:
+    old_attempt = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    position = _make_position(size="1.0")
+    tp1_order = _make_tp_order(oid_str="33333")
+    tp1_order.raw_response = {
+        "resubmits": [
+            {
+                "attempted_at": old_attempt,
+                "old_oid": str(i),
+                "new_oid": str(i + 1),
+                "status": "ok",
+                "size": "0.5",
+            }
+            for i in range(3)
+        ]
+    }
+    db = FakeDb(positions=[position], orders=[tp1_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        open_order_oids=[],
+        resubmit_oid="44444",
+    )
+
+    reconcile_live_positions(db, trading_client=trading, force_repair=True)
+
+    assert len(trading.resubmitted) == 1
+    assert tp1_order.hyperliquid_order_id == "44444"
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_resubmitted" in events
+    assert "live_protection_order_resubmit_skipped_retry_cap" not in events
 
 
 def test_no_resubmit_when_tp1_present_in_hl_open_orders() -> None:
@@ -804,6 +937,39 @@ def test_resubmit_sl_order_with_correct_tpsl_flag() -> None:
     assert len(trading.resubmitted) == 1
     assert trading.resubmitted[0]["tpsl"] == "sl"
     assert sl_order.hyperliquid_order_id == "66666"
+
+
+def test_resubmit_ignores_older_stop_loss_when_newer_one_exists() -> None:
+    position = _make_short_position(size="1.0")
+    old_sl = _make_sl_order(oid=8888)
+    old_sl.id = 55
+    new_sl = _make_sl_order(oid=9999)
+    new_sl.id = 56
+    new_sl.price = Decimal("95")
+    new_sl.hyperliquid_order_id = "9999"
+    db = FakeDb(positions=[position], orders=[old_sl, new_sl])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "-1.0", "entryPx": "100", "liquidationPx": "130"}],
+        open_order_oids=[9999],
+        frontend_open_orders=[
+            {
+                "coin": "BTC",
+                "oid": 9999,
+                "cloid": "0xnewstop",
+                "orderType": "Stop Market",
+                "isTrigger": True,
+                "reduceOnly": True,
+                "triggerPx": "95",
+                "sz": "1.0",
+            }
+        ],
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert trading.resubmitted == []
+    assert old_sl.hyperliquid_order_id == "8888"
+    assert new_sl.hyperliquid_order_id == "9999"
 
 
 def test_no_resubmit_when_manual_stop_exists_in_frontend_open_orders() -> None:
@@ -896,6 +1062,111 @@ def test_resubmit_tp1_immediately_filled_by_hl() -> None:
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_protection_order_resubmit_filled_immediately" in events
     assert "live_protection_order_resubmitted" not in events
+
+
+def test_protection_state_matches_frontend_rounded_prices_and_latest_stop() -> None:
+    position = _make_short_position(size="68.6")
+    position.market.symbol = "SUI"
+    position.market.metadata_json = {"hl_coin": "SUI"}
+    position.stop_loss = Decimal("0.9049462781")
+    position.metadata_json = {
+        "take_profit_plan": [
+            {"level": "tp1", "price": "0.8435937219", "allocation": "0.3", "filled": False},
+            {"level": "tp2", "price": "0.8129174438", "allocation": "0.25", "filled": False},
+        ],
+        "last_stop_replacement_failure": {"reason": "submit_rejected"},
+        "stop_replacement_attempts": 2,
+    }
+    old_stop = Order(
+        id=1,
+        position_id=position.id,
+        mode="live",
+        order_type="stop_loss",
+        side="buy",
+        price=Decimal("0.974689"),
+        size=Decimal("68.6"),
+        status="error",
+    )
+    new_stop = Order(
+        id=2,
+        position_id=position.id,
+        mode="live",
+        order_type="stop_loss",
+        side="buy",
+        price=Decimal("0.9049462781"),
+        size=Decimal("68.6"),
+        status="ok",
+        hyperliquid_order_id="451113303177",
+        cloid="bfbe1703f146525791b0ded66bde8edc",
+    )
+    tp1 = Order(
+        id=3,
+        position_id=position.id,
+        mode="live",
+        order_type="tp1",
+        side="buy",
+        price=Decimal("0.8435937219"),
+        size=Decimal("20.6"),
+        status="ok",
+        hyperliquid_order_id="451113323637",
+        cloid="881de04935e85699854d5af8699ea3e2",
+    )
+    tp2 = Order(
+        id=4,
+        position_id=position.id,
+        mode="live",
+        order_type="tp2",
+        side="buy",
+        price=Decimal("0.8129174438"),
+        size=Decimal("17.2"),
+        status="ok",
+        hyperliquid_order_id="451113337187",
+        cloid="551b4debfbe254b2ba79fe2b0c636634",
+    )
+    db = FakeDb(positions=[position], orders=[old_stop, new_stop, tp1, tp2])
+
+    state = protection_state_for_live_position(
+        db,
+        position,
+        frontend_orders=[
+            {
+                "coin": "SUI",
+                "oid": 451113303177,
+                "cloid": "0xbfbe1703f146525791b0ded66bde8edc",
+                "orderType": "Stop Market",
+                "isTrigger": True,
+                "reduceOnly": True,
+                "triggerPx": "0.90495",
+                "sz": "68.6",
+            },
+            {
+                "coin": "SUI",
+                "oid": 451113323637,
+                "cloid": "0x881de04935e85699854d5af8699ea3e2",
+                "orderType": "Take Profit Market",
+                "isTrigger": True,
+                "reduceOnly": True,
+                "triggerPx": "0.84359",
+                "sz": "20.6",
+            },
+            {
+                "coin": "SUI",
+                "oid": 451113337187,
+                "cloid": "0x551b4debfbe254b2ba79fe2b0c636634",
+                "orderType": "Take Profit Market",
+                "isTrigger": True,
+                "reduceOnly": True,
+                "triggerPx": "0.81292",
+                "sz": "17.2",
+            },
+        ],
+    )
+
+    assert state["needs_intervention"] is False
+    assert state["missing_orders"] == []
+    assert state["rejected_orders"] == []
+    assert state["stop_update_failed"] is False
+    assert set(state["active_orders"]) == {"stop_loss", "tp1", "tp2"}
 
 
 # ---------------------------------------------------------------------------

@@ -299,6 +299,28 @@ def test_lock_profit_can_move_stop_past_breakeven() -> None:
     assert position.stop_loss >= Decimal("110")
 
 
+def test_apply_stop_update_falls_back_when_current_price_indicator_is_none() -> None:
+    engine = PositionManagementEngine(Settings())
+    db = _db()
+    position = _position("long", "90")
+
+    engine.apply_stop_update(
+        db,
+        position,
+        StopCandidate(
+            price=Decimal("100"),
+            reason="breakeven_after_tp1",
+            indicators={"current_price": None},
+            r_multiple=Decimal("1"),
+        ),
+        mode="paper",
+    )
+
+    updates = [row for row in db.added if isinstance(row, PositionStopUpdate)]
+    assert updates
+    assert updates[-1].current_price == Decimal("100")
+
+
 def test_no_update_below_min_distance() -> None:
     engine = PositionManagementEngine(Settings())
     db = _db({"trailingStop": {"minStopUpdateDistancePct": 50}})
@@ -537,6 +559,28 @@ def test_retry_succeeds_on_second_attempt(monkeypatch) -> None:
     # ogni tentativo deve usare un cloid diverso
     cloids = [s["cloid"] for s in trading.submitted]
     assert len(set(cloids)) == 2
+
+
+def test_successful_stop_replacement_clears_previous_failure(monkeypatch) -> None:
+    monkeypatch.setattr("app.engine.position_management.time.sleep", lambda _: None)
+    engine = PositionManagementEngine(Settings())
+    position = _live_position_with_metadata()
+    position.metadata_json["last_stop_replacement_failure"] = {"reason": "submit_rejected"}
+    position.metadata_json["stop_replacement_attempts"] = 2
+    db = _db()
+    trading = _RetryTrading(fail_times=0)
+    candidate = StopCandidate(
+        price=Decimal("95"),
+        reason="breakeven",
+        indicators={"current_price": "105"},
+        r_multiple=Decimal("1"),
+    )
+
+    result = engine.replace_live_stop_order(db, _market(), position, candidate, trading)
+
+    assert result is True
+    assert position.metadata_json["stop_replacement_attempts"] == 0
+    assert "last_stop_replacement_failure" not in position.metadata_json
 
 
 def test_retry_all_attempts_fail_records_failure_once(monkeypatch) -> None:

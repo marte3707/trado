@@ -10,9 +10,12 @@ import { SignalFunnelChart } from "@/components/calibration/SignalFunnelChart";
 import { RejectionReasonsList } from "@/components/calibration/RejectionReasonsList";
 import { fmt } from "@/components/atoms";
 import { cn } from "@/lib/utils";
+import { useOutcomeProfile } from "@/lib/hooks/queries";
 import type {
   Calibration,
   CalibrationHistoryEntry,
+  CalibrationStats,
+  OutcomeProfile,
   Signal,
   SignalRejections,
   WorkerCycle,
@@ -45,6 +48,24 @@ const TONE_BG: Record<string, string> = {
   info: "border-info/40 bg-info/10 text-info",
 };
 
+const EDGE_CHANGE_KEYS = new Set([
+  "directional_score_adjustments",
+  "score_bucket_adjustments",
+  "market_score_adjustments",
+  "timeframe_score_adjustments",
+]);
+
+function weakestRows(groups: Record<string, CalibrationStats> | undefined, limit = 5) {
+  return Object.entries(groups ?? {})
+    .filter(([, stats]) => stats.trades > 0)
+    .sort(([, left], [, right]) => {
+      const leftPf = left.profit_factor ?? Number.POSITIVE_INFINITY;
+      const rightPf = right.profit_factor ?? Number.POSITIVE_INFINITY;
+      return leftPf - rightPf || left.realized_pnl - right.realized_pnl;
+    })
+    .slice(0, limit);
+}
+
 export function DiagnosticsTab({
   calibration,
   history,
@@ -52,6 +73,7 @@ export function DiagnosticsTab({
   rejections,
   workerCycles,
 }: Props) {
+  const { data: outcomeProfile } = useOutcomeProfile(500);
   const overall = calibration.overall;
   const winRate = overall?.win_rate ?? null;
   const profitFactor = overall?.profit_factor ?? null;
@@ -59,6 +81,10 @@ export function DiagnosticsTab({
 
   const recentHistory = useMemo(() => history.slice(0, 8), [history]);
   const recentCycles = useMemo(() => workerCycles.slice(0, 5), [workerCycles]);
+  const edgeChanges = useMemo(
+    () => calibration.changes.filter((change) => EDGE_CHANGE_KEYS.has(change.key)),
+    [calibration.changes],
+  );
 
   return (
     <div className="space-y-4">
@@ -98,6 +124,8 @@ export function DiagnosticsTab({
         />
         <RejectionReasonsList rejections={rejections} />
       </div>
+
+      <OutcomeProfilePanel profile={outcomeProfile} edgeChanges={edgeChanges} />
 
       {/* Calibration history + worker cycles */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -212,6 +240,93 @@ export function DiagnosticsTab({
           </ScrollArea>
         </Card>
       </div>
+    </div>
+  );
+}
+
+function OutcomeProfilePanel({
+  profile,
+  edgeChanges,
+}: {
+  profile: OutcomeProfile | null | undefined;
+  edgeChanges: Calibration["changes"];
+}) {
+  const weakDirections = weakestRows(profile?.by_direction, 3);
+  const weakBuckets = weakestRows(profile?.by_score_bucket, 4);
+  const weakMarkets = weakestRows(profile?.by_market, 4);
+  const tpRows = Object.entries(profile?.by_tp_state ?? {});
+  const activePenaltyCount = edgeChanges.reduce((total, change) => {
+    if (change.after && typeof change.after === "object") {
+      return total + Object.keys(change.after).length;
+    }
+    return total;
+  }, 0);
+
+  return (
+    <Card className="p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+            Outcome profile
+          </div>
+          <div className="mt-0.5 text-xs text-fg-3">
+            Profilo ultimi {profile?.filters.lookback ?? 500} trade chiusi per edge calibration
+          </div>
+        </div>
+        <Badge variant="outline" className={cn("font-mono", activePenaltyCount > 0 && "border-warn/40 bg-warn/10 text-warn")}>
+          {activePenaltyCount} penalty preview
+        </Badge>
+      </div>
+      <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-4">
+        <OutcomeGroup title="Direzione" rows={weakDirections} />
+        <OutcomeGroup title="Score bucket" rows={weakBuckets} />
+        <OutcomeGroup title="Market probation" rows={weakMarkets} />
+        <OutcomeGroup title="TP profile" rows={tpRows} />
+      </div>
+    </Card>
+  );
+}
+
+function OutcomeGroup({
+  title,
+  rows,
+}: {
+  title: string;
+  rows: [string, CalibrationStats][];
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+        {title}
+      </div>
+      {rows.length === 0 ? (
+        <div className="rounded border border-border px-3 py-2 text-xs text-fg-3">
+          Nessun dato
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          {rows.map(([key, stats]) => (
+            <div key={key} className="rounded border border-border px-3 py-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="truncate font-mono text-xs text-fg-2">{key}</span>
+                <span
+                  className={cn(
+                    "font-mono text-xs tabular-nums",
+                    stats.realized_pnl >= 0 ? "text-success" : "text-danger",
+                  )}
+                >
+                  {fmt.pnl(stats.realized_pnl)}
+                </span>
+              </div>
+              <div className="mt-1 flex items-center justify-between text-[10px] text-fg-3">
+                <span>{stats.trades} trade</span>
+                <span>WR {pct(stats.win_rate)}</span>
+                <span>PF {stats.profit_factor != null ? stats.profit_factor.toFixed(2) : "—"}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

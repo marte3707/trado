@@ -151,6 +151,36 @@ class PositionManagementEngine:
         self.apply_stop_update(db, position, candidate, mode=OrderMode.PAPER.value)
         return True
 
+    def protect_paper_stop_at_breakeven_after_tp1(
+        self,
+        db: Session,
+        position: Position,
+    ) -> bool:
+        metadata = self.ensure_position_state(position)
+        if not metadata.get("tp1_hit") or metadata.get("breakeven_triggered"):
+            return False
+        entry = position.entry_price
+        if entry is None or entry <= 0:
+            return False
+        stop = position.stop_loss
+        side = position.side.lower()
+        if side == "long" and stop is not None and stop >= entry:
+            return False
+        if side == "short" and stop is not None and stop <= entry:
+            return False
+        candidate = StopCandidate(
+            price=entry,
+            reason="breakeven_after_tp1",
+            indicators={
+                "current_price": str(entry),
+                "source": "paper_tp1",
+                "trigger": "tp1_hit_metadata",
+            },
+            r_multiple=Decimal("1"),
+        )
+        self.apply_stop_update(db, position, candidate, mode=OrderMode.PAPER.value)
+        return True
+
     def manage_live_positions_for_timeframe(
         self,
         db: Session,
@@ -409,7 +439,8 @@ class PositionManagementEngine:
                 position_id=position.id,
                 old_stop_loss=old_stop,
                 new_stop_loss=candidate.price,
-                current_price=Decimal(str(candidate.indicators.get("current_price", candidate.price))),
+                current_price=_decimal(candidate.indicators.get("current_price"), candidate.price)
+                or candidate.price,
                 r_multiple=candidate.r_multiple,
                 reason=candidate.reason,
                 indicators=candidate.indicators,
@@ -569,6 +600,7 @@ class PositionManagementEngine:
         # Successo: azzeriamo il contatore degli attempt falliti
         metadata = dict(position.metadata_json or {})
         metadata["stop_replacement_attempts"] = 0
+        metadata.pop("last_stop_replacement_failure", None)
         position.metadata_json = metadata
 
         new_order = Order(

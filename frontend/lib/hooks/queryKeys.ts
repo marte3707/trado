@@ -18,6 +18,7 @@ export const qk = {
   calibration: ["calibration"] as const,
   calibrationHistory: ["calibration", "history"] as const,
   calibrationStability: ["calibration", "stability"] as const,
+  outcomeProfile: (lookback: number) => ["outcome-profile", lookback] as const,
   tunerStatus: ["tuner", "status"] as const,
   tunerSourceTests: ["tuner", "source-tests"] as const,
   workerCycles: (limit: number) => ["worker", "cycles", limit] as const,

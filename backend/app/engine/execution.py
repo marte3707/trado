@@ -881,14 +881,24 @@ class OrderExecutionEngine:
         paper_closed = 0
         live_alerted = 0
         if bool(config.get("paperEnabled", True)):
-            paper_closed = self._close_paper_time_stops(db, max_age_by_tf)
+            paper_closed = self._close_paper_time_stops(
+                db,
+                max_age_by_tf,
+                close_losing_positions=bool(config.get("closeLosingPaperPositions", False)),
+            )
         if str(config.get("liveMode", "alert")) == "alert":
             live_alerted = self._alert_live_time_stops(db, max_age_by_tf)
         if paper_closed or live_alerted:
             db.commit()
         return {"paper_closed": paper_closed, "live_alerted": live_alerted}
 
-    def _close_paper_time_stops(self, db: Session, max_age_by_tf: dict[str, Any]) -> int:
+    def _close_paper_time_stops(
+        self,
+        db: Session,
+        max_age_by_tf: dict[str, Any],
+        *,
+        close_losing_positions: bool,
+    ) -> int:
         positions = (
             db.query(Position)
             .filter(
@@ -910,6 +920,8 @@ class OrderExecutionEngine:
             if pos_metadata.get("tp1_hit") or pos_metadata.get("tp2_hit"):
                 continue
             if _position_is_in_profit(position, candle):
+                continue
+            if not close_losing_positions:
                 continue
             self.close_position(
                 db,
@@ -1234,6 +1246,10 @@ class OrderExecutionEngine:
             exits += exit_count
             closed += closed_count
             if position.status == "open":
+                protected = self.position_manager.protect_paper_stop_at_breakeven_after_tp1(
+                    db, position
+                )
+                exits += 1 if protected else 0
                 updated = self.position_manager.manage_paper_position_for_candle(
                     db, market, position, [candle], candle
                 )
@@ -1290,6 +1306,10 @@ class OrderExecutionEngine:
                     metadata = dict(position.metadata_json or {})
                     metadata["last_trigger_checked_candle_open_time"] = candle_key
                     position.metadata_json = metadata
+                    protected = self.position_manager.protect_paper_stop_at_breakeven_after_tp1(
+                        db, position
+                    )
+                    exits += 1 if protected else 0
                     updated = self.position_manager.manage_paper_position_for_candle(
                         db, market, position, candles, candle
                     )

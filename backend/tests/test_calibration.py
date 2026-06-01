@@ -1,8 +1,13 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
+from app.core.enums import Direction
 from app.db.models import AppSetting, Position, StrategyConfig
+from app.engine import calibration as calibration_module
 from app.engine.calibration import AutoCalibrationEngine
+from app.engine.edge_profile import edge_adjustment_for_stats, signal_threshold_adjustment
 from app.engine.performance import PerformanceStats, SignalPerformanceAnalyzer
 
 
@@ -135,6 +140,108 @@ def test_strategy_params_become_more_selective_after_weak_performance() -> None:
 
     assert params == {"period": 15, "oversold": 25, "overbought": 75}
     assert "more selective" in reason
+
+
+def test_edge_penalty_flags_weak_long_but_not_healthy_short() -> None:
+    long_penalty = edge_adjustment_for_stats(
+        PerformanceStats(
+            trades=32,
+            wins=7,
+            losses=25,
+            win_rate=7 / 32,
+            realized_pnl=-420.0,
+            gross_profit=160.0,
+            gross_loss=580.0,
+            profit_factor=0.28,
+        ),
+        weak_trades=20,
+        weak_pf=0.8,
+        weak_wr=0.35,
+        weak_adjustment=8,
+        severe_trades=30,
+        severe_pf=0.6,
+        severe_wr=0.25,
+        severe_adjustment=12,
+    )
+    short_penalty = edge_adjustment_for_stats(
+        PerformanceStats(
+            trades=35,
+            wins=18,
+            losses=17,
+            win_rate=18 / 35,
+            realized_pnl=220.0,
+            gross_profit=620.0,
+            gross_loss=400.0,
+            profit_factor=1.55,
+        ),
+        weak_trades=20,
+        weak_pf=0.8,
+        weak_wr=0.35,
+        weak_adjustment=8,
+        severe_trades=30,
+        severe_pf=0.6,
+        severe_wr=0.25,
+        severe_adjustment=12,
+    )
+
+    assert long_penalty == 12
+    assert short_penalty == 0
+
+
+def test_signal_threshold_adjustment_combines_and_caps_penalties() -> None:
+    risk = {
+        "directional_score_adjustments": {"LONG:5m": {"adjustment": 12}},
+        "score_bucket_adjustments": {"LONG:60-69": {"adjustment": 8}},
+        "market_score_adjustments": {"42": {"adjustment": 10}},
+        "timeframe_score_adjustments": {"5m": {"adjustment": 5}},
+        "max_combined_score_adjustment": 15,
+    }
+
+    adjustment = signal_threshold_adjustment(
+        risk,
+        market_id=42,
+        timeframe="5m",
+        direction=Direction.LONG,
+        score=64,
+    )
+
+    assert adjustment["raw_total"] == 35
+    assert adjustment["total"] == 15
+    assert adjustment["components"]["directional"] == 12
+    assert adjustment["score_bucket"] == "60-69"
+
+
+def test_edge_calibration_clears_recovered_penalties(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = FakeDb(
+        {
+            "directional_score_adjustments": {"LONG:5m": {"adjustment": 12}},
+            "score_bucket_adjustments": {"LONG:60-69": {"adjustment": 8}},
+            "market_score_adjustments": {"42": {"adjustment": 10}},
+            "timeframe_score_adjustments": {"5m": {"adjustment": 5}},
+            "max_combined_score_adjustment": 15,
+            "entry_quality_filter_enabled": True,
+        }
+    )
+    monkeypatch.setattr(
+        calibration_module,
+        "compute_edge_adjustments",
+        lambda *args, **kwargs: {
+            "directional_score_adjustments": {},
+            "score_bucket_adjustments": {},
+            "market_score_adjustments": {},
+            "timeframe_score_adjustments": {},
+        },
+    )
+
+    changes = AutoCalibrationEngine()._calibrate_edge_adjustments(
+        db,  # type: ignore[arg-type]
+        {"lookback_trades": 500},
+    )
+
+    risk = db.rows["risk"].value
+    assert risk["directional_score_adjustments"] == {}
+    assert risk["score_bucket_adjustments"] == {}
+    assert any(change.key == "directional_score_adjustments" for change in changes)
 
 
 class FakeQuery:

@@ -65,6 +65,19 @@ LEGACY_DEFAULT_STRATEGY_WEIGHTS = {
     "volume_spike": 25,
 }
 
+DEFAULT_EDGE_RISK_SETTINGS = {
+    "directional_score_adjustments": {},
+    "score_bucket_adjustments": {},
+    "market_score_adjustments": {},
+    "timeframe_score_adjustments": {},
+    "allow_ob_imbalance_only_signals": False,
+    "entry_quality_filter_enabled": True,
+    "entry_quality_ema_period": 21,
+    "entry_quality_long_ob_imbalance_min": 0.05,
+    "entry_quality_short_ob_imbalance_max": 0.0,
+    "max_combined_score_adjustment": 15,
+}
+
 
 def create_schema() -> None:
     Base.metadata.create_all(bind=engine)
@@ -121,6 +134,7 @@ def seed_defaults(db: Session) -> None:
                     "max_open_positions": settings.max_open_positions,
                     "max_total_exposure_pct": settings.max_total_exposure_pct,
                     "max_leverage": settings.max_leverage,
+                    **DEFAULT_EDGE_RISK_SETTINGS,
                     **DEFAULT_UAR_RISK_SETTINGS,
                 },
             )
@@ -131,6 +145,10 @@ def seed_defaults(db: Session) -> None:
             value = dict(risk_setting.value)
             mutated = False
             for key, default in DEFAULT_UAR_RISK_SETTINGS.items():
+                if key not in value:
+                    value[key] = default
+                    mutated = True
+            for key, default in DEFAULT_EDGE_RISK_SETTINGS.items():
                 if key not in value:
                     value[key] = default
                     mutated = True

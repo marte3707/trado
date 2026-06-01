@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from app.api.routes import _calculate_unrealized_pnl
 from app.core.config import Settings
-from app.db.models import AppSetting, Candle, DecisionLog, Order, Position, Signal
+from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, Signal
 from app.engine.execution import OrderExecutionEngine
 
 
@@ -405,6 +405,62 @@ def test_take_profit_plan_closes_half_at_tp1() -> None:
     assert position.metadata_json["take_profit_plan"][0]["filled"] is True
 
 
+def test_close_paper_positions_for_candle_moves_stop_to_breakeven_after_tp1() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=50,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        stop_loss=Decimal("90"),
+        status="open",
+        opened_at=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        metadata_json={
+            "source_timeframe": "5m",
+            "initial_size": "1",
+            "initial_stop_loss": "90",
+            "initial_risk_per_unit": "10",
+            "take_profit_plan": [
+                {"level": "tp1", "price": "110", "allocation": "0.3", "filled": False},
+                {"level": "tp2", "price": "120", "allocation": "0.3", "filled": False},
+                {"level": "runner", "price": "", "allocation": "0.4", "filled": False, "runner": True},
+            ],
+        },
+    )
+    candle = Candle(
+        market_id=1,
+        timeframe="5m",
+        open_time=datetime(2026, 1, 1, 12, 5, tzinfo=timezone.utc),
+        open=Decimal("100"),
+        high=Decimal("111"),
+        low=Decimal("99"),
+        close=Decimal("110"),
+        volume=Decimal("1"),
+    )
+    market = Market(
+        id=1,
+        exchange="hyperliquid",
+        symbol="BTC",
+        base="BTC",
+        quote="USDC",
+        market_type="perp",
+        active=True,
+        metadata_json={"hl_coin": "BTC"},
+    )
+    db = FakeTimeStopDb(positions=[position])
+
+    closed = engine.close_paper_positions_for_candle(db, market, candle)  # type: ignore[arg-type]
+
+    assert closed == 0
+    assert position.size == Decimal("0.7")
+    assert position.metadata_json["tp1_hit"] is True
+    assert position.stop_loss == Decimal("100")
+    assert position.metadata_json["breakeven_triggered"] is True
+    assert position.metadata_json["last_stop_update_reason"] == "breakeven_after_tp1"
+
+
 def test_take_profit_plan_can_fill_all_targets_in_one_candle() -> None:
     engine = OrderExecutionEngine(Settings())
     signal = Signal(id=12, market_id=1, timeframe="5m", direction="LONG", score=80, confidence_label="high", entry_price=Decimal("100"), reason="test", strategy_breakdown={}, status="executed")
@@ -482,6 +538,7 @@ def test_time_stop_closes_stale_unprofitable_paper_position_at_latest_candle_clo
             "timeStop": {
                 "enabled": True,
                 "paperEnabled": True,
+                "closeLosingPaperPositions": True,
                 "liveMode": "off",
                 "maxAgeHoursByTimeframe": {"5m": 8},
             }
@@ -496,6 +553,54 @@ def test_time_stop_closes_stale_unprofitable_paper_position_at_latest_candle_clo
     assert position.realized_pnl == Decimal("-2")
     assert position.metadata_json["exit_reason"] == "time_stop"
     assert any(
+        isinstance(row, DecisionLog) and row.event_type == "paper_position_time_stop_closed"
+        for row in db.added
+    )
+
+
+def test_time_stop_skips_losing_paper_position_by_default() -> None:
+    engine = OrderExecutionEngine(Settings())
+    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
+    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    position = Position(
+        id=12,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=opened_at,
+        metadata_json={"source_timeframe": "5m", "initial_size": "1"},
+    )
+    candle = Candle(
+        market_id=1,
+        timeframe="5m",
+        open_time=candle_open,
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("97"),
+        close=Decimal("98"),
+        volume=Decimal("1"),
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        candles=[candle],
+        position_management={
+            "timeStop": {
+                "enabled": True,
+                "paperEnabled": True,
+                "liveMode": "off",
+                "maxAgeHoursByTimeframe": {"5m": 8},
+            }
+        },
+    )
+
+    result = engine.apply_time_stops(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "live_alerted": 0}
+    assert position.status == "open"
+    assert not any(
         isinstance(row, DecisionLog) and row.event_type == "paper_position_time_stop_closed"
         for row in db.added
     )
