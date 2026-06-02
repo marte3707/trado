@@ -111,7 +111,7 @@ def _build_live_close_message(
         sign = "+" if float(pnl_value) >= 0 else ""
         pnl_icon = "📈" if float(pnl_value) >= 0 else "📉"
         lines.append(f"{pnl_icon} {pnl_label}: <code>{sign}{float(pnl_value):.2f} $</code>")
-    lines += [sep, "🤖 <i>Trado · Hyperliquid</i>"]
+    lines += [sep, "🤖 <i>Trado · @crypto_free_live_signals</i>"]
     return "\n".join(lines)
 
 
@@ -143,7 +143,7 @@ def _build_message(signal: Signal) -> str:
     if signal.risk_reward is not None:
         lines.append(f"⚖️ R/R          <code>{signal.risk_reward:.2f}</code>")
 
-    lines += [sep, "🤖 <i>Trado · Hyperliquid</i>"]
+    lines += [sep, "🤖 <i>Trado · @crypto_free_live_signals</i>"]
     return "\n".join(lines)
 
 
@@ -374,3 +374,17 @@ class TelegramNotifier:
         alert.sent_at = datetime.now(timezone.utc) if response.is_success else None
         alert.payload = {**payload, "telegram_status": response.status_code}
         db.commit()
+
+        if self.settings.telegram_signal_chat_id:
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(
+                        url,
+                        json={
+                            "chat_id": self.settings.telegram_signal_chat_id,
+                            "text": _build_message(signal),
+                            "parse_mode": "HTML",
+                        },
+                    )
+            except Exception as exc:
+                logger.warning("telegram_signal_channel_send_failed", error=str(exc))

@@ -13,6 +13,7 @@ import { AutoTunerTab } from "@/components/calibration/AutoTunerTab";
 import { StabilityTab } from "@/components/calibration/StabilityTab";
 import { EquitySlopeTab } from "@/components/calibration/EquitySlopeTab";
 import { DiagnosticsTab } from "@/components/calibration/DiagnosticsTab";
+import { ScoreAlignmentTab } from "@/components/calibration/ScoreAlignmentTab";
 import { useSignals } from "@/lib/hooks/queries";
 import type {
   AppSettings,
@@ -65,6 +66,7 @@ export function CalibrationScreen({
           <TabsTrigger value="stability">Stability</TabsTrigger>
           <TabsTrigger value="equity-slope">Equity slope</TabsTrigger>
           <TabsTrigger value="diagnostics">Diagnostics</TabsTrigger>
+          <TabsTrigger value="score-alignment">Score Alignment</TabsTrigger>
         </TabsList>
 
         <TabsContent value="tuner" className="mt-5">
@@ -77,6 +79,10 @@ export function CalibrationScreen({
 
         <TabsContent value="equity-slope" className="mt-5">
           <EquitySlopeTab />
+        </TabsContent>
+
+        <TabsContent value="score-alignment" className="mt-5">
+          <ScoreAlignmentTab />
         </TabsContent>
 
         <TabsContent value="diagnostics" className="mt-5">

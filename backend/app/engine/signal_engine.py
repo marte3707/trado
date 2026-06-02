@@ -477,6 +477,20 @@ class SignalEngine:
         # taglia effettivamente mercati morti (sotto p25) e panic moves (sopra p90).
         atr_pct_min = float(risk_value.get("atr_pct_min", 0.25))
         atr_pct_max = float(risk_value.get("atr_pct_max", 0.90))
+        # Durante starvation override la maggior parte dei mercati può trovarsi in una
+        # fase di compressione di volatilità relativa: il filtro ATR percentile blocca
+        # più candidati del previsto (>60% osservato) aggravando la starvation stessa.
+        # Il bypass è automatico e si disattiva non appena la starvation rientra.
+        if volatility_filter_enabled:
+            cal_state_setting = db.get(AppSetting, "auto_calibration_state")
+            if cal_state_setting and isinstance(cal_state_setting.value, dict):
+                if cal_state_setting.value.get("starvation_override_active"):
+                    volatility_filter_enabled = False
+                    logger.debug(
+                        "volatility_filter_bypassed_starvation",
+                        market=market.symbol,
+                        timeframe=timeframe,
+                    )
         mtf_confluence_enabled = bool(risk_value.get("mtf_confluence_enabled", False))
         mtf_ema_period = int(risk_value.get("mtf_ema_period", 50))
         volatility_passed, volatility_info = evaluate_volatility(
@@ -773,6 +787,17 @@ class SignalEngine:
             score=score.score,
         )
         effective_min_signal_score = min_signal_score + int(edge_adjustment["total"])
+        # Penalità direzione applicata dopo il cap max_combined_score_adjustment.
+        # Permette di alzare ulteriormente la soglia per LONG/STRONG_LONG senza
+        # interferire con la logica di calibrazione automatica.
+        if score.direction in {Direction.LONG, Direction.STRONG_LONG}:
+            long_score_penalty = int(risk_value.get("long_score_penalty", 0))
+            if long_score_penalty > 0:
+                effective_min_signal_score += long_score_penalty
+                score.breakdown["_long_score_penalty"] = {
+                    "penalty": long_score_penalty,
+                    "effective_min_signal_score": effective_min_signal_score,
+                }
         if int(edge_adjustment["total"]) > 0:
             direction_family = edge_adjustment.get("direction")
             score_bucket = edge_adjustment.get("score_bucket")

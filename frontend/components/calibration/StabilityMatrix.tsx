@@ -80,7 +80,7 @@ export function StabilityMatrix() {
     }
     const thr = data.settings.factor_history_std_threshold;
     const candidatesArr = data.by_strategy
-      .filter((e) => e.factor_stddev > thr)
+      .filter((e) => e.enabled && e.factor_stddev > thr)
       .sort((a, b) => b.factor_stddev - a.factor_stddev);
     const tracked = data.by_strategy.filter((e) => e.factor_history.length >= 2).length;
     return {

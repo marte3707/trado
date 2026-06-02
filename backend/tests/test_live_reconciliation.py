@@ -821,7 +821,7 @@ def test_resubmit_missing_tp1_stops_after_total_retry_cap() -> None:
                 "status": "ok",
                 "size": "0.5",
             }
-            for i in range(3)
+            for i in range(10)
         ]
     }
     db = FakeDb(positions=[position], orders=[tp1_order])

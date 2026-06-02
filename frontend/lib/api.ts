@@ -612,7 +612,6 @@ export type CalibrationStabilityEntry = {
   trades: number;
   factor_history: number[];
   factor_stddev: number;
-  stable: boolean;
   holdout: {
     train: CalibrationStats;
     test: CalibrationStats;
@@ -717,6 +716,29 @@ export async function apiPut<T>(path: string, body?: unknown): Promise<T> {
   }
   return response.json() as Promise<T>;
 }
+
+export type ScoreCalibrationBucket = {
+  range: string;
+  min_score: number;
+  count: number;
+  win_rate: number;
+  avg_pnl: number;
+  profit_factor: number;
+};
+
+export type ScoreCalibrationPeriod = {
+  period: string;
+  avg_score: number;
+  win_rate: number;
+  count: number;
+};
+
+export type ScoreCalibration = {
+  buckets: ScoreCalibrationBucket[];
+  correlation: number | null;
+  total_trades: number;
+  by_week: ScoreCalibrationPeriod[];
+};
 
 export async function apiDelete<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {

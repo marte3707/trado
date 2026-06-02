@@ -308,6 +308,11 @@ class AutoCalibrationEngine:
         factor_history_threshold = float(settings.get("factor_history_std_threshold", 0.25))
         # Storico dei factor decisi per strategia (serve per detectare instabilità)
         factor_history: dict[str, list[float]] = dict(state_value.get("factor_history") or {})
+        # Fix 4: rileva regime corrente una volta per tutta la calibrazione
+        current_regime = self.analyzer.recent_regime(db)
+        regime_pos_cache: dict[str, dict[str, list[Position]]] = {}
+        # Fix 3: contribution-weighted stats per timeframe (lazy, calcolate una volta per TF)
+        contrib_cache: dict[str, dict] = {}
 
         for strategy in strategies:
             if strategy.timeframe not in positions_by_timeframe:
@@ -319,6 +324,12 @@ class AutoCalibrationEngine:
             strategy_positions = positions_by_timeframe[strategy.timeframe].get(
                 strategy.strategy_name, []
             )
+            # Fix 3: stats pesate per fraction di contributo (lazy per timeframe)
+            if strategy.timeframe not in contrib_cache:
+                contrib_cache[strategy.timeframe] = self.analyzer.strategy_weighted_stats(
+                    db, timeframe=strategy.timeframe, limit=int(settings["lookback_trades"])
+                )
+            contrib_perf = contrib_cache[strategy.timeframe].get(strategy.strategy_name)
             stats = self.analyzer.summarize_positions(strategy_positions)
             if stats.trades < min_trades:
                 continue
@@ -357,6 +368,34 @@ class AutoCalibrationEngine:
                 train_ratio=wf_train_ratio,
                 min_per_side=wf_min_per_side,
             )
+            # Fix 3: nudge del factor in base al contribution-weighted win rate.
+            # Se la strategia vince di più quando è il contribuente principale, merita
+            # un factor più alto di quanto suggerisca il semplice conteggio vittorie.
+            if contrib_perf and contrib_perf.trades >= max(3, min_trades // 2):
+                wr_delta = contrib_perf.win_rate - (stats.win_rate if stats.trades > 0 else 0.5)
+                contrib_nudge = max(-0.15, min(0.15, wr_delta * 1.5))
+                if abs(contrib_nudge) >= 0.05:
+                    factor += contrib_nudge
+                    reason += f" | contrib_adj={contrib_nudge:+.2f}"
+            # Fix 4: blending con factor regime-specifico (60% regime / 40% globale).
+            # Il regime corrente è più predittivo degli ultimi N trade aggregati su tutti i regimi.
+            if current_regime and current_regime != "unknown":
+                if strategy.timeframe not in regime_pos_cache:
+                    regime_pos_cache[strategy.timeframe] = self.analyzer.regime_strategy_positions(
+                        db, current_regime,
+                        timeframe=strategy.timeframe,
+                        limit=int(settings["lookback_trades"]),
+                    )
+                regime_pos = regime_pos_cache[strategy.timeframe].get(strategy.strategy_name, [])
+                if len(regime_pos) >= min_trades:
+                    regime_factor, regime_reason = self._strategy_factor_holdout_validated(
+                        regime_pos,
+                        enabled=wf_enabled,
+                        train_ratio=wf_train_ratio,
+                        min_per_side=wf_min_per_side,
+                    )
+                    factor = 0.4 * factor + 0.6 * regime_factor
+                    reason = f"regime={current_regime}: {regime_reason} | global: {reason}"
             # Stability tracking: registra il factor calcolato e congela il cambio se
             # i factor recenti per questa strategia variano troppo. La instabilità
             # è un segnale di overfitting al rumore — meglio non muovere i pesi.
@@ -651,7 +690,10 @@ class AutoCalibrationEngine:
                 "parametri ripristinati al baseline"
             )
         elif in_deep_defensive and zero_cycles >= starvation_soft:
-            score_delta = 6
+            # score_delta=0: min_signal_score non è un predittore affidabile (correlazione
+            # score↔outcome ~0.03), alzarlo non migliora la qualità ma causa starvation.
+            # La difesa agisce solo su RR e size del rischio per trade.
+            score_delta = 0
             rr_delta = 0.2
             risk_pct = max(min_risk_floor, base_risk * 0.75)
             reason = (
@@ -659,7 +701,7 @@ class AutoCalibrationEngine:
                 f"equity slope {equity_slope_value:.4f}"
             )
         elif in_deep_defensive:
-            score_delta = 12
+            score_delta = 0
             rr_delta = 0.4
             risk_pct = max(min_risk_floor, base_risk * 0.5)
             reason = (
@@ -681,7 +723,7 @@ class AutoCalibrationEngine:
                     f"(wr={recent_stats.win_rate:.2f}), ripristino baseline"  # type: ignore[union-attr]
                 )
             else:
-                score_delta = 8
+                score_delta = 0
                 rr_delta = 0.25
                 risk_pct = max(min_risk_floor, base_risk * 0.75)
                 reason = "defensive mode after weak historical results"

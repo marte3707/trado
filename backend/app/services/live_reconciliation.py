@@ -37,13 +37,16 @@ _TPSL_BY_ORDER_TYPE: dict[str, str] = {
     "stop_loss": "sl",
 }
 
-# After this many consecutive failed re-submissions we stop retrying to avoid
-# infinite resubmit loops when HL persistently rejects the order.
-_MAX_RESUBMIT_ATTEMPTS = 3
-# Successful re-submissions can also loop if HL keeps omitting the new order from
-# openOrders. Cap total attempts and cool down successful retries before trying
-# again so one missing TP cannot churn orders every reconciliation cycle.
-_MAX_RESUBMIT_TOTAL_ATTEMPTS = 3
+# Hard failures: HL rejects the order with a non-"ok" status (e.g. trigger price
+# already passed, wrong side). These indicate a permanent problem — stop retrying
+# after this many to avoid futile loops.
+_MAX_RESUBMIT_HARD_FAILURES = 3
+# Soft failures: exceptions during submission (network timeout, rate limit, etc.).
+# These are transient — allow more retries before giving up.
+_MAX_RESUBMIT_SOFT_FAILURES = 8
+# Cap total attempts regardless of outcome so one missing order cannot churn
+# indefinitely when HL keeps omitting it from openOrders.
+_MAX_RESUBMIT_TOTAL_ATTEMPTS = 10
 _RESUBMIT_RETRY_COOLDOWN_SECONDS = 15 * 60
 
 
@@ -965,8 +968,14 @@ def _resubmit_missing_protection_orders(
         resubmits: list[dict] = [
             item for item in raw_resubmits if isinstance(item, dict)
         ] if isinstance(raw_resubmits, list) else []
-        failed_attempts = sum(1 for r in resubmits if r.get("status") != "ok")
-        if not force_repair and failed_attempts >= _MAX_RESUBMIT_ATTEMPTS:
+        hard_failures = sum(
+            1 for r in resubmits
+            if r.get("status") not in ("ok", "error", "skipped_liquidation_guard")
+        )
+        soft_failures = sum(1 for r in resubmits if r.get("status") == "error")
+        if not force_repair and hard_failures >= _MAX_RESUBMIT_HARD_FAILURES:
+            continue
+        if not force_repair and soft_failures >= _MAX_RESUBMIT_SOFT_FAILURES:
             continue
 
         oid_int: int | None = None
@@ -1000,8 +1009,10 @@ def _resubmit_missing_protection_orders(
             raw["resubmit_blocked"] = {
                 "reason": "max_total_attempts",
                 "blocked_at": now.isoformat(),
-                "attempts": len(resubmits),
-                "max_attempts": _MAX_RESUBMIT_TOTAL_ATTEMPTS,
+                "total_attempts": len(resubmits),
+                "hard_failures": hard_failures,
+                "soft_failures": soft_failures,
+                "max_total_attempts": _MAX_RESUBMIT_TOTAL_ATTEMPTS,
             }
             _set_order_raw_response(order, raw)
             db.add(order)
@@ -1018,8 +1029,10 @@ def _resubmit_missing_protection_orders(
                         "coin": coin,
                         "order_id": order.id,
                         "order_type": order.order_type,
-                        "attempts": len(resubmits),
-                        "max_attempts": _MAX_RESUBMIT_TOTAL_ATTEMPTS,
+                        "total_attempts": len(resubmits),
+                        "hard_failures": hard_failures,
+                        "soft_failures": soft_failures,
+                        "max_total_attempts": _MAX_RESUBMIT_TOTAL_ATTEMPTS,
                     },
                 )
             )

@@ -899,6 +899,110 @@ def analytics_outcome_profile(
     return build_outcome_profile(db, lookback=lookback)
 
 
+@router.get("/analytics/score-calibration")
+def analytics_score_calibration(
+    limit: int = Query(500, ge=1, le=2000),
+    db: Session = Depends(get_db),
+) -> dict:
+    analyzer = SignalPerformanceAnalyzer()
+    positions = analyzer.closed_paper_positions(db, limit=limit)
+
+    signal_ids = {
+        int(position.metadata_json["source_signal_id"])
+        for position in positions
+        if isinstance(position.metadata_json, dict)
+        and position.metadata_json.get("source_signal_id") is not None
+    }
+    signals_by_id = (
+        {signal.id: signal for signal in db.query(Signal).filter(Signal.id.in_(signal_ids)).all()}
+        if signal_ids
+        else {}
+    )
+
+    pairs: list[tuple[int, float, Any]] = []
+    for position in positions:
+        metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+        source_signal_id = metadata.get("source_signal_id")
+        if source_signal_id is None:
+            continue
+        try:
+            signal = signals_by_id.get(int(source_signal_id))
+        except (TypeError, ValueError):
+            continue
+        if signal is None or signal.score is None:
+            continue
+        pnl = float(position.realized_pnl or 0)
+        closed_at = position.closed_at or position.opened_at
+        pairs.append((signal.score, pnl, closed_at))
+
+    if not pairs:
+        return {"buckets": [], "correlation": None, "total_trades": 0, "by_week": []}
+
+    bucket_data: dict[int, list[float]] = {}
+    for score, pnl, _ in pairs:
+        bucket = (score // 10) * 10
+        bucket_data.setdefault(bucket, []).append(pnl)
+
+    buckets = []
+    for min_score in sorted(bucket_data.keys()):
+        pnls = bucket_data[min_score]
+        wins = sum(1 for p in pnls if p > 0)
+        gross_profit = sum(p for p in pnls if p > 0)
+        gross_loss = abs(sum(p for p in pnls if p < 0))
+        buckets.append({
+            "range": f"{min_score}-{min_score + 9}",
+            "min_score": min_score,
+            "count": len(pnls),
+            "win_rate": wins / len(pnls),
+            "avg_pnl": sum(pnls) / len(pnls),
+            "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0),
+        })
+
+    scores_list = [p[0] for p in pairs]
+    pnls_list = [p[1] for p in pairs]
+    n = len(scores_list)
+    correlation: float | None = None
+    if n >= 2:
+        mean_s = sum(scores_list) / n
+        mean_p = sum(pnls_list) / n
+        cov = sum((s - mean_s) * (p - mean_p) for s, p in zip(scores_list, pnls_list)) / n
+        std_s = (sum((s - mean_s) ** 2 for s in scores_list) / n) ** 0.5
+        std_p = (sum((p - mean_p) ** 2 for p in pnls_list) / n) ** 0.5
+        if std_s > 0 and std_p > 0:
+            correlation = round(cov / (std_s * std_p), 3)
+
+    now = datetime.now(timezone.utc)
+    period_days = 14
+    n_periods = 8
+    by_week = []
+    for i in range(n_periods - 1, -1, -1):
+        period_end = now - timedelta(days=i * period_days)
+        period_start = period_end - timedelta(days=period_days)
+        period_pairs = []
+        for s, p, dt in pairs:
+            if dt is None:
+                continue
+            dt_utc = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+            if period_start <= dt_utc < period_end:
+                period_pairs.append((s, p))
+        if not period_pairs:
+            continue
+        wins = sum(1 for _, p in period_pairs if p > 0)
+        by_week.append({
+            "period": period_start.strftime("%Y-%m-%d"),
+            "avg_score": round(sum(s for s, _ in period_pairs) / len(period_pairs), 1),
+            "win_rate": round(wins / len(period_pairs), 3),
+            "count": len(period_pairs),
+        })
+
+    return {
+        "buckets": buckets,
+        "correlation": correlation,
+        "total_trades": len(pairs),
+        "by_week": by_week,
+    }
+
+
 @router.post("/analytics/report/send")
 async def send_diagnostic_report(
     lookback: int = Query(200, ge=10, le=2000),
@@ -1076,7 +1180,7 @@ def calibration_stability(db: Session = Depends(get_db)) -> dict:
             stddev = 0.0
             if len(history) >= 2:
                 mean = sum(history) / len(history)
-                stddev = _math.sqrt(sum((v - mean) ** 2 for v in history) / len(history))
+                stddev = _math.sqrt(sum((v - mean) ** 2 for v in history) / (len(history) - 1))
             split = SignalPerformanceAnalyzer.holdout_split_stats(
                 positions, train_ratio=train_ratio, min_samples_per_side=min_per_side
             )
@@ -1089,7 +1193,6 @@ def calibration_stability(db: Session = Depends(get_db)) -> dict:
                 "trades": len(positions),
                 "factor_history": history,
                 "factor_stddev": round(stddev, 4),
-                "stable": stddev <= float(settings.get("factor_history_std_threshold", 0.25)),
             }
             if split is None:
                 entry["holdout"] = None

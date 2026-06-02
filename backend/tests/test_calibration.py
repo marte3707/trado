@@ -89,11 +89,10 @@ def test_weak_historical_performance_tightens_risk_settings() -> None:
     )
 
     risk = db.rows["risk"].value
-    assert risk["min_signal_score"] == 68
+    assert risk["min_signal_score"] == 60  # score rimane al baseline — non ha potere predittivo
     assert risk["min_risk_reward"] == 2.25
     assert risk["max_risk_per_trade_pct"] == 0.75
     assert {change.key for change in changes} == {
-        "min_signal_score",
         "min_risk_reward",
         "max_risk_per_trade_pct",
     }
@@ -280,6 +279,15 @@ class FakeAnalyzer:
     def summarize_positions(self, positions):  # noqa: ANN001
         return self._real_analyzer.summarize_positions(positions)
 
+    def strategy_weighted_stats(self, db, timeframe=None, limit=500):  # noqa: ANN001
+        return {}
+
+    def recent_regime(self, db, window=40):  # noqa: ANN001
+        return None
+
+    def regime_strategy_positions(self, db, regime, timeframe=None, limit=500):  # noqa: ANN001
+        return {}
+
 
 def test_calibrate_strategy_params_updates_strategy_config_params() -> None:
     strategy = StrategyConfig(
@@ -412,7 +420,7 @@ def test_deep_defensive_activates_on_strongly_negative_equity_slope() -> None:
 
     risk = db.rows["risk"].value
     state = db.rows["auto_calibration_state"].value
-    assert risk["min_signal_score"] == 72  # 60 + 12
+    assert risk["min_signal_score"] == 60  # score rimane al baseline — non ha potere predittivo
     assert risk["min_risk_reward"] == 2.4
     assert risk["max_risk_per_trade_pct"] == 0.5
     assert state["deep_defensive_active"] is True
@@ -567,7 +575,7 @@ def test_deep_defensive_cooldown_expires_after_new_trades() -> None:
     state = db.rows["auto_calibration_state"].value
     assert state["deep_defensive_cooldown_remaining"] == 0
     assert state["deep_defensive_active"] is True
-    assert risk["min_signal_score"] == 72
+    assert risk["min_signal_score"] == 60  # score rimane al baseline — non ha potere predittivo
 
 
 def test_defensive_mode_exits_when_recent_profit_factor_above_one() -> None:
@@ -625,8 +633,8 @@ def test_defensive_mode_stays_when_recent_profit_factor_below_one() -> None:
     )
 
     risk = db.rows["risk"].value
-    # PF recente <= 1.0 → defensive rimane attivo
-    assert risk["min_signal_score"] == 68  # 60 + 8
+    # PF recente <= 1.0 → defensive rimane attivo; score al baseline (nessun potere predittivo)
+    assert risk["min_signal_score"] == 60
     assert risk["min_risk_reward"] == 2.25
     assert risk["max_risk_per_trade_pct"] == 0.75
 

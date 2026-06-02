@@ -172,6 +172,9 @@ class OrderExecutionEngine:
                 "step_key": ab_tag.get("step_key"),
                 "arm": ab_tag.get("arm"),
             }
+        regime_info = breakdown.get("_regime") if isinstance(breakdown, dict) else None
+        if isinstance(regime_info, dict):
+            base_metadata["regime_at_open"] = regime_info.get("regime", "unknown")
         metadata = self.position_manager.initial_metadata(
             db,
             signal,
@@ -415,6 +418,9 @@ class OrderExecutionEngine:
                 "step_key": ab_tag.get("step_key"),
                 "arm": ab_tag.get("arm"),
             }
+        regime_info = breakdown.get("_regime") if isinstance(breakdown, dict) else None
+        if isinstance(regime_info, dict):
+            live_base["regime_at_open"] = regime_info.get("regime", "unknown")
         metadata = self.position_manager.initial_metadata(
             db,
             signal,

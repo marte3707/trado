@@ -26,6 +26,7 @@ export const qk = {
   marketIntelligence: ["market-intelligence"] as const,
   marketDashboard: ["market-intelligence", "dashboard"] as const,
   equitySlope: ["equity-slope"] as const,
+  scoreCalibration: ["score-calibration"] as const,
   diagnostics: ["diagnostics"] as const,
   accountMonitor: ["account", "snapshot"] as const,
   accountEquityHistory: (days: number) => ["account", "equity-history", days] as const,

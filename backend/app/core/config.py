@@ -94,6 +94,7 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
+    telegram_signal_chat_id: str | None = None
 
     vapid_private_key: str | None = None
     vapid_public_key: str | None = None

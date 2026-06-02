@@ -143,6 +143,177 @@ class SignalPerformanceAnalyzer:
             ).items()
         }
 
+    # ------------------------------------------------------------------
+    # Fix 3 — contribution-weighted attribution
+    # ------------------------------------------------------------------
+
+    def strategy_contribution_fractions(
+        self,
+        db: Session,
+        timeframe: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, list[tuple[float, float]]]:
+        """Per ogni strategia: lista di (realized_pnl, contribution_fraction).
+
+        contribution_fraction = contribution[strategy] / voting_weight del segnale.
+        Permette di pesare vittorie/perdite in base a quanto quella strategia ha guidato
+        il segnale invece di creditar la egualmente a tutte le strategie presenti.
+        """
+        positions = self.closed_paper_positions(db, timeframe=timeframe, limit=limit)
+        signal_ids = {
+            int(p.metadata_json["source_signal_id"])
+            for p in positions
+            if isinstance(p.metadata_json, dict) and p.metadata_json.get("source_signal_id") is not None
+        }
+        signals: dict[int, Signal] = (
+            {s.id: s for s in db.query(Signal).filter(Signal.id.in_(signal_ids)).all()}
+            if signal_ids else {}
+        )
+        result: dict[str, list[tuple[float, float]]] = {}
+        for position in positions:
+            if position.realized_pnl is None:
+                continue
+            metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+            signal_id_raw = metadata.get("source_signal_id")
+            if signal_id_raw is None:
+                continue
+            try:
+                signal = signals.get(int(signal_id_raw))
+            except (TypeError, ValueError):
+                signal = None
+            if signal is None:
+                continue
+            breakdown = signal.strategy_breakdown or {}
+            score_meta = breakdown.get("_score")
+            voting_weight = (
+                float(score_meta.get("voting_weight", 0))
+                if isinstance(score_meta, dict) else 0.0
+            )
+            pnl = float(position.realized_pnl)
+            for name, strat_data in breakdown.items():
+                if name.startswith("_") or not isinstance(strat_data, dict):
+                    continue
+                if strat_data.get("direction") == "NEUTRAL" or strat_data.get("contribution", 0) <= 0:
+                    continue
+                contrib = float(strat_data.get("contribution", 0))
+                fraction = contrib / voting_weight if voting_weight > 0 else 0.0
+                result.setdefault(name, []).append((pnl, fraction))
+        return result
+
+    def strategy_weighted_stats(
+        self,
+        db: Session,
+        timeframe: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, PerformanceStats]:
+        """Stats per strategia pesate per la frazione di contributo al segnale.
+
+        Corregge il bias dell'attribuzione uniforme: se una strategia ha contribuito
+        il 20% del segnale, ottiene credito 0.20 per quella vittoria/perdita invece di 1.
+        """
+        fractions_map = self.strategy_contribution_fractions(db, timeframe=timeframe, limit=limit)
+        result: dict[str, PerformanceStats] = {}
+        for name, entries in fractions_map.items():
+            if not entries:
+                continue
+            eff_trades = sum(f for _, f in entries)
+            if eff_trades <= 0:
+                continue
+            eff_wins = sum(f for pnl, f in entries if pnl > 0)
+            gross_profit = sum(pnl * f for pnl, f in entries if pnl > 0)
+            gross_loss = abs(sum(pnl * f for pnl, f in entries if pnl <= 0))
+            realized_pnl = sum(pnl * f for pnl, f in entries)
+            profit_factor = gross_profit / gross_loss if gross_loss > 0 else None
+            result[name] = PerformanceStats(
+                trades=int(round(eff_trades)),
+                wins=int(round(eff_wins)),
+                losses=int(round(eff_trades - eff_wins)),
+                win_rate=eff_wins / eff_trades,
+                realized_pnl=realized_pnl,
+                gross_profit=gross_profit,
+                gross_loss=gross_loss,
+                profit_factor=profit_factor,
+            )
+        return result
+
+    # ------------------------------------------------------------------
+    # Fix 4 — regime-conditioned performance tracking
+    # ------------------------------------------------------------------
+
+    def positions_by_regime(
+        self,
+        db: Session,
+        timeframe: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, list[Position]]:
+        """Posizioni chiuse raggruppate per regime al momento dell'apertura."""
+        positions = self.closed_paper_positions(db, timeframe=timeframe, limit=limit)
+        result: dict[str, list[Position]] = {}
+        for p in positions:
+            metadata = p.metadata_json if isinstance(p.metadata_json, dict) else {}
+            regime = metadata.get("regime_at_open")
+            if regime:
+                result.setdefault(str(regime), []).append(p)
+        return result
+
+    def recent_regime(self, db: Session, window: int = 40) -> str | None:
+        """Regime dominante nelle ultime `window` posizioni con regime tracciato."""
+        positions = self.closed_paper_positions(db, limit=window * 3)
+        counts: dict[str, int] = {}
+        seen = 0
+        for p in positions:
+            metadata = p.metadata_json if isinstance(p.metadata_json, dict) else {}
+            regime = metadata.get("regime_at_open")
+            if regime:
+                counts[str(regime)] = counts.get(str(regime), 0) + 1
+                seen += 1
+                if seen >= window:
+                    break
+        return max(counts, key=lambda r: counts[r]) if counts else None
+
+    def regime_strategy_positions(
+        self,
+        db: Session,
+        regime: str,
+        timeframe: str | None = None,
+        limit: int = 500,
+    ) -> dict[str, list[Position]]:
+        """strategy_positions() filtrato per regime specifico."""
+        all_by_regime = self.positions_by_regime(db, timeframe=timeframe, limit=limit)
+        regime_positions = all_by_regime.get(regime, [])
+        if not regime_positions:
+            return {}
+        # Ricostruisce la stessa struttura di strategy_positions() per i soli trade di quel regime
+        regime_position_ids = {p.id for p in regime_positions}
+        signal_ids = {
+            int(p.metadata_json["source_signal_id"])
+            for p in regime_positions
+            if isinstance(p.metadata_json, dict) and p.metadata_json.get("source_signal_id") is not None
+        }
+        signals: dict[int, Signal] = (
+            {s.id: s for s in db.query(Signal).filter(Signal.id.in_(signal_ids)).all()}
+            if signal_ids else {}
+        )
+        by_strategy: dict[str, list[Position]] = {}
+        for position in regime_positions:
+            metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+            signal_id_raw = metadata.get("source_signal_id")
+            if signal_id_raw is None:
+                continue
+            try:
+                signal = signals.get(int(signal_id_raw))
+            except (TypeError, ValueError):
+                signal = None
+            if signal is None:
+                continue
+            for name, bd in (signal.strategy_breakdown or {}).items():
+                if name.startswith("_") or not isinstance(bd, dict):
+                    continue
+                if bd.get("direction") == "NEUTRAL" or bd.get("contribution", 0) <= 0:
+                    continue
+                by_strategy.setdefault(name, []).append(position)
+        return by_strategy
+
     @staticmethod
     def holdout_split_stats(
         positions: list[Position],

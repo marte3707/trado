@@ -24,6 +24,7 @@ import {
   type Order,
   type OutcomeProfile,
   type Position,
+  type ScoreCalibration,
   type Signal,
   type SignalRejections,
   type Strategy,
@@ -241,6 +242,15 @@ export function useEquitySlope(opts?: QueryOpts<EquitySlopeDiagnostics | null>) 
   return useQuery({
     queryKey: qk.equitySlope,
     queryFn: () => apiGet<EquitySlopeDiagnostics>("/api/analytics/equity-slope").catch(() => null),
+    refetchInterval: 60_000,
+    ...opts,
+  });
+}
+
+export function useScoreCalibration(opts?: QueryOpts<ScoreCalibration | null>) {
+  return useQuery({
+    queryKey: qk.scoreCalibration,
+    queryFn: () => apiGet<ScoreCalibration>("/api/analytics/score-calibration").catch(() => null),
     refetchInterval: 60_000,
     ...opts,
   });
