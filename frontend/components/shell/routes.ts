@@ -8,6 +8,7 @@ import {
   RefreshCcw,
   Settings,
   SlidersHorizontal,
+  Users,
   Wallet,
   type LucideIcon,
 } from "lucide-react";
@@ -21,6 +22,7 @@ export type Route =
   | "strategy-lab"
   | "calibration"
   | "history"
+  | "funnel"
   | "alerts"
   | "settings";
 
@@ -44,6 +46,7 @@ export const ROUTES: RouteMeta[] = [
   { id: "strategy-lab",label: "Analisi",    group: "analytics", icon: Beaker,            description: "Strategy lab: ranking e combinazioni" },
   { id: "calibration", label: "Calibration",group: "analytics", icon: RefreshCcw,        description: "Auto-tuner e stability" },
   { id: "history",     label: "Storico",    group: "analytics", icon: History,           description: "Posizioni chiuse e exit orders" },
+  { id: "funnel",      label: "Funnel",     group: "analytics", icon: Users,             description: "Bot Telegram: iscritti, conversione, source" },
 
   { id: "strategies",  label: "Strategie",  group: "config",    icon: SlidersHorizontal, description: "Pesi e parametri per timeframe" },
   { id: "alerts",      label: "Alert",      group: "config",    icon: Bell,              description: "Feed alert, push, telegram" },

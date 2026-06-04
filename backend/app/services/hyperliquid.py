@@ -261,7 +261,17 @@ class HyperliquidTradingClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    def account_value(self) -> Decimal:
+    def account_summary(self) -> tuple[Decimal, Decimal]:
+        """Ritorna (total_account_value, available_margin).
+
+        total_account_value = marginSummary.accountValue + free USDC spot.
+        available_margin    = total_account_value - totalMarginUsed.
+
+        Usare available_margin per il sizing delle nuove posizioni: con molte
+        posizioni isolate aperte, totalMarginUsed può essere = accountValue e
+        il margine libero effettivo è quasi zero. Usare il totale causerebbe
+        size enormi che HL può solo parzialmente fillare.
+        """
         address = self._account_address()
         state = self.user_state(address)
         margin = state.get("marginSummary", {})
@@ -269,8 +279,8 @@ class HyperliquidTradingClient:
         if value is None:
             raise HyperliquidError("Hyperliquid user_state did not include accountValue")
         account_val = Decimal(str(value))
+        margin_used = Decimal(str(margin.get("totalMarginUsed", "0")))
         # Unified account: add free USDC from spot wallet (total − hold).
-        # The held portion is already reflected in marginSummary.accountValue.
         try:
             spot_state = self.spot_user_state(address)
             for balance in spot_state.get("balances", []):
@@ -283,7 +293,13 @@ class HyperliquidTradingClient:
                     break
         except Exception:
             pass
-        return account_val
+        available = max(Decimal("0"), account_val - margin_used)
+        return account_val, available
+
+    def account_value(self) -> Decimal:
+        """Compatibilità: ritorna solo il valore totale del conto."""
+        total, _ = self.account_summary()
+        return total
 
     def spot_user_state(self, address: str | None = None) -> dict[str, Any]:
         info = self._info()
@@ -318,6 +334,45 @@ class HyperliquidTradingClient:
         info = self._info()
         result = info.frontend_open_orders(address or self._account_address())
         return result if isinstance(result, list) else []
+
+    def available_fill_notional(
+        self,
+        coin: str,
+        is_buy: bool,
+        slippage_pct: float,
+        mid_price: float,
+    ) -> Decimal:
+        """Stima il notional USD fillabile al prezzo di slippage leggendo il book L2.
+
+        Per un SHORT (is_buy=False): somma i bid con px >= limit_px.
+        Per un LONG (is_buy=True): somma gli ask con px <= limit_px.
+        Restituisce il notional totale fillabile. Ritorna Decimal('Inf') in
+        caso di errore per non bloccare il trade in modo conservativo.
+        """
+        try:
+            info = self._info()
+            book = info.l2_snapshot(coin)
+            levels = book.get("levels", [[], []])
+            slippage_factor = slippage_pct / 100.0
+            if is_buy:
+                limit_px = mid_price * (1 + slippage_factor)
+                side_levels = levels[1] if len(levels) > 1 else []
+                total_size = sum(
+                    float(lvl["sz"])
+                    for lvl in side_levels
+                    if float(lvl["px"]) <= limit_px
+                )
+            else:
+                limit_px = mid_price * (1 - slippage_factor)
+                side_levels = levels[0] if levels else []
+                total_size = sum(
+                    float(lvl["sz"])
+                    for lvl in side_levels
+                    if float(lvl["px"]) >= limit_px
+                )
+            return Decimal(str(total_size * mid_price))
+        except Exception:
+            return Decimal("Inf")
 
     def submit_market_order(
         self,

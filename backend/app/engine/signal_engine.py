@@ -5,6 +5,8 @@ import structlog
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
 from app.core.config import get_settings
 from app.core.enums import Direction, SignalStatus
 from app.db.models import AppSetting, Candle, Indicator, Market, Signal, StrategyConfig
@@ -45,6 +47,13 @@ _DEFAULT_MIN_STOP_BY_TF: dict[str, float] = {
     "2h": 0.018,   # 1.8%
     "4h": 0.022,   # 2.2%
     "1d": 0.030,   # 3.0%
+}
+
+# Minuti per timeframe: usato per scalare min_average_quote_volume_usd
+# proporzionalmente rispetto al riferimento 1h (60 min).
+_TF_MINUTES: dict[str, int] = {
+    "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240, "1d": 1440,
 }
 
 
@@ -338,26 +347,26 @@ class SignalEngine:
         timestamp,
         results,
     ) -> None:
-        db.query(Indicator).filter(
-            Indicator.market_id == market.id,
-            Indicator.timeframe == timeframe,
-            Indicator.timestamp == timestamp,
-        ).delete(synchronize_session=False)
-        for result in results:
-            db.add(
-                Indicator(
-                    market_id=market.id,
-                    timeframe=timeframe,
-                    timestamp=timestamp,
-                    indicator_name=result.strategy_name,
-                    values={
-                        **result.indicator_values,
-                        "_direction": result.direction.value,
-                        "_confidence": result.confidence,
-                        "_reason": result.reason,
-                    },
-                )
-            )
+        merged = {
+            result.strategy_name: {
+                **result.indicator_values,
+                "_direction": result.direction.value,
+                "_confidence": result.confidence,
+                "_reason": result.reason,
+            }
+            for result in results
+        }
+        stmt = pg_insert(Indicator).values(
+            market_id=market.id,
+            timeframe=timeframe,
+            timestamp=timestamp,
+            values=merged,
+        )
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_indicators_market_tf_time",
+            set_={"values": merged},
+        )
+        db.execute(stmt)
 
     def generate(self, db: Session, market: Market, timeframe: str, limit: int = 250) -> Signal | None:
         settings = get_settings()
@@ -422,6 +431,11 @@ class SignalEngine:
         min_average_quote_volume_usd = float(
             risk_value.get("min_average_quote_volume_usd", min_average_quote_volume_usd)
         )
+        # Scala la soglia proporzionalmente al timeframe: il valore in DB è il
+        # riferimento per 1h (60 min). Candle più corte hanno meno volume per
+        # definizione, quindi la soglia si riduce linearmente.
+        tf_minutes = _TF_MINUTES.get(timeframe, 60)
+        min_average_quote_volume_usd *= tf_minutes / 60
         min_atr_multiplier = float(risk_value.get("min_atr_multiplier", min_atr_multiplier))
         min_stop_distance_pct = float(
             risk_value.get("min_stop_distance_pct", min_stop_distance_pct)

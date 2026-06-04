@@ -30,6 +30,7 @@ class LiveOrderPlan:
     account_value: Decimal
     max_leverage: int = 10
     risk_amount: Decimal = Decimal("0")
+    available_margin: Decimal | None = None
 
 
 class OrderValidator:
@@ -117,6 +118,17 @@ class OrderValidator:
             reasons.append(
                 f"live order notional below exchange minimum (${plan.notional:.2f} < ${min_notional:.2f})"
             )
+        # Margine libero insufficiente: anche se il notional calcolato è ok,
+        # HL non può fillare se account ha già tutto il margine impegnato.
+        # Soglia: serve almeno min_notional / max_leverage di margine libero.
+        # Check attivo solo se available_margin è stato passato esplicitamente.
+        if plan.available_margin is not None:
+            required_margin = min_notional / Decimal(str(max_leverage))
+            if plan.available_margin < required_margin:
+                reasons.append(
+                    f"available margin insufficient "
+                    f"(${plan.available_margin:.2f} < ${required_margin:.2f} required for min position)"
+                )
         if plan.leverage > Decimal(str(max_leverage)):
             reasons.append("max leverage exceeded")
         current_risk = live_open_risk(db)

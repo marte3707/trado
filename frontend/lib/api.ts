@@ -593,6 +593,7 @@ export type WorkerCycle = {
     closed?: number;
     calibrated?: boolean;
     active_timeframes?: string[];
+    skip_reasons?: Record<string, number>;
     error?: string;
   };
 };
@@ -738,6 +739,35 @@ export type ScoreCalibration = {
   correlation: number | null;
   total_trades: number;
   by_week: ScoreCalibrationPeriod[];
+};
+
+export type BotFunnelUser = {
+  telegram_username: string | null;
+  first_name: string | null;
+  language: string;
+  trade_capital: string | null;
+  source: string | null;
+  onboarding_stage: string;
+  paused: boolean;
+  created_at: string | null;
+  risk_ack_at: string | null;
+  joined_channel_at: string | null;
+};
+
+export type BotFunnelStats = {
+  total: number;
+  completed: number;
+  declined: number;
+  paused: number;
+  completion_rate: number;
+  completed_last_24h: number;
+  completed_last_7d: number;
+  by_stage: Record<string, number>;
+  by_source: Record<string, number>;
+  by_language: Record<string, number>;
+  by_capital: Record<string, number>;
+  source_funnel: Record<string, { started: number; completed: number }>;
+  recent: BotFunnelUser[];
 };
 
 export async function apiDelete<T>(path: string): Promise<T> {

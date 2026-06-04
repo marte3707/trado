@@ -9,6 +9,7 @@ import {
   type AppSettings,
   type AutoTunerSourceTests,
   type AutoTunerStatus,
+  type BotFunnelStats,
   type Calibration,
   type CalibrationHistoryEntry,
   type CalibrationStability,
@@ -260,6 +261,15 @@ export function useDiagnostics(opts?: QueryOpts<DiagnosticReport | null>) {
   return useQuery({
     queryKey: qk.diagnostics,
     queryFn: () => apiGet<DiagnosticReport>("/api/analytics/diagnostics").catch(() => null),
+    refetchInterval: 60_000,
+    ...opts,
+  });
+}
+
+export function useBotFunnel(opts?: QueryOpts<BotFunnelStats>) {
+  return useQuery({
+    queryKey: qk.botFunnel,
+    queryFn: () => apiGet<BotFunnelStats>("/api/admin/bot-funnel"),
     refetchInterval: 60_000,
     ...opts,
   });

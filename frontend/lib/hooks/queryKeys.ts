@@ -32,4 +32,5 @@ export const qk = {
   accountEquityHistory: (days: number) => ["account", "equity-history", days] as const,
   coinMarketCapUsage: ["market-intelligence", "cmc-usage"] as const,
   coinGeckoUsage: ["market-intelligence", "cg-usage"] as const,
+  botFunnel: ["bot-funnel"] as const,
 } as const;

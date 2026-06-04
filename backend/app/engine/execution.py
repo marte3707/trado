@@ -154,6 +154,27 @@ class OrderExecutionEngine:
             leverage=max_leverage,
         )
         notional = Decimal(str(size)) * signal.entry_price
+        live_settings = effective_live_execution_settings(db, self.settings)
+        min_notional = Decimal(str(live_settings["min_order_notional_usd"]))
+        if size <= 0 or notional < min_notional:
+            logger.warning(
+                "execute_paper_skipped_below_min_notional",
+                signal_id=signal.id,
+                market_id=signal.market_id,
+                notional=str(notional),
+                min_notional=str(min_notional),
+            )
+            db.add(
+                DecisionLog(
+                    event_type="paper_order_skipped_below_min_notional",
+                    market_id=signal.market_id,
+                    signal_id=signal.id,
+                    message=f"Paper position skipped: notional ${float(notional):.2f} below minimum ${float(min_notional):.2f}",
+                    data={"notional": str(notional), "min_notional": str(min_notional)},
+                )
+            )
+            db.commit()
+            return None
         leverage = notional / Decimal(str(equity)) if equity > 0 else Decimal("0")
         base_metadata: dict[str, Any] = {
             "source_signal_id": signal.id,
@@ -232,8 +253,8 @@ class OrderExecutionEngine:
         trading_client: HyperliquidTradingClient | None = None,
     ) -> Position:
         trading = trading_client or HyperliquidTradingClient(self.settings)
-        account_value = trading.account_value()
-        plan = self._build_live_order_plan(db, signal, account_value)
+        account_value, available_margin = trading.account_summary()
+        plan = self._build_live_order_plan(db, signal, account_value, sizing_equity=available_margin)
         if not self._validate_or_reject(db, signal, plan):
             raise PermissionError(
                 "; ".join(
@@ -286,6 +307,50 @@ class OrderExecutionEngine:
             except Exception as exc:
                 logger.warning("live_preflight_hl_check_failed", coin=coin, error=str(exc))
 
+        # Pre-flight: controlla la depth del book L2 PRIMA di inviare l'ordine.
+        # La soglia è l'order_notional effettivo con un buffer del 20% per
+        # assorbire variazioni di book nell'intervallo check→invio.
+        # Questo previene sia i mercati illiquidi sia le race condition parziali.
+        min_notional_dec = Decimal(str(live_settings["min_order_notional_usd"]))
+        is_long = plan.side == "long"
+        order_notional = order_size * signal.entry_price
+        depth_threshold = max(min_notional_dec, order_notional * Decimal("1.2"))
+        try:
+            fillable = trading.available_fill_notional(
+                coin=coin,
+                is_buy=is_long,
+                slippage_pct=float(live_settings["max_slippage_pct"]),
+                mid_price=float(signal.entry_price),
+            )
+            if fillable < depth_threshold:
+                db.add(
+                    DecisionLog(
+                        event_type="live_order_skipped_insufficient_depth",
+                        market_id=signal.market_id,
+                        signal_id=signal.id,
+                        message=(
+                            f"Trade skippato: depth book insufficiente per {coin} "
+                            f"(fillable ${float(fillable):.2f} < soglia ${float(depth_threshold):.2f})"
+                        ),
+                        data={
+                            "coin": coin,
+                            "fillable_notional": str(fillable),
+                            "order_notional": str(order_notional),
+                            "depth_threshold": str(depth_threshold),
+                            "min_notional": str(min_notional_dec),
+                            "is_long": is_long,
+                        },
+                    )
+                )
+                db.commit()
+                raise PermissionError(
+                    f"insufficient book depth for {coin}: fillable ${float(fillable):.2f} < threshold ${float(depth_threshold):.2f}"
+                )
+        except PermissionError:
+            raise
+        except Exception as exc:
+            logger.warning("live_preflight_depth_check_failed", coin=coin, error=str(exc))
+
         hl_max_lev = (market.metadata_json or {}).get("raw", {}).get("maxLeverage")
         safe_leverage = (
             min(plan.max_leverage, int(hl_max_lev))
@@ -310,7 +375,7 @@ class OrderExecutionEngine:
             safe_leverage = _FALLBACK_LEVERAGE
         entry_result = trading.submit_market_order(
             coin=coin,
-            is_buy=plan.side == "long",
+            is_buy=is_long,
             size=order_size,
             max_slippage_pct=float(live_settings["max_slippage_pct"]),
             expires_after_seconds=int(live_settings["order_expires_after_seconds"]),
@@ -328,6 +393,16 @@ class OrderExecutionEngine:
             )
             db.commit()
             raise HyperliquidError("live order rejected by Hyperliquid")
+        # Post-fill safety net: se nonostante il pre-flight check HL ha
+        # restituito un partial fill sotto il minimo (race condition, book
+        # cambiato nel frattempo), tracciamo la posizione nel DB con flag
+        # tiny_fill=True per poterla identificare e chiudere manualmente.
+        # NON chiudiamo qui per evitare doppia fee — la posizione rimane
+        # tracciata per la riconciliazione.
+        actual_filled = entry_result.filled_size or order_size
+        actual_price = entry_result.avg_price or signal.entry_price
+        actual_notional = actual_filled * actual_price
+        _post_fill_tiny = actual_notional < min_notional_dec
         position = self._persist_live_position(
             db,
             signal,
@@ -338,9 +413,43 @@ class OrderExecutionEngine:
             market_cloid,
             safe_leverage,
         )
+        if _post_fill_tiny:
+            meta = dict(position.metadata_json or {})
+            meta["tiny_fill"] = True
+            meta["tiny_fill_notional"] = str(actual_notional)
+            meta["tiny_fill_min_notional"] = str(min_notional_dec)
+            position.metadata_json = meta
+            db.add(
+                DecisionLog(
+                    event_type="live_order_partial_fill_below_min_notional",
+                    market_id=signal.market_id,
+                    signal_id=signal.id,
+                    message=(
+                        f"ATTENZIONE: partial fill sotto il minimo nonostante il pre-flight check "
+                        f"(race condition) — filled ${float(actual_notional):.4f} < min ${float(min_notional_dec):.2f}. "
+                        f"Posizione tracciata con tiny_fill=True, chiudere manualmente."
+                    ),
+                    data={
+                        "requested_size": str(order_size),
+                        "filled_size": str(actual_filled),
+                        "avg_price": str(actual_price),
+                        "actual_notional": str(actual_notional),
+                        "min_notional": str(min_notional_dec),
+                        "coin": coin,
+                    },
+                )
+            )
+            logger.error(
+                "live_order_partial_fill_below_min_notional",
+                coin=coin,
+                signal_id=signal.id,
+                actual_notional=str(actual_notional),
+                min_notional=str(min_notional_dec),
+            )
         db.commit()
         db.refresh(position)
-        self._submit_live_protection_orders(db, trading, position, signal, coin, sz_dec)
+        if not _post_fill_tiny:
+            self._submit_live_protection_orders(db, trading, position, signal, coin, sz_dec)
         return position
 
     def _validate_or_reject(self, db: Session, signal: Signal, plan: LiveOrderPlan) -> bool:
@@ -478,7 +587,16 @@ class OrderExecutionEngine:
         )
         return position
 
-    def _build_live_order_plan(self, db: Session, signal: Signal, account_value: Decimal) -> LiveOrderPlan:
+    def _build_live_order_plan(
+        self,
+        db: Session,
+        signal: Signal,
+        account_value: Decimal,
+        sizing_equity: Decimal | None = None,
+    ) -> LiveOrderPlan:
+        # sizing_equity = margine disponibile (accountValue - totalMarginUsed).
+        # Se non fornito, usa account_value (retrocompatibile con i test).
+        equity_for_sizing = sizing_equity if sizing_equity is not None else account_value
         side = "long" if signal.direction in {Direction.LONG, Direction.STRONG_LONG} else "short"
         risk_settings = db.get(AppSetting, "risk")
         risk_pct = self.settings.max_risk_per_trade_pct
@@ -490,7 +608,7 @@ class OrderExecutionEngine:
         size = Decimal(
             str(
                 calculate_position_size(
-                    equity=float(account_value),
+                    equity=float(equity_for_sizing),
                     risk_pct=risk_pct,
                     entry_price=float(signal.entry_price),
                     stop_loss=float(stop_loss),
@@ -504,10 +622,13 @@ class OrderExecutionEngine:
         if signal.entry_price > 0 and size * signal.entry_price > notional_cap:
             size = notional_cap / signal.entry_price
         notional = min(size * signal.entry_price, notional_cap)
+        required_margin_for_bump = notional_floor / Decimal(str(max_leverage))
+        can_bump = equity_for_sizing >= required_margin_for_bump
         if (
             live_settings["bump_to_min_notional"]
             and signal.entry_price > 0
             and notional < notional_floor
+            and can_bump
         ):
             target_notional = min(notional_floor, notional_cap)
             market = db.get(Market, signal.market_id)
@@ -536,6 +657,7 @@ class OrderExecutionEngine:
             account_value=account_value,
             max_leverage=target_leverage,
             risk_amount=risk_amount,
+            available_margin=equity_for_sizing,
         )
 
     def _submit_live_protection_orders(

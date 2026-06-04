@@ -29,6 +29,7 @@ from app.engine.signal_engine import SignalEngine
 from app.notifications.diagnostic_report import DiagnosticReporter
 from app.notifications.telegram import TelegramNotifier
 from app.services.candle_sync import CandleSyncService, TIMEFRAME_MS
+from app.services.data_retention import prune_old_data
 from app.services.hyperliquid import HyperliquidTradingClient, HyperliquidTransientError, fetch_perp_open_interests
 from app.services.live_reconciliation import reconcile_live_positions
 from app.services.market_sync import MarketSyncService
@@ -48,11 +49,13 @@ _RECAP_INTERVAL_SECONDS = 10800  # ogni 3 ore
 _DIAGNOSTIC_REPORT_INTERVAL_SECONDS = 86400  # ogni 24h
 _LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS = 10800  # ogni 3 ore
 _UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS = 60
+_DATA_RETENTION_INTERVAL_SECONDS = 86400  # ogni 24h
 _ERROR_NOTIFY_COOLDOWN_SECONDS = 1800  # max 1 notifica errore ogni 30 min
 _next_recap_at: float = 0.0
 _next_diagnostic_at: float = 0.0
 _next_live_liquidation_guard_at: float = 0.0
 _next_unified_account_ratio_guard_at: float = 0.0
+_next_data_retention_at: float = 0.0
 _last_error_notify_at: float = 0.0
 
 
@@ -570,6 +573,43 @@ _FILL_EVENT_TYPES = frozenset(
 )
 
 
+def _calc_close_card_extras(
+    position: "Position",
+    exit_price: Decimal | None,
+    pnl_usd: Decimal | None,
+) -> tuple[float | None, int | None]:
+    """Restituisce (pnl_pct, duration_seconds) per la share card."""
+    pnl_pct: float | None = None
+    # Usa la leva contrattuale HL (es. 10x) se disponibile, altrimenti nessun %
+    meta = position.metadata_json or {}
+    contract_lev = meta.get("contract_leverage")
+    lev = float(contract_lev) if contract_lev is not None else None
+
+    if lev and lev > 0:
+        if exit_price is not None:
+            ep = float(position.entry_price)
+            xp = float(exit_price)
+            if ep > 0:
+                direction = 1 if position.side.upper() == "LONG" else -1
+                pnl_pct = direction * (xp - ep) / ep * lev * 100
+        elif pnl_usd is not None and position.size:
+            # fallback: stima da USD se non abbiamo exit price
+            notional = float(position.entry_price) * float(position.size)
+            if notional > 0:
+                pnl_pct = float(pnl_usd) / notional * lev * 100
+
+    duration: int | None = None
+    if position.opened_at:
+        ref = position.closed_at or datetime.now(timezone.utc)
+        opened = position.opened_at
+        if opened.tzinfo is None:
+            from datetime import timezone as _tz
+            opened = opened.replace(tzinfo=_tz.utc)
+        duration = int((ref - opened).total_seconds())
+
+    return pnl_pct, duration
+
+
 async def _notify_live_position_closes(
     db: Session,
     notifier: TelegramNotifier,
@@ -611,6 +651,13 @@ async def _notify_live_position_closes(
         if market is None:
             continue
 
+        position_meta = position.metadata_json or {}
+        raw_source_signal = position_meta.get("source_signal_id")
+        try:
+            source_signal_id = int(raw_source_signal) if raw_source_signal is not None else None
+        except (TypeError, ValueError):
+            source_signal_id = None
+
         try:
             if event.event_type in _FILL_EVENT_TYPES:
                 order_type = (
@@ -625,6 +672,8 @@ async def _notify_live_position_closes(
                 total_pnl = (
                     Decimal(str(position.realized_pnl or 0)) if not is_partial else None
                 )
+                pnl_usd = step_pnl if is_partial else total_pnl
+                pnl_pct, duration = _calc_close_card_extras(position, exit_price, pnl_usd)
                 await notifier.send_live_position_closed(
                     symbol=market.symbol,
                     side=position.side,
@@ -635,6 +684,11 @@ async def _notify_live_position_closes(
                     step_pnl=step_pnl,
                     total_pnl=total_pnl,
                     is_partial=is_partial,
+                    leverage=position.leverage,
+                    pnl_pct=pnl_pct,
+                    duration_seconds=duration,
+                    signal_id=source_signal_id,
+                    db=db,
                 )
 
             elif event.event_type in ("position_closed", "position_partially_closed"):
@@ -650,6 +704,8 @@ async def _notify_live_position_closes(
                 cum_str = event.data.get("cumulative_realized_pnl")
                 total_pnl = Decimal(cum_str) if cum_str and not is_partial else None
                 reason = event.data.get("reason") or "manual"
+                pnl_usd = step_pnl if is_partial else total_pnl
+                pnl_pct, duration = _calc_close_card_extras(position, exit_price, pnl_usd)
                 await notifier.send_live_position_closed(
                     symbol=market.symbol,
                     side=event.data.get("side") or position.side,
@@ -660,11 +716,18 @@ async def _notify_live_position_closes(
                     step_pnl=step_pnl if is_partial else None,
                     total_pnl=total_pnl,
                     is_partial=is_partial,
+                    leverage=position.leverage,
+                    pnl_pct=pnl_pct,
+                    duration_seconds=duration,
+                    signal_id=source_signal_id,
+                    db=db,
                 )
 
             elif event.event_type == "live_position_reconciled_closed":
                 if event.position_id in positions_with_fills:
                     continue
+                recon_pnl = Decimal(str(position.realized_pnl or 0))
+                pnl_pct, duration = _calc_close_card_extras(position, None, recon_pnl)
                 await notifier.send_live_position_closed(
                     symbol=market.symbol,
                     side=position.side,
@@ -673,8 +736,13 @@ async def _notify_live_position_closes(
                     exit_price=None,
                     remaining_size=None,
                     step_pnl=None,
-                    total_pnl=Decimal(str(position.realized_pnl or 0)),
+                    total_pnl=recon_pnl,
                     is_partial=False,
+                    leverage=position.leverage,
+                    pnl_pct=pnl_pct,
+                    duration_seconds=duration,
+                    signal_id=source_signal_id,
+                    db=db,
                 )
 
         except Exception:
@@ -682,6 +750,41 @@ async def _notify_live_position_closes(
                 "telegram_live_close_notify_failed",
                 event_type=event.event_type,
                 position_id=event.position_id,
+            )
+
+
+async def _notify_btc_macro_reversals(
+    db: Session,
+    notifier: TelegramNotifier,
+    since: datetime,
+) -> None:
+    """Broadcast BTC macro reversal events logged during the current tick to
+    the public signals channel. One Telegram message per detected reversal."""
+    events = (
+        db.query(DecisionLog)
+        .filter(
+            DecisionLog.event_type == "btc_macro_reversal_detected",
+            DecisionLog.timestamp >= since,
+        )
+        .order_by(DecisionLog.timestamp)
+        .all()
+    )
+    if not events:
+        return
+    for event in events:
+        data = event.data or {}
+        try:
+            await notifier.send_btc_macro_detected(
+                from_trend=str(data.get("from_trend") or "—"),
+                to_trend=str(data.get("to_trend") or "—"),
+                delta_pct=float(data.get("delta_pct") or 0.0),
+                vol_ratio=float(data.get("vol_ratio") or 0.0),
+                timeframe=str(data.get("timeframe") or "—"),
+            )
+        except Exception:
+            logger.warning(
+                "telegram_btc_macro_notify_failed",
+                event_id=event.id,
             )
 
 
@@ -765,6 +868,7 @@ async def run_once(
             ))
             db.commit()
             await _notify_live_position_closes(db, notifier, tick_start)
+            await _notify_btc_macro_reversals(db, notifier, tick_start)
         finally:
             db.close()
         return 0, 0
@@ -902,6 +1006,7 @@ async def run_once(
         )
         db.commit()
         await _notify_live_position_closes(db, notifier, tick_start)
+        await _notify_btc_macro_reversals(db, notifier, tick_start)
         return generated, skipped
     finally:
         db.close()
@@ -937,11 +1042,12 @@ async def main() -> None:
     btc_protection = BtcMacroProtectionEngine(settings)
     _record_heartbeat("starting")
 
-    global _next_recap_at, _next_diagnostic_at, _next_live_liquidation_guard_at, _next_unified_account_ratio_guard_at, _last_error_notify_at
+    global _next_recap_at, _next_diagnostic_at, _next_live_liquidation_guard_at, _next_unified_account_ratio_guard_at, _next_data_retention_at, _last_error_notify_at
     _next_recap_at = time.time() + _RECAP_INTERVAL_SECONDS
     _next_diagnostic_at = time.time() + _DIAGNOSTIC_REPORT_INTERVAL_SECONDS
     _next_live_liquidation_guard_at = 0.0
     _next_unified_account_ratio_guard_at = 0.0
+    _next_data_retention_at = time.time() + _DATA_RETENTION_INTERVAL_SECONDS
     _last_error_notify_at = 0.0
     stats = _WorkerStats()
 
@@ -1015,6 +1121,18 @@ async def main() -> None:
                 logger.exception("telegram_diagnostic_report_failed")
             finally:
                 diag_db.close()
+
+        if now >= _next_data_retention_at:
+            _next_data_retention_at = now + _DATA_RETENTION_INTERVAL_SECONDS
+            retention_db = SessionLocal()
+            try:
+                result = await asyncio.to_thread(prune_old_data, retention_db)
+                logger.info("data_retention_cycle_completed", **result)
+            except Exception:
+                logger.exception("data_retention_cycle_failed")
+                retention_db.rollback()
+            finally:
+                retention_db.close()
 
         if now >= _next_live_liquidation_guard_at:
             _next_live_liquidation_guard_at = now + _LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS

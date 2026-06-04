@@ -2,6 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -58,7 +59,7 @@ class Candle(Base):
 
     __table_args__ = (
         UniqueConstraint("market_id", "timeframe", "open_time", name="uq_candle_market_tf_time"),
-        Index("ix_candles_market_tf_time", "market_id", "timeframe", "open_time"),
+        # ix_candles_market_tf_time rimosso: identico alla unique constraint sopra
     )
 
 
@@ -67,12 +68,13 @@ class Indicator(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     market_id: Mapped[int] = mapped_column(ForeignKey("markets.id", ondelete="CASCADE"), index=True)
-    timeframe: Mapped[str] = mapped_column(String(8), index=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
-    indicator_name: Mapped[str] = mapped_column(String(64), index=True)
+    timeframe: Mapped[str] = mapped_column(String(8))
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # values = { indicator_name: { key: val, "_direction": ..., ... }, ... }
     values: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     __table_args__ = (
+        UniqueConstraint("market_id", "timeframe", "timestamp", name="uq_indicators_market_tf_time"),
         Index("ix_indicators_market_tf_time", "market_id", "timeframe", "timestamp"),
     )
 
@@ -245,6 +247,27 @@ class PushSubscription(Base):
     auth: Mapped[str] = mapped_column(Text)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class BotUser(Base):
+    __tablename__ = "bot_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    telegram_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    language: Mapped[str] = mapped_column(String(8), default="en")
+    source: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    trade_capital: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    onboarding_stage: Mapped[str] = mapped_column(String(32), default="started", index=True)
+    risk_ack_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    invite_link: Mapped[str | None] = mapped_column(Text, nullable=True)
+    joined_channel_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class DecisionLog(Base):

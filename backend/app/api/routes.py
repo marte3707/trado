@@ -25,6 +25,7 @@ from app.db.models import (
     AccountSnapshot,
     Alert,
     AppSetting,
+    BotUser,
     Candle,
     DecisionLog,
     Indicator,
@@ -169,6 +170,111 @@ def _computed_indicator_snapshots(db: Session, market: Market, timeframe: str, l
             }
         )
     return snapshots
+
+
+@router.get("/admin/bot-funnel")
+def admin_bot_funnel(db: Session = Depends(get_db)) -> dict:
+    """Admin view of the onboarding funnel: counts, conversion, distributions
+    and the most recent users. Read-only; no auth here because the API key
+    middleware only protects mutating methods (same convention as the rest of
+    the dashboard endpoints)."""
+
+    rows = db.query(BotUser).all()
+    total = len(rows)
+    by_stage: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    by_language: dict[str, int] = {}
+    by_capital: dict[str, int] = {}
+    completed = 0
+    declined = 0
+    paused = 0
+    now = datetime.now(timezone.utc)
+    completed_last_24h = 0
+    completed_last_7d = 0
+    for row in rows:
+        by_stage[row.onboarding_stage] = by_stage.get(row.onboarding_stage, 0) + 1
+        by_source[row.source or "—"] = by_source.get(row.source or "—", 0) + 1
+        by_language[row.language] = by_language.get(row.language, 0) + 1
+        if row.trade_capital:
+            by_capital[row.trade_capital] = by_capital.get(row.trade_capital, 0) + 1
+        else:
+            by_capital["skipped"] = by_capital.get("skipped", 0) + 1
+        if row.onboarding_stage == "completed":
+            completed += 1
+            if row.risk_ack_at is not None:
+                age = now - row.risk_ack_at
+                if age <= timedelta(hours=24):
+                    completed_last_24h += 1
+                if age <= timedelta(days=7):
+                    completed_last_7d += 1
+        elif row.onboarding_stage == "declined":
+            declined += 1
+        if row.paused:
+            paused += 1
+
+    completion_rate = (completed / total) if total > 0 else 0.0
+
+    # Per-source funnel: count started vs completed for each source so you can
+    # tell which channels (reddit, twitter, landing, ...) bring users that
+    # actually finish the disclaimer.
+    source_funnel: dict[str, dict[str, int]] = {}
+    for row in rows:
+        src = row.source or "—"
+        bucket = source_funnel.setdefault(src, {"started": 0, "completed": 0})
+        bucket["started"] += 1
+        if row.onboarding_stage == "completed":
+            bucket["completed"] += 1
+
+    recent = (
+        db.query(BotUser)
+        .order_by(BotUser.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    recent_payload = [
+        {
+            "telegram_username": u.telegram_username,
+            "first_name": u.first_name,
+            "language": u.language,
+            "trade_capital": u.trade_capital,
+            "source": u.source,
+            "onboarding_stage": u.onboarding_stage,
+            "paused": u.paused,
+            "created_at": u.created_at.isoformat() if u.created_at else None,
+            "risk_ack_at": u.risk_ack_at.isoformat() if u.risk_ack_at else None,
+            "joined_channel_at": u.joined_channel_at.isoformat() if u.joined_channel_at else None,
+        }
+        for u in recent
+    ]
+
+    return {
+        "total": total,
+        "completed": completed,
+        "declined": declined,
+        "paused": paused,
+        "completion_rate": round(completion_rate, 4),
+        "completed_last_24h": completed_last_24h,
+        "completed_last_7d": completed_last_7d,
+        "by_stage": by_stage,
+        "by_source": by_source,
+        "by_language": by_language,
+        "by_capital": by_capital,
+        "source_funnel": source_funnel,
+        "recent": recent_payload,
+    }
+
+
+@router.get("/public/bot-info")
+def public_bot_info() -> dict:
+    """Public, unauthenticated endpoint used by the landing page to render
+    the "Join the channel" CTA without leaking any credentials. Returns the
+    bot username (so the frontend can build a https://t.me/<username>?start=...
+    deep link) and a hint about whether the funnel is configured at all."""
+    settings = get_settings()
+    return {
+        "bot_username": settings.landing_bot_username,
+        "configured": bool(settings.landing_bot_username and settings.public_bot_token),
+    }
 
 
 @router.get("/health")
@@ -452,7 +558,7 @@ def indicators(
     timeframe: str = Query(..., pattern=r"^(5m|15m|30m|1h|4h|1d)$"),
     market_type: str | None = Query(None, max_length=16, pattern=r"^[a-z]+$"),
     db: Session = Depends(get_db),
-) -> list[Indicator] | list[dict]:
+) -> list[IndicatorOut] | list[dict]:
     market_query = db.query(Market).filter(Market.symbol == symbol)
     if market_type:
         market_query = market_query.filter(Market.market_type == market_type)
@@ -468,16 +574,26 @@ def indicators(
     )
     if latest is None:
         return _computed_indicator_snapshots(db, market, timeframe)
-    return (
+    row = (
         db.query(Indicator)
         .filter(
             Indicator.market_id == market.id,
             Indicator.timeframe == timeframe,
             Indicator.timestamp == latest[0],
         )
-        .order_by(Indicator.indicator_name)
-        .all()
+        .first()
     )
+    if row is None:
+        return []
+    return [
+        IndicatorOut(
+            indicator_name=name,
+            timeframe=row.timeframe,
+            timestamp=row.timestamp,
+            values=vals,
+        )
+        for name, vals in sorted(row.values.items())
+    ]
 
 
 @router.get("/signals", response_model=list[SignalOut])
@@ -2151,3 +2267,58 @@ async def push_test(db: Session = Depends(get_db)) -> dict:
     from app.notifications.push import WebPushNotifier
     sent = await WebPushNotifier(get_settings()).send(db, "Trado", "Browser push funzionante!")
     return {"status": "sent", "count": sent}
+
+
+@router.post("/telegram/test-close-card")
+async def telegram_test_close_card() -> dict:
+    """Invia una card di test sui canali Telegram configurati."""
+    from app.notifications.card_renderer import render_close_card
+    from app.notifications.telegram import TelegramNotifier, _build_live_close_message
+
+    settings = get_settings()
+    notifier = TelegramNotifier(settings)
+
+    symbol = "BTC"
+    side = "LONG"
+    entry = Decimal("95000")
+    exit_p = Decimal("101650")
+    pnl_usd = Decimal("332.50")
+    pnl_pct = 7.0
+    leverage = Decimal("3")
+    duration = 14400  # 4h
+
+    text = _build_live_close_message(
+        symbol=symbol,
+        side=side,
+        reason="tp2",
+        entry_price=entry,
+        exit_price=exit_p,
+        remaining_size=None,
+        step_pnl=None,
+        total_pnl=pnl_usd,
+        is_partial=False,
+    )
+
+    png = render_close_card(
+        symbol=symbol,
+        side=side,
+        leverage=leverage,
+        entry_price=entry,
+        exit_price=exit_p,
+        pnl_usd=pnl_usd,
+        pnl_pct=pnl_pct,
+        duration_seconds=duration,
+        reason="tp2",
+    )
+
+    channels: list[str] = []
+    if settings.telegram_chat_id:
+        ok = await notifier._send_photo(png, text)
+        channels.append(f"main({'ok' if ok else 'fail'})")
+    if settings.telegram_signal_chat_id:
+        ok = await notifier._send_photo(png, text, chat_id=settings.telegram_signal_chat_id)
+        channels.append(f"signal({'ok' if ok else 'fail'})")
+
+    if not channels:
+        return {"status": "skipped", "reason": "nessun chat_id configurato"}
+    return {"status": "sent", "channels": channels}

@@ -634,7 +634,7 @@ def _expected_protection_order_types(position: Position) -> list[str]:
     expected = ["stop_loss"]
     plan = (position.metadata_json or {}).get("take_profit_plan") or []
     for entry in plan:
-        if not isinstance(entry, dict) or entry.get("runner") or bool(entry.get("filled")):
+        if not isinstance(entry, dict) or entry.get("runner") or bool(entry.get("filled")) or bool(entry.get("skipped")):
             continue
         level = str(entry.get("level", ""))
         if level in {"tp1", "tp2", "tp3"}:
@@ -705,6 +705,7 @@ def _create_missing_protection_orders(
     expires_after_seconds: int,
     sz_decimals: int,
     remote_size: Decimal | None,
+    remote_position: dict | None = None,
 ) -> None:
     expected_types = _expected_protection_order_types(position)
     existing_orders = (
@@ -726,6 +727,38 @@ def _create_missing_protection_orders(
         price = _planned_protection_price(position, order_type)
         if price is None:
             continue
+        if order_type in ("tp1", "tp2", "tp3") and isinstance(remote_position, dict):
+            mark_px = _decimal(remote_position.get("markPx"))
+            if mark_px is not None and _tp_target_already_breached(position, mark_px, price):
+                _mark_tp_plan_entry_skipped(position, order_type, mark_px)
+                db.add(position)
+                db.add(
+                    DecisionLog(
+                        event_type="live_protection_order_tp_already_passed",
+                        market_id=position.market_id,
+                        position_id=position.id,
+                        message=(
+                            f"Protection order {order_type} skipped: mark price {mark_px} "
+                            f"has already breached target {price}"
+                        ),
+                        data={
+                            "coin": coin,
+                            "order_type": order_type,
+                            "target_price": str(price),
+                            "mark_price": str(mark_px),
+                            "side": position.side,
+                        },
+                    )
+                )
+                logger.warning(
+                    "live_protection_order_tp_already_passed",
+                    position_id=position.id,
+                    order_type=order_type,
+                    target_price=str(price),
+                    mark_price=str(mark_px),
+                    coin=coin,
+                )
+                continue
         frontend_match = _match_frontend_order_for_missing(frontend_orders, position, order_type, price)
         if frontend_match is not None:
             size = _decimal(frontend_match.get("sz")) or _decimal(frontend_match.get("origSz")) or Decimal("0")
@@ -1120,6 +1153,49 @@ def _resubmit_missing_protection_orders(
             )
             continue
 
+        if order.order_type in ("tp1", "tp2", "tp3") and isinstance(remote_position, dict):
+            mark_px = _decimal(remote_position.get("markPx"))
+            if mark_px is not None and _tp_target_already_breached(position, mark_px, order.price):
+                raw["resubmit_blocked"] = {
+                    "reason": "tp_price_already_breached",
+                    "blocked_at": now.isoformat(),
+                    "target_price": str(order.price),
+                    "mark_price": str(mark_px),
+                }
+                _set_order_raw_response(order, raw)
+                db.add(order)
+                _mark_tp_plan_entry_skipped(position, order.order_type, mark_px)
+                db.add(position)
+                db.add(
+                    DecisionLog(
+                        event_type="live_protection_order_tp_already_passed",
+                        market_id=position.market_id,
+                        position_id=position.id,
+                        message=(
+                            f"Protection order {order.order_type} resubmit blocked: "
+                            f"mark price {mark_px} has already breached target {order.price}"
+                        ),
+                        data={
+                            "coin": coin,
+                            "order_id": order.id,
+                            "order_type": order.order_type,
+                            "target_price": str(order.price),
+                            "mark_price": str(mark_px),
+                            "side": position.side,
+                        },
+                    )
+                )
+                logger.warning(
+                    "live_protection_order_tp_already_passed",
+                    position_id=position.id,
+                    order_id=order.id,
+                    order_type=order.order_type,
+                    target_price=str(order.price),
+                    mark_price=str(mark_px),
+                    coin=coin,
+                )
+                continue
+
         # Compute the correct submission size:
         # - TP: remote_size * allocation (keeps the sum of all TPs = position size)
         # - SL: remote_size (always covers the full remaining position)
@@ -1488,6 +1564,33 @@ def _tp_price_reached(position: Position, reference_price: Decimal, target_price
     return reference_price >= target_price
 
 
+def _tp_target_already_breached(position: Position, mark_price: Decimal, target_price: Decimal) -> bool:
+    """True se il mark price ha già superato il trigger del TP (l'ordine verrebbe rifiutato da HL)."""
+    return _tp_price_reached(position, mark_price, target_price)
+
+
+def _mark_tp_plan_entry_skipped(
+    position: Position,
+    order_type: str,
+    mark_price: Decimal,
+) -> None:
+    """Segna il livello TP come 'skipped' nel take_profit_plan e aggiorna i flag di metadata."""
+    metadata = dict(position.metadata_json or {})
+    plan = metadata.get("take_profit_plan")
+    if isinstance(plan, list):
+        for entry in plan:
+            if isinstance(entry, dict) and entry.get("level") == order_type:
+                entry["skipped"] = True
+                entry["skip_reason"] = "tp_price_already_breached"
+                entry["mark_price_at_skip"] = str(mark_price)
+    if order_type == "tp1":
+        metadata["tp1_hit"] = True
+    elif order_type == "tp2":
+        metadata["tp2_hit"] = True
+        metadata["runner_active"] = True
+    position.metadata_json = metadata
+
+
 def _infer_missing_tp_fills_from_open_position(
     position: Position,
     remote_position: dict,
@@ -1790,6 +1893,7 @@ def reconcile_live_positions(
                 expires_after_seconds,
                 _sz_decimals(position.market),
                 remote_abs,
+                remote_position=remote,
             )
             _resubmit_missing_protection_orders(
                 db,

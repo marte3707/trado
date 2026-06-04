@@ -75,7 +75,7 @@ class SnapshotDb:
         self.committed += 1
 
     def query(self, model):
-        assert model is AccountSnapshot
+        assert model in (AccountSnapshot, Position)
         return SnapshotQuery()
 
 
@@ -83,8 +83,17 @@ class SnapshotQuery:
     def order_by(self, *_args):
         return self
 
+    def options(self, *_args):
+        return self
+
+    def filter(self, *_args):
+        return self
+
     def first(self):
         return None
+
+    def all(self):
+        return []
 
 
 def test_account_snapshot_exposes_unified_account_ratio_fields(monkeypatch) -> None:

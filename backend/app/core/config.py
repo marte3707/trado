@@ -95,6 +95,17 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     telegram_signal_chat_id: str | None = None
+    # Separate token for the PUBLIC-facing bot. Used to:
+    #   * post signals + share cards to telegram_signal_chat_id
+    #   * run the onboarding flow (long polling getUpdates + DM users)
+    # Keeping this distinct from telegram_bot_token lets the admin-side bot
+    # remain private (account balances in recap_orario etc.) while a separate
+    # public identity handles the channel and user-facing DMs.
+    # If unset, the code falls back to telegram_bot_token (legacy single-bot setup).
+    landing_bot_token: str | None = None
+    # Public username of the bot (without @) used by the landing page to build
+    # https://t.me/<username>?start=<source> deep links.
+    landing_bot_username: str | None = None
 
     vapid_private_key: str | None = None
     vapid_public_key: str | None = None
@@ -135,6 +146,12 @@ class Settings(BaseSettings):
     @property
     def live_trading_allowed(self) -> bool:
         return self.operation_mode == OperationMode.AUTO_TRADE and self.enable_live_trading
+
+    @property
+    def public_bot_token(self) -> str | None:
+        """Token used for public-facing Telegram operations (channel posting,
+        onboarding bot). Falls back to the admin token for backward compat."""
+        return self.landing_bot_token or self.telegram_bot_token
 
 
 @lru_cache

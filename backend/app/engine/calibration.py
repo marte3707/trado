@@ -169,6 +169,7 @@ class AutoCalibrationEngine:
             "deep_defensive_slope_threshold": -0.1,
             "starvation_soft_cycles": 10,
             "starvation_hard_cycles": 15,
+            "starvation_exit_cycles": 3,
             "min_trades_for_slope": 10,
             "recent_window": 50,
             "recent_slope_exit_cycles": 3,
@@ -597,15 +598,41 @@ class AutoCalibrationEngine:
 
         # Starvation recovery: se troppi cicli consecutivi senza segnali il deep
         # defensive non sta proteggendo nulla — allentare progressivamente.
+        # L'uscita è graduale (ipertesi): l'override rimane attivo finché non si
+        # osservano starvation_exit_cycles cicli consecutivi con almeno un segnale,
+        # evitando il loop on/off in cui un singolo segnale disattiva il bypass e il
+        # filtro blocca di nuovo tutto immediatamente.
         zero_cycles = self._consecutive_zero_signal_cycles(db)
         starvation_soft = int(settings.get("starvation_soft_cycles", 10))
         starvation_hard = int(settings.get("starvation_hard_cycles", 15))
+        starvation_exit_cycles = int(settings.get("starvation_exit_cycles", 3))
+        prev_starvation_active = bool(state_value.get("starvation_override_active", False))
+        starvation_generating_streak = int(state_value.get("starvation_generating_streak", 0))
+
         starvation_override = False
+        new_generating_streak = starvation_generating_streak
+
         if in_deep_defensive and zero_cycles >= starvation_hard:
+            # Nuovo ingresso in starvation recovery.
             in_deep_defensive = False
             new_streak = 0
             starvation_override = True
+            new_generating_streak = 0
             state_value["deep_defensive_last_exit_reason"] = "starvation_recovery"
+        elif prev_starvation_active:
+            # Continuazione della starvation recovery: uscita graduale.
+            if zero_cycles > 0:
+                # Ancora senza segnali: resetta la streak generativa, mantieni override.
+                new_generating_streak = 0
+                starvation_override = True
+                in_deep_defensive = False
+            else:
+                # Almeno un segnale generato nell'ultimo ciclo: incrementa streak.
+                new_generating_streak = starvation_generating_streak + 1
+                if new_generating_streak < starvation_exit_cycles:
+                    starvation_override = True
+                    in_deep_defensive = False
+                # else: starvation_override resta False → uscita normale
 
         # Equity-slope "ambiguo": se la calibrazione è in deep defensive ma il numero
         # di trade chiusi nella finestra è troppo basso per stimare lo slope in modo
@@ -620,6 +647,7 @@ class AutoCalibrationEngine:
             state_value["deep_defensive_last_exit_reason"] = "ambiguous_slope"
         state_value["consecutive_zero_signal_cycles"] = zero_cycles
         state_value["starvation_override_active"] = starvation_override
+        state_value["starvation_generating_streak"] = new_generating_streak
         state_value["ambiguous_slope_override"] = ambiguous_slope and starvation_override
 
         cooldown_started = False

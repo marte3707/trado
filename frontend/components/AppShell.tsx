@@ -11,6 +11,7 @@ import { AccountMonitorScreen } from "@/components/screens/AccountMonitorScreen"
 import { StrategiesScreen } from "@/components/screens/StrategiesScreen";
 import { CalibrationScreen } from "@/components/screens/CalibrationScreen";
 import { HistoryScreen } from "@/components/screens/HistoryScreen";
+import { FunnelScreen } from "@/components/screens/FunnelScreen";
 import { AlertsScreen } from "@/components/screens/AlertsScreen";
 import { SettingsScreen } from "@/components/screens/SettingsScreen";
 import { StrategyAnalysisScreen } from "@/components/screens/StrategyAnalysisScreen";
@@ -292,6 +293,8 @@ export function AppShell({ initialData }: AppShellProps) {
         )}
 
         {route === "history" && <HistoryScreen positions={positions} orders={orders} />}
+
+        {route === "funnel" && <FunnelScreen />}
 
         {route === "strategy-lab" && (
           <StrategyAnalysisScreen

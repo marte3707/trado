@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -9,6 +10,16 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings
 from app.db.models import Alert, AppSetting, Position, Signal
+from app.notifications.card_renderer import render_close_card
+
+_CHANNEL_CLOSE_REASONS = {
+    "tp1",
+    "tp2",
+    "tp3",
+    "take_profit",
+    "stop_loss",
+    "trailing_stop",
+}
 
 logger = structlog.get_logger()
 
@@ -23,10 +34,11 @@ _REASON_LABELS: dict[str, str] = {
     "tp3": "TP3",
     "take_profit": "Take Profit",
     "stop_loss": "Stop Loss",
-    "manual": "Manuale",
+    "trailing_stop": "Trailing Stop",
+    "manual": "Manual",
     "btc_macro_protection_loss_exit": "BTC Macro Stop",
     "btc_macro_protection_breakeven": "BTC Macro Breakeven",
-    "reconciliazione hl": "Riconciliata HL",
+    "reconciliazione hl": "HL Reconciled",
 }
 
 _REASON_ICONS: dict[str, str] = {
@@ -35,6 +47,7 @@ _REASON_ICONS: dict[str, str] = {
     "tp3": "🥇",
     "take_profit": "🎯",
     "stop_loss": "🛑",
+    "trailing_stop": "🛑",
     "manual": "✋",
     "btc_macro_protection_loss_exit": "🟠",
     "btc_macro_protection_breakeven": "🟠",
@@ -72,6 +85,7 @@ def _build_live_close_message(
     step_pnl: Decimal | None,
     total_pnl: Decimal | None,
     is_partial: bool,
+    pnl_pct: float | None = None,
 ) -> str:
     direction = side.upper()
     side_icon = _DIRECTION_ICON.get(direction, "🔔")
@@ -82,36 +96,111 @@ def _build_live_close_message(
 
     if is_partial:
         header_icon = reason_icon or "🟡"
-        header = f"{header_icon} <b>LIVE · Chiusura parziale</b>"
-        pnl_label = "PnL"
-        pnl_value = step_pnl
+        header = f"{header_icon} <b>LIVE · Partial closure</b>"
+        pnl_usd = step_pnl
     else:
-        pnl_value = total_pnl
+        pnl_usd = total_pnl
         if reason_icon is not None and reason_key in {"tp1", "tp2", "tp3", "stop_loss"}:
             header_icon = reason_icon
-        elif pnl_value is not None and float(pnl_value) >= 0:
+        elif (pnl_pct is not None and pnl_pct >= 0) or (pnl_usd is not None and float(pnl_usd) >= 0):
             header_icon = "✅"
         else:
             header_icon = "🔴"
-        header = f"{header_icon} <b>LIVE · Posizione chiusa</b>"
-        pnl_label = "PnL tot"
+        header = f"{header_icon} <b>LIVE · Position closed</b>"
 
     lines = [
         header,
         f"{side_icon} {symbol} · {direction}",
         sep,
-        f"📊 Motivo:  <code>{_fmt_reason(reason)}</code>",
+        f"📊 Reason:  <code>{_fmt_reason(reason)}</code>",
         f"💰 Entry:   <code>{_fmt_price(entry_price)}</code>",
     ]
     if exit_price is not None:
         lines.append(f"📤 Exit:    <code>{_fmt_price(exit_price)}</code>")
-    if is_partial and remaining_size is not None:
-        lines.append(f"📦 Rimasto: <code>{remaining_size.normalize():f}</code>")
-    if pnl_value is not None:
-        sign = "+" if float(pnl_value) >= 0 else ""
-        pnl_icon = "📈" if float(pnl_value) >= 0 else "📉"
-        lines.append(f"{pnl_icon} {pnl_label}: <code>{sign}{float(pnl_value):.2f} $</code>")
-    lines += [sep, "🤖 <i>Trado · @crypto_free_live_signals</i>"]
+    if is_partial:
+        if remaining_size is not None:
+            lines.append(f"📦 Rimasto: <code>{remaining_size.normalize():f}</code>")
+        if pnl_usd is not None:
+            sign = "+" if float(pnl_usd) >= 0 else ""
+            pnl_icon = "📈" if float(pnl_usd) >= 0 else "📉"
+            lines.append(f"{pnl_icon} PnL: <code>{sign}{float(pnl_usd):.2f} $</code>")
+    else:
+        if pnl_pct is not None:
+            sign = "+" if pnl_pct >= 0 else ""
+            pnl_icon = "📈" if pnl_pct >= 0 else "📉"
+            lines.append(f"{pnl_icon} PnL: <code>{sign}{pnl_pct:.1f}%</code>")
+    lines += [
+        sep,
+        "🤖 <i>Trado · @crypto_free_live_signals</i>",
+        "🔗 Trade on Hyperliquid &amp; get 4% fee discount: https://app.hyperliquid.xyz/join/CRYPTOFREESIGNALS",
+    ]
+    return "\n".join(lines)
+
+
+def _build_channel_close_message(
+    *,
+    symbol: str,
+    side: str,
+    reason: str,
+    exit_price: Decimal | None,
+    is_partial: bool,
+    pnl_pct: float | None,
+) -> str:
+    """Lean English notification posted to the public signals channel as a
+    reply to the original signal opening message."""
+    direction = side.upper()
+    side_icon = _DIRECTION_ICON.get(direction, "🔔")
+    reason_key = reason.lower()
+    reason_label = _fmt_reason(reason)
+
+    if is_partial:
+        reason_icon = _REASON_ICONS.get(reason_key, "🎯")
+        header = f"{reason_icon} <b>{reason_label} hit · Partial close</b>"
+    else:
+        if reason_key in _REASON_ICONS:
+            reason_icon = _REASON_ICONS[reason_key]
+        elif pnl_pct is not None and pnl_pct < 0:
+            reason_icon = "🔴"
+        else:
+            reason_icon = "✅"
+        header = f"{reason_icon} <b>{reason_label} · Position closed</b>"
+
+    lines = [
+        header,
+        f"{side_icon} {symbol} · {direction}",
+    ]
+    if exit_price is not None:
+        lines.append(f"📤 Exit: <code>{_fmt_price(exit_price)}</code>")
+    if pnl_pct is not None:
+        sign = "+" if pnl_pct >= 0 else ""
+        pnl_icon = "📈" if pnl_pct >= 0 else "📉"
+        lines.append(f"{pnl_icon} PnL: <code>{sign}{pnl_pct:.1f}%</code>")
+    else:
+        lines.append("📊 PnL: <code>N/A</code>")
+    return "\n".join(lines)
+
+
+def _build_btc_macro_message(
+    *,
+    from_trend: str,
+    to_trend: str,
+    delta_pct: float,
+    vol_ratio: float,
+    timeframe: str,
+) -> str:
+    sep = "━━━━━━━━━━━━━━━━━━━━"
+    arrow_icon = "📈" if to_trend.upper() == "BULLISH" else "📉"
+    delta_sign = "+" if delta_pct >= 0 else ""
+    lines = [
+        "⚠️ <b>BTC Macro Reversal Detected</b>",
+        sep,
+        f"{arrow_icon} Trend: <b>{from_trend} → {to_trend}</b>",
+        f"📊 Move: <code>{delta_sign}{delta_pct:.2f}%</code> · Vol: <code>{vol_ratio:.2f}x avg</code>",
+        f"⏱️ Timeframe: <code>{timeframe}</code>",
+        sep,
+        "🛡️ Open positions against the new regime may be reduced, hedged or stopped at breakeven.",
+        "🤖 <i>Trado · @crypto_free_live_signals</i>",
+    ]
     return "\n".join(lines)
 
 
@@ -151,24 +240,100 @@ class TelegramNotifier:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    async def _send_text(self, text: str) -> bool:
-        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+    def _token_for(self, chat_id: str | None) -> str | None:
+        """Pick the right bot token based on destination chat. Messages sent to
+        the public signals channel use landing_bot_token (the public-facing
+        bot); everything else (admin DMs, recaps with private balances, errors)
+        keeps using telegram_bot_token (the admin-only bot)."""
+        if chat_id and chat_id == self.settings.telegram_signal_chat_id:
+            return self.settings.public_bot_token
+        return self.settings.telegram_bot_token
+
+    async def _send_text(
+        self,
+        text: str,
+        chat_id: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> bool:
+        target = chat_id or self.settings.telegram_chat_id
+        token = self._token_for(target)
+        if not token or not target:
             return False
-        url = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/sendMessage"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload: dict[str, object] = {
+            "chat_id": target,
+            "text": text,
+            "parse_mode": "HTML",
+        }
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True
         try:
             async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(
-                    url,
-                    json={
-                        "chat_id": self.settings.telegram_chat_id,
-                        "text": text,
-                        "parse_mode": "HTML",
-                    },
-                )
+                response = await client.post(url, json=payload)
             return response.is_success
         except Exception as exc:
             logger.warning("telegram_send_failed", error=str(exc))
             return False
+
+    async def _send_photo(
+        self,
+        png_bytes: bytes,
+        caption: str,
+        chat_id: str | None = None,
+        reply_to_message_id: int | None = None,
+    ) -> bool:
+        target = chat_id or self.settings.telegram_chat_id
+        token = self._token_for(target)
+        if not token or not target:
+            return False
+        url = f"https://api.telegram.org/bot{token}/sendPhoto"
+        data: dict[str, object] = {
+            "chat_id": target,
+            "caption": caption,
+            "parse_mode": "HTML",
+        }
+        if reply_to_message_id is not None:
+            data["reply_to_message_id"] = reply_to_message_id
+            data["allow_sending_without_reply"] = True
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.post(
+                    url,
+                    data=data,
+                    files={"photo": ("card.png", png_bytes, "image/png")},
+                )
+            return response.is_success
+        except Exception as exc:
+            logger.warning("telegram_send_photo_failed", error=str(exc))
+            return False
+
+    def _signal_channel_reply_id(self, db: Session, signal_id: int | None) -> int | None:
+        """Look up the Telegram message_id of the original signal opening
+        message in the public signals channel, so close notifications can be
+        sent as a reply to it. Returns None if not available."""
+        if signal_id is None:
+            return None
+        alert = (
+            db.query(Alert)
+            .filter(
+                Alert.signal_id == signal_id,
+                Alert.channel == "telegram",
+                Alert.status == "sent",
+            )
+            .order_by(Alert.id.desc())
+            .first()
+        )
+        if alert is None:
+            return None
+        payload: dict[str, Any] = getattr(alert, "payload", None) or {}
+        raw = payload.get("telegram_message_id")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
 
     async def send_worker_online(self, db: Session) -> None:
         now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
@@ -327,6 +492,11 @@ class TelegramNotifier:
         step_pnl: Decimal | None,
         total_pnl: Decimal | None,
         is_partial: bool,
+        leverage: Decimal | None = None,
+        pnl_pct: float | None = None,
+        duration_seconds: int | None = None,
+        signal_id: int | None = None,
+        db: Session | None = None,
     ) -> None:
         text = _build_live_close_message(
             symbol=symbol,
@@ -338,10 +508,101 @@ class TelegramNotifier:
             step_pnl=step_pnl,
             total_pnl=total_pnl,
             is_partial=is_partial,
+            pnl_pct=pnl_pct,
         )
-        await self._send_text(text)
+        # Admin DM: invia la share card PNG per chiusure complete (non parziali)
+        if not is_partial:
+            pnl_for_card = total_pnl if total_pnl is not None else step_pnl
+            try:
+                png = render_close_card(
+                    symbol=symbol,
+                    side=side,
+                    leverage=leverage,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    pnl_usd=pnl_for_card,
+                    pnl_pct=pnl_pct,
+                    duration_seconds=duration_seconds,
+                    reason=reason,
+                )
+                sent = await self._send_photo(png, text)
+            except Exception as exc:
+                logger.warning("telegram_card_render_failed", error=str(exc))
+                sent = False
+            if not sent:
+                await self._send_text(text)
+        else:
+            await self._send_text(text)
+
+        # Public signals channel: send a lean English message as a reply to the
+        # original signal opening message, so subscribers can follow each trade
+        # in a single thread. Only relay closures that map to a public exit
+        # reason (TP1/2/3, take_profit, stop_loss, trailing_stop); skip manual,
+        # reconciliation and internal BTC-macro management events.
+        if (
+            self.settings.telegram_signal_chat_id
+            and reason.lower() in _CHANNEL_CLOSE_REASONS
+        ):
+            try:
+                reply_to = (
+                    self._signal_channel_reply_id(db, signal_id)
+                    if db is not None
+                    else None
+                )
+                channel_text = _build_channel_close_message(
+                    symbol=symbol,
+                    side=side,
+                    reason=reason,
+                    exit_price=exit_price,
+                    is_partial=is_partial,
+                    pnl_pct=pnl_pct,
+                )
+                await self._send_text(
+                    channel_text,
+                    chat_id=self.settings.telegram_signal_chat_id,
+                    reply_to_message_id=reply_to,
+                )
+            except Exception as exc:
+                logger.warning("telegram_signal_close_reply_failed", error=str(exc))
+
+    async def send_btc_macro_detected(
+        self,
+        *,
+        from_trend: str,
+        to_trend: str,
+        delta_pct: float,
+        vol_ratio: float,
+        timeframe: str,
+    ) -> None:
+        """Publish a BTC macro reversal alert to the public signals channel.
+
+        The detection itself is logged in DecisionLog by BtcMacroProtectionEngine;
+        this method is the user-facing broadcast so subscribers can react to a
+        regime change even before any of their open positions get adjusted."""
+        if not self.settings.telegram_signal_chat_id:
+            return
+        text = _build_btc_macro_message(
+            from_trend=from_trend,
+            to_trend=to_trend,
+            delta_pct=delta_pct,
+            vol_ratio=vol_ratio,
+            timeframe=timeframe,
+        )
+        try:
+            await self._send_text(text, chat_id=self.settings.telegram_signal_chat_id)
+        except Exception as exc:
+            logger.warning("telegram_btc_macro_send_failed", error=str(exc))
 
     async def send_signal(self, db: Session, signal: Signal) -> None:
+        """Publish a new signal to the public channel only.
+
+        The admin DM intentionally does NOT receive signals anymore — they're
+        already broadcast to the public channel by the public bot, and the
+        admin can subscribe there like any other user if they want to see them
+        in real time. Position-related notifications (open/close, hourly
+        recap) keep going to the admin DM as before, since those are about
+        the operator's live account and contain sensitive numbers.
+        """
         payload: dict[str, str | int | None] = {
             "signal_id": signal.id,
             "direction": signal.direction,
@@ -356,35 +617,46 @@ class TelegramNotifier:
         alert = Alert(signal_id=signal.id, channel="telegram", status="pending", payload=payload)
         db.add(alert)
         db.commit()
-        if not self.settings.telegram_bot_token or not self.settings.telegram_chat_id:
+
+        public_token = self.settings.public_bot_token
+        if not self.settings.telegram_signal_chat_id or not public_token:
             alert.status = "skipped"
             db.commit()
             return
-        url = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/sendMessage"
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(
-                url,
-                json={
-                    "chat_id": self.settings.telegram_chat_id,
-                    "text": _build_message(signal),
-                    "parse_mode": "HTML",
-                },
-            )
-        alert.status = "sent" if response.is_success else "failed"
-        alert.sent_at = datetime.now(timezone.utc) if response.is_success else None
-        alert.payload = {**payload, "telegram_status": response.status_code}
-        db.commit()
 
-        if self.settings.telegram_signal_chat_id:
-            try:
-                async with httpx.AsyncClient(timeout=10) as client:
-                    await client.post(
-                        url,
-                        json={
-                            "chat_id": self.settings.telegram_signal_chat_id,
-                            "text": _build_message(signal),
-                            "parse_mode": "HTML",
-                        },
-                    )
-            except Exception as exc:
-                logger.warning("telegram_signal_channel_send_failed", error=str(exc))
+        public_url = f"https://api.telegram.org/bot{public_token}/sendMessage"
+        response_status: int | None = None
+        message_id: int | None = None
+        success = False
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(
+                    public_url,
+                    json={
+                        "chat_id": self.settings.telegram_signal_chat_id,
+                        "text": _build_message(signal),
+                        "parse_mode": "HTML",
+                    },
+                )
+            response_status = response.status_code
+            success = response.is_success
+            if success:
+                try:
+                    body: dict[str, Any] = response.json()
+                    result: dict[str, Any] = body.get("result") or {}
+                    raw_id: Any = result.get("message_id")
+                    if raw_id is not None:
+                        message_id = int(raw_id)
+                except Exception:
+                    message_id = None
+        except Exception as exc:
+            logger.warning("telegram_signal_channel_send_failed", error=str(exc))
+
+        alert.status = "sent" if success else "failed"
+        alert.sent_at = datetime.now(timezone.utc) if success else None
+        alert.payload = {
+            **payload,
+            "telegram_status": response_status,
+            "telegram_message_id": message_id,
+        }
+        db.commit()

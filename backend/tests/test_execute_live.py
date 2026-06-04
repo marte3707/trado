@@ -124,6 +124,9 @@ class FakeTradingClient:
     def account_value(self) -> Decimal:
         return self._account_value
 
+    def account_summary(self) -> tuple[Decimal, Decimal]:
+        return self._account_value, self._account_value
+
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> None:
         self.leverage_calls.append({"coin": coin, "leverage": leverage, "is_cross": is_cross})
 
