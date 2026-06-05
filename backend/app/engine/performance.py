@@ -34,6 +34,70 @@ class PerformanceStats:
 
 
 class SignalPerformanceAnalyzer:
+    def __init__(self) -> None:
+        # Cache per-cycle opt-in: attivata da `begin_cycle()` (chiamato dal
+        # SignalEngine all'inizio di ogni worker tick). Gli aggregati *global* e
+        # *per-timeframe* sono identici per tutti i market dello stesso timeframe
+        # nello stesso tick: senza cache venivano ricalcolati (3 query da 500
+        # posizioni) per ogni candidato. Le istanze usa-e-getta (API, calibration)
+        # non chiamano begin_cycle → `_cycle_active=False` → comportamento invariato.
+        self._cycle_active: bool = False
+        self._cycle_global_stats: dict[str, PerformanceStats] | None = None
+        self._cycle_timeframe_stats: dict[str, dict[str, PerformanceStats]] = {}
+        self._cycle_market_closed_count: dict[int, int] = {}
+
+    def begin_cycle(self) -> None:
+        """Abilita e invalida la cache per-cycle all'inizio di ogni worker tick.
+
+        La leggera staleness intra-tick (posizioni chiuse durante lo stesso tick non
+        rientrano negli aggregati) è accettabile: il performance adjustment è
+        statistico e le chiusure per tick sono poche rispetto al lookback di 500.
+        """
+        self._cycle_active = True
+        self._cycle_global_stats = None
+        self._cycle_timeframe_stats = {}
+        self._cycle_market_closed_count = {}
+
+    def _global_stats_cached(self, db: Session) -> dict[str, PerformanceStats]:
+        if not self._cycle_active:
+            return self.strategy_stats(db)
+        if self._cycle_global_stats is None:
+            self._cycle_global_stats = self.strategy_stats(db)
+        return self._cycle_global_stats
+
+    def _timeframe_stats_cached(self, db: Session, timeframe: str) -> dict[str, PerformanceStats]:
+        if not self._cycle_active:
+            return self.strategy_stats(db, timeframe=timeframe)
+        cached = self._cycle_timeframe_stats.get(timeframe)
+        if cached is None:
+            cached = self.strategy_stats(db, timeframe=timeframe)
+            self._cycle_timeframe_stats[timeframe] = cached
+        return cached
+
+    def _market_closed_count(self, db: Session, market_id: int) -> int:
+        """Conteggio posizioni paper chiuse per market (cached per-cycle).
+
+        Necessario per saltare lo `scoped_stats`: lo scope market_timeframe richiede
+        ≥ `min_trades` posizioni *per strategia*, quindi se il market ha meno di
+        `min_trades` posizioni chiuse in totale nessuna strategia può qualificarsi
+        e l'intera query scoped (la più costosa) è lavoro sprecato.
+        """
+        if self._cycle_active and market_id in self._cycle_market_closed_count:
+            return self._cycle_market_closed_count[market_id]
+        count = (
+            db.query(Position)
+            .filter(
+                Position.mode == OrderMode.PAPER.value,
+                Position.status == "closed",
+                Position.realized_pnl.is_not(None),
+                Position.market_id == market_id,
+            )
+            .count()
+        )
+        if self._cycle_active:
+            self._cycle_market_closed_count[market_id] = count
+        return count
+
     def closed_paper_positions(
         self,
         db: Session,
@@ -284,7 +348,6 @@ class SignalPerformanceAnalyzer:
         if not regime_positions:
             return {}
         # Ricostruisce la stessa struttura di strategy_positions() per i soli trade di quel regime
-        regime_position_ids = {p.id for p in regime_positions}
         signal_ids = {
             int(p.metadata_json["source_signal_id"])
             for p in regime_positions
@@ -414,9 +477,17 @@ class SignalPerformanceAnalyzer:
         market_id: int,
         min_trades: int = 20,
     ) -> tuple[dict[str, int], dict[str, dict]]:
-        scoped_stats = self.strategy_stats(db, timeframe=timeframe, market_id=market_id)
-        timeframe_stats = self.strategy_stats(db, timeframe=timeframe)
-        global_stats = self.strategy_stats(db)
+        # Scoped (market_timeframe) calcolato solo se il market ha abbastanza
+        # posizioni chiuse da poter qualificare almeno una strategia (≥ min_trades).
+        # In assenza, `scoped_stats` resta vuoto e la selezione scope ricade su
+        # timeframe/global — identico al comportamento precedente, ma senza pagare
+        # la query scoped per la stragrande maggioranza dei market a bassa attività.
+        if self._market_closed_count(db, market_id) >= min_trades:
+            scoped_stats = self.strategy_stats(db, timeframe=timeframe, market_id=market_id)
+        else:
+            scoped_stats = {}
+        timeframe_stats = self._timeframe_stats_cached(db, timeframe)
+        global_stats = self._global_stats_cached(db)
         adjusted = dict(weights)
         notes: dict[str, dict] = {}
         for strategy_name, base_weight in weights.items():

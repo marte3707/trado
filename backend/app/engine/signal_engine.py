@@ -83,6 +83,9 @@ class SignalEngine:
         self._cycle_fundings = None
         self._cycle_l2_cache = {}
         self._cycle_skip_counts = {}
+        # Abilita/invalida la cache per-cycle degli aggregati di performance
+        # (global/timeframe stats + conteggi per market) usati da adjusted_weights.
+        self.performance.begin_cycle()
 
     def cycle_skip_counts(self) -> dict[str, int]:
         """Snapshot dei contatori di skip aggregati per il tick in corso."""

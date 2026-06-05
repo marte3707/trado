@@ -945,6 +945,17 @@ async def run_once(
         if settings.external_quote_enrichment_enabled:
             signal_engine.market_data.prefetch_quotes([m.base for m in markets])
         perp_oi_map = await asyncio.to_thread(fetch_perp_open_interests, settings.info_url)
+        # Prefetch parallelo dei fetch HTTP candele per tutte le coppie attive del tick.
+        # La latenza di rete è il costo dominante del ciclo: scaricare in parallelo (con
+        # concorrenza limitata) invece che una coppia per volta riduce drasticamente la
+        # durata del tick. La persistenza resta serializzata sulla sessione condivisa.
+        sync_pairs = [
+            (market, timeframe)
+            for market in markets
+            for timeframe in paper_active_timeframes
+            if timeframe in TIMEFRAME_MS
+        ]
+        prefetched_candles = await candle_sync.prefetch(db, sync_pairs)
         synced = 0
         skipped = 0
         generated = 0
@@ -959,8 +970,18 @@ async def run_once(
             hl_coin = (market.metadata_json or {}).get("hl_coin") or market.symbol
             market_oi = perp_oi_map.get(str(hl_coin))
             for timeframe in paper_active_timeframes:
+                prefetched = prefetched_candles.get((market.id, timeframe))
                 try:
-                    await candle_sync.sync_market(db, market, timeframe, open_interest=market_oi)
+                    if isinstance(prefetched, Exception):
+                        raise prefetched
+                    await asyncio.to_thread(
+                        candle_sync.persist_candles,
+                        db,
+                        market,
+                        timeframe,
+                        prefetched or [],
+                        market_oi,
+                    )
                 except HyperliquidTransientError as exc:
                     skipped += 1
                     logger.warning(
@@ -971,7 +992,6 @@ async def run_once(
                         error=str(exc),
                     )
                     db.rollback()
-                    await asyncio.sleep(0.25)
                     continue
                 except Exception as exc:
                     skipped += 1
@@ -989,7 +1009,6 @@ async def run_once(
                     executor.close_paper_positions_for_timeframe, db, market, timeframe
                 )
                 if timeframe not in active_timeframes:
-                    await asyncio.sleep(0.01)
                     continue
                 if operation_mode == OperationMode.AUTO_TRADE:
                     live_stop_updates += await asyncio.to_thread(
@@ -1000,7 +1019,6 @@ async def run_once(
                     )
                 signal = await asyncio.to_thread(signal_engine.generate, db, market, timeframe)
                 if signal is None:
-                    await asyncio.sleep(0.05)
                     continue
                 generated += 1
                 logger.info(
@@ -1020,7 +1038,6 @@ async def run_once(
                         await notifier.send_live_position_opened(live_position)
                     except Exception:
                         logger.exception("telegram_live_open_notify_failed")
-                await asyncio.sleep(0.05)
         if not calibration_attempted and should_run_calibration(db, closed):
             calibrated = run_calibration(db, calibration_engine)
             calibration_attempted = True
