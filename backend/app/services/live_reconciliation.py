@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
 import structlog
 from sqlalchemy.orm.attributes import flag_modified
@@ -69,7 +70,7 @@ class _ExitFillMatch:
     last_exit_reason: str | None
 
 
-def _decimal(value: str | int | float | Decimal | None) -> Decimal | None:
+def _decimal(value: object) -> Decimal | None:
     if value is None:
         return None
     try:
@@ -97,7 +98,9 @@ def _price_match_tolerance(raw_price: object) -> Decimal:
     if value is None:
         return Decimal("0")
     exponent = value.as_tuple().exponent
-    if exponent >= 0:
+    # Per valori non finiti (NaN/Infinity) l'exponent è un Literal['n','N','F'],
+    # non un int: in quel caso usiamo la tolleranza unitaria di default.
+    if not isinstance(exponent, int) or exponent >= 0:
         return Decimal("1")
     return Decimal(10) ** exponent
 
@@ -543,7 +546,8 @@ def _match_frontend_protection_order(
     if desired_tpsl is None:
         return None
 
-    local_oid = int(order.hyperliquid_order_id) if str(order.hyperliquid_order_id or "").isdigit() else None
+    raw_oid = str(order.hyperliquid_order_id or "")
+    local_oid = int(raw_oid) if raw_oid.isdigit() else None
     local_cloid = str(order.cloid or "").lower().removeprefix("0x")
     for item in frontend_orders:
         frontend_oid = item.get("oid")
@@ -923,19 +927,19 @@ def protection_state_for_live_position(
     active: list[str] = []
 
     for order_type in expected_types:
-        order = latest_by_type.get(order_type)
-        if order is None:
+        protection_order = latest_by_type.get(order_type)
+        if protection_order is None:
             missing.append(order_type)
             continue
-        match = _match_frontend_protection_order(frontend_orders, order, position)
+        match = _match_frontend_protection_order(frontend_orders, protection_order, position)
         if match is not None:
             active.append(order_type)
             continue
-        raw = dict(order.raw_response or {})
+        raw = dict(protection_order.raw_response or {})
         resubmits = raw.get("resubmits")
         last_resubmit = resubmits[-1] if isinstance(resubmits, list) and resubmits else None
         is_rejected = (
-            order.status == "error"
+            protection_order.status == "error"
             or raw.get("resubmit_blocked") is not None
             or (isinstance(last_resubmit, dict) and last_resubmit.get("status") not in {None, "ok"})
         )
@@ -1667,11 +1671,6 @@ def _find_close_fill(
             best = fill
             best_time = fill_time
     return best
-
-
-def _round_size(size: Decimal, decimals: int) -> Decimal:
-    quantizer = Decimal(10) ** -decimals
-    return size.quantize(quantizer)
 
 
 def _tp_reference_price(

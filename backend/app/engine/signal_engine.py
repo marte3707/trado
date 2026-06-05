@@ -670,7 +670,11 @@ class SignalEngine:
             if ob_result is not None:
                 results.append(ob_result)
                 weights[ob_result.strategy_name] = max(0, settings.ob_imbalance_weight)
-        self._persist_indicators(db, market, timeframe, latest_candle_open_time, results)
+        # Nota: la persistenza degli indicatori (`_persist_indicators`) è rimandata
+        # a valle di tutti i filtri, subito prima di creare il Signal: scriviamo solo
+        # per i segnali effettivamente emessi invece che per ogni valutazione (la
+        # maggior parte viene scartata). L'endpoint /indicators ricade su un calcolo
+        # on-demand quando non trova righe, quindi la UI resta coperta.
 
         weights, performance_notes = self.performance.adjusted_weights(
             db,
@@ -1075,6 +1079,10 @@ class SignalEngine:
                 "arm": ab_overlay_payload["arm"],
                 "assignment_method": ab_overlay_payload.get("assignment_method"),
             }
+        # Segnale confermato: ora persistiamo lo snapshot degli indicatori delle
+        # strategie (un'unica riga per la candela sorgente), committato insieme al
+        # Signal nello stesso commit sottostante.
+        self._persist_indicators(db, market, timeframe, latest_candle_open_time, results)
         signal = Signal(
             market_id=market.id,
             timeframe=timeframe,
