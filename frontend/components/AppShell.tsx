@@ -292,7 +292,7 @@ export function AppShell({ initialData }: AppShellProps) {
           />
         )}
 
-        {route === "history" && <HistoryScreen positions={positions} orders={orders} />}
+        {route === "history" && <HistoryScreen fallbackPositions={positions} fallbackOrders={orders} />}
 
         {route === "funnel" && <FunnelScreen />}
 

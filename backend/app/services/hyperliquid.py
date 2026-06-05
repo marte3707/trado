@@ -335,6 +335,17 @@ class HyperliquidTradingClient:
         result = info.frontend_open_orders(address or self._account_address())
         return result if isinstance(result, list) else []
 
+    def all_mids(self) -> dict[str, str]:
+        """Restituisce {coin: mid_price_str} per tutti i mercati HL.
+
+        Fallback usato dalla reconciliation per derivare il mark price quando
+        `assetPositions` non lo include (HL non lo restituisce sempre nel payload
+        di user_state).
+        """
+        info = self._info()
+        result = info.all_mids()
+        return result if isinstance(result, dict) else {}
+
     def available_fill_notional(
         self,
         coin: str,

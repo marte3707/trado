@@ -11,6 +11,7 @@ export const qk = {
   markets: (filters?: string) => ["markets", filters ?? ""] as const,
   signals: (filters?: string) => ["signals", filters ?? ""] as const,
   positions: ["positions"] as const,
+  positionHistory: (filters: string) => ["positions", "history", filters] as const,
   orders: ["orders"] as const,
   strategies: ["strategies"] as const,
   settings: ["settings"] as const,

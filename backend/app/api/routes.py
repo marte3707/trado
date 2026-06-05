@@ -12,6 +12,8 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
+from fastapi.responses import HTMLResponse
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import get_settings
@@ -80,6 +82,82 @@ PNL_STALENESS = timedelta(minutes=5)
 POSITION_HISTORY_LIMIT = 250
 ORDER_HISTORY_LIMIT = 250
 EXIT_ORDER_TYPES = ("tp1", "tp2", "tp3", "take_profit", "stop_loss", "manual")
+HISTORY_ORDER_TYPES = (
+    *EXIT_ORDER_TYPES,
+    "time_stop",
+    "btc_macro_protection_loss_exit",
+    "liquidation_guard_failed",
+)
+
+_TRADE_MANAGEMENT_GUIDE_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trado · Trade Management Guide</title>
+    <style>
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; background: #0b1411; color: #ecf4ef; }
+      main { max-width: 860px; margin: 0 auto; padding: 40px 20px 72px; line-height: 1.6; }
+      h1, h2, h3 { line-height: 1.2; }
+      h1 { font-size: 2rem; margin-bottom: 0.25rem; }
+      h2 { margin-top: 2rem; border-top: 1px solid #214036; padding-top: 1.5rem; }
+      .muted { color: #9bb5ab; }
+      .card { background: #11201b; border: 1px solid #214036; border-radius: 14px; padding: 18px 20px; margin-top: 16px; }
+      a { color: #57d6a3; }
+      ul { padding-left: 1.2rem; }
+      code { background: #173028; padding: 0.1rem 0.35rem; border-radius: 6px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Trade Management Guide</h1>
+      <p class="muted">Italiano + English glossary for the terms used in Trado Telegram messages.</p>
+
+      <h2 id="trailing-stop">Trailing Stop</h2>
+      <div class="card">
+        <p><strong>IT:</strong> Uno stop loss che viene spostato a favore della posizione mentre il trade va in profitto, per proteggere parte del guadagno.</p>
+        <p><strong>EN:</strong> A stop loss that moves in your favor as the trade becomes profitable, helping protect part of the gains.</p>
+      </div>
+
+      <h2 id="breakeven">Breakeven</h2>
+      <div class="card">
+        <p><strong>IT:</strong> Spostare lo stop in corrispondenza del prezzo di ingresso, così l'uscita non genera più perdita netta sul trade.</p>
+        <p><strong>EN:</strong> Moving the stop to the entry price so the trade can no longer produce a net loss.</p>
+      </div>
+
+      <h2 id="risk-reward">Risk / Reward</h2>
+      <div class="card">
+        <p><strong>IT:</strong> Rapporto tra perdita potenziale e profitto atteso. Un <code>R/R 2.0</code> indica che il target teorico vale circa il doppio del rischio iniziale.</p>
+        <p><strong>EN:</strong> The ratio between potential loss and expected profit. A <code>R/R 2.0</code> means the theoretical target is about twice the initial risk.</p>
+      </div>
+
+      <h2 id="runner">Runner</h2>
+      <div class="card">
+        <p><strong>IT:</strong> La parte residua della posizione lasciata aperta dopo i take profit parziali, con l'obiettivo di sfruttare ulteriormente il trend.</p>
+        <p><strong>EN:</strong> The remaining part of the position left open after partial take profits, aiming to capture more of the trend.</p>
+      </div>
+
+      <h2 id="stop-loss">Stop Loss</h2>
+      <div class="card">
+        <p><strong>IT:</strong> Livello di uscita che limita la perdita massima pianificata se il trade si muove contro la posizione.</p>
+        <p><strong>EN:</strong> Exit level designed to cap the planned maximum loss if the trade moves against the position.</p>
+      </div>
+
+      <h2 id="martingale">Martingale</h2>
+      <div class="card">
+        <p><strong>IT:</strong> Strategia che aumenta la size dopo una perdita per cercare di recuperarla. In Trado non viene usata.</p>
+        <p><strong>EN:</strong> A strategy that increases position size after a loss to try to recover it. Trado does not use it.</p>
+      </div>
+
+      <h2 id="averaging-down">Averaging Down</h2>
+      <div class="card">
+        <p><strong>IT:</strong> Aggiungere size a una posizione in perdita per abbassare il prezzo medio di ingresso. In Trado non viene usato automaticamente.</p>
+        <p><strong>EN:</strong> Adding size to a losing position to lower the average entry price. Trado does not do this automatically.</p>
+      </div>
+    </main>
+  </body>
+</html>
+"""
 
 
 def market_data_client() -> CoinMarketCapClient:
@@ -113,6 +191,100 @@ def _latest_candle_for_position(db: Session, position: Position) -> Candle | Non
         if candle is not None:
             return candle
     return query.order_by(Candle.open_time.desc()).first()
+
+
+def _serialize_market(market: Market | None) -> dict | None:
+    if market is None:
+        return None
+    return {
+        "id": market.id,
+        "exchange": market.exchange,
+        "symbol": market.symbol,
+        "base": market.base,
+        "quote": market.quote,
+        "market_type": market.market_type,
+        "active": market.active,
+        "metadata_json": market.metadata_json,
+    }
+
+
+def _serialize_order(row: Order, market: Market | None = None) -> dict:
+    return {
+        "id": row.id,
+        "position_id": row.position_id,
+        "signal_id": row.signal_id,
+        "market": _serialize_market(market),
+        "mode": row.mode,
+        "order_type": row.order_type,
+        "side": row.side,
+        "price": str(row.price) if row.price is not None else None,
+        "size": str(row.size),
+        "status": row.status,
+        "fee": str(row.fee) if row.fee is not None else None,
+        "created_at": row.created_at,
+    }
+
+
+def _serialize_position(
+    db: Session,
+    row: Position,
+    orders: list[Order] | None = None,
+    *,
+    now_utc: datetime | None = None,
+) -> dict:
+    def serialize_decimal(value: object | None) -> str | None:
+        return str(value) if value is not None else None
+
+    now_utc = now_utc or datetime.now(timezone.utc)
+    unrealized_pnl = row.unrealized_pnl
+    # Single source of truth: trust the worker-updated unrealized_pnl unless
+    # it is missing or stale. Falling back to a candle-based recompute keeps
+    # the UI consistent while we wait for the next worker tick.
+    is_stale = row.pnl_updated_at is None or (now_utc - row.pnl_updated_at) > PNL_STALENESS
+    if row.status == "open" and row.mode == "live":
+        # For live positions the authoritative P&L comes from Hyperliquid
+        # (written by reconcile_live_positions). Never override it with a
+        # candle-based estimate — stale candles give wrong sign and magnitude.
+        if unrealized_pnl is None:
+            mark_str = (row.metadata_json or {}).get("last_mark_price")
+            if mark_str:
+                try:
+                    unrealized_pnl = _calculate_unrealized_pnl(row, Decimal(str(mark_str)))
+                except Exception:
+                    pass
+    elif row.status == "open" and (unrealized_pnl is None or is_stale):
+        latest_candle = _latest_candle_for_position(db, row)
+        unrealized_pnl = _calculate_unrealized_pnl(row, latest_candle.close if latest_candle else None)
+    metrics = build_trade_metrics(row, orders or [], unrealized_pnl=unrealized_pnl)
+    return {
+        "id": row.id,
+        "market_id": row.market_id,
+        "market": _serialize_market(row.market),
+        "mode": row.mode,
+        "side": row.side,
+        "entry_price": str(row.entry_price),
+        "size": str(row.size),
+        "leverage": str(row.leverage) if row.leverage is not None else None,
+        "stop_loss": str(row.stop_loss) if row.stop_loss is not None else None,
+        "take_profit": str(row.take_profit) if row.take_profit is not None else None,
+        "status": row.status,
+        "opened_at": row.opened_at,
+        "closed_at": row.closed_at,
+        "realized_pnl": str(row.realized_pnl) if row.realized_pnl is not None else None,
+        "unrealized_pnl": str(unrealized_pnl) if unrealized_pnl is not None else None,
+        "cum_funding_since_open": str(row.cum_funding_since_open)
+        if row.cum_funding_since_open is not None
+        else None,
+        "initial_size": serialize_decimal(metrics.initial_size),
+        "notional": serialize_decimal(metrics.notional),
+        "initial_risk": serialize_decimal(metrics.initial_risk),
+        "total_pnl": serialize_decimal(metrics.total_pnl),
+        "return_pct": serialize_decimal(metrics.return_pct),
+        "realized_return_pct": serialize_decimal(metrics.realized_return_pct),
+        "r_multiple": serialize_decimal(metrics.r_multiple),
+        "realized_r_multiple": serialize_decimal(metrics.realized_r_multiple),
+        "metadata_json": row.metadata_json,
+    }
 
 
 def _computed_indicator_snapshots(db: Session, market: Market, timeframe: str, limit: int = 250) -> list[dict]:
@@ -735,74 +907,113 @@ def positions(db: Session = Depends(get_db)) -> list[dict]:
             if order.position_id is not None:
                 orders_by_position.setdefault(order.position_id, []).append(order)
 
-    def serialize_decimal(value: object | None) -> str | None:
-        return str(value) if value is not None else None
-
-    result = []
     now_utc = datetime.now(timezone.utc)
-    for row in rows:
-        unrealized_pnl = row.unrealized_pnl
-        # Single source of truth: trust the worker-updated unrealized_pnl unless
-        # it is missing or stale. Falling back to a candle-based recompute keeps
-        # the UI consistent while we wait for the next worker tick.
-        is_stale = (
-            row.pnl_updated_at is None
-            or (now_utc - row.pnl_updated_at) > PNL_STALENESS
+    return [
+        _serialize_position(
+            db,
+            row,
+            orders_by_position.get(row.id, []),
+            now_utc=now_utc,
         )
-        if row.status == "open" and row.mode == "live":
-            # For live positions the authoritative P&L comes from Hyperliquid
-            # (written by reconcile_live_positions). Never override it with a
-            # candle-based estimate — stale candles give wrong sign and magnitude.
-            if unrealized_pnl is None:
-                mark_str = (row.metadata_json or {}).get("last_mark_price")
-                if mark_str:
-                    try:
-                        unrealized_pnl = _calculate_unrealized_pnl(row, Decimal(str(mark_str)))
-                    except Exception:
-                        pass
-        elif row.status == "open" and (unrealized_pnl is None or is_stale):
-            latest_candle = _latest_candle_for_position(db, row)
-            unrealized_pnl = _calculate_unrealized_pnl(row, latest_candle.close if latest_candle else None)
-        metrics = build_trade_metrics(row, orders_by_position.get(row.id, []), unrealized_pnl=unrealized_pnl)
-        result.append(
-            {
-                "id": row.id,
-                "market_id": row.market_id,
-                "market": {
-                    "id": row.market.id,
-                    "exchange": row.market.exchange,
-                    "symbol": row.market.symbol,
-                    "base": row.market.base,
-                    "quote": row.market.quote,
-                    "market_type": row.market.market_type,
-                    "active": row.market.active,
-                    "metadata_json": row.market.metadata_json,
-                },
-                "mode": row.mode,
-                "side": row.side,
-                "entry_price": str(row.entry_price),
-                "size": str(row.size),
-                "leverage": str(row.leverage) if row.leverage is not None else None,
-                "stop_loss": str(row.stop_loss) if row.stop_loss is not None else None,
-                "take_profit": str(row.take_profit) if row.take_profit is not None else None,
-                "status": row.status,
-                "opened_at": row.opened_at,
-                "closed_at": row.closed_at,
-                "realized_pnl": str(row.realized_pnl) if row.realized_pnl is not None else None,
-                "unrealized_pnl": str(unrealized_pnl) if unrealized_pnl is not None else None,
-                "cum_funding_since_open": str(row.cum_funding_since_open) if row.cum_funding_since_open is not None else None,
-                "initial_size": serialize_decimal(metrics.initial_size),
-                "notional": serialize_decimal(metrics.notional),
-                "initial_risk": serialize_decimal(metrics.initial_risk),
-                "total_pnl": serialize_decimal(metrics.total_pnl),
-                "return_pct": serialize_decimal(metrics.return_pct),
-                "realized_return_pct": serialize_decimal(metrics.realized_return_pct),
-                "r_multiple": serialize_decimal(metrics.r_multiple),
-                "realized_r_multiple": serialize_decimal(metrics.realized_r_multiple),
-                "metadata_json": row.metadata_json,
-            }
+        for row in rows
+    ]
+
+
+@router.get("/positions/history")
+def position_history(
+    period: str = Query("7d"),
+    mode: str = Query("all"),
+    market_type: str = Query("all"),
+    limit: int = Query(1000, ge=1, le=5000),
+    db: Session = Depends(get_db),
+) -> dict:
+    valid_periods = {"1d", "7d", "30d", "all"}
+    valid_modes = {"all", "paper", "live"}
+    valid_market_types = {"all", "perp", "spot"}
+    if period not in valid_periods:
+        raise HTTPException(status_code=422, detail="Invalid period")
+    if mode not in valid_modes:
+        raise HTTPException(status_code=422, detail="Invalid mode")
+    if market_type not in valid_market_types:
+        raise HTTPException(status_code=422, detail="Invalid market_type")
+
+    query = (
+        db.query(Position)
+        .join(Position.market)
+        .options(joinedload(Position.market))
+        .filter(or_(Position.status != "open", Position.realized_pnl.is_not(None)))
+    )
+    if period != "all":
+        cutoff = datetime.now(timezone.utc) - {
+            "1d": timedelta(days=1),
+            "7d": timedelta(days=7),
+            "30d": timedelta(days=30),
+        }[period]
+        query = query.filter(
+            or_(
+                Position.closed_at >= cutoff,
+                Position.closed_at.is_(None) & (Position.opened_at >= cutoff),
+            )
         )
-    return result
+    if mode != "all":
+        query = query.filter(Position.mode == mode)
+    if market_type != "all":
+        query = query.filter(Market.market_type == market_type)
+
+    total = query.count()
+    rows = (
+        query.order_by(Position.closed_at.desc().nullslast(), Position.opened_at.desc())
+        .limit(limit)
+        .all()
+    )
+    position_ids = [row.id for row in rows]
+    orders_by_position: dict[int, list[Order]] = {position_id: [] for position_id in position_ids}
+    if position_ids:
+        history_orders = (
+            db.query(Order)
+            .filter(
+                Order.position_id.in_(position_ids),
+                Order.order_type.in_(HISTORY_ORDER_TYPES),
+                or_(Order.status == "filled", Order.fee.is_not(None)),
+            )
+            .order_by(Order.created_at.asc())
+            .all()
+        )
+        for order in history_orders:
+            if order.position_id is not None:
+                orders_by_position.setdefault(order.position_id, []).append(order)
+
+    now_utc = datetime.now(timezone.utc)
+    positions_payload = [
+        _serialize_position(
+            db,
+            row,
+            orders_by_position.get(row.id, []),
+            now_utc=now_utc,
+        )
+        for row in rows
+    ]
+    markets_by_position_id = {row.id: row.market for row in rows}
+    orders_payload = [
+        _serialize_order(order, markets_by_position_id.get(order.position_id or -1))
+        for order in sorted(
+            [order for orders in orders_by_position.values() for order in orders],
+            key=lambda row: row.created_at,
+            reverse=True,
+        )
+    ]
+    return {
+        "positions": positions_payload,
+        "orders": orders_payload,
+        "total": total,
+        "filters": {
+            "period": period,
+            "mode": mode,
+            "market_type": market_type,
+            "limit": limit,
+            "returned": len(rows),
+        },
+    }
 
 
 @router.post("/positions/{position_id}/close")
@@ -896,40 +1107,11 @@ def orders(db: Session = Depends(get_db)) -> list[dict]:
         else {}
     )
 
-    def serialize_market(market: Market | None) -> dict | None:
-        if market is None:
-            return None
-        return {
-            "id": market.id,
-            "exchange": market.exchange,
-            "symbol": market.symbol,
-            "base": market.base,
-            "quote": market.quote,
-            "market_type": market.market_type,
-            "active": market.active,
-            "metadata_json": market.metadata_json,
-        }
-
     result = []
     for row in rows:
         position = positions_by_id.get(row.position_id) if row.position_id is not None else None
         signal = signals_by_id.get(row.signal_id) if row.signal_id is not None else None
-        result.append(
-            {
-                "id": row.id,
-                "position_id": row.position_id,
-                "signal_id": row.signal_id,
-                "market": serialize_market(position.market if position else signal.market if signal else None),
-                "mode": row.mode,
-                "order_type": row.order_type,
-                "side": row.side,
-                "price": str(row.price) if row.price is not None else None,
-                "size": str(row.size),
-                "status": row.status,
-                "fee": str(row.fee) if row.fee is not None else None,
-                "created_at": row.created_at,
-            }
-        )
+        result.append(_serialize_order(row, position.market if position else signal.market if signal else None))
     return result
 
 
@@ -2269,6 +2451,11 @@ async def push_test(db: Session = Depends(get_db)) -> dict:
     return {"status": "sent", "count": sent}
 
 
+@router.get("/learn/trade-management", include_in_schema=False, response_class=HTMLResponse)
+async def trade_management_guide() -> HTMLResponse:
+    return HTMLResponse(_TRADE_MANAGEMENT_GUIDE_HTML)
+
+
 @router.post("/telegram/test-close-card")
 async def telegram_test_close_card() -> dict:
     """Invia una card di test sui canali Telegram configurati."""
@@ -2322,3 +2509,13 @@ async def telegram_test_close_card() -> dict:
     if not channels:
         return {"status": "skipped", "reason": "nessun chat_id configurato"}
     return {"status": "sent", "channels": channels}
+
+
+@router.post("/telegram/channel-strategy-message")
+async def telegram_channel_strategy_message(pin: bool = True) -> dict:
+    """Pubblica nel canale segnali il messaggio bilingue di strategia e,
+    opzionalmente, lo pinna."""
+    from app.notifications.telegram import TelegramNotifier
+
+    notifier = TelegramNotifier(get_settings())
+    return await notifier.send_channel_strategy_message(pin=pin)

@@ -80,6 +80,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Parametri specifici per mode="ab_test".
     "ab_test_min_trades_per_arm": 30,
     "ab_test_significance_level": 0.05,
+    "ab_test_segment_min_trades_per_arm": 5,
+    "ab_test_segment_max_mean_pnl_deterioration": 0.0,
     # P(assegnazione arm "test"); 0.5 = 50/50.
     "ab_test_allocation": 0.5,
     "ab_test_assignment_salt": "trado-v1",
@@ -365,8 +367,10 @@ class AutoTuner:
                 "key": step.get("key"),
                 "label": step.get("label"),
                 "status": outcome,
+                "evidence_type": "sequential_legacy",
                 "metrics_before": metrics_before,
                 "metrics_after": metrics_after,
+                "segment_metrics": self._segment_metrics(post_positions),
                 "trades_evaluated": len(post_positions),
                 "evaluated_at": evaluated_at,
             }
@@ -393,6 +397,8 @@ class AutoTuner:
                 "label": step.get("label"),
                 "metrics_before": metrics_before,
                 "metrics_after": metrics_after,
+                "evidence_type": "sequential_legacy",
+                "segment_metrics": self._segment_metrics(post_positions),
                 "improvement_threshold": threshold,
                 "trades_evaluated": len(post_positions),
                 "adaptive_threshold_multiplier": adaptive_multiplier,
@@ -494,7 +500,18 @@ class AutoTuner:
         # H1 one-tailed: test > control. Promuoviamo solo se la differenza è
         # positiva *e* statisticamente significativa.
         improvement = stats["mean_test"] - stats["mean_control"]
-        promoted = improvement > 0 and stats["p_one_tailed"] < alpha
+        segment_metrics = {
+            "control": self._segment_metrics(arms["control"]),
+            "test": self._segment_metrics(arms["test"]),
+        }
+        segment_failures = self._segment_failures(
+            segment_metrics,
+            min_trades=int(config.get("ab_test_segment_min_trades_per_arm", 5)),
+            max_deterioration=float(
+                config.get("ab_test_segment_max_mean_pnl_deterioration", 0.0)
+            ),
+        )
+        promoted = improvement > 0 and stats["p_one_tailed"] < alpha and not segment_failures
         sample_balance = (
             min(len(control_pnls), len(test_pnls)) / max(len(control_pnls), len(test_pnls))
             if control_pnls and test_pnls
@@ -522,6 +539,7 @@ class AutoTuner:
                 "label": step.get("label"),
                 "status": outcome,
                 "mode": "ab_test",
+                "evidence_type": "ab_test",
                 "ab_test": {
                     "n_control": len(control_pnls),
                     "n_test": len(test_pnls),
@@ -538,6 +556,8 @@ class AutoTuner:
                     "sample_balance": sample_balance,
                     "assignment_method": assignment_method,
                 },
+                "segment_metrics": segment_metrics,
+                "segment_failures": segment_failures,
                 "evaluated_at": evaluated_at,
             }
         )
@@ -571,6 +591,9 @@ class AutoTuner:
                 "mean_delta": improvement,
                 "sample_balance": sample_balance,
                 "assignment_method": assignment_method,
+                "evidence_type": "ab_test",
+                "segment_metrics": segment_metrics,
+                "segment_failures": segment_failures,
             },
         )
         db.commit()
@@ -585,6 +608,8 @@ class AutoTuner:
             "alpha": alpha,
             "sample_balance": sample_balance,
             "assignment_method": assignment_method,
+            "segment_metrics": segment_metrics,
+            "segment_failures": segment_failures,
         }
 
     def pause(self, db: Session) -> dict[str, Any]:
@@ -775,7 +800,7 @@ class AutoTuner:
             "trades_now": trades_now,
             "progress": progress,
             "ab_progress": ab_progress,
-            "step_history": state.get("step_history", []),
+            "step_history": self._annotated_step_history(state.get("step_history", [])),
             "config": {
                 "min_trades_per_step": int(config.get("min_trades_per_step", 50)),
                 "improvement_threshold": float(config.get("improvement_threshold", 0.0)),
@@ -787,6 +812,12 @@ class AutoTuner:
                     config.get("ab_test_significance_level", 0.05)
                 ),
                 "ab_test_allocation": float(config.get("ab_test_allocation", 0.5)),
+                "ab_test_segment_min_trades_per_arm": int(
+                    config.get("ab_test_segment_min_trades_per_arm", 5)
+                ),
+                "ab_test_segment_max_mean_pnl_deterioration": float(
+                    config.get("ab_test_segment_max_mean_pnl_deterioration", 0.0)
+                ),
                 "ab_test_assignment_salt": str(
                     config.get("ab_test_assignment_salt", "trado-v1")
                 ),
@@ -914,6 +945,65 @@ class AutoTuner:
             "profit_factor": stats.profit_factor,
             "equity_slope": equity_slope(positions),
         }
+
+    def _segment_metrics(self, positions: list[Position]) -> dict[str, dict[str, Any]]:
+        groups: dict[str, list[Position]] = {}
+        for position in positions:
+            metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+            timeframe = str(metadata.get("source_timeframe") or "unknown")
+            side = str(position.side or "unknown").upper()
+            key = f"{side}:{timeframe}"
+            groups.setdefault(key, []).append(position)
+        return {
+            key: self._metrics_for(group_positions)
+            for key, group_positions in sorted(groups.items())
+        }
+
+    def _segment_failures(
+        self,
+        segment_metrics: dict[str, dict[str, dict[str, Any]]],
+        *,
+        min_trades: int,
+        max_deterioration: float,
+    ) -> list[dict[str, Any]]:
+        failures: list[dict[str, Any]] = []
+        control = segment_metrics.get("control", {})
+        test = segment_metrics.get("test", {})
+        for key in sorted(set(control) & set(test)):
+            control_metrics = control[key]
+            test_metrics = test[key]
+            if int(control_metrics.get("trades", 0)) < min_trades:
+                continue
+            if int(test_metrics.get("trades", 0)) < min_trades:
+                continue
+            delta = float(test_metrics.get("mean_pnl", 0.0)) - float(
+                control_metrics.get("mean_pnl", 0.0)
+            )
+            if delta < -abs(max_deterioration):
+                failures.append(
+                    {
+                        "segment": key,
+                        "mean_delta": delta,
+                        "control": control_metrics,
+                        "test": test_metrics,
+                    }
+                )
+        return failures
+
+    def _annotated_step_history(self, history: object) -> list[dict[str, Any]]:
+        if not isinstance(history, list):
+            return []
+        annotated: list[dict[str, Any]] = []
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            row = dict(item)
+            if "evidence_type" not in row:
+                row["evidence_type"] = (
+                    "ab_test" if row.get("mode") == "ab_test" else "sequential_legacy"
+                )
+            annotated.append(row)
+        return annotated
 
     def _partition_by_arm(
         self,

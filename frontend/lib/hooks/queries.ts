@@ -25,6 +25,8 @@ import {
   type Order,
   type OutcomeProfile,
   type Position,
+  type PositionHistoryFilters,
+  type PositionHistoryResponse,
   type ScoreCalibration,
   type Signal,
   type SignalRejections,
@@ -73,6 +75,21 @@ export function usePositions(opts?: QueryOpts<Position[]>) {
     queryKey: qk.positions,
     queryFn: () => apiGet<Position[]>("/api/positions"),
     refetchInterval: 15_000,
+    ...opts,
+  });
+}
+
+export function usePositionHistory(filters: PositionHistoryFilters = {}, opts?: QueryOpts<PositionHistoryResponse>) {
+  const params = new URLSearchParams();
+  params.set("period", filters.period ?? "7d");
+  params.set("mode", filters.mode ?? "all");
+  params.set("market_type", filters.market_type ?? "all");
+  params.set("limit", String(filters.limit ?? 5000));
+  const qs = params.toString();
+  return useQuery({
+    queryKey: qk.positionHistory(qs),
+    queryFn: () => apiGet<PositionHistoryResponse>(`/api/positions/history?${qs}`),
+    refetchInterval: 30_000,
     ...opts,
   });
 }

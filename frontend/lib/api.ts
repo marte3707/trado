@@ -377,6 +377,26 @@ export type Order = {
   created_at: string;
 };
 
+export type PositionHistoryFilters = {
+  period?: "1d" | "7d" | "30d" | "all";
+  mode?: "all" | "paper" | "live";
+  market_type?: "all" | "perp" | "spot";
+  limit?: number;
+};
+
+export type PositionHistoryResponse = {
+  positions: Position[];
+  orders: Order[];
+  total: number;
+  filters: {
+    period: string;
+    mode: string;
+    market_type: string;
+    limit: number;
+    returned: number;
+  };
+};
+
 export type Strategy = {
   id: number;
   strategy_name: string;

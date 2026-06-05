@@ -3,10 +3,11 @@
 import React, { useMemo, useState } from "react";
 import { Icon, Seg, fmt } from "@/components/atoms";
 import { Position, Order } from "@/lib/api";
+import { usePositionHistory } from "@/lib/hooks/queries";
 
 interface Props {
-  positions: Position[];
-  orders: Order[];
+  fallbackPositions?: Position[];
+  fallbackOrders?: Order[];
 }
 
 type ModeFilter = "all" | "live" | "paper";
@@ -44,8 +45,20 @@ type EquityHover = {
   y: number;
 };
 
-const EXIT_ORDER_TYPES = new Set(["tp1", "tp2", "tp3", "take_profit", "stop_loss", "manual"]);
+const EXIT_ORDER_TYPES = new Set([
+  "tp1",
+  "tp2",
+  "tp3",
+  "take_profit",
+  "stop_loss",
+  "manual",
+  "time_stop",
+  "btc_macro_protection_loss_exit",
+  "liquidation_guard_failed",
+]);
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100];
+const EMPTY_POSITIONS: Position[] = [];
+const EMPTY_ORDERS: Order[] = [];
 
 function asNumber(v: unknown): number | null {
   if (v == null) return null;
@@ -263,7 +276,7 @@ function positionSearchText(position: Position, exitOrders: Order[]): string {
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-export function HistoryScreen({ positions, orders }: Props) {
+export function HistoryScreen({ fallbackPositions = EMPTY_POSITIONS, fallbackOrders = EMPTY_ORDERS }: Props) {
   const [modeFilter, setModeFilter] = useState<ModeFilter>("all");
   const [marketTypeFilter, setMarketTypeFilter] = useState<"all" | "perp" | "spot">("all");
   const [periodFilter, setPeriodFilter] = useState("7d");
@@ -273,16 +286,22 @@ export function HistoryScreen({ positions, orders }: Props) {
   const [historyPage, setHistoryPage] = useState(1);
   const [historyPageSize, setHistoryPageSize] = useState(10);
   const [perfExpanded, setPerfExpanded] = useState(false);
+  const history = usePositionHistory({
+    period: periodFilter as "1d" | "7d" | "30d" | "all",
+    mode: "all",
+    market_type: "all",
+    limit: 5000,
+  });
+  const positions = history.data?.positions ?? fallbackPositions;
+  const orders = history.data?.orders ?? fallbackOrders;
+  const totalAvailable = history.data?.total ?? fallbackPositions.length;
+  const usingFallbackHistory = !history.data && fallbackPositions.length > 0;
 
   const trackedPositions = useMemo(() => positions.filter(p => hasExitActivity(p, orders)), [positions, orders]);
 
   const cutoff = useMemo(() => {
-    const now = Date.now();
-    if (periodFilter === "1d")  return now - 86400000;
-    if (periodFilter === "7d")  return now - 7 * 86400000;
-    if (periodFilter === "30d") return now - 30 * 86400000;
     return 0;
-  }, [periodFilter]);
+  }, []);
 
   const periodFiltered = useMemo(
     () => trackedPositions.filter(p => new Date(p.closed_at ?? p.opened_at).getTime() >= cutoff),
@@ -470,7 +489,10 @@ export function HistoryScreen({ positions, orders }: Props) {
         <div>
           <h1 className="page-title">Storico segnali</h1>
           <div className="page-sub">
-            {historySearchTokens.length > 0 ? `${rows.length}/${modeRows.length}` : rows.length} posizioni con exit · {visibleLive.length} live · {visiblePaper.length} paper
+            {history.isFetching ? "Aggiornamento storico..." : null}
+            {history.isFetching ? " · " : ""}
+            {historySearchTokens.length > 0 ? `${rows.length}/${modeRows.length}` : rows.length} posizioni nel periodo · {totalAvailable} disponibili · {visibleLive.length} live · {visiblePaper.length} paper
+            {usingFallbackHistory ? " · fallback realtime: riavvia backend per storico completo" : ""}
           </div>
         </div>
         <div className="page-actions">

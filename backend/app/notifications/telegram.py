@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -8,9 +9,11 @@ import structlog
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.config import Settings
-from app.db.models import Alert, AppSetting, Position, Signal
+from app.core.config import Settings, get_settings
+from app.core.runtime_settings import DEFAULT_POSITION_MANAGEMENT_SETTINGS
+from app.db.models import Alert, AppSetting, Order, Position, Signal
 from app.notifications.card_renderer import render_close_card
+from app.services.trade_metrics import build_trade_metrics
 
 _CHANNEL_CLOSE_REASONS = {
     "tp1",
@@ -54,6 +57,26 @@ _REASON_ICONS: dict[str, str] = {
     "reconciliazione hl": "🔄",
 }
 
+_TERM_ANCHORS: dict[str, str] = {
+    "trailing_stop": "trailing-stop",
+    "risk_reward": "risk-reward",
+    "breakeven": "breakeven",
+    "martingale": "martingale",
+    "averaging_down": "averaging-down",
+    "stop_loss": "stop-loss",
+    "runner": "runner",
+}
+_TERM_FALLBACK_URLS: dict[str, str] = {
+    "trailing_stop": "https://www.investopedia.com/terms/t/trailingstop.asp",
+    "risk_reward": "https://www.investopedia.com/terms/r/riskrewardratio.asp",
+    "breakeven": "https://www.investopedia.com/terms/b/breakevenpoint.asp",
+    "martingale": "https://www.investopedia.com/terms/m/martingalesystem.asp",
+    "averaging_down": "https://www.investopedia.com/terms/a/averagedown.asp",
+    "stop_loss": "https://www.investopedia.com/terms/s/stop-lossorder.asp",
+    "runner": "https://www.investopedia.com/terms/t/trailingstop.asp",
+}
+_DAILY_RECAP_STATE_KEY = "telegram_daily_recap_state"
+
 
 def _fmt_price(value: Decimal | None) -> str:
     if value is None:
@@ -72,6 +95,50 @@ def _score_bar(score: int) -> str:
 
 def _fmt_reason(reason: str) -> str:
     return _REASON_LABELS.get(reason.lower(), reason.upper())
+
+
+def _terms_guide_url(anchor: str | None = None) -> str:
+    base = get_settings().public_api_base_url.rstrip("/")
+    if not base or "localhost" in base or "127.0.0.1" in base:
+        return ""
+    url = f"{base}/api/learn/trade-management"
+    if anchor:
+        return f"{url}#{anchor}"
+    return url
+
+
+def _term_link(label: str, key: str) -> str:
+    url = _terms_guide_url(_TERM_ANCHORS[key]) or _TERM_FALLBACK_URLS[key]
+    return f'<a href="{url}">{label}</a>'
+
+
+def _tp_allocation_pct(key: str) -> int:
+    take_profit = DEFAULT_POSITION_MANAGEMENT_SETTINGS.get("takeProfit", {})
+    try:
+        return int(take_profit.get(key, 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_profitable_close(
+    *,
+    pnl_pct: float | None,
+    pnl_usd: Decimal | None,
+) -> bool:
+    if pnl_usd is not None:
+        return float(pnl_usd) > 0
+    if pnl_pct is not None:
+        return pnl_pct > 0
+    return False
+
+
+def _should_send_channel_close_photo(
+    *,
+    is_partial: bool,
+    pnl_pct: float | None,
+    pnl_usd: Decimal | None,
+) -> bool:
+    return not is_partial and _is_profitable_close(pnl_pct=pnl_pct, pnl_usd=pnl_usd)
 
 
 def _build_live_close_message(
@@ -128,7 +195,16 @@ def _build_live_close_message(
         if pnl_pct is not None:
             sign = "+" if pnl_pct >= 0 else ""
             pnl_icon = "📈" if pnl_pct >= 0 else "📉"
-            lines.append(f"{pnl_icon} PnL: <code>{sign}{pnl_pct:.1f}%</code>")
+        elif pnl_usd is not None:
+            sign = "+" if float(pnl_usd) >= 0 else ""
+            pnl_icon = "📈" if float(pnl_usd) >= 0 else "📉"
+        else:
+            sign = ""
+            pnl_icon = "📈"
+        if pnl_usd is not None:
+            lines.append(f"{pnl_icon} PnL: <code>{sign}{float(pnl_usd):.2f} $</code>")
+        if pnl_pct is not None:
+            lines.append(f"{pnl_icon} PnL %: <code>{sign}{pnl_pct:.1f}%</code>")
     lines += [
         sep,
         "🤖 <i>Trado · @crypto_free_live_signals</i>",
@@ -204,7 +280,127 @@ def _build_btc_macro_message(
     return "\n".join(lines)
 
 
+def _daily_recap_summary(
+    closed_positions: list[Position],
+    orders_by_position: dict[int, list[Order]],
+) -> dict[str, Any]:
+    total_pnl = Decimal("0")
+    total_notional = Decimal("0")
+    realized_trades = 0
+    wins = 0
+    r_values: list[Decimal] = []
+
+    for position in closed_positions:
+        position_id = position.id if position.id is not None else -1
+        metrics = build_trade_metrics(position, orders_by_position.get(position_id, ()))
+        realized = metrics.realized_pnl
+        if realized is None:
+            continue
+        realized_trades += 1
+        total_pnl += realized
+        if metrics.notional is not None:
+            total_notional += metrics.notional
+        if realized > 0:
+            wins += 1
+        if metrics.realized_r_multiple is not None:
+            r_values.append(metrics.realized_r_multiple)
+
+    avg_r_multiple = (
+        sum(r_values, Decimal("0")) / Decimal(len(r_values))
+        if r_values
+        else None
+    )
+    total_return_pct = (
+        (total_pnl / total_notional) * Decimal("100")
+        if total_notional > 0
+        else None
+    )
+    win_rate = (wins / realized_trades) if realized_trades else None
+    return {
+        "closed_trades": realized_trades,
+        "total_pnl": total_pnl,
+        "total_return_pct": total_return_pct,
+        "win_rate": win_rate,
+        "avg_r_multiple": avg_r_multiple,
+    }
+
+
+def _build_daily_recap_message(
+    *,
+    opened_trades: int,
+    total_return_pct: Decimal | None,
+    win_rate: float | None,
+    avg_r_multiple: Decimal | None,
+    window_start: datetime,
+    window_end: datetime,
+) -> str:
+    rome = ZoneInfo("Europe/Rome")
+    start_str = window_start.astimezone(rome).strftime("%d/%m %H:%M")
+    end_str = window_end.astimezone(rome).strftime("%d/%m %H:%M")
+    if total_return_pct is not None:
+        pnl_sign = "+" if total_return_pct >= 0 else ""
+        pnl_str = f"{pnl_sign}{float(total_return_pct):.2f}%"
+    else:
+        pnl_str = "n/d"
+    win_rate_str = f"{win_rate * 100:.1f}%" if win_rate is not None else "n/d"
+    avg_r_str = f"{float(avg_r_multiple):+.2f}R" if avg_r_multiple is not None else "n/d"
+    return "\n".join(
+        [
+            "🗓️ <b>Trado — Daily Recap</b>",
+            f"<code>{start_str} → {end_str} (Roma)</code>",
+            "",
+            f"📌 Opened trades: <b>{opened_trades}</b>",
+            f"💰 Total P&amp;L 24h: <code>{pnl_str}</code>",
+            f"✅ Win rate: <b>{win_rate_str}</b>",
+            f"📏 Medium R-Multiple: <b>{avg_r_str}</b>",
+        ]
+    )
+
+
+def _build_channel_strategy_message() -> str:
+    tp1_pct = _tp_allocation_pct("tp1ClosePct")
+    tp2_pct = _tp_allocation_pct("tp2ClosePct")
+    runner_pct = _tp_allocation_pct("runnerPct")
+    risk_reward = _term_link("risk/reward", "risk_reward")
+    martingale = _term_link("martingale", "martingale")
+    averaging_down = _term_link("averaging down", "averaging_down")
+    trailing_stop = _term_link("trailing stop", "trailing_stop")
+    breakeven = _term_link("breakeven", "breakeven")
+    return "\n".join(
+        [
+            "📌 <b>How We Trade · Come operiamo</b>",
+            "",
+            "🇮🇹 <b>Italiano</b>",
+            f"• Entriamo solo quando più segnali tecnici convergono e il trade supera i filtri minimi di score e {risk_reward}.",
+            "• Uno score più alto non è una probabilità matematica di riuscita: è un indicatore interno di qualità e confluenza del setup.",
+            f"• Il sizing segue regole di rischio fisse: niente {martingale}, niente {averaging_down} automatico.",
+            "• Tradate solo capitali che potete permettervi di perdere completamente e dimensionate la size in base al vostro conto e al rischio del trade.",
+            "• Impostate limiti di perdita giornalieri e guardrail personali per proteggere il capitale.",
+            f"• Le uscite usano TP1 ({tp1_pct}%) e TP2 ({tp2_pct}%) parziali; la size restante ({runner_pct}%) va gestita personalmente con {trailing_stop}.",
+            f"• Non inviamo tutti gli aggiornamenti intermedi di stop: {breakeven} e trailing vanno seguiti e aggiornati manualmente.",
+            "• La performance del sistema va letta sul campione completo: saltando alcuni trade il risultato personale può essere diverso, anche inferiore, rispetto al track record registrato.",
+            "• Se volete testare il sistema, iniziate con size piccole.",
+            "",
+            "🇬🇧 <b>English</b>",
+            f"• We enter only when multiple technical signals align and the trade clears minimum score and {risk_reward} filters.",
+            "• A higher score is not a mathematical probability of success: it is an internal indicator of setup quality and confluence.",
+            f"• Position sizing follows fixed risk rules: no {martingale}, no automatic {averaging_down}.",
+            "• Trade only capital you can afford to lose completely, and size positions according to your account and the risk of the trade.",
+            "• Set daily loss limits and personal guardrails to protect your capital.",
+            f"• Exits use partial TP1 ({tp1_pct}%) and TP2 ({tp2_pct}%); the remaining size ({runner_pct}%) should be managed manually with a {trailing_stop}.",
+            f"• We do not broadcast every stop update: {breakeven} and trailing adjustments should be monitored and managed personally.",
+            "• System performance should be read over the full sample: skipping some trades can lead to personal results that differ from, and may underperform, the recorded track record.",
+            "• If you want to test the system, start with small size.",
+            "",
+            "⚠️ <i>Educational content, not financial advice.</i>",
+        ]
+    )
+
+
 def _build_message(signal: Signal) -> str:
+    tp1_pct = _tp_allocation_pct("tp1ClosePct")
+    tp2_pct = _tp_allocation_pct("tp2ClosePct")
+    runner_pct = _tp_allocation_pct("runnerPct")
     symbol = signal.market.symbol if signal.market else "—"
     direction = signal.direction.upper()
     icon = _DIRECTION_ICON.get(direction, "🔔")
@@ -223,11 +419,10 @@ def _build_message(signal: Signal) -> str:
         lines.append(f"🛑 Stop Loss   <code>{_fmt_price(signal.stop_loss)}</code>")
 
     if signal.take_profit_1 is not None:
-        lines.append(f"🎯 TP1         <code>{_fmt_price(signal.take_profit_1)}</code>")
+        lines.append(f"🎯 TP1 ({tp1_pct}%)   <code>{_fmt_price(signal.take_profit_1)}</code>")
     if signal.take_profit_2 is not None:
-        lines.append(f"🎯 TP2         <code>{_fmt_price(signal.take_profit_2)}</code>")
-    if signal.take_profit_3 is not None:
-        lines.append(f"🎯 TP3         <code>{_fmt_price(signal.take_profit_3)}</code>")
+        lines.append(f"🎯 TP2 ({tp2_pct}%)   <code>{_fmt_price(signal.take_profit_2)}</code>")
+    lines.append(f"🏃 Runner ({runner_pct}%) Move remaining size to trailing stop")
 
     if signal.risk_reward is not None:
         lines.append(f"⚖️ R/R          <code>{signal.risk_reward:.2f}</code>")
@@ -249,32 +444,118 @@ class TelegramNotifier:
             return self.settings.public_bot_token
         return self.settings.telegram_bot_token
 
+    async def _telegram_json_post(
+        self,
+        *,
+        method: str,
+        payload: dict[str, object],
+        chat_id: str | None = None,
+        timeout: int = 10,
+    ) -> dict[str, Any]:
+        target = chat_id or self.settings.telegram_chat_id
+        token = self._token_for(target)
+        if not token or not target:
+            return {"ok": False, "description": "missing_token_or_chat_id"}
+        url = f"https://api.telegram.org/bot{token}/{method}"
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, json=payload)
+            body = response.json()
+            if response.is_success and body.get("ok"):
+                return {"ok": True, "result": body.get("result")}
+            return {
+                "ok": False,
+                "status_code": response.status_code,
+                "description": body.get("description") or "telegram_api_error",
+            }
+        except Exception as exc:
+            return {"ok": False, "description": str(exc)}
+
+    async def _send_text_result(
+        self,
+        text: str,
+        chat_id: str | None = None,
+        reply_to_message_id: int | None = None,
+        disable_web_page_preview: bool = True,
+    ) -> dict[str, Any] | None:
+        target = chat_id or self.settings.telegram_chat_id
+        payload: dict[str, object] = {
+            "chat_id": target,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": disable_web_page_preview,
+        }
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = reply_to_message_id
+            payload["allow_sending_without_reply"] = True
+        result = await self._telegram_json_post(
+            method="sendMessage",
+            payload=payload,
+            chat_id=target,
+            timeout=10,
+        )
+        if not result.get("ok"):
+            logger.warning("telegram_send_failed", error=result.get("description"))
+            return None
+        return result.get("result")
+
     async def _send_text(
         self,
         text: str,
         chat_id: str | None = None,
         reply_to_message_id: int | None = None,
     ) -> bool:
-        target = chat_id or self.settings.telegram_chat_id
-        token = self._token_for(target)
-        if not token or not target:
-            return False
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload: dict[str, object] = {
-            "chat_id": target,
-            "text": text,
-            "parse_mode": "HTML",
+        return (
+            await self._send_text_result(
+                text,
+                chat_id=chat_id,
+                reply_to_message_id=reply_to_message_id,
+            )
+        ) is not None
+
+    async def _pin_message(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+        disable_notification: bool = True,
+    ) -> bool:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "disable_notification": disable_notification,
         }
-        if reply_to_message_id is not None:
-            payload["reply_to_message_id"] = reply_to_message_id
-            payload["allow_sending_without_reply"] = True
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(url, json=payload)
-            return response.is_success
-        except Exception as exc:
-            logger.warning("telegram_send_failed", error=str(exc))
+        result = await self._telegram_json_post(
+            method="pinChatMessage",
+            payload=payload,
+            chat_id=chat_id,
+            timeout=10,
+        )
+        if not result.get("ok"):
+            logger.warning("telegram_pin_failed", error=result.get("description"))
             return False
+        return True
+
+    async def _unpin_message(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+    ) -> bool:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }
+        result = await self._telegram_json_post(
+            method="unpinChatMessage",
+            payload=payload,
+            chat_id=chat_id,
+            timeout=10,
+        )
+        if not result.get("ok"):
+            logger.warning("telegram_unpin_failed", error=result.get("description"))
+            return False
+        return True
 
     async def _send_photo(
         self,
@@ -334,6 +615,37 @@ class TelegramNotifier:
             return int(raw)
         except (TypeError, ValueError):
             return None
+
+    async def send_channel_strategy_message(self, *, pin: bool = True) -> dict[str, Any]:
+        if not self.settings.telegram_signal_chat_id:
+            return {"status": "skipped", "reason": "telegram_signal_chat_id_not_configured"}
+        result = await self._send_text_result(
+            _build_channel_strategy_message(),
+            chat_id=self.settings.telegram_signal_chat_id,
+            disable_web_page_preview=True,
+        )
+        if result is None:
+            return {"status": "failed", "pinned": False}
+        raw_message_id = result.get("message_id")
+        try:
+            message_id = int(raw_message_id) if raw_message_id is not None else None
+        except (TypeError, ValueError):
+            message_id = None
+        pinned = False
+        pin_hint: str | None = None
+        if pin and message_id is not None:
+            pinned = await self._pin_message(
+                chat_id=self.settings.telegram_signal_chat_id,
+                message_id=message_id,
+            )
+            if not pinned:
+                pin_hint = "verify_public_bot_is_channel_admin_with_message_management_permissions"
+        return {
+            "status": "sent",
+            "message_id": message_id,
+            "pinned": pinned,
+            "pin_hint": pin_hint,
+        }
 
     async def send_worker_online(self, db: Session) -> None:
         now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
@@ -463,6 +775,111 @@ class TelegramNotifier:
             f"{defensive_line}"
         )
 
+    async def send_daily_recap(
+        self,
+        db: Session,
+        *,
+        window_start: datetime | None = None,
+        window_end: datetime | None = None,
+    ) -> dict[str, Any]:
+        if not self.settings.telegram_signal_chat_id:
+            return {"status": "skipped", "reason": "telegram_signal_chat_id_not_configured"}
+        end = window_end or datetime.now(timezone.utc)
+        start = window_start or (end - timedelta(hours=24))
+        opened_trades = 0
+        closed_positions: list[Position] = []
+        orders_by_position: dict[int, list[Order]] = defaultdict(list)
+        try:
+            opened_trades = (
+                db.query(func.count(Position.id))
+                .filter(
+                    Position.mode == "live",
+                    Position.opened_at >= start,
+                    Position.opened_at < end,
+                )
+                .scalar() or 0
+            )
+            closed_positions = (
+                db.query(Position)
+                .filter(
+                    Position.mode == "live",
+                    Position.status == "closed",
+                    Position.closed_at.is_not(None),
+                    Position.closed_at >= start,
+                    Position.closed_at < end,
+                )
+                .all()
+            )
+            position_ids = [position.id for position in closed_positions if position.id is not None]
+            if position_ids:
+                orders = db.query(Order).filter(Order.position_id.in_(position_ids)).all()
+                for order in orders:
+                    if order.position_id is not None:
+                        orders_by_position[order.position_id].append(order)
+        except Exception:
+            logger.exception("daily_recap_query_failed")
+
+        summary = _daily_recap_summary(closed_positions, orders_by_position)
+        state = db.get(AppSetting, _DAILY_RECAP_STATE_KEY) or AppSetting(
+            key=_DAILY_RECAP_STATE_KEY,
+            value={},
+        )
+        previous_message_id: int | None = None
+        if isinstance(state.value, dict):
+            raw_previous = state.value.get("message_id")
+            try:
+                previous_message_id = int(raw_previous) if raw_previous is not None else None
+            except (TypeError, ValueError):
+                previous_message_id = None
+
+        result = await self._send_text_result(
+            _build_daily_recap_message(
+                opened_trades=opened_trades,
+                total_return_pct=summary["total_return_pct"],
+                win_rate=summary["win_rate"],
+                avg_r_multiple=summary["avg_r_multiple"],
+                window_start=start,
+                window_end=end,
+            ),
+            chat_id=self.settings.telegram_signal_chat_id,
+            disable_web_page_preview=True,
+        )
+        if result is None:
+            return {"status": "failed", "pinned": False}
+
+        raw_message_id = result.get("message_id")
+        try:
+            message_id = int(raw_message_id) if raw_message_id is not None else None
+        except (TypeError, ValueError):
+            message_id = None
+
+        unpinned_previous = False
+        if previous_message_id is not None and previous_message_id != message_id:
+            unpinned_previous = await self._unpin_message(
+                chat_id=self.settings.telegram_signal_chat_id,
+                message_id=previous_message_id,
+            )
+
+        pinned = False
+        if message_id is not None:
+            pinned = await self._pin_message(
+                chat_id=self.settings.telegram_signal_chat_id,
+                message_id=message_id,
+            )
+
+        state.value = {
+            "message_id": message_id,
+            "sent_at": end.isoformat(),
+        }
+        db.add(state)
+        db.commit()
+        return {
+            "status": "sent",
+            "message_id": message_id,
+            "pinned": pinned,
+            "unpinned_previous": unpinned_previous,
+        }
+
     async def send_live_position_opened(self, position: Position) -> None:
         symbol = position.market.symbol if position.market else "?"
         side = position.side.upper()
@@ -498,6 +915,7 @@ class TelegramNotifier:
         signal_id: int | None = None,
         db: Session | None = None,
     ) -> None:
+        pnl_for_card = total_pnl if total_pnl is not None else step_pnl
         text = _build_live_close_message(
             symbol=symbol,
             side=side,
@@ -510,9 +928,25 @@ class TelegramNotifier:
             is_partial=is_partial,
             pnl_pct=pnl_pct,
         )
+        channel_text = _build_channel_close_message(
+            symbol=symbol,
+            side=side,
+            reason=reason,
+            exit_price=exit_price,
+            is_partial=is_partial,
+            pnl_pct=pnl_pct,
+        )
+        should_send_channel_photo = _should_send_channel_close_photo(
+            is_partial=is_partial,
+            pnl_pct=pnl_pct,
+            pnl_usd=pnl_for_card,
+        )
+        channel_reason_allowed = reason.lower() in _CHANNEL_CLOSE_REASONS
+        channel_should_notify = channel_reason_allowed or should_send_channel_photo
+
+        png: bytes | None = None
         # Admin DM: invia la share card PNG per chiusure complete (non parziali)
         if not is_partial:
-            pnl_for_card = total_pnl if total_pnl is not None else step_pnl
             try:
                 png = render_close_card(
                     symbol=symbol,
@@ -536,12 +970,11 @@ class TelegramNotifier:
 
         # Public signals channel: send a lean English message as a reply to the
         # original signal opening message, so subscribers can follow each trade
-        # in a single thread. Only relay closures that map to a public exit
-        # reason (TP1/2/3, take_profit, stop_loss, trailing_stop); skip manual,
-        # reconciliation and internal BTC-macro management events.
+        # in a single thread. Profitable final closes get the share card; the
+        # rest keep the lean text notification.
         if (
             self.settings.telegram_signal_chat_id
-            and reason.lower() in _CHANNEL_CLOSE_REASONS
+            and channel_should_notify
         ):
             try:
                 reply_to = (
@@ -549,19 +982,25 @@ class TelegramNotifier:
                     if db is not None
                     else None
                 )
-                channel_text = _build_channel_close_message(
-                    symbol=symbol,
-                    side=side,
-                    reason=reason,
-                    exit_price=exit_price,
-                    is_partial=is_partial,
-                    pnl_pct=pnl_pct,
-                )
-                await self._send_text(
-                    channel_text,
-                    chat_id=self.settings.telegram_signal_chat_id,
-                    reply_to_message_id=reply_to,
-                )
+                if should_send_channel_photo and png is not None:
+                    sent = await self._send_photo(
+                        png,
+                        channel_text,
+                        chat_id=self.settings.telegram_signal_chat_id,
+                        reply_to_message_id=reply_to,
+                    )
+                    if not sent:
+                        await self._send_text(
+                            channel_text,
+                            chat_id=self.settings.telegram_signal_chat_id,
+                            reply_to_message_id=reply_to,
+                        )
+                else:
+                    await self._send_text(
+                        channel_text,
+                        chat_id=self.settings.telegram_signal_chat_id,
+                        reply_to_message_id=reply_to,
+                    )
             except Exception as exc:
                 logger.warning("telegram_signal_close_reply_failed", error=str(exc))
 

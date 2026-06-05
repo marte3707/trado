@@ -115,6 +115,9 @@ class FakeTrading:
     def frontend_open_orders(self, _address: str) -> list[dict[str, Any]]:
         return list(self._frontend_open_orders)
 
+    def all_mids(self) -> dict[str, str]:
+        return getattr(self, "_all_mids", {}) or {}
+
     def submit_trigger_order(
         self,
         *,
@@ -1322,3 +1325,284 @@ def test_companion_exit_price_none_uses_entry() -> None:
     assert paper.status == "closed"
     assert paper.realized_pnl == Decimal("0")  # exit at entry → zero PnL
     assert paper.metadata_json["exit_price"] == "95"
+
+
+# ---------------------------------------------------------------------------
+# TP rescue tests: quando il prezzo ha già superato il TP target, invece di
+# saltare il livello dobbiamo riposizionare il TP oltre il mark price.
+# ---------------------------------------------------------------------------
+
+
+def _make_position_with_tp_plan(
+    side: str = "long",
+    entry: str = "100",
+    stop: str = "90",
+    tp1_price: str = "110",
+    tp2_price: str = "120",
+) -> Position:
+    if side == "long":
+        position = _make_position(size="1.0")
+    else:
+        position = _make_short_position(size="1.0")
+    position.entry_price = Decimal(entry)
+    position.stop_loss = Decimal(stop)
+    position.metadata_json = {
+        "source_signal_id": 42,
+        "take_profit_plan": [
+            {"level": "tp1", "price": tp1_price, "allocation": "0.5", "filled": False},
+            {"level": "tp2", "price": tp2_price, "allocation": "0.3", "filled": False},
+            {"level": "runner", "price": "", "allocation": "0.2", "filled": False, "runner": True},
+        ],
+    }
+    return position
+
+
+def test_create_missing_tp_rescue_when_long_mark_breaches_target() -> None:
+    """Long: nessun TP1 locale, mark > target → il rescue ricalcola un nuovo target
+    oltre il mark e crea l'ordine su HL, senza marcare il livello come skipped."""
+    position = _make_position_with_tp_plan(side="long", tp1_price="110", tp2_price="200")
+    sl_order = _make_sl_order(oid=8888)
+    db = FakeDb(positions=[position], orders=[sl_order])
+    # mark 111 ha già superato tp1=110 → trigger rescue
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "BTC", "szi": "1.0", "entryPx": "100", "markPx": "111"}
+        ],
+        open_order_oids=[8888],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_tp_rescued" in events
+    assert "live_protection_order_tp_already_passed" not in events
+
+    plan = position.metadata_json["take_profit_plan"]
+    tp1_entry = next(e for e in plan if e.get("level") == "tp1")
+    assert tp1_entry.get("rescued") is True
+    assert tp1_entry.get("rescue_count") == 1
+    assert tp1_entry.get("original_price") == "110"
+    new_tp1 = Decimal(tp1_entry["price"])
+    assert new_tp1 > Decimal("111")  # nuovo target oltre il mark
+    assert not tp1_entry.get("skipped")
+
+    recreated = [row for row in db.added if isinstance(row, Order) and row.order_type == "tp1"]
+    assert recreated
+    assert recreated[-1].price == new_tp1
+    assert recreated[-1].hyperliquid_order_id == "77777"
+
+
+def test_create_missing_tp_rescue_when_short_mark_breaches_target() -> None:
+    """Short: mark < tp1 target → rescue sposta il target sotto il mark."""
+    position = _make_position_with_tp_plan(
+        side="short", entry="100", stop="110", tp1_price="90", tp2_price="50"
+    )
+    sl_order = _make_sl_order(oid=8888)
+    sl_order.side = "buy"
+    sl_order.price = Decimal("110")
+    db = FakeDb(positions=[position], orders=[sl_order])
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "BTC", "szi": "-1.0", "entryPx": "100", "markPx": "89"}
+        ],
+        open_order_oids=[8888],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    plan = position.metadata_json["take_profit_plan"]
+    tp1_entry = next(e for e in plan if e.get("level") == "tp1")
+    assert tp1_entry.get("rescued") is True
+    new_tp1 = Decimal(tp1_entry["price"])
+    assert new_tp1 < Decimal("89")  # nuovo target sotto il mark
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_tp_rescued" in events
+
+
+def test_create_missing_tp_skipped_when_rescue_would_overlap_next_tp() -> None:
+    """Se il rescue calcolato finirebbe oltre il TP successivo, restiamo sul fallback
+    (skipped) per non sovrapporre i livelli."""
+    # mark=110.9 con buffer fallback ~0.3% → new_tp1 ~ 111.23 ≥ TP2=111 → blocked
+    position = _make_position_with_tp_plan(side="long", tp1_price="110", tp2_price="111")
+    sl_order = _make_sl_order(oid=8888)
+    db = FakeDb(positions=[position], orders=[sl_order])
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "BTC", "szi": "1.0", "entryPx": "100", "markPx": "110.9"}
+        ],
+        open_order_oids=[8888],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_tp_rescued" not in events
+    assert "live_protection_order_tp_already_passed" in events
+    plan = position.metadata_json["take_profit_plan"]
+    tp1_entry = next(e for e in plan if e.get("level") == "tp1")
+    assert tp1_entry.get("skipped") is True
+
+
+def test_resubmit_tp_rescue_updates_order_price_and_submits() -> None:
+    """Resubmit: TP order esistente con prezzo già superato dal mark.
+    Il rescue deve aggiornare order.price prima del resubmit e creare l'ordine su HL."""
+    position = _make_position_with_tp_plan(side="long", tp1_price="110", tp2_price="200")
+    sl_order = _make_sl_order(oid=8888)
+    tp1_order = _make_tp_order(oid_str="9999", price="110", size="0.5")
+    tp2_order = _make_tp_order(cloid="tp2", level="tp2", price="200", size="0.3", oid_str="9998")
+    db = FakeDb(positions=[position], orders=[sl_order, tp1_order, tp2_order])
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "BTC", "szi": "1.0", "entryPx": "100", "markPx": "112"}
+        ],
+        # solo tp1 (9999) assente; SL e TP2 ancora aperti su HL
+        open_order_oids=[8888, 9998],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_tp_rescued" in events
+    assert "live_protection_order_tp_already_passed" not in events
+    # Il prezzo dell'order è stato aggiornato e l'ordine è stato resubmittato
+    assert tp1_order.price > Decimal("112")
+    tp_resubmits = [item for item in trading.resubmitted if item["tpsl"] == "tp"]
+    assert len(tp_resubmits) == 1
+    assert tp1_order.hyperliquid_order_id == "77777"
+    # Metadata raw del rescue salvato
+    assert "last_tp_rescue" in tp1_order.raw_response
+    assert tp1_order.raw_response["last_tp_rescue"]["original_target"] == "110"
+
+
+def test_resubmit_tp_rescue_count_caps_after_max_attempts() -> None:
+    """Dopo _MAX_TP_RESCUE_PER_LEVEL rescue, il livello deve essere marcato skipped
+    invece di essere riposizionato ulteriormente."""
+    position = _make_position_with_tp_plan(side="long", tp1_price="110", tp2_price="200")
+    plan = position.metadata_json["take_profit_plan"]
+    tp1_entry = next(e for e in plan if e.get("level") == "tp1")
+    tp1_entry["rescue_count"] = 3  # già al cap (_MAX_TP_RESCUE_PER_LEVEL = 3)
+    tp1_entry["rescued"] = True
+    sl_order = _make_sl_order(oid=8888)
+    tp1_order = _make_tp_order(oid_str="9999", price="110", size="0.5")
+    tp2_order = _make_tp_order(cloid="tp2", level="tp2", price="200", size="0.3", oid_str="9998")
+    db = FakeDb(positions=[position], orders=[sl_order, tp1_order, tp2_order])
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "BTC", "szi": "1.0", "entryPx": "100", "markPx": "112"}
+        ],
+        # solo tp1 (9999) assente
+        open_order_oids=[8888, 9998],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_tp_rescued" not in events
+    assert "live_protection_order_tp_already_passed" in events
+    # TP1 non resubmittato (rescue capped)
+    tp_resubmits = [item for item in trading.resubmitted if item["tpsl"] == "tp"]
+    assert tp_resubmits == []
+    # Skipped marcato
+    plan_after = position.metadata_json["take_profit_plan"]
+    tp1_after = next(e for e in plan_after if e.get("level") == "tp1")
+    assert tp1_after.get("skipped") is True
+
+
+def test_rescue_bypasses_max_total_attempts_cap_and_resets_state() -> None:
+    """Caso reale dei produzione: un TP ha raggiunto max_total_attempts perché HL
+    rifiutava ogni resubmit (prezzo già breached). Il rescue deve scattare PRIMA
+    del check del cap, resettare resubmits/resubmit_blocked e creare l'ordine."""
+    position = _make_position_with_tp_plan(side="long", tp1_price="110", tp2_price="200")
+    sl_order = _make_sl_order(oid=8888)
+    tp1_order = _make_tp_order(oid_str="9999", price="110", size="0.5")
+    # Simuliamo 10 tentativi precedenti già bloccati
+    tp1_order.raw_response = {
+        "resubmits": [
+            {
+                "attempted_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                "old_oid": str(i),
+                "status": "error",
+            }
+            for i in range(10)
+        ],
+        "resubmit_blocked": {
+            "reason": "max_total_attempts",
+            "total_attempts": 10,
+        },
+    }
+    tp2_order = _make_tp_order(cloid="tp2", level="tp2", price="200", size="0.3", oid_str="9998")
+    db = FakeDb(positions=[position], orders=[sl_order, tp1_order, tp2_order])
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "BTC", "szi": "1.0", "entryPx": "100", "markPx": "112"}
+        ],
+        open_order_oids=[8888, 9998],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_tp_rescued" in events
+    assert "live_protection_order_resubmit_skipped_retry_cap" not in events
+    # Stato resettato
+    assert tp1_order.raw_response["resubmits"] == [] or len(tp1_order.raw_response["resubmits"]) == 1
+    # ^ dopo il rescue, viene aggiunto il nuovo resubmit di successo
+    assert "resubmit_blocked" not in tp1_order.raw_response
+    assert tp1_order.price > Decimal("112")
+    tp_resubmits = [item for item in trading.resubmitted if item["tpsl"] == "tp"]
+    assert len(tp_resubmits) == 1
+    assert tp1_order.hyperliquid_order_id == "77777"
+
+
+def test_rescue_uses_all_mids_fallback_when_user_state_omits_mark_px() -> None:
+    """HL non sempre include markPx nei payload di user_state. Quando manca,
+    la reconciliation deve usare allMids per derivarlo (altrimenti il rescue
+    non scatta mai)."""
+    position = _make_position_with_tp_plan(side="long", tp1_price="110", tp2_price="200")
+    sl_order = _make_sl_order(oid=8888)
+    db = FakeDb(positions=[position], orders=[sl_order])
+    trading = FakeTrading(
+        # markPx assente nel remote_position
+        remote_positions=[{"coin": "BTC", "szi": "1.0", "entryPx": "100"}],
+        open_order_oids=[8888],
+        resubmit_oid="77777",
+    )
+    trading._all_mids = {"BTC": "112"}  # type: ignore[attr-defined]
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_tp_rescued" in events
+    plan = position.metadata_json["take_profit_plan"]
+    tp1_entry = next(e for e in plan if e.get("level") == "tp1")
+    assert tp1_entry.get("rescued") is True
+    assert Decimal(tp1_entry["price"]) > Decimal("112")
+
+
+def test_resubmit_tp_rescue_skipped_when_below_stop_loss() -> None:
+    """Se lo stop loss è già oltre il mark price (caso patologico), il rescue
+    non deve produrre un TP che finirebbe dietro lo stop."""
+    position = _make_position_with_tp_plan(side="long", tp1_price="110", tp2_price="200")
+    position.stop_loss = Decimal("115")  # SL "sopra" il mark — caso patologico
+    tp1_order = _make_tp_order(oid_str="9999", price="110", size="0.5")
+    db = FakeDb(positions=[position], orders=[tp1_order])
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "BTC", "szi": "1.0", "entryPx": "100", "markPx": "112"}
+        ],
+        open_order_oids=[],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    # mark=112, buffer fallback ~0.3% → new_tp ~ 112.336 < stop=115 → reject_reason=below_stop_loss
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_protection_order_tp_rescued" not in events
+    assert "live_protection_order_tp_already_passed" in events

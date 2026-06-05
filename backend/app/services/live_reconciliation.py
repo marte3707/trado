@@ -11,9 +11,10 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.config import get_settings
 from app.core.enums import OrderMode, SignalStatus
 from app.core.runtime_settings import effective_live_execution_settings
-from app.db.models import DecisionLog, Market, Order, Position, Signal
+from app.db.models import Candle, DecisionLog, Market, Order, Position, Signal
 from app.engine.execution import make_cloid
 from app.engine.position_management import PositionManagementEngine, StopCandidate
+from app.indicators.core import atr
 from app.services.hyperliquid import HyperliquidTradingClient
 
 logger = structlog.get_logger()
@@ -48,6 +49,17 @@ _MAX_RESUBMIT_SOFT_FAILURES = 8
 # indefinitely when HL keeps omitting it from openOrders.
 _MAX_RESUBMIT_TOTAL_ATTEMPTS = 10
 _RESUBMIT_RETRY_COOLDOWN_SECONDS = 15 * 60
+
+# TP rescue: quando il mark price ha già superato il target del TP, l'ordine
+# verrebbe rifiutato da HL. Invece di rinunciare al livello (skipped), spostiamo
+# il target oltre il mark price corrente di una distanza basata su ATR (fallback
+# a una percentuale del mark). Limitiamo il numero di rescue per livello per
+# evitare loop infiniti quando il prezzo continua a correre nella direzione del TP.
+_TP_RESCUE_ATR_PERIOD = 14
+_TP_RESCUE_ATR_MULTIPLIER = Decimal("0.6")
+_TP_RESCUE_PCT_FALLBACK = Decimal("0.003")  # 0.3%
+_TP_RESCUE_MIN_BUFFER_PCT = Decimal("0.0005")  # 0.05% — pavimento contro tick troppo piccoli
+_MAX_TP_RESCUE_PER_LEVEL = 3
 
 
 @dataclass(frozen=True)
@@ -730,35 +742,80 @@ def _create_missing_protection_orders(
         if order_type in ("tp1", "tp2", "tp3") and isinstance(remote_position, dict):
             mark_px = _decimal(remote_position.get("markPx"))
             if mark_px is not None and _tp_target_already_breached(position, mark_px, price):
-                _mark_tp_plan_entry_skipped(position, order_type, mark_px)
-                db.add(position)
-                db.add(
-                    DecisionLog(
-                        event_type="live_protection_order_tp_already_passed",
-                        market_id=position.market_id,
-                        position_id=position.id,
-                        message=(
-                            f"Protection order {order_type} skipped: mark price {mark_px} "
-                            f"has already breached target {price}"
-                        ),
-                        data={
-                            "coin": coin,
-                            "order_type": order_type,
-                            "target_price": str(price),
-                            "mark_price": str(mark_px),
-                            "side": position.side,
-                        },
+                rescue_count = _tp_rescue_count(position, order_type)
+                rescued_price: Decimal | None = None
+                rescue_indicators: dict = {}
+                if rescue_count < _MAX_TP_RESCUE_PER_LEVEL:
+                    rescued_price, rescue_indicators = _compute_rescued_tp_price(
+                        db, position, order_type, mark_px, price
                     )
-                )
-                logger.warning(
-                    "live_protection_order_tp_already_passed",
-                    position_id=position.id,
-                    order_type=order_type,
-                    target_price=str(price),
-                    mark_price=str(mark_px),
-                    coin=coin,
-                )
-                continue
+                if rescued_price is not None:
+                    original_price = price
+                    _apply_tp_rescue(position, order_type, rescued_price, mark_px, original_price)
+                    db.add(position)
+                    price = rescued_price
+                    db.add(
+                        DecisionLog(
+                            event_type="live_protection_order_tp_rescued",
+                            market_id=position.market_id,
+                            position_id=position.id,
+                            message=(
+                                f"Protection order {order_type} rescued: target moved from "
+                                f"{original_price} to {rescued_price} (mark {mark_px})"
+                            ),
+                            data={
+                                "coin": coin,
+                                "order_type": order_type,
+                                "original_target": str(original_price),
+                                "new_target": str(rescued_price),
+                                "mark_price": str(mark_px),
+                                "rescue_count": rescue_count + 1,
+                                "side": position.side,
+                                "indicators": rescue_indicators,
+                            },
+                        )
+                    )
+                    logger.warning(
+                        "live_protection_order_tp_rescued",
+                        position_id=position.id,
+                        order_type=order_type,
+                        original_target=str(original_price),
+                        new_target=str(rescued_price),
+                        mark_price=str(mark_px),
+                        coin=coin,
+                    )
+                else:
+                    _mark_tp_plan_entry_skipped(position, order_type, mark_px)
+                    db.add(position)
+                    db.add(
+                        DecisionLog(
+                            event_type="live_protection_order_tp_already_passed",
+                            market_id=position.market_id,
+                            position_id=position.id,
+                            message=(
+                                f"Protection order {order_type} skipped: mark price {mark_px} "
+                                f"has already breached target {price} (rescue unavailable)"
+                            ),
+                            data={
+                                "coin": coin,
+                                "order_type": order_type,
+                                "target_price": str(price),
+                                "mark_price": str(mark_px),
+                                "side": position.side,
+                                "rescue_count": rescue_count,
+                                "rescue_indicators": rescue_indicators,
+                            },
+                        )
+                    )
+                    logger.warning(
+                        "live_protection_order_tp_already_passed",
+                        position_id=position.id,
+                        order_type=order_type,
+                        target_price=str(price),
+                        mark_price=str(mark_px),
+                        coin=coin,
+                    )
+                    continue
         frontend_match = _match_frontend_order_for_missing(frontend_orders, position, order_type, price)
         if frontend_match is not None:
             size = _decimal(frontend_match.get("sz")) or _decimal(frontend_match.get("origSz")) or Decimal("0")
@@ -1001,15 +1058,6 @@ def _resubmit_missing_protection_orders(
         resubmits: list[dict] = [
             item for item in raw_resubmits if isinstance(item, dict)
         ] if isinstance(raw_resubmits, list) else []
-        hard_failures = sum(
-            1 for r in resubmits
-            if r.get("status") not in ("ok", "error", "skipped_liquidation_guard")
-        )
-        soft_failures = sum(1 for r in resubmits if r.get("status") == "error")
-        if not force_repair and hard_failures >= _MAX_RESUBMIT_HARD_FAILURES:
-            continue
-        if not force_repair and soft_failures >= _MAX_RESUBMIT_SOFT_FAILURES:
-            continue
 
         oid_int: int | None = None
         if order.hyperliquid_order_id:
@@ -1038,6 +1086,132 @@ def _resubmit_missing_protection_orders(
             continue
 
         now = datetime.now(timezone.utc)
+
+        # TP rescue check PRIMA dei cap di retry: se il mark price ha già superato
+        # il target del TP (HL rifiuterebbe), proviamo a riposizionare il TP oltre
+        # il mark con un buffer basato su ATR. Se il rescue ha successo,
+        # resettiamo i contatori di retry perché il target è cambiato — gli
+        # attempts precedenti riguardavano un prezzo ormai irrilevante.
+        if order.order_type in ("tp1", "tp2", "tp3") and isinstance(remote_position, dict):
+            mark_px = _decimal(remote_position.get("markPx"))
+            if mark_px is not None and _tp_target_already_breached(position, mark_px, order.price):
+                rescue_count = _tp_rescue_count(position, order.order_type)
+                rescued_price: Decimal | None = None
+                rescue_indicators: dict = {}
+                if rescue_count < _MAX_TP_RESCUE_PER_LEVEL:
+                    rescued_price, rescue_indicators = _compute_rescued_tp_price(
+                        db, position, order.order_type, mark_px, order.price
+                    )
+                if rescued_price is not None:
+                    original_price = order.price
+                    _apply_tp_rescue(position, order.order_type, rescued_price, mark_px, original_price)
+                    order.price = rescued_price
+                    # Reset stato di retry: nuovo target, nuovo "ordine" effettivo.
+                    resubmits = []
+                    raw["resubmits"] = []
+                    raw.pop("resubmit_blocked", None)
+                    raw["last_tp_rescue"] = {
+                        "rescued_at": now.isoformat(),
+                        "original_target": str(original_price),
+                        "new_target": str(rescued_price),
+                        "mark_price": str(mark_px),
+                        "rescue_count": rescue_count + 1,
+                        "indicators": rescue_indicators,
+                    }
+                    _set_order_raw_response(order, raw)
+                    db.add(order)
+                    db.add(position)
+                    db.add(
+                        DecisionLog(
+                            event_type="live_protection_order_tp_rescued",
+                            market_id=position.market_id,
+                            position_id=position.id,
+                            message=(
+                                f"Protection order {order.order_type} rescued before resubmit: "
+                                f"target moved from {original_price} to {rescued_price} (mark {mark_px})"
+                            ),
+                            data={
+                                "coin": coin,
+                                "order_id": order.id,
+                                "order_type": order.order_type,
+                                "original_target": str(original_price),
+                                "new_target": str(rescued_price),
+                                "mark_price": str(mark_px),
+                                "rescue_count": rescue_count + 1,
+                                "side": position.side,
+                                "indicators": rescue_indicators,
+                            },
+                        )
+                    )
+                    logger.warning(
+                        "live_protection_order_tp_rescued",
+                        position_id=position.id,
+                        order_id=order.id,
+                        order_type=order.order_type,
+                        original_target=str(original_price),
+                        new_target=str(rescued_price),
+                        mark_price=str(mark_px),
+                        coin=coin,
+                    )
+                    # Fall through al normale flow di resubmit con il nuovo prezzo.
+                else:
+                    raw["resubmit_blocked"] = {
+                        "reason": "tp_price_already_breached",
+                        "blocked_at": now.isoformat(),
+                        "target_price": str(order.price),
+                        "mark_price": str(mark_px),
+                        "rescue_count": rescue_count,
+                        "rescue_indicators": rescue_indicators,
+                    }
+                    _set_order_raw_response(order, raw)
+                    db.add(order)
+                    _mark_tp_plan_entry_skipped(position, order.order_type, mark_px)
+                    db.add(position)
+                    db.add(
+                        DecisionLog(
+                            event_type="live_protection_order_tp_already_passed",
+                            market_id=position.market_id,
+                            position_id=position.id,
+                            message=(
+                                f"Protection order {order.order_type} resubmit blocked: "
+                                f"mark price {mark_px} has already breached target {order.price} "
+                                "(rescue unavailable)"
+                            ),
+                            data={
+                                "coin": coin,
+                                "order_id": order.id,
+                                "order_type": order.order_type,
+                                "target_price": str(order.price),
+                                "mark_price": str(mark_px),
+                                "side": position.side,
+                                "rescue_count": rescue_count,
+                                "rescue_indicators": rescue_indicators,
+                            },
+                        )
+                    )
+                    logger.warning(
+                        "live_protection_order_tp_already_passed",
+                        position_id=position.id,
+                        order_id=order.id,
+                        order_type=order.order_type,
+                        target_price=str(order.price),
+                        mark_price=str(mark_px),
+                        coin=coin,
+                    )
+                    continue
+
+        # Ricalcolo i counter DOPO il potenziale rescue, perché il rescue resetta
+        # `resubmits` quando avviene.
+        hard_failures = sum(
+            1 for r in resubmits
+            if r.get("status") not in ("ok", "error", "skipped_liquidation_guard")
+        )
+        soft_failures = sum(1 for r in resubmits if r.get("status") == "error")
+        if not force_repair and hard_failures >= _MAX_RESUBMIT_HARD_FAILURES:
+            continue
+        if not force_repair and soft_failures >= _MAX_RESUBMIT_SOFT_FAILURES:
+            continue
+
         if not force_repair and len(resubmits) >= _MAX_RESUBMIT_TOTAL_ATTEMPTS:
             raw["resubmit_blocked"] = {
                 "reason": "max_total_attempts",
@@ -1152,49 +1326,6 @@ def _resubmit_missing_protection_orders(
                 trigger_price=str(order.price),
             )
             continue
-
-        if order.order_type in ("tp1", "tp2", "tp3") and isinstance(remote_position, dict):
-            mark_px = _decimal(remote_position.get("markPx"))
-            if mark_px is not None and _tp_target_already_breached(position, mark_px, order.price):
-                raw["resubmit_blocked"] = {
-                    "reason": "tp_price_already_breached",
-                    "blocked_at": now.isoformat(),
-                    "target_price": str(order.price),
-                    "mark_price": str(mark_px),
-                }
-                _set_order_raw_response(order, raw)
-                db.add(order)
-                _mark_tp_plan_entry_skipped(position, order.order_type, mark_px)
-                db.add(position)
-                db.add(
-                    DecisionLog(
-                        event_type="live_protection_order_tp_already_passed",
-                        market_id=position.market_id,
-                        position_id=position.id,
-                        message=(
-                            f"Protection order {order.order_type} resubmit blocked: "
-                            f"mark price {mark_px} has already breached target {order.price}"
-                        ),
-                        data={
-                            "coin": coin,
-                            "order_id": order.id,
-                            "order_type": order.order_type,
-                            "target_price": str(order.price),
-                            "mark_price": str(mark_px),
-                            "side": position.side,
-                        },
-                    )
-                )
-                logger.warning(
-                    "live_protection_order_tp_already_passed",
-                    position_id=position.id,
-                    order_id=order.id,
-                    order_type=order.order_type,
-                    target_price=str(order.price),
-                    mark_price=str(mark_px),
-                    coin=coin,
-                )
-                continue
 
         # Compute the correct submission size:
         # - TP: remote_size * allocation (keeps the sum of all TPs = position size)
@@ -1591,6 +1722,179 @@ def _mark_tp_plan_entry_skipped(
     position.metadata_json = metadata
 
 
+def _tp_plan_entry(position: Position, order_type: str) -> dict | None:
+    plan = (position.metadata_json or {}).get("take_profit_plan") or []
+    for entry in plan:
+        if isinstance(entry, dict) and entry.get("level") == order_type:
+            return entry
+    return None
+
+
+def _position_timeframe(db: Session, position: Position) -> str | None:
+    metadata = position.metadata_json or {}
+    source_tf = metadata.get("source_timeframe")
+    if isinstance(source_tf, str) and source_tf:
+        return source_tf
+    signal_id = _source_signal_id(position)
+    if signal_id is None:
+        return None
+    signal = db.get(Signal, signal_id)
+    return signal.timeframe if signal is not None else None
+
+
+def _compute_position_atr(db: Session, position: Position) -> Decimal | None:
+    """Calcola l'ATR(14) sui candle chiusi del timeframe della posizione."""
+    timeframe = _position_timeframe(db, position)
+    if not timeframe or position.market_id is None:
+        return None
+    needed = _TP_RESCUE_ATR_PERIOD + 1
+    candles = (
+        db.query(Candle)
+        .filter(Candle.market_id == position.market_id, Candle.timeframe == timeframe)
+        .order_by(Candle.open_time.desc())
+        .limit(needed * 4)
+        .all()
+    )
+    if len(candles) < needed:
+        return None
+    candles = list(reversed(candles))
+    highs = [float(row.high) for row in candles]
+    lows = [float(row.low) for row in candles]
+    closes = [float(row.close) for row in candles]
+    try:
+        atr_value = atr(highs, lows, closes, _TP_RESCUE_ATR_PERIOD)[-1]
+    except Exception:  # pragma: no cover - difensivo
+        return None
+    if atr_value is None or atr_value <= 0:
+        return None
+    return Decimal(str(atr_value))
+
+
+def _tp_rescue_count(position: Position, order_type: str) -> int:
+    entry = _tp_plan_entry(position, order_type)
+    if entry is None:
+        return 0
+    try:
+        return int(entry.get("rescue_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _next_tp_price_in_plan(position: Position, order_type: str) -> Decimal | None:
+    """Restituisce il prezzo del TP successivo nel plan (utile per evitare di
+    sovrapporre il rescue al TP successivo)."""
+    order_sequence = ["tp1", "tp2", "tp3"]
+    try:
+        idx = order_sequence.index(order_type)
+    except ValueError:
+        return None
+    for next_type in order_sequence[idx + 1 :]:
+        entry = _tp_plan_entry(position, next_type)
+        if entry is None or entry.get("runner"):
+            continue
+        if bool(entry.get("filled")) or bool(entry.get("skipped")):
+            continue
+        price = _decimal(entry.get("price"))
+        if price is not None and price > 0:
+            return price
+    return None
+
+
+def _compute_rescued_tp_price(
+    db: Session,
+    position: Position,
+    order_type: str,
+    mark_price: Decimal,
+    original_target: Decimal,
+) -> tuple[Decimal | None, dict]:
+    """Calcola un nuovo target TP oltre il mark price corrente.
+
+    Strategia: distanza = max(k*ATR, pct_floor*mark). Long → mark + dist; short → mark - dist.
+    Vincoli: rispetta lo stop loss e il TP successivo nel plan.
+
+    Ritorna (nuovo_prezzo | None, indicators). None se non è possibile/sensato
+    fare rescue (es. ATR e fallback violano lo stop o il TP successivo).
+    """
+    indicators: dict = {
+        "mark_price": str(mark_price),
+        "original_target": str(original_target),
+    }
+    side = position.side.lower()
+    atr_dec = _compute_position_atr(db, position)
+    if atr_dec is not None:
+        buffer = atr_dec * _TP_RESCUE_ATR_MULTIPLIER
+        indicators["atr"] = str(atr_dec)
+        indicators["buffer_source"] = "atr"
+    else:
+        buffer = mark_price * _TP_RESCUE_PCT_FALLBACK
+        indicators["buffer_source"] = "pct_fallback"
+    floor = mark_price * _TP_RESCUE_MIN_BUFFER_PCT
+    if buffer < floor:
+        buffer = floor
+        indicators["buffer_floor_applied"] = True
+    indicators["buffer"] = str(buffer)
+
+    if side == "long":
+        new_price = mark_price + buffer
+    else:
+        new_price = mark_price - buffer
+
+    if new_price <= 0:
+        indicators["reject_reason"] = "non_positive_price"
+        return None, indicators
+
+    stop = position.stop_loss
+    if stop is not None:
+        if side == "long" and new_price <= stop:
+            indicators["reject_reason"] = "below_stop_loss"
+            return None, indicators
+        if side == "short" and new_price >= stop:
+            indicators["reject_reason"] = "above_stop_loss"
+            return None, indicators
+
+    next_tp = _next_tp_price_in_plan(position, order_type)
+    if next_tp is not None:
+        if side == "long" and new_price >= next_tp:
+            indicators["reject_reason"] = "would_overlap_next_tp"
+            indicators["next_tp"] = str(next_tp)
+            return None, indicators
+        if side == "short" and new_price <= next_tp:
+            indicators["reject_reason"] = "would_overlap_next_tp"
+            indicators["next_tp"] = str(next_tp)
+            return None, indicators
+
+    indicators["new_price"] = str(new_price)
+    return new_price, indicators
+
+
+def _apply_tp_rescue(
+    position: Position,
+    order_type: str,
+    new_price: Decimal,
+    mark_price: Decimal,
+    original_price: Decimal,
+) -> None:
+    """Aggiorna il take_profit_plan con il nuovo target di rescue."""
+    metadata = dict(position.metadata_json or {})
+    plan = metadata.get("take_profit_plan")
+    if isinstance(plan, list):
+        for entry in plan:
+            if isinstance(entry, dict) and entry.get("level") == order_type:
+                if entry.get("original_price") is None:
+                    entry["original_price"] = str(original_price)
+                entry["price"] = str(new_price)
+                try:
+                    rescue_count = int(entry.get("rescue_count") or 0)
+                except (TypeError, ValueError):
+                    rescue_count = 0
+                entry["rescue_count"] = rescue_count + 1
+                entry["last_rescue_mark_price"] = str(mark_price)
+                entry["last_rescue_at"] = datetime.now(timezone.utc).isoformat()
+                entry["rescued"] = True
+                break
+    position.metadata_json = metadata
+
+
 def _infer_missing_tp_fills_from_open_position(
     position: Position,
     remote_position: dict,
@@ -1680,6 +1984,18 @@ def reconcile_live_positions(
         return 0
     trading = trading_client or HyperliquidTradingClient(settings)
     remote_positions = _position_map(trading.user_state(settings.hyperliquid_account_address))
+    # HL non sempre include markPx nei payload di user_state. Quando manca usiamo
+    # allMids come fallback: serve per il TP rescue (check "mark > target") che
+    # altrimenti non scatterebbe mai e per `last_mark_price` nel metadata.
+    if any(not item.get("markPx") for item in remote_positions.values()):
+        try:
+            mids = trading.all_mids()
+        except Exception as exc:
+            logger.warning("live_reconciliation_all_mids_failed", error=str(exc))
+            mids = {}
+        for coin_key, item in remote_positions.items():
+            if not item.get("markPx") and coin_key in mids:
+                item["markPx"] = mids[coin_key]
     try:
         raw_fills = trading.user_fills(settings.hyperliquid_account_address)
     except Exception as exc:

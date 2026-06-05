@@ -155,6 +155,28 @@ def compute_edge_adjustments(
         rows,
         lambda row: row.signal.timeframe if row.signal else None,
     )
+    strategy_direction_groups: dict[str, list[Position]] = {}
+    for row in rows:
+        if row.signal is None or not isinstance(row.signal.strategy_breakdown, dict):
+            continue
+        for strategy_name, payload in row.signal.strategy_breakdown.items():
+            if strategy_name.startswith("_") or not isinstance(payload, dict):
+                continue
+            family = direction_family(payload.get("direction"))
+            if family is None:
+                continue
+            try:
+                contribution = float(payload.get("contribution", 0.0))
+            except (TypeError, ValueError):
+                contribution = 0.0
+            if contribution <= 0:
+                continue
+            key = f"{row.signal.timeframe}:{family}:{strategy_name}"
+            strategy_direction_groups.setdefault(key, []).append(row.position)
+    strategy_direction_stats = {
+        key: serialize_stats(analyzer.summarize_positions(group_positions))
+        for key, group_positions in strategy_direction_groups.items()
+    }
 
     directional = {
         key: {
@@ -225,6 +247,41 @@ def compute_edge_adjustments(
         }
         for key, stats in by_timeframe.items()
     }
+    directional_min_score_adjustments = {
+        key: {
+            "adjustment": 35 if stats.get("profit_factor") is not None and float(stats["profit_factor"]) < 0.25 else 20,
+            "stats": stats,
+            "reason": "weak directional edge; additional score threshold",
+        }
+        for key, stats in by_direction_tf.items()
+        if key.startswith("LONG:")
+        and int(stats.get("trades", 0)) >= 20
+        and float(stats.get("realized_pnl", 0.0)) < 0
+        and stats.get("profit_factor") is not None
+        and float(stats["profit_factor"]) < 0.5
+    }
+    directional_blocklist = {
+        key: {
+            "stats": stats,
+            "reason": "severe LONG underperformance",
+        }
+        for key, stats in by_direction_tf.items()
+        if key.startswith("LONG:")
+        and int(stats.get("trades", 0)) >= 30
+        and float(stats.get("realized_pnl", 0.0)) < 0
+        and stats.get("profit_factor") is not None
+        and float(stats["profit_factor"]) < 0.35
+        and float(stats.get("win_rate", 0.0)) < 0.3
+    }
+    direction_strategy_weight_overrides = {
+        key: 1
+        for key, stats in strategy_direction_stats.items()
+        if ":LONG:" in key
+        and int(stats.get("trades", 0)) >= 10
+        and float(stats.get("realized_pnl", 0.0)) < 0
+        and stats.get("profit_factor") is not None
+        and float(stats["profit_factor"]) < 0.5
+    }
 
     return {
         "directional_score_adjustments": {
@@ -247,6 +304,9 @@ def compute_edge_adjustments(
             for key, value in timeframes.items()
             if _safe_int(value.get("adjustment")) > 0
         },
+        "directional_min_score_adjustments": directional_min_score_adjustments,
+        "directional_blocklist": directional_blocklist,
+        "direction_strategy_weight_overrides": direction_strategy_weight_overrides,
     }
 
 
@@ -288,6 +348,10 @@ def signal_threshold_adjustment(
         ),
         "market": _adjustment_value(risk.get("market_score_adjustments"), str(market_id)),
         "timeframe": _adjustment_value(risk.get("timeframe_score_adjustments"), timeframe),
+        "directional_min_score": _adjustment_value(
+            risk.get("directional_min_score_adjustments"),
+            f"{family}:{timeframe}",
+        ),
     }
     raw_total = sum(components.values())
     return {
@@ -320,6 +384,15 @@ def build_outcome_profile(db: Session, *, lookback: int = 500) -> dict[str, Any]
         .all()
     )
     rows = linked_position_signals(db, positions)
+    by_direction_summary = _summarize_groups(
+        analyzer,
+        rows,
+        lambda row: direction_family(row.signal.direction) if row.signal else None,
+    )
+
+    def recent_cohort(size: int) -> dict[str, Any]:
+        sample = positions[: min(size, len(positions))]
+        return serialize_stats(analyzer.summarize_positions(sample))
 
     def market_key(row: PositionSignal) -> str | None:
         market = row.position.market
@@ -331,11 +404,7 @@ def build_outcome_profile(db: Session, *, lookback: int = 500) -> dict[str, Any]
         "filters": {"lookback": lookback},
         "overall": serialize_stats(analyzer.summarize_positions(positions)),
         "by_mode": _summarize_groups(analyzer, rows, lambda row: row.position.mode),
-        "by_direction": _summarize_groups(
-            analyzer,
-            rows,
-            lambda row: direction_family(row.signal.direction) if row.signal else None,
-        ),
+        "by_direction": by_direction_summary,
         "by_timeframe": _summarize_groups(
             analyzer,
             rows,
@@ -365,6 +434,18 @@ def build_outcome_profile(db: Session, *, lookback: int = 500) -> dict[str, Any]
             rows,
             lambda row: _tp_state(row.position),
         ),
+        "recent_cohorts": {
+            "last_50": recent_cohort(50),
+            "last_100": recent_cohort(100),
+        },
+        "long_drag": {
+            "long": by_direction_summary.get("LONG"),
+            "short": by_direction_summary.get("SHORT"),
+            "pnl_delta_long_minus_short": (
+                float(by_direction_summary.get("LONG", {}).get("realized_pnl", 0.0))
+                - float(by_direction_summary.get("SHORT", {}).get("realized_pnl", 0.0))
+            ),
+        },
     }
 
 

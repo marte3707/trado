@@ -578,13 +578,34 @@ class SignalEngine:
         # performance adjustment e del regime filter). Serve per esporre la pipeline
         # completa nel breakdown del segnale.
         calibrated_weights: dict[str, int] = {}
+        raw_direction_strategy_overrides = risk_value.get("direction_strategy_weight_overrides")
+        direction_strategy_overrides: dict[str, Any] = (
+            raw_direction_strategy_overrides
+            if isinstance(raw_direction_strategy_overrides, dict)
+            else {}
+        )
         for config in configs:
             strategy = self.registry.get(config.strategy_name)
             if strategy is None:
                 continue
-            results.append(strategy.evaluate(context, config.params))
-            weights[config.strategy_name] = config.weight
-            calibrated_weights[config.strategy_name] = config.weight
+            result = strategy.evaluate(context, config.params)
+            results.append(result)
+            weight = config.weight
+            direction_key = (
+                "LONG"
+                if result.direction in {Direction.LONG, Direction.STRONG_LONG}
+                else "SHORT"
+                if result.direction in {Direction.SHORT, Direction.STRONG_SHORT}
+                else None
+            )
+            override_key = f"{timeframe}:{direction_key}:{config.strategy_name}" if direction_key else None
+            if override_key and override_key in direction_strategy_overrides:
+                try:
+                    weight = max(0, int(direction_strategy_overrides[override_key]))
+                except (TypeError, ValueError):
+                    weight = config.weight
+            weights[config.strategy_name] = weight
+            calibrated_weights[config.strategy_name] = weight
         disabled_sources = set(risk_value.get("disabled_signal_sources", []))
         fear_greed = self.market_data.latest_fear_greed()
         if "fear_greed" not in disabled_sources:
@@ -801,6 +822,51 @@ class SignalEngine:
             score=score.score,
         )
         effective_min_signal_score = min_signal_score + int(edge_adjustment["total"])
+        direction_family = edge_adjustment.get("direction")
+        directional_key = f"{direction_family}:{timeframe}" if direction_family else None
+        directional_blocklist = risk_value.get("directional_blocklist")
+        if (
+            bool(risk_value.get("directional_blocklist_enabled", True))
+            and directional_key
+            and isinstance(directional_blocklist, dict)
+            and directional_key in directional_blocklist
+        ):
+            score.breakdown["_directional_blocklist"] = {
+                "key": directional_key,
+                "payload": directional_blocklist.get(directional_key),
+                "effective_min_signal_score": effective_min_signal_score,
+            }
+            logger.debug(
+                "signal_skipped_directional_blocklist",
+                market=market.symbol,
+                timeframe=timeframe,
+                direction=score.direction.value,
+                score=score.score,
+                directional_key=directional_key,
+            )
+            self._record_skip("directional_blocklist")
+            db.commit()
+            return None
+        extra_directional_min_score = 0
+        directional_min_score_adjustments = risk_value.get("directional_min_score_adjustments")
+        if directional_key and isinstance(directional_min_score_adjustments, dict):
+            raw_extra = directional_min_score_adjustments.get(directional_key)
+            if isinstance(raw_extra, dict):
+                raw_extra = raw_extra.get("adjustment", 0)
+            try:
+                extra_directional_min_score = max(0, int(raw_extra or 0))
+            except (TypeError, ValueError):
+                extra_directional_min_score = 0
+        if extra_directional_min_score > 0:
+            effective_min_signal_score += extra_directional_min_score
+            score.breakdown["_directional_min_score_adjustment"] = {
+                "key": directional_key,
+                "adjustment": extra_directional_min_score,
+                "payload": directional_min_score_adjustments.get(directional_key)
+                if isinstance(directional_min_score_adjustments, dict) and directional_key
+                else None,
+                "effective_min_signal_score": effective_min_signal_score,
+            }
         # Penalità direzione applicata dopo il cap max_combined_score_adjustment.
         # Permette di alzare ulteriormente la soglia per LONG/STRONG_LONG senza
         # interferire con la logica di calibrazione automatica.
@@ -813,9 +879,7 @@ class SignalEngine:
                     "effective_min_signal_score": effective_min_signal_score,
                 }
         if int(edge_adjustment["total"]) > 0:
-            direction_family = edge_adjustment.get("direction")
             score_bucket = edge_adjustment.get("score_bucket")
-            directional_key = f"{direction_family}:{timeframe}"
             score_bucket_key = f"{direction_family}:{score_bucket}"
             components = edge_adjustment.get("components", {})
             score.breakdown["_edge_calibration"] = {

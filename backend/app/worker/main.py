@@ -1,9 +1,10 @@
 import asyncio
 import dataclasses
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import structlog
 from sqlalchemy.orm import Session
@@ -51,7 +52,10 @@ _LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS = 10800  # ogni 3 ore
 _UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS = 60
 _DATA_RETENTION_INTERVAL_SECONDS = 86400  # ogni 24h
 _ERROR_NOTIFY_COOLDOWN_SECONDS = 1800  # max 1 notifica errore ogni 30 min
+_DAILY_RECAP_HOUR_ROME = 10
+_ROME_TZ = ZoneInfo("Europe/Rome")
 _next_recap_at: float = 0.0
+_next_daily_recap_at: float = 0.0
 _next_diagnostic_at: float = 0.0
 _next_live_liquidation_guard_at: float = 0.0
 _next_unified_account_ratio_guard_at: float = 0.0
@@ -66,6 +70,19 @@ class _WorkerStats:
     candle_errors: int = 0
     cycle_failures: int = 0
     period_start: float = dataclasses.field(default_factory=time.time)
+
+
+def next_daily_recap_timestamp(now: datetime | None = None) -> float:
+    current = now.astimezone(_ROME_TZ) if now is not None else datetime.now(_ROME_TZ)
+    target = current.replace(
+        hour=_DAILY_RECAP_HOUR_ROME,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if current >= target:
+        target += timedelta(days=1)
+    return target.astimezone(timezone.utc).timestamp()
 
 
 def should_run_timeframe(timeframe: str, now_ms: int) -> bool:
@@ -573,6 +590,37 @@ _FILL_EVENT_TYPES = frozenset(
 )
 
 
+def _is_profitable_close(
+    position: "Position",
+    exit_price: Decimal | None,
+    pnl_usd: Decimal | None,
+) -> bool:
+    if pnl_usd is not None:
+        return pnl_usd > 0
+    if exit_price is None:
+        return False
+    side = position.side.lower()
+    if side == "long":
+        return exit_price > position.entry_price
+    if side == "short":
+        return exit_price < position.entry_price
+    return False
+
+
+def _display_live_close_reason(
+    position: "Position",
+    reason: str,
+    *,
+    exit_price: Decimal | None,
+    pnl_usd: Decimal | None,
+) -> str:
+    if reason.lower() != "stop_loss":
+        return reason
+    if _is_profitable_close(position, exit_price, pnl_usd):
+        return "trailing_stop"
+    return reason
+
+
 def _calc_close_card_extras(
     position: "Position",
     exit_price: Decimal | None,
@@ -673,11 +721,17 @@ async def _notify_live_position_closes(
                     Decimal(str(position.realized_pnl or 0)) if not is_partial else None
                 )
                 pnl_usd = step_pnl if is_partial else total_pnl
+                display_reason = _display_live_close_reason(
+                    position,
+                    order_type,
+                    exit_price=exit_price,
+                    pnl_usd=pnl_usd,
+                )
                 pnl_pct, duration = _calc_close_card_extras(position, exit_price, pnl_usd)
                 await notifier.send_live_position_closed(
                     symbol=market.symbol,
                     side=position.side,
-                    reason=order_type,
+                    reason=display_reason,
                     entry_price=position.entry_price,
                     exit_price=exit_price,
                     remaining_size=remaining_size,
@@ -705,11 +759,17 @@ async def _notify_live_position_closes(
                 total_pnl = Decimal(cum_str) if cum_str and not is_partial else None
                 reason = event.data.get("reason") or "manual"
                 pnl_usd = step_pnl if is_partial else total_pnl
+                display_reason = _display_live_close_reason(
+                    position,
+                    reason,
+                    exit_price=exit_price,
+                    pnl_usd=pnl_usd,
+                )
                 pnl_pct, duration = _calc_close_card_extras(position, exit_price, pnl_usd)
                 await notifier.send_live_position_closed(
                     symbol=market.symbol,
                     side=event.data.get("side") or position.side,
-                    reason=reason,
+                    reason=display_reason,
                     entry_price=position.entry_price,
                     exit_price=exit_price,
                     remaining_size=remaining_size if is_partial else None,
@@ -1042,8 +1102,9 @@ async def main() -> None:
     btc_protection = BtcMacroProtectionEngine(settings)
     _record_heartbeat("starting")
 
-    global _next_recap_at, _next_diagnostic_at, _next_live_liquidation_guard_at, _next_unified_account_ratio_guard_at, _next_data_retention_at, _last_error_notify_at
+    global _next_recap_at, _next_daily_recap_at, _next_diagnostic_at, _next_live_liquidation_guard_at, _next_unified_account_ratio_guard_at, _next_data_retention_at, _last_error_notify_at
     _next_recap_at = time.time() + _RECAP_INTERVAL_SECONDS
+    _next_daily_recap_at = next_daily_recap_timestamp()
     _next_diagnostic_at = time.time() + _DIAGNOSTIC_REPORT_INTERVAL_SECONDS
     _next_live_liquidation_guard_at = 0.0
     _next_unified_account_ratio_guard_at = 0.0
@@ -1111,6 +1172,24 @@ async def main() -> None:
             finally:
                 recap_db.close()
             stats = _WorkerStats()
+
+        if now >= _next_daily_recap_at:
+            _next_daily_recap_at = next_daily_recap_timestamp(
+                datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(seconds=1)
+            )
+            recap_db = SessionLocal()
+            try:
+                window_end = datetime.fromtimestamp(now, tz=timezone.utc)
+                window_start = window_end - timedelta(hours=24)
+                await notifier.send_daily_recap(
+                    recap_db,
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+            except Exception:
+                logger.exception("telegram_daily_recap_failed")
+            finally:
+                recap_db.close()
 
         if now >= _next_diagnostic_at:
             _next_diagnostic_at = now + _DIAGNOSTIC_REPORT_INTERVAL_SECONDS

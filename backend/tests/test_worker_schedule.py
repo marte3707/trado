@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from app.core.enums import OperationMode, SignalStatus
@@ -112,6 +113,23 @@ def test_active_timeframes_do_not_run_unknown_timeframes() -> None:
     assert worker.active_timeframes_for_tick(["2m"], 0) == []
 
 
+def test_next_daily_recap_timestamp_targets_10am_rome() -> None:
+    before = datetime(2026, 6, 5, 7, 30, tzinfo=timezone.utc)  # 09:30 Rome
+    after = datetime(2026, 6, 5, 8, 30, tzinfo=timezone.utc)   # 10:30 Rome
+
+    next_before = datetime.fromtimestamp(
+        worker.next_daily_recap_timestamp(before),
+        tz=timezone.utc,
+    )
+    next_after = datetime.fromtimestamp(
+        worker.next_daily_recap_timestamp(after),
+        tz=timezone.utc,
+    )
+
+    assert next_before == datetime(2026, 6, 5, 8, 0, tzinfo=timezone.utc)
+    assert next_after == datetime(2026, 6, 6, 8, 0, tzinfo=timezone.utc)
+
+
 def test_paper_management_timeframes_include_open_position_timeframes() -> None:
     positions = [
         Position(mode="paper", status="open", metadata_json={"source_timeframe": "30m"}),
@@ -138,6 +156,57 @@ def test_paper_management_timeframes_fall_back_to_signal_timeframe() -> None:
         FakeDb(positions=positions, signals=signals),
         ["5m"],
     ) == ["5m", "4h"]
+
+
+def test_display_live_close_reason_uses_trailing_stop_for_profitable_dynamic_stop() -> None:
+    position = Position(
+        side="long",
+        entry_price=Decimal("100"),
+        metadata_json={
+            "trailing_stop_enabled": True,
+            "last_stop_update_reason": "chandelier",
+        },
+    )
+
+    assert worker._display_live_close_reason(
+        position,
+        "stop_loss",
+        exit_price=Decimal("108"),
+        pnl_usd=Decimal("8"),
+    ) == "trailing_stop"
+
+
+def test_display_live_close_reason_keeps_stop_loss_without_profit() -> None:
+    position = Position(
+        side="long",
+        entry_price=Decimal("100"),
+        metadata_json={
+            "trailing_stop_enabled": True,
+            "last_stop_update_reason": "breakeven",
+        },
+    )
+
+    assert worker._display_live_close_reason(
+        position,
+        "stop_loss",
+        exit_price=Decimal("95"),
+        pnl_usd=Decimal("-5"),
+    ) == "stop_loss"
+
+
+def test_display_live_close_reason_uses_trailing_stop_for_profitable_close_without_metadata() -> None:
+    position = Position(
+        side="long",
+        entry_price=Decimal("100"),
+        metadata_json={},
+    )
+
+    assert worker._display_live_close_reason(
+        position,
+        "stop_loss",
+        exit_price=Decimal("108"),
+        pnl_usd=Decimal("8"),
+    ) == "trailing_stop"
 
 
 def test_auto_trade_executes_paper_before_live() -> None:
