@@ -10,11 +10,13 @@ import { SignalFunnelChart } from "@/components/calibration/SignalFunnelChart";
 import { RejectionReasonsList } from "@/components/calibration/RejectionReasonsList";
 import { fmt } from "@/components/atoms";
 import { cn } from "@/lib/utils";
-import { useOutcomeProfile, useEquitySlope } from "@/lib/hooks/queries";
+import { useOutcomeProfile, useEquitySlope, useExpectedRCalibration } from "@/lib/hooks/queries";
 import type {
   Calibration,
   CalibrationHistoryEntry,
   CalibrationStats,
+  ExpectedRBucket,
+  ExpectedRCalibration,
   OutcomeProfile,
   Signal,
   SignalRejections,
@@ -92,6 +94,7 @@ export function DiagnosticsTab({
   workerCycles,
 }: Props) {
   const { data: outcomeProfile } = useOutcomeProfile(500);
+  const { data: expectedRCalibration } = useExpectedRCalibration();
   const overall = calibration.overall;
   const winRate = overall?.win_rate ?? null;
   const profitFactor = overall?.profit_factor ?? null;
@@ -146,6 +149,8 @@ export function DiagnosticsTab({
       </div>
 
       <OutcomeProfilePanel profile={outcomeProfile} edgeChanges={edgeChanges} />
+
+      <ExpectedRCalibrationPanel data={expectedRCalibration} />
 
       <SkipReasonsPanel workerCycles={workerCycles} />
 
@@ -721,6 +726,154 @@ function Stat({
         {value ?? "—"}
       </div>
     </div>
+  );
+}
+
+const CONFIDENCE_TONE: Record<string, string> = {
+  high: "border-success/40 bg-success/10 text-success",
+  medium: "border-warn/40 bg-warn/10 text-warn",
+  low: "border-border bg-surface-1 text-fg-3",
+};
+
+const BUCKET_ORDER = ["50-59", "60-69", "70-79", "80+", "unknown"];
+
+function expectedRTone(value: number | null | undefined): "success" | "warn" | "danger" | "muted" {
+  if (value == null || !Number.isFinite(value)) return "muted";
+  if (value >= 0.2) return "success";
+  if (value >= 0) return "warn";
+  return "danger";
+}
+
+function ExpectedRCalibrationPanel({ data }: { data: ExpectedRCalibration | null | undefined }) {
+  const grouped = useMemo(() => {
+    const groups: Record<string, ExpectedRBucket[]> = {};
+    if (!data) return groups;
+    for (const bucket of Object.values(data.buckets)) {
+      const key = `${bucket.direction}:${bucket.timeframe}`;
+      groups[key] ??= [];
+      groups[key].push(bucket);
+    }
+    for (const list of Object.values(groups)) {
+      list.sort(
+        (a, b) =>
+          (BUCKET_ORDER.indexOf(a.score_bucket) + 999) % 999 -
+          ((BUCKET_ORDER.indexOf(b.score_bucket) + 999) % 999),
+      );
+    }
+    return groups;
+  }, [data]);
+
+  const groupKeys = Object.keys(grouped).sort();
+  const totalSamples = useMemo(
+    () =>
+      data
+        ? Object.values(data.buckets).reduce((sum, b) => sum + b.n_samples, 0)
+        : 0,
+    [data],
+  );
+
+  return (
+    <Card className="p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+            Expected R calibration
+          </div>
+          <div className="mt-0.5 text-xs text-fg-3">
+            Mappa empirica score → Expected R-multiple, con Bayesian shrinkage (prior{" "}
+            {data?.prior_strength ?? "—"}) su {data?.lookback_positions ?? "—"} posizioni paper.
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <Badge variant="outline" className="font-mono">
+            {totalSamples} sample
+          </Badge>
+          {data?.computed_at && (
+            <Badge variant="outline" className="font-mono text-[10px] border-border text-fg-3">
+              {fmt.relTime(data.computed_at)}
+            </Badge>
+          )}
+        </div>
+      </div>
+      {!data || groupKeys.length === 0 ? (
+        <div className="mt-5 text-xs text-fg-3">
+          Nessuna posizione paper disponibile per calibrare i bucket.
+        </div>
+      ) : (
+        <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {groupKeys.map((groupKey) => {
+            const buckets = grouped[groupKey];
+            const [direction, timeframe] = groupKey.split(":");
+            const isLong = direction === "LONG";
+            return (
+              <div key={groupKey} className="rounded-md border border-border p-3">
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={cn(
+                        "font-mono text-xs font-semibold",
+                        isLong ? "text-success" : "text-danger",
+                      )}
+                    >
+                      {direction}
+                    </span>
+                    <span className="font-mono text-[11px] text-fg-3">{timeframe}</span>
+                  </div>
+                  <span className="font-mono text-[10px] text-fg-3">
+                    {buckets.reduce((s, b) => s + b.n_samples, 0)} sample
+                  </span>
+                </div>
+                <div className="space-y-1.5">
+                  {buckets.map((bucket) => {
+                    const tone = expectedRTone(bucket.expected_r);
+                    return (
+                      <div
+                        key={bucket.key}
+                        className="grid grid-cols-[3.5rem_1fr_3rem_2.5rem] items-center gap-2"
+                      >
+                        <span className="font-mono text-[11px] text-fg-2">
+                          {bucket.score_bucket}
+                        </span>
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span
+                            className={cn(
+                              "font-mono text-[11px] tabular-nums",
+                              tone === "success" && "text-success",
+                              tone === "warn" && "text-warn",
+                              tone === "danger" && "text-danger",
+                              tone === "muted" && "text-fg-3",
+                            )}
+                          >
+                            {bucket.expected_r != null
+                              ? `${bucket.expected_r >= 0 ? "+" : ""}${bucket.expected_r.toFixed(2)}R`
+                              : "—"}
+                          </span>
+                          <span className="font-mono text-[10px] text-fg-3">
+                            WR {pct(bucket.shrunk_win_rate)}
+                          </span>
+                        </div>
+                        <span className="font-mono text-[10px] tabular-nums text-fg-3 text-right">
+                          n={bucket.n_samples}
+                        </span>
+                        <span
+                          className={cn(
+                            "rounded border px-1.5 py-0.5 text-center font-mono text-[9px] uppercase",
+                            CONFIDENCE_TONE[bucket.confidence] ?? "border-border text-fg-3",
+                          )}
+                          title={`Confidence: ${bucket.confidence} (min ${data.min_samples_for_use} sample)`}
+                        >
+                          {bucket.confidence}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Card>
   );
 }
 

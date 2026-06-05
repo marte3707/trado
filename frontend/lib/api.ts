@@ -325,6 +325,10 @@ export type Signal = {
   strategy_breakdown: Record<string, unknown>;
   status: string;
   created_at: string;
+  calibrated_expected_r?: number | null;
+  calibrated_win_rate?: number | null;
+  calibration_n_samples?: number | null;
+  calibration_confidence?: "low" | "medium" | "high" | null;
 };
 
 export type IndicatorSnapshot = {
@@ -759,6 +763,30 @@ export type ScoreCalibration = {
   correlation: number | null;
   total_trades: number;
   by_week: ScoreCalibrationPeriod[];
+};
+
+export type ExpectedRBucket = {
+  key: string;
+  direction: "LONG" | "SHORT";
+  timeframe: string;
+  score_bucket: string;
+  n_samples: number;
+  wins: number;
+  raw_win_rate: number | null;
+  shrunk_win_rate: number | null;
+  mean_r_win: number | null;
+  mean_r_loss: number | null;
+  expected_r: number | null;
+  confidence: "low" | "medium" | "high";
+};
+
+export type ExpectedRCalibration = {
+  buckets: Record<string, ExpectedRBucket>;
+  computed_at: string;
+  lookback_positions: number;
+  excluded_count: number;
+  prior_strength: number;
+  min_samples_for_use: number;
 };
 
 export type BotFunnelUser = {

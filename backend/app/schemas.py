@@ -59,6 +59,10 @@ class SignalOut(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+    calibrated_expected_r: float | None = None
+    calibrated_win_rate: float | None = None
+    calibration_n_samples: int | None = None
+    calibration_confidence: str | None = None
 
 
 class SettingsPatch(BaseModel):

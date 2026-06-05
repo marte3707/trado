@@ -45,6 +45,12 @@ from app.engine.diagnostics import build_diagnostics_report, build_equity_slope_
 from app.engine.edge_profile import build_outcome_profile
 from app.engine.execution import OrderExecutionEngine
 from app.engine.performance import SignalPerformanceAnalyzer, serialize_stats
+from app.engine.score_calibration import (
+    DEFAULT_LOOKBACK as CALIBRATION_DEFAULT_LOOKBACK,
+    build_calibration_table_from_db,
+    cached_calibration_table,
+    serialize_table,
+)
 from app.schemas import CandleOut, IndicatorOut, MarketOut, PushSubscribePayload, PushUnsubscribePayload, SettingsPatch, SignalOut, StrategyPatch
 from app.services.candle_sync import TIMEFRAME_MS
 from app.services.coinmarketcap import CoinMarketCapClient
@@ -768,6 +774,32 @@ def indicators(
     ]
 
 
+def _enrich_signal_with_calibration(signal: Signal, db: Session) -> SignalOut:
+    """Costruisce SignalOut con i campi di calibrazione popolati via lookup nella
+    cached calibration table. Tolerante: in caso di errore (es. DB transitorio)
+    ritorna il segnale senza calibrazione invece di sollevare."""
+    payload = SignalOut.model_validate(signal)
+    try:
+        table = cached_calibration_table(db)
+        metrics = table.lookup(
+            direction=signal.direction,
+            timeframe=signal.timeframe,
+            score=signal.score,
+        )
+    except Exception:  # pragma: no cover — tolerante a transient DB errors
+        return payload
+    if metrics is None:
+        return payload
+    return payload.model_copy(
+        update={
+            "calibrated_expected_r": metrics.expected_r,
+            "calibrated_win_rate": metrics.shrunk_win_rate,
+            "calibration_n_samples": metrics.n_samples,
+            "calibration_confidence": metrics.confidence,
+        }
+    )
+
+
 @router.get("/signals", response_model=list[SignalOut])
 def signals(
     status: str | None = None,
@@ -775,7 +807,7 @@ def signals(
     direction: str | None = None,
     timeframe: str | None = None,
     db: Session = Depends(get_db),
-) -> list[Signal]:
+) -> list[SignalOut]:
     query = db.query(Signal).options(joinedload(Signal.market)).order_by(Signal.created_at.desc())
     if status:
         query = query.filter(Signal.status == status)
@@ -785,15 +817,16 @@ def signals(
         query = query.filter(Signal.direction == direction)
     if timeframe:
         query = query.filter(Signal.timeframe == timeframe)
-    return query.limit(250).all()
+    rows = query.limit(250).all()
+    return [_enrich_signal_with_calibration(signal, db) for signal in rows]
 
 
 @router.get("/signals/{signal_id}", response_model=SignalOut)
-def signal_detail(signal_id: int, db: Session = Depends(get_db)) -> Signal:
+def signal_detail(signal_id: int, db: Session = Depends(get_db)) -> SignalOut:
     signal = db.query(Signal).options(joinedload(Signal.market)).filter(Signal.id == signal_id).first()
     if signal is None:
         raise HTTPException(status_code=404, detail="Signal not found")
-    return signal
+    return _enrich_signal_with_calibration(signal, db)
 
 
 @router.post("/signals/{signal_id}/ignore")
@@ -1195,6 +1228,26 @@ def analytics_outcome_profile(
     db: Session = Depends(get_db),
 ) -> dict:
     return build_outcome_profile(db, lookback=lookback)
+
+
+@router.get("/analytics/expected-r-calibration")
+def analytics_expected_r_calibration(
+    lookback: int = Query(CALIBRATION_DEFAULT_LOOKBACK, ge=50, le=2000),
+    enforce_monotonic: bool = Query(False),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Calibrazione empirica score → Expected R-multiple per (direction, timeframe, score_bucket).
+
+    Distinto dall'endpoint legacy `/analytics/score-calibration` (binning PnL grezzo
+    senza shrinkage). Questo applica Bayesian shrinkage e usa R-multiple normalizzato
+    per rischio iniziale invece di PnL assoluto.
+    """
+    table = build_calibration_table_from_db(
+        db,
+        lookback=lookback,
+        enforce_monotonic=enforce_monotonic,
+    )
+    return serialize_table(table)
 
 
 @router.get("/analytics/score-calibration")

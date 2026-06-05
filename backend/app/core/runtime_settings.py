@@ -145,6 +145,28 @@ def effective_alert_min_score(db: Session, settings: Settings) -> int:
         return settings.min_signal_score
 
 
+MIN_SIGNAL_EXPECTED_R_BOUNDS = (-0.5, 1.0)
+
+
+def effective_min_signal_expected_r(db: Session) -> float | None:
+    """Soglia minima di Expected R-multiple calibrato per gate del signal engine.
+
+    Letta da `AppSetting("risk").value["min_signal_expected_r"]`. `None` = gate disabilitato.
+    Valori fuori da [-0.5, 1.0] vengono ignorati (gate disabilitato) per evitare freeze totale.
+    """
+    raw = setting_value(db, "risk").get("min_signal_expected_r")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    low, high = MIN_SIGNAL_EXPECTED_R_BOUNDS
+    if value < low or value > high:
+        return None
+    return value
+
+
 def _deep_merge(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, default_value in defaults.items():

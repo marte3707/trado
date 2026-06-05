@@ -9,6 +9,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import get_settings
 from app.core.enums import Direction, SignalStatus
+from app.core.runtime_settings import effective_min_signal_expected_r
 from app.db.models import AppSetting, Candle, Indicator, Market, Signal, StrategyConfig
 from app.engine.auto_tuner import active_ab_overlay
 from app.engine.edge_profile import signal_threshold_adjustment
@@ -17,6 +18,7 @@ from app.engine.orderbook import OrderBookAnalysis, analyze_order_book, ob_imbal
 from app.engine.performance import SignalPerformanceAnalyzer
 from app.engine.regime import apply_regime_filter
 from app.engine.risk import RiskManager
+from app.engine.score_calibration import cached_calibration_table, serialize_metrics
 from app.engine.scoring import SignalScoringEngine
 from app.engine.volatility import evaluate_volatility
 from app.indicators.core import ema
@@ -932,6 +934,38 @@ class SignalEngine:
             self._record_skip(skip_reason)
             db.commit()
             return None
+        min_expected_r = effective_min_signal_expected_r(db)
+        if min_expected_r is not None:
+            calibration_table = cached_calibration_table(db)
+            calibrated = calibration_table.lookup(
+                direction=score.direction,
+                timeframe=timeframe,
+                score=score.score,
+            )
+            if calibrated is not None:
+                score.breakdown["_expected_r_calibration"] = {
+                    **serialize_metrics(calibrated),
+                    "min_required": min_expected_r,
+                    "computed_at": calibration_table.computed_at.isoformat(),
+                }
+                if (
+                    calibrated.confidence != "low"
+                    and calibrated.expected_r < min_expected_r
+                ):
+                    logger.debug(
+                        "signal_skipped_low_expected_r",
+                        market=market.symbol,
+                        timeframe=timeframe,
+                        direction=score.direction.value,
+                        score=score.score,
+                        expected_r=calibrated.expected_r,
+                        min_expected_r=min_expected_r,
+                        confidence=calibrated.confidence,
+                        n_samples=calibrated.n_samples,
+                    )
+                    self._record_skip("low_expected_r")
+                    db.commit()
+                    return None
         if (
             not bool(risk_value.get("allow_ob_imbalance_only_signals", False))
             and self._is_ob_imbalance_only_signal(score.breakdown, score.direction)

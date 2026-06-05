@@ -18,6 +18,7 @@ import {
   type DecisionLog,
   type DiagnosticReport,
   type EquitySlopeDiagnostics,
+  type ExpectedRCalibration,
   type Health,
   type Market,
   type MarketDashboardSnapshot,
@@ -270,6 +271,16 @@ export function useScoreCalibration(opts?: QueryOpts<ScoreCalibration | null>) {
     queryKey: qk.scoreCalibration,
     queryFn: () => apiGet<ScoreCalibration>("/api/analytics/score-calibration").catch(() => null),
     refetchInterval: 60_000,
+    ...opts,
+  });
+}
+
+export function useExpectedRCalibration(opts?: QueryOpts<ExpectedRCalibration | null>) {
+  return useQuery({
+    queryKey: qk.expectedRCalibration,
+    queryFn: () =>
+      apiGet<ExpectedRCalibration>("/api/analytics/expected-r-calibration").catch(() => null),
+    refetchInterval: 5 * 60_000,
     ...opts,
   });
 }
