@@ -344,3 +344,17 @@ Raccomandazioni 3.2 (non ancora implementate — decisioni di prodotto):
 limit/post-only non sono una priorità immediata; il margine maggiore viene dal ridurre il
 peso relativo delle fee (size più grandi o meno trade su mercati a basso edge). Resta una
 decisione di prodotto.
+
+### Fase 4 — 🔶 parziale (manutenibilità)
+
+**4.2 — ✅ implementata** (`PeriodicScheduler`). La logica di timing dei job ricorrenti del
+worker, prima in 7 variabili globali mutabili dentro `worker/main.py`, è ora incapsulata in
+`worker/scheduler.py` e coperta da test. Comportamento invariato (il lavoro dei job, inclusi
+i guardrail di sicurezza, resta byte-identico).
+
+**4.1 / 4.3 — ⏸️ rimandate (scelta di rischio).** Il refactor di `generate()` (4.1) e lo
+split di `api/routes.py` (4.3) toccano rispettivamente il cuore della generazione segnali e
+l'intera superficie API su un sistema **live**. Sono refactor a comportamento invariato ma
+voluminosi: il rischio di regressione su codice funzionante supera il beneficio immediato di
+sola leggibilità. Vanno affrontati in modo incrementale, un blocco per volta con verifica a
+ogni passo, quando ci sarà una ragione funzionale per toccarli.
