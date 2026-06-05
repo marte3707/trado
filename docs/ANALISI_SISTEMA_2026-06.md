@@ -300,14 +300,22 @@ Risultati sui **218 trade live chiusi** (dati reali di produzione):
 | **PnL netto stimato** | **≈ +31.70 USD** |
 
 Finding principali:
-- Le **fee non erano né tracciate né sottratte**: erodono ~19% del PnL lordo. Il
-  PnL netto resta positivo ma sottile (~0.145 USD/trade).
+- Le **fee in valore assoluto sono trascurabili**: ≈0.018 USD per lato (≈0.035 USD
+  round-trip), coerenti con quanto si osserva sul wallet Hyperliquid. Il totale di
+  7.66 USD è il loro accumulo sui 218 trade.
+- ⚠️ Attenzione alla metrica "fee / PnL lordo" (≈19%): è **fuorviante**. Non indica
+  fee alte, ma un **edge lordo sottile** — il PnL lordo medio è ~0.18 USD/trade, solo
+  ~5× la fee per trade. Su size minuscole le fee fisse percentuali pesano *in rapporto*
+  pur restando irrilevanti in assoluto.
+- Le **fee non erano tracciate né sottratte** dal PnL riportato: ora lo sono (sia il
+  tracciamento reale che il report). Il netto resta positivo: ~+31.70 USD.
 - Lo **slippage di entry** è già incorporato nel `closedPnl` (usa l'entry reale),
   quindi è una metrica *informativa*, non sottratta dal netto. In aggregato è stato
   lievemente **favorevole** (≈ −15 USD di "costo", cioè a beneficio): l'esecuzione
   market non sta penalizzando.
-- Il **notional medio è molto piccolo** (~39 USD contro un cap di 250): il sistema
-  opera in size ridotta.
+- Il vero tema non sono i costi ma il **notional ridotto** (~39 USD/trade contro un cap
+  di 250) e l'**edge lordo per trade sottile**: il margine di crescita sta nell'operare
+  size maggiori dove l'edge è robusto, non nel ridurre fee già trascurabili.
 
 **3.2 — Validazione del filtro di volatilità.** Analisi dei 115 trade paper con dato
 `atr_percentile_rank` registrato:
