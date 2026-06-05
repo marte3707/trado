@@ -4,7 +4,6 @@ import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import structlog
 from sqlalchemy.orm import Session
@@ -41,26 +40,15 @@ from app.services.unified_account_ratio import (
     decimal_or_none,
     free_spot_usdc_from_balances,
 )
+from app.worker.scheduler import PeriodicScheduler, next_daily_recap_timestamp
+
+# Re-export per retro-compatibilità: alcuni test referenziano
+# `app.worker.main.next_daily_recap_timestamp`.
+__all__ = ["next_daily_recap_timestamp"]
 
 logger = structlog.get_logger()
 _LAST_TIMEFRAME_RUN_MS: dict[str, int] = {}
 _TICK_LOCK = asyncio.Lock()
-
-_RECAP_INTERVAL_SECONDS = 10800  # ogni 3 ore
-_DIAGNOSTIC_REPORT_INTERVAL_SECONDS = 86400  # ogni 24h
-_LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS = 10800  # ogni 3 ore
-_UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS = 60
-_DATA_RETENTION_INTERVAL_SECONDS = 86400  # ogni 24h
-_ERROR_NOTIFY_COOLDOWN_SECONDS = 1800  # max 1 notifica errore ogni 30 min
-_DAILY_RECAP_HOUR_ROME = 10
-_ROME_TZ = ZoneInfo("Europe/Rome")
-_next_recap_at: float = 0.0
-_next_daily_recap_at: float = 0.0
-_next_diagnostic_at: float = 0.0
-_next_live_liquidation_guard_at: float = 0.0
-_next_unified_account_ratio_guard_at: float = 0.0
-_next_data_retention_at: float = 0.0
-_last_error_notify_at: float = 0.0
 
 
 @dataclasses.dataclass
@@ -70,19 +58,6 @@ class _WorkerStats:
     candle_errors: int = 0
     cycle_failures: int = 0
     period_start: float = dataclasses.field(default_factory=time.time)
-
-
-def next_daily_recap_timestamp(now: datetime | None = None) -> float:
-    current = now.astimezone(_ROME_TZ) if now is not None else datetime.now(_ROME_TZ)
-    target = current.replace(
-        hour=_DAILY_RECAP_HOUR_ROME,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
-    if current >= target:
-        target += timedelta(days=1)
-    return target.astimezone(timezone.utc).timestamp()
 
 
 def should_run_timeframe(timeframe: str, now_ms: int) -> bool:
@@ -1119,14 +1094,7 @@ async def main() -> None:
     btc_protection = BtcMacroProtectionEngine(settings)
     _record_heartbeat("starting")
 
-    global _next_recap_at, _next_daily_recap_at, _next_diagnostic_at, _next_live_liquidation_guard_at, _next_unified_account_ratio_guard_at, _next_data_retention_at, _last_error_notify_at
-    _next_recap_at = time.time() + _RECAP_INTERVAL_SECONDS
-    _next_daily_recap_at = next_daily_recap_timestamp()
-    _next_diagnostic_at = time.time() + _DIAGNOSTIC_REPORT_INTERVAL_SECONDS
-    _next_live_liquidation_guard_at = 0.0
-    _next_unified_account_ratio_guard_at = 0.0
-    _next_data_retention_at = time.time() + _DATA_RETENTION_INTERVAL_SECONDS
-    _last_error_notify_at = 0.0
+    scheduler = PeriodicScheduler(time.time())
     stats = _WorkerStats()
 
     startup_db = SessionLocal()
@@ -1155,16 +1123,14 @@ async def main() -> None:
                     _record_worker_failure(exc)
                     stats.cycle_failures += 1
                     now = time.time()
-                    if now - _last_error_notify_at >= _ERROR_NOTIFY_COOLDOWN_SECONDS:
-                        _last_error_notify_at = now
+                    if scheduler.due_error_notify(now):
                         try:
                             await notifier.send_worker_error("worker_cycle", exc)
                         except Exception:
                             logger.exception("telegram_error_notify_failed")
 
         now = time.time()
-        if now >= _next_recap_at:
-            _next_recap_at = now + _RECAP_INTERVAL_SECONDS
+        if scheduler.due_recap(now):
             period_min = round((now - stats.period_start) / 60)
             live_balance = None
             try:
@@ -1190,10 +1156,7 @@ async def main() -> None:
                 recap_db.close()
             stats = _WorkerStats()
 
-        if now >= _next_daily_recap_at:
-            _next_daily_recap_at = next_daily_recap_timestamp(
-                datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(seconds=1)
-            )
+        if scheduler.due_daily_recap(now):
             recap_db = SessionLocal()
             try:
                 window_end = datetime.fromtimestamp(now, tz=timezone.utc)
@@ -1208,8 +1171,7 @@ async def main() -> None:
             finally:
                 recap_db.close()
 
-        if now >= _next_diagnostic_at:
-            _next_diagnostic_at = now + _DIAGNOSTIC_REPORT_INTERVAL_SECONDS
+        if scheduler.due_diagnostic(now):
             diag_db = SessionLocal()
             try:
                 await DiagnosticReporter().send(diag_db, notifier)
@@ -1218,8 +1180,7 @@ async def main() -> None:
             finally:
                 diag_db.close()
 
-        if now >= _next_data_retention_at:
-            _next_data_retention_at = now + _DATA_RETENTION_INTERVAL_SECONDS
+        if scheduler.due_data_retention(now):
             retention_db = SessionLocal()
             try:
                 result = await asyncio.to_thread(prune_old_data, retention_db)
@@ -1230,8 +1191,7 @@ async def main() -> None:
             finally:
                 retention_db.close()
 
-        if now >= _next_live_liquidation_guard_at:
-            _next_live_liquidation_guard_at = now + _LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS
+        if scheduler.due_live_liquidation_guard(now):
             liq_db = SessionLocal()
             try:
                 result = await asyncio.to_thread(
@@ -1245,8 +1205,7 @@ async def main() -> None:
             finally:
                 liq_db.close()
 
-        if now >= _next_unified_account_ratio_guard_at:
-            _next_unified_account_ratio_guard_at = now + _UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS
+        if scheduler.due_unified_account_ratio_guard(now):
             uar_db = SessionLocal()
             try:
                 result = await asyncio.to_thread(
