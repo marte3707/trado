@@ -54,6 +54,10 @@ class Settings(BaseSettings):
     # TTL of the signed order request submitted to Hyperliquid. If the order
     # is not picked up within this window the exchange rejects it.
     live_order_expires_after_seconds: int = 30
+    # Taker fee rate di Hyperliquid (frazione del notional, per lato). Usato dal
+    # report costo-per-trade per stimare le fee quando il dato reale del fill non
+    # è registrato su Order.fee. Default 0.045% (tier base perp Hyperliquid).
+    live_taker_fee_rate: float = 0.00045
 
     coinmarketcap_api_key: str | None = None
     coinmarketcap_enabled: bool = True

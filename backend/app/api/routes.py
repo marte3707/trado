@@ -58,6 +58,7 @@ from app.services.hyperliquid import HyperliquidClient, HyperliquidError, Hyperl
 from app.services.market_dashboard import MarketDashboardService
 from app.services.market_sync import MarketSyncService
 from app.services.position_pnl import calculate_unrealized_pnl as _calculate_unrealized_pnl
+from app.services.trade_cost import aggregate_live_costs, serialize_live_cost_report
 from app.services.trade_metrics import build_trade_metrics
 from app.services.unified_account_ratio import (
     DEFAULT_UAR_RISK_SETTINGS,
@@ -1228,6 +1229,19 @@ def analytics_outcome_profile(
     db: Session = Depends(get_db),
 ) -> dict:
     return build_outcome_profile(db, lookback=lookback)
+
+
+@router.get("/analytics/live-trade-costs")
+def analytics_live_trade_costs(
+    lookback: int = Query(500, ge=1, le=2000),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Scompone il PnL live (lordo da closedPnl) in fee, funding e slippage per
+    esporre il PnL netto reale dei trade live chiusi."""
+    report = aggregate_live_costs(
+        db, taker_fee_rate=get_settings().live_taker_fee_rate, limit=lookback
+    )
+    return serialize_live_cost_report(report)
 
 
 @router.get("/analytics/expected-r-calibration")

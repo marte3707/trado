@@ -268,3 +268,71 @@ rapporto impatto/rischio, non cambiano la logica di trading e sbloccano la scala
 sistema all'aumentare dei mercati. La **Fase 3.1** (misura dei costi live) è la più
 importante sul piano economico ed è puramente additiva (strumentazione), quindi può
 procedere in parallelo senza rischi.
+
+---
+
+## 8. Stato di implementazione e risultati (aggiornamento)
+
+### Fase 1 — ✅ implementata (commit `8352d24`)
+Cache per-cycle degli aggregati di performance + parallelizzazione dei fetch candele
+(`prefetch` con `Semaphore`) + rimozione degli sleep per-iterazione.
+
+### Fase 2 — ✅ implementata (commit `ed3a992`)
+`_persist_indicators` spostato a valle di tutti i filtri (scrittura solo per segnali
+emessi); riparati gli errori preesistenti di mypy/ruff in `live_reconciliation.py`
+(backend ora pulito su 72 file).
+
+### Fase 3 — ✅ implementata (strumentazione costi)
+
+**3.1 — Report costo-per-trade live.** Aggiunti: setting `live_taker_fee_rate`
+(default 0.045%), tracciamento della **fee reale** dei fill nella reconciliation
+(`Order.fee`, finora ignorata), modulo `services/trade_cost.py` e endpoint
+`GET /analytics/live-trade-costs`.
+
+Risultati sui **218 trade live chiusi** (dati reali di produzione):
+
+| Voce | Valore |
+|------|-------:|
+| PnL lordo (da `closedPnl`) | +39.35 USD |
+| Notional totale | 8 512 USD (≈39 USD/trade) |
+| Fee stimate (0.045% × 2 lati) | −7.66 USD |
+| Funding | ≈0 USD |
+| **PnL netto stimato** | **≈ +31.70 USD** |
+
+Finding principali:
+- Le **fee non erano né tracciate né sottratte**: erodono ~19% del PnL lordo. Il
+  PnL netto resta positivo ma sottile (~0.145 USD/trade).
+- Lo **slippage di entry** è già incorporato nel `closedPnl` (usa l'entry reale),
+  quindi è una metrica *informativa*, non sottratta dal netto. In aggregato è stato
+  lievemente **favorevole** (≈ −15 USD di "costo", cioè a beneficio): l'esecuzione
+  market non sta penalizzando.
+- Il **notional medio è molto piccolo** (~39 USD contro un cap di 250): il sistema
+  opera in size ridotta.
+
+**3.2 — Validazione del filtro di volatilità.** Analisi dei 115 trade paper con dato
+`atr_percentile_rank` registrato:
+
+| Fascia ATR rank | Trade | Win rate | PnL |
+|-----------------|------:|---------:|----:|
+| 0.25–0.50 | 42 | 50.0% | +1242 |
+| 0.50–0.75 | 36 | 50.0% | +810 |
+| 0.75–0.90 | 34 | **55.9%** | **+1946** |
+
+- L'ATR percentile rank **non discrimina** vincenti da perdenti (rank medio 0.579 vs
+  0.594): tra i segnali emessi non c'è segnale predittivo nel livello di volatilità.
+- I trade ad **alta volatilità** (vicino al cap 0.90) hanno il **WR e il PnL migliori**
+  → il cap superiore a 0.90 rischia di tagliare *edge*, non rumore.
+- **Limite metodologico**: i candidati scartati dal filtro non vengono loggati, quindi
+  l'A/B diretto non è possibile sui dati esistenti.
+
+Raccomandazioni 3.2 (non ancora implementate — decisioni di prodotto):
+1. Loggare un campione dei candidati scartati dal `volatility_filter` con esito
+   ipotetico, per abilitare un vero A/B.
+2. Valutare di **alzare/rimuovere il cap superiore** (0.90): l'alta volatilità correla
+   con performance migliore.
+3. Il taglio inferiore (~0.25) appare ragionevole (rimuove mercati morti).
+
+**3.3 — Esecuzione live.** Dato lo slippage favorevole e il notional ridotto, gli ordini
+limit/post-only non sono una priorità immediata; il margine maggiore viene dal ridurre il
+peso relativo delle fee (size più grandi o meno trade su mercati a basso edge). Resta una
+decisione di prodotto.

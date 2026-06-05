@@ -397,13 +397,16 @@ def _reconcile_exit_fills(
         total_sz = Decimal("0")
         total_pnl = Decimal("0")
         total_notional = Decimal("0")
+        total_fee = Decimal("0")
         for fill in matched:
             sz = _decimal(fill.get("sz")) or Decimal("0")
             px = _decimal(fill.get("px")) or Decimal("0")
             pnl = _decimal(fill.get("closedPnl")) or Decimal("0")
+            fee = _decimal(fill.get("fee")) or Decimal("0")
             total_sz += sz
             total_pnl += pnl
             total_notional += sz * px
+            total_fee += fee
         avg_px = total_notional / total_sz if total_sz > 0 else None
 
         order.status = "filled"
@@ -411,6 +414,9 @@ def _reconcile_exit_fills(
             order.price = avg_px
         if total_sz > 0:
             order.size = total_sz
+        # Registra la fee reale del fill (finora ignorata): alimenta il report
+        # costo-per-trade con il dato effettivo invece della sola stima.
+        order.fee = total_fee
         if not order.hyperliquid_order_id:
             oid_val = matched[0].get("oid")
             if oid_val is not None:
