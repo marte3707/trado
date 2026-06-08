@@ -931,6 +931,11 @@ async def run_once(
             if timeframe in TIMEFRAME_MS
         ]
         prefetched_candles = await candle_sync.prefetch(db, sync_pairs)
+        # Prefetch L2 books per tutti i market attivi prima del loop segnali: evita
+        # le ~N fetch sequenziali (una per coin) dentro generate(), sostituendole con
+        # un batch async a concorrenza limitata che pre-popola _cycle_l2_cache.
+        if active_timeframes:
+            await signal_engine.prefetch_l2_books(markets, settings)
         synced = 0
         skipped = 0
         generated = 0
@@ -1220,6 +1225,7 @@ async def main() -> None:
             finally:
                 uar_db.close()
 
+        _record_heartbeat("idle")
         await asyncio.sleep(60)
 
 

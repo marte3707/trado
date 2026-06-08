@@ -32,7 +32,7 @@ DEFAULT_CANDLE_LOOKBACK = 300
 # Moderato di proposito: il client HTTP gestisce 429/5xx con backoff esponenziale
 # e un circuit breaker condiviso, ma evitiamo comunque di saturare l'endpoint info
 # di Hyperliquid con centinaia di richieste simultanee.
-DEFAULT_PREFETCH_CONCURRENCY = 8
+DEFAULT_PREFETCH_CONCURRENCY = 4
 
 
 def _compute_start_ms(

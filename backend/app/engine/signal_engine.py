@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 from typing import Any
 
@@ -28,7 +29,7 @@ from app.services.coinmarketcap import (
     FearGreedIndex,
     MarketQuote,
 )
-from app.services.hyperliquid import fetch_l2_book, fetch_predicted_fundings
+from app.services.hyperliquid import fetch_l2_book, fetch_l2_book_async, fetch_predicted_fundings
 from app.services.whale_alert import WhaleAlertClient, WhaleFlow
 from app.strategies.base import CandleInput, StrategyContext
 from app.strategies.base import StrategyResult
@@ -77,15 +78,39 @@ class SignalEngine:
         # "signal_skipped_*" non si vedono in produzione; questo conta dove muoiono
         # i segnali per esporre un breakdown nel `worker_cycle` event.
         self._cycle_skip_counts: dict[str, int] = {}
+        # Cache del funding breadth per ciclo: frazione di mercati con funding
+        # estremo nella direzione short/long. Calcolata una sola volta per tick.
+        self._cycle_funding_breadth: dict[str, float] | None = None
 
     def begin_cycle(self) -> None:
         """Invalidate per-cycle caches at the start of each worker tick."""
         self._cycle_fundings = None
         self._cycle_l2_cache = {}
         self._cycle_skip_counts = {}
+        self._cycle_funding_breadth = None
         # Abilita/invalida la cache per-cycle degli aggregati di performance
         # (global/timeframe stats + conteggi per market) usati da adjusted_weights.
         self.performance.begin_cycle()
+
+    async def prefetch_l2_books(self, markets: list, settings) -> None:
+        """Pre-popola _cycle_l2_cache con fetch async paralleli (concorrenza=4) prima
+        del loop segnali, eliminando le fetch L2 sequenziali dentro generate()."""
+        n_levels = settings.ob_imbalance_n_levels
+        coins = {
+            str((market.metadata_json or {}).get("hl_coin") or market.symbol)
+            for market in markets
+        }
+        semaphore = asyncio.Semaphore(4)
+
+        async def _fetch(coin: str) -> None:
+            cache_key = f"{coin}:{n_levels}"
+            if cache_key in self._cycle_l2_cache:
+                return
+            async with semaphore:
+                snapshot = await fetch_l2_book_async(settings.info_url, coin, n_levels)
+                self._cycle_l2_cache[cache_key] = snapshot
+
+        await asyncio.gather(*(_fetch(coin) for coin in coins))
 
     def cycle_skip_counts(self) -> dict[str, int]:
         """Snapshot dei contatori di skip aggregati per il tick in corso."""
@@ -93,6 +118,37 @@ class SignalEngine:
 
     def _record_skip(self, reason: str) -> None:
         self._cycle_skip_counts[reason] = self._cycle_skip_counts.get(reason, 0) + 1
+
+    def _get_cycle_funding_breadth(self, threshold_pct: float) -> dict[str, float]:
+        """Restituisce la frazione di mercati con funding estremo per direzione.
+
+        Calcolata una sola volta per ciclo (lazy) su tutti i coin in _cycle_fundings.
+        `threshold_pct` è espresso in % per 8h (es. 0.03 = 0.03%/8h).
+        La cache viene invalidata se il threshold cambia rispetto all'ultimo calcolo.
+        """
+        cached = self._cycle_funding_breadth
+        if cached is not None and cached.get("_threshold") == threshold_pct:
+            return cached
+        if not self._cycle_fundings:
+            result: dict[str, float] = {"short": 0.0, "long": 0.0, "_threshold": threshold_pct}
+            self._cycle_funding_breadth = result
+            return result
+        rates = list(self._cycle_fundings.values())
+        total = len(rates)
+        if total == 0:
+            result = {"short": 0.0, "long": 0.0, "_threshold": threshold_pct}
+            self._cycle_funding_breadth = result
+            return result
+        threshold = threshold_pct / 100  # % → decimale
+        crowded_short = sum(1 for r in rates if r < -threshold)
+        crowded_long = sum(1 for r in rates if r > threshold)
+        result = {
+            "short": crowded_short / total,
+            "long": crowded_long / total,
+            "_threshold": threshold_pct,
+        }
+        self._cycle_funding_breadth = result
+        return result
 
     @staticmethod
     def _is_ob_imbalance_only_signal(breakdown: dict[str, Any], direction: Direction) -> bool:
@@ -885,6 +941,34 @@ class SignalEngine:
                 effective_min_signal_score += long_score_penalty
                 score.breakdown["_long_score_penalty"] = {
                     "penalty": long_score_penalty,
+                    "effective_min_signal_score": effective_min_signal_score,
+                }
+        # Funding breadth penalty: se il mercato è sovra-affollato nella direzione
+        # del segnale (es. 60%+ dei perp con funding molto negativo durante un bear
+        # move), il trade è fragile — tipico segnale di false breakout soggetto a
+        # short squeeze. Alziamo la soglia min invece di bloccare: i segnali deboli
+        # vengono filtrati ma quelli forti passano, e i dati paper rimangono intatti.
+        if self._cycle_fundings is not None and score.direction != Direction.NEUTRAL:
+            fb_threshold_pct = float(risk_value.get("funding_breadth_threshold_pct", 0.03))
+            fb_trigger = float(risk_value.get("funding_breadth_trigger_pct", 0.60))
+            fb_penalty = int(risk_value.get("funding_breadth_score_penalty", 5))
+            if fb_penalty > 0:
+                breadth = self._get_cycle_funding_breadth(fb_threshold_pct)
+                is_short = score.direction in {Direction.SHORT, Direction.STRONG_SHORT}
+                is_long = score.direction in {Direction.LONG, Direction.STRONG_LONG}
+                direction_breadth = (
+                    breadth["short"] if is_short else breadth["long"] if is_long else 0.0
+                )
+                penalty_applied = fb_penalty if direction_breadth >= fb_trigger else 0
+                if penalty_applied:
+                    effective_min_signal_score += penalty_applied
+                score.breakdown["_funding_breadth"] = {
+                    "short_breadth": round(breadth["short"], 3),
+                    "long_breadth": round(breadth["long"], 3),
+                    "direction_breadth": round(direction_breadth, 3),
+                    "threshold_pct": fb_threshold_pct,
+                    "trigger_pct": fb_trigger,
+                    "penalty_applied": penalty_applied,
                     "effective_min_signal_score": effective_min_signal_score,
                 }
         if int(edge_adjustment["total"]) > 0:

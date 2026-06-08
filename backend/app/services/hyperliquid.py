@@ -60,6 +60,33 @@ def fetch_l2_book(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapsho
         return None
 
 
+async def fetch_l2_book_async(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapshot | None:
+    """Versione async di fetch_l2_book. None in caso di errore o rate limit."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.post(
+                info_url,
+                json={"type": "l2Book", "coin": coin, "nLevels": n_levels},
+            )
+            if response.is_error:
+                return None
+            data = response.json()
+            raw_levels = data.get("levels", [])
+            if len(raw_levels) < 2:
+                return None
+            bids = [
+                OrderBookLevel(price=float(level["px"]), size=float(level["sz"]))
+                for level in raw_levels[0]
+            ]
+            asks = [
+                OrderBookLevel(price=float(level["px"]), size=float(level["sz"]))
+                for level in raw_levels[1]
+            ]
+            return L2BookSnapshot(bids=bids, asks=asks)
+    except Exception:
+        return None
+
+
 def fetch_predicted_fundings(info_url: str) -> dict[str, float]:
     """Returns coin → predicted 8h funding rate (decimal fraction). Empty dict on failure."""
     try:
@@ -260,6 +287,7 @@ class HyperliquidOrderResult:
 class HyperliquidTradingClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._cached_info: Any = None
 
     def account_summary(self) -> tuple[Decimal, Decimal]:
         """Ritorna (total_account_value, available_margin).
@@ -500,11 +528,14 @@ class HyperliquidTradingClient:
         return constants.TESTNET_API_URL
 
     def _info(self):
+        if self._cached_info is not None:
+            return self._cached_info
         try:
             Info = import_module("hyperliquid.info").Info
         except ImportError as exc:
             raise HyperliquidError("Install hyperliquid-python-sdk to enable live trading") from exc
-        return Info(self._base_url(), skip_ws=True)
+        self._cached_info = Info(self._base_url(), skip_ws=True)
+        return self._cached_info
 
     def _exchange(self, expires_after_seconds: int):
         try:
