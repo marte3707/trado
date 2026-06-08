@@ -7,6 +7,7 @@ import {
   type AccountEquityHistory,
   type AccountMonitor,
   type AppSettings,
+  type AutoTunerStrategyTests,
   type AutoTunerSourceTests,
   type AutoTunerStatus,
   type BotFunnelStats,
@@ -208,6 +209,15 @@ export function useTunerSourceTests(opts?: QueryOpts<AutoTunerSourceTests | null
   return useQuery({
     queryKey: qk.tunerSourceTests,
     queryFn: () => apiGet<AutoTunerSourceTests>("/api/auto-tuner/source-tests").catch(() => null),
+    refetchInterval: 15_000,
+    ...opts,
+  });
+}
+
+export function useTunerStrategyTests(opts?: QueryOpts<AutoTunerStrategyTests | null>) {
+  return useQuery({
+    queryKey: qk.tunerStrategyTests,
+    queryFn: () => apiGet<AutoTunerStrategyTests>("/api/auto-tuner/strategy-tests").catch(() => null),
     refetchInterval: 15_000,
     ...opts,
   });

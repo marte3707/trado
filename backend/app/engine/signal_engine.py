@@ -119,6 +119,19 @@ class SignalEngine:
     def _record_skip(self, reason: str) -> None:
         self._cycle_skip_counts[reason] = self._cycle_skip_counts.get(reason, 0) + 1
 
+    @staticmethod
+    def _disabled_strategy_names_for_timeframe(
+        risk_value: dict[str, Any],
+        timeframe: str,
+    ) -> set[str]:
+        raw = risk_value.get("disabled_strategies_by_timeframe")
+        if not isinstance(raw, dict):
+            return set()
+        disabled = raw.get(timeframe)
+        if not isinstance(disabled, list):
+            return set()
+        return {str(item) for item in disabled if isinstance(item, str) and item}
+
     def _get_cycle_funding_breadth(self, threshold_pct: float) -> dict[str, float]:
         """Restituisce la frazione di mercati con funding estremo per direzione.
 
@@ -626,6 +639,15 @@ class SignalEngine:
             .filter(StrategyConfig.timeframe == timeframe, StrategyConfig.enabled.is_(True))
             .all()
         )
+        disabled_strategy_names = self._disabled_strategy_names_for_timeframe(
+            risk_value, timeframe
+        )
+        if disabled_strategy_names:
+            configs = [
+                config
+                for config in configs
+                if config.strategy_name not in disabled_strategy_names
+            ]
         context = StrategyContext(
             market="hyperliquid",
             symbol=market.symbol,

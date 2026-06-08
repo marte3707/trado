@@ -1,6 +1,6 @@
 "use client";
 
-import { Play } from "lucide-react";
+import { Play, Sparkles, X } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -21,10 +21,10 @@ import {
 import { AutoTunerHeader } from "@/components/calibration/AutoTunerHeader";
 import { AbAllocationDonut } from "@/components/calibration/AbAllocationDonut";
 import { SequenceRoadmap } from "@/components/calibration/SequenceRoadmap";
-import { useTunerSourceTests, useTunerStatus } from "@/lib/hooks/queries";
-import { useStartSourceTest } from "@/lib/hooks/mutations";
+import { useTunerSourceTests, useTunerStatus, useTunerStrategyTests } from "@/lib/hooks/queries";
+import { useClearQueuedStrategyTest, useQueueStrategyTest, useStartSourceTest, useStartStrategyTest } from "@/lib/hooks/mutations";
 import { cn } from "@/lib/utils";
-import type { AutoTunerSourceTest, AutoTunerStatus } from "@/lib/api";
+import type { AutoTunerSourceTest, AutoTunerStatus, AutoTunerStrategyTest } from "@/lib/api";
 
 interface Props {
   initialStatus: AutoTunerStatus | null;
@@ -42,6 +42,17 @@ function testArmSummary(test: AutoTunerSourceTest): string {
   const activated = controlDisabled.filter((s) => !testDisabled.includes(s));
   if (activated.length === 0) return "nessun cambio (source già attiva)";
   return activated.map((s) => `${s} abilitato`).join(", ");
+}
+
+function strategyTestArmSummary(test: AutoTunerStrategyTest): string {
+  return `${test.strategy} OFF su ${test.timeframe} nel braccio test`;
+}
+
+function recommendationLabel(value: string | null | undefined): string {
+  if (value === "keep_enabled") return "Keep enabled";
+  if (value === "candidate_disable") return "Candidate disable";
+  if (value === "inconclusive") return "Inconclusive";
+  return "—";
 }
 
 function fmtSigned(value: number | null | undefined, digits = 2): string {
@@ -65,7 +76,11 @@ export function AutoTunerTab({ initialStatus }: Props) {
     initialData: initialStatus ?? undefined,
   });
   const { data: sourceTests } = useTunerSourceTests();
-  const { mutate: startSourceTest, isPending: isStarting } = useStartSourceTest();
+  const { data: strategyTests } = useTunerStrategyTests();
+  const { mutate: startSourceTest, isPending: isStartingSource } = useStartSourceTest();
+  const { mutate: startStrategyTest, isPending: isStartingStrategy } = useStartStrategyTest();
+  const { mutate: queueStrategyTest, isPending: isQueueingStrategy } = useQueueStrategyTest();
+  const { mutate: clearQueuedStrategyTest, isPending: isClearingQueuedStrategy } = useClearQueuedStrategyTest();
 
   const abProgress = status?.ab_progress ?? null;
   const isAbActive =
@@ -75,6 +90,11 @@ export function AutoTunerTab({ initialStatus }: Props) {
   const activeSourceKey = sourceTests?.active_step_key;
   const blockedBySequential =
     sourceTests?.blocked && !activeSourceKey?.endsWith("_source");
+  const activeStrategyKey = strategyTests?.active_step_key;
+  const blockedStrategyTests =
+    strategyTests?.blocked &&
+    !(status?.target_timeframe && status?.target_strategy);
+  const queuedStrategyTest = strategyTests?.queued_strategy_test ?? status?.queued_strategy_test ?? null;
 
   return (
     <div className="space-y-4">
@@ -139,7 +159,7 @@ export function AutoTunerTab({ initialStatus }: Props) {
             <TableBody>
               {sourceTests.tests.map((t) => {
                 const armSummary = testArmSummary(t);
-                const canStart = t.available && !t.active && !isStarting;
+                const canStart = t.available && !t.active && !isStartingSource;
                 const disabledReason = !t.available
                   ? activeSourceKey && activeSourceKey !== t.key
                     ? "Altro source test già in corso"
@@ -222,6 +242,195 @@ export function AutoTunerTab({ initialStatus }: Props) {
         ) : (
           <div className="grid h-24 place-items-center text-xs text-fg-3">
             Nessun source test configurato.
+          </div>
+        )}
+      </Card>
+
+      <Card className="overflow-hidden p-0">
+        <div className="flex items-start justify-between border-b border-border px-6 py-4">
+          <div>
+            <div className="flex items-center gap-2">
+              <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+                Strategy A/B tests
+              </div>
+              {strategyTests?.enabled === false && (
+                <Badge variant="outline" className="border-warn/40 bg-warn/10 text-[10px] text-warn">
+                  Tuner disabilitato
+                </Badge>
+              )}
+              {status?.target_timeframe && status?.target_strategy && (
+                <Badge variant="outline" className="border-info/40 bg-info/10 text-[10px] text-info">
+                  Attivo: {status.target_timeframe}/{status.target_strategy}
+                </Badge>
+              )}
+            </div>
+            <div className="mt-0.5 text-xs text-fg-3">
+              Test A/B manuali su singola strategia e timeframe. La strategia resta attiva globalmente:
+              nel braccio test viene solo esclusa runtime dal timeframe scelto.
+            </div>
+          </div>
+        </div>
+
+        {blockedStrategyTests && (
+          <div className="border-b border-border bg-warn/5 px-6 py-2.5 text-xs text-warn">
+            Strategy test bloccati da step tuner attivo (
+            <span className="font-mono">{status?.current_step_key ?? activeStrategyKey ?? "—"}</span>
+            ). Quando questo step si chiude, qui potrai avviare il test dal pulsante.
+          </div>
+        )}
+
+        {strategyTests === null ? (
+          <div className="grid h-24 place-items-center text-center text-xs text-fg-3">
+            Strategy tests non disponibili dal backend.
+            <br />
+            Riavvia il backend se hai appena aggiornato il codice.
+          </div>
+        ) : strategyTests && strategyTests.tests.length > 0 ? (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Strategia</TableHead>
+                <TableHead>Braccio test</TableHead>
+                <TableHead>Ultimo esito</TableHead>
+                <TableHead>Stato</TableHead>
+                <TableHead className="text-right">Azione</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {strategyTests.tests.map((t) => {
+                const isQueued = Boolean(t.queued);
+                const hasOtherQueued = Boolean(queuedStrategyTest && queuedStrategyTest.step_key !== t.key);
+                const canStart = t.available && !t.active && !isQueued && !hasOtherQueued && !isStartingStrategy;
+                const canQueue =
+                  !t.active &&
+                  !isQueued &&
+                  !hasOtherQueued &&
+                  !t.available &&
+                  !isQueueingStrategy;
+                const canClearQueue = isQueued && !isClearingQueuedStrategy;
+                const disabledReason = isQueued
+                  ? `In coda: ${queuedStrategyTest?.timeframe}/${queuedStrategyTest?.strategy}`
+                  : hasOtherQueued
+                    ? `Altro test gia' in coda: ${queuedStrategyTest?.timeframe}/${queuedStrategyTest?.strategy}`
+                    : !t.available
+                      ? strategyTests.active_step_key && strategyTests.active_step_key !== t.key
+                        ? `Bloccato da ${strategyTests.active_step_key}`
+                        : "Step tuner attivo"
+                      : null;
+
+                return (
+                  <TableRow key={t.key}>
+                    <TableCell>
+                      <div className="space-y-0.5">
+                        <div className="font-mono font-medium text-fg">
+                          {t.timeframe}/{t.strategy}
+                        </div>
+                        <div className="font-mono text-[10px] text-fg-3">{t.key}</div>
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <div className="space-y-0.5">
+                        <div className="text-xs text-fg-2">{strategyTestArmSummary(t)}</div>
+                        <div className="text-[10px] text-fg-4">
+                          Control invariato, test con esclusione selettiva
+                        </div>
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      {t.last_recommendation ? (
+                        <Badge
+                          variant="outline"
+                          className={cn(
+                            t.last_recommendation === "candidate_disable"
+                              ? "border-danger/40 bg-danger/10 text-danger"
+                              : t.last_recommendation === "keep_enabled"
+                                ? "border-success/40 bg-success/10 text-success"
+                                : "border-warn/40 bg-warn/10 text-warn",
+                          )}
+                        >
+                          {recommendationLabel(t.last_recommendation)}
+                        </Badge>
+                      ) : (
+                        <span className="text-xs text-fg-3">Nessun test completato</span>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      {t.active ? (
+                        <Badge variant="outline" className="border-info/40 bg-info/10 text-info">
+                          In corso
+                        </Badge>
+                      ) : isQueued ? (
+                        <Badge variant="outline" className="border-warn/40 bg-warn/10 text-warn">
+                          In coda
+                        </Badge>
+                      ) : t.available ? (
+                        <Badge variant="outline" className="border-success/40 bg-success/10 text-success">
+                          Avviabile
+                        </Badge>
+                      ) : (
+                        <Badge variant="outline">Bloccato</Badge>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {t.active ? (
+                        <span className="text-[10px] text-fg-3">A/B in esecuzione</span>
+                      ) : isQueued ? (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 text-[11px]"
+                          disabled={!canClearQueue}
+                          onClick={() => clearQueuedStrategyTest()}
+                        >
+                          <X className="mr-1 h-3 w-3" />
+                          Rimuovi coda
+                        </Button>
+                      ) : (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <div className="inline-flex gap-2">
+                              <span>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="h-7 text-[11px]"
+                                  disabled={!canStart}
+                                  onClick={() => startStrategyTest({ timeframe: t.timeframe, strategy: t.strategy })}
+                                >
+                                  <Sparkles className="mr-1 h-3 w-3" />
+                                  Avvia test
+                                </Button>
+                              </span>
+                              {!t.available && (
+                                <span>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-7 text-[11px]"
+                                    disabled={!canQueue}
+                                    onClick={() => queueStrategyTest({ timeframe: t.timeframe, strategy: t.strategy })}
+                                  >
+                                    <Play className="mr-1 h-3 w-3" />
+                                    Metti in coda
+                                  </Button>
+                                </span>
+                              )}
+                            </div>
+                          </TooltipTrigger>
+                          {disabledReason && (
+                            <TooltipContent>{disabledReason}</TooltipContent>
+                          )}
+                        </Tooltip>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        ) : (
+          <div className="grid h-24 place-items-center text-xs text-fg-3">
+            Nessun strategy test configurato.
           </div>
         )}
       </Card>

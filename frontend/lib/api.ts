@@ -532,6 +532,19 @@ export type AutoTunerSourceTest = {
   available: boolean;
 };
 
+export type AutoTunerStrategyTest = {
+  timeframe: string;
+  strategy: string;
+  key: string;
+  label: string;
+  control_overlay: Record<string, unknown>;
+  test_overlay: Record<string, unknown>;
+  active: boolean;
+  available: boolean;
+  queued?: boolean;
+  last_recommendation?: string | null;
+};
+
 export type AutoTunerSourceTests = {
   enabled: boolean;
   mode: string;
@@ -539,6 +552,21 @@ export type AutoTunerSourceTests = {
   active_mode?: string | null;
   blocked: boolean;
   tests: AutoTunerSourceTest[];
+};
+
+export type AutoTunerStrategyTests = {
+  enabled: boolean;
+  mode: string;
+  active_step_key: string | null;
+  active_mode?: string | null;
+  blocked: boolean;
+  queued_strategy_test?: {
+    timeframe: string;
+    strategy: string;
+    step_key: string;
+    queued_at?: string;
+  } | null;
+  tests: AutoTunerStrategyTest[];
 };
 
 export type AutoTunerStatus = {
@@ -551,6 +579,15 @@ export type AutoTunerStatus = {
   metrics_before: TunerStepMetrics | null;
   metrics_now?: TunerStepMetrics | null;
   ab_test_state?: Record<string, unknown> | null;
+  target_timeframe?: string | null;
+  target_strategy?: string | null;
+  recommendation?: string | null;
+  queued_strategy_test?: {
+    timeframe: string;
+    strategy: string;
+    step_key: string;
+    queued_at?: string;
+  } | null;
   next_step_key: string | null;
   trades_now: number;
   progress: TunerProgress | null;

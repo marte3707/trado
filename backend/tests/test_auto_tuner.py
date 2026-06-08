@@ -860,6 +860,301 @@ def test_start_source_test_returns_conflict_when_step_active() -> None:
     assert result["active_step_key"] == "volatility_filter"
 
 
+def test_strategy_tests_lists_only_supported_pairs_and_last_recommendation() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(enabled=False)
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "step_history": [
+                {
+                    "key": "strategy_test:5m:cvd_divergence",
+                    "status": "evaluated",
+                    "ab_test": {"recommendation": "candidate_disable"},
+                }
+            ]
+        },
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.strategy_tests(db)
+
+    assert result["blocked"] is False
+    pairs = {(row["timeframe"], row["strategy"]) for row in result["tests"]}
+    assert pairs == {
+        ("5m", "cvd_divergence"),
+        ("5m", "volume_profile"),
+        ("15m", "cvd_divergence"),
+        ("15m", "volume_profile"),
+    }
+    row = next(
+        item
+        for item in result["tests"]
+        if item["timeframe"] == "5m" and item["strategy"] == "cvd_divergence"
+    )
+    assert row["last_recommendation"] == "candidate_disable"
+    assert row["queued"] is False
+
+
+def test_start_strategy_test_creates_dynamic_ab_sequence_without_mutating_risk() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(enabled=False)
+    db.app_settings["risk"] = AppSetting(
+        key="risk", value={"min_signal_score": 70}
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.start_strategy_test(db, "5m", "cvd_divergence")
+
+    assert result["ok"] is True
+    assert result["mode"] == "ab_test"
+    assert result["step"] == "strategy_test:5m:cvd_divergence"
+    config = db.app_settings["auto_tuner_config"].value
+    assert config["enabled"] is True
+    assert config["mode"] == "ab_test"
+    assert config["sequence"][0]["strategy_test"] == {
+        "timeframe": "5m",
+        "strategy": "cvd_divergence",
+    }
+    assert db.app_settings["risk"].value == {"min_signal_score": 70}
+    state = db.app_settings["auto_tuner_state"].value
+    assert state["ab_test"]["control_overlay"] == {}
+    assert state["ab_test"]["test_overlay"] == {
+        "disabled_strategies_by_timeframe": {"5m": ["cvd_divergence"]}
+    }
+
+
+def test_start_strategy_test_rejects_unsupported_pair() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(enabled=False)
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.start_strategy_test(db, "1h", "cvd_divergence")
+
+    assert result["ok"] is False
+    assert result["status"] == "unsupported_strategy_test"
+
+
+def test_ab_strategy_test_evaluates_without_mutating_risk_and_sets_recommendation() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(
+        ab_test_min_trades_per_arm=10,
+        ab_test_significance_level=0.05,
+    )
+    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "strategy_test:5m:cvd_divergence",
+            "mode": "ab_test",
+            "activated_at": activated.isoformat(),
+            "trades_at_activation": 0,
+            "ab_test": {
+                "control_overlay": {},
+                "test_overlay": {
+                    "disabled_strategies_by_timeframe": {"5m": ["cvd_divergence"]}
+                },
+                "allocation": 0.5,
+            },
+            "step_history": [],
+        },
+    )
+    db.app_settings["auto_tuner_config"].value["sequence"] = [
+        {
+            "key": "strategy_test:5m:cvd_divergence",
+            "label": "Strategy test 5m/cvd_divergence",
+            "patch": {
+                "disabled_strategies_by_timeframe": {"5m": ["cvd_divergence"]}
+            },
+            "revert": {},
+            "strategy_test": {"timeframe": "5m", "strategy": "cvd_divergence"},
+        }
+    ]
+    db.app_settings["risk"] = AppSetting(
+        key="risk", value={"regime_filter_enabled": False}
+    )
+    rng = random.Random(17)
+    control_positions = [
+        _position(
+            pnl=-4.0 + rng.uniform(-0.3, 0.3),
+            closed_at=activated + timedelta(minutes=i + 1),
+            arm="control",
+            step_key="strategy_test:5m:cvd_divergence",
+        )
+        for i in range(20)
+    ]
+    test_positions = [
+        _position(
+            pnl=3.0 + rng.uniform(-0.3, 0.3),
+            closed_at=activated + timedelta(minutes=i + 50),
+            arm="test",
+            step_key="strategy_test:5m:cvd_divergence",
+        )
+        for i in range(20)
+    ]
+    tuner = AutoTuner(analyzer=FakeAnalyzer(control_positions + test_positions))
+
+    result = tuner.run(db)
+
+    assert result["status"] == "evaluated"
+    assert result["recommendation"] == "candidate_disable"
+    assert db.app_settings["risk"].value["regime_filter_enabled"] is False
+    history = db.app_settings["auto_tuner_state"].value["step_history"]
+    assert history[0]["status"] == "evaluated"
+    assert history[0]["ab_test"]["recommendation"] == "candidate_disable"
+
+
+def test_status_exposes_active_strategy_test_target() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    db.app_settings["auto_tuner_config"].value["sequence"] = [
+        {
+            "key": "strategy_test:15m:volume_profile",
+            "label": "Strategy test 15m/volume_profile",
+            "patch": {
+                "disabled_strategies_by_timeframe": {"15m": ["volume_profile"]}
+            },
+            "revert": {},
+            "strategy_test": {"timeframe": "15m", "strategy": "volume_profile"},
+        }
+    ]
+    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "strategy_test:15m:volume_profile",
+            "mode": "ab_test",
+            "activated_at": activated.isoformat(),
+            "trades_at_activation": 0,
+            "ab_test": {
+                "control_overlay": {},
+                "test_overlay": {
+                    "disabled_strategies_by_timeframe": {"15m": ["volume_profile"]}
+                },
+                "allocation": 0.5,
+                "assignment_method": "deterministic_hash",
+            },
+            "step_history": [],
+        },
+    )
+    positions = (
+        _tagged_positions(
+            4,
+            -1.0,
+            activated + timedelta(minutes=1),
+            "control",
+            step_key="strategy_test:15m:volume_profile",
+        )
+        + _tagged_positions(
+            6,
+            2.0,
+            activated + timedelta(minutes=20),
+            "test",
+            step_key="strategy_test:15m:volume_profile",
+        )
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer(positions))
+
+    status = tuner.status(db)
+
+    assert status["target_timeframe"] == "15m"
+    assert status["target_strategy"] == "volume_profile"
+    assert status["ab_progress"]["trades_control"] == 4
+    assert status["ab_progress"]["trades_test"] == 6
+
+
+def test_queue_strategy_test_persists_single_queued_item() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.queue_strategy_test(db, "5m", "cvd_divergence")
+
+    assert result["ok"] is True
+    assert result["status"] == "queued"
+    state = db.app_settings["auto_tuner_state"].value
+    assert state["queued_strategy_test"]["step_key"] == "strategy_test:5m:cvd_divergence"
+
+
+def test_queue_strategy_test_rejects_second_different_queue() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "queued_strategy_test": {
+                "timeframe": "5m",
+                "strategy": "cvd_divergence",
+                "step_key": "strategy_test:5m:cvd_divergence",
+                "queued_at": "2026-06-08T10:00:00+00:00",
+            },
+            "step_history": [],
+        },
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.queue_strategy_test(db, "15m", "volume_profile")
+
+    assert result["ok"] is False
+    assert result["status"] == "queue_conflict"
+    assert result["queued_strategy_test"]["step_key"] == "strategy_test:5m:cvd_divergence"
+
+
+def test_run_starts_queued_strategy_test_when_idle() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    db.app_settings["risk"] = AppSetting(key="risk", value={"min_signal_score": 70})
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "queued_strategy_test": {
+                "timeframe": "5m",
+                "strategy": "cvd_divergence",
+                "step_key": "strategy_test:5m:cvd_divergence",
+                "queued_at": "2026-06-08T10:00:00+00:00",
+            },
+            "step_history": [],
+        },
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.run(db)
+
+    assert result["ok"] is True
+    assert result["status"] == "started"
+    assert result["queued"] is True
+    state = db.app_settings["auto_tuner_state"].value
+    assert state["current_step_key"] == "strategy_test:5m:cvd_divergence"
+    assert state["queued_strategy_test"] is None
+
+
+def test_clear_queued_strategy_test_removes_queue() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config()
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "queued_strategy_test": {
+                "timeframe": "15m",
+                "strategy": "volume_profile",
+                "step_key": "strategy_test:15m:volume_profile",
+                "queued_at": "2026-06-08T10:00:00+00:00",
+            },
+            "step_history": [],
+        },
+    )
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.clear_queued_strategy_test(db)
+
+    assert result["ok"] is True
+    assert result["status"] == "queue_cleared"
+    state = db.app_settings["auto_tuner_state"].value
+    assert state["queued_strategy_test"] is None
+
+
 def test_active_ab_overlay_returns_control_when_allocation_zero() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _ab_config()

@@ -187,6 +187,7 @@ export function useAutoTuner() {
       toast.success(labels[action]);
       qc.invalidateQueries({ queryKey: qk.tunerStatus });
       qc.invalidateQueries({ queryKey: qk.tunerSourceTests });
+      qc.invalidateQueries({ queryKey: qk.tunerStrategyTests });
     },
     onError: (err) => toast.error(`Azione tuner fallita: ${errorMessage(err)}`),
   });
@@ -201,8 +202,51 @@ export function useStartSourceTest() {
       toast.success(`A/B test "${source}" avviato`);
       qc.invalidateQueries({ queryKey: qk.tunerStatus });
       qc.invalidateQueries({ queryKey: qk.tunerSourceTests });
+      qc.invalidateQueries({ queryKey: qk.tunerStrategyTests });
     },
     onError: (err) => toast.error(`Avvio test fallito: ${errorMessage(err)}`),
+  });
+}
+
+export function useStartStrategyTest() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ timeframe, strategy }: { timeframe: string; strategy: string }) =>
+      apiPost<unknown>(`/api/auto-tuner/strategy-tests/${timeframe}/${strategy}/start`),
+    onSuccess: (_, payload) => {
+      toast.success(`A/B test ${payload.timeframe}/${payload.strategy} avviato`);
+      qc.invalidateQueries({ queryKey: qk.tunerStatus });
+      qc.invalidateQueries({ queryKey: qk.tunerSourceTests });
+      qc.invalidateQueries({ queryKey: qk.tunerStrategyTests });
+    },
+    onError: (err) => toast.error(`Avvio strategy test fallito: ${errorMessage(err)}`),
+  });
+}
+
+export function useQueueStrategyTest() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ timeframe, strategy }: { timeframe: string; strategy: string }) =>
+      apiPost<unknown>(`/api/auto-tuner/strategy-tests/${timeframe}/${strategy}/queue`),
+    onSuccess: (_, payload) => {
+      toast.success(`Test ${payload.timeframe}/${payload.strategy} messo in coda`);
+      qc.invalidateQueries({ queryKey: qk.tunerStatus });
+      qc.invalidateQueries({ queryKey: qk.tunerStrategyTests });
+    },
+    onError: (err) => toast.error(`Queue strategy test fallita: ${errorMessage(err)}`),
+  });
+}
+
+export function useClearQueuedStrategyTest() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => apiDelete<unknown>("/api/auto-tuner/strategy-tests/queue"),
+    onSuccess: () => {
+      toast.success("Coda strategy test rimossa");
+      qc.invalidateQueries({ queryKey: qk.tunerStatus });
+      qc.invalidateQueries({ queryKey: qk.tunerStrategyTests });
+    },
+    onError: (err) => toast.error(`Rimozione coda fallita: ${errorMessage(err)}`),
   });
 }
 

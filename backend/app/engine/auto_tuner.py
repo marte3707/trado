@@ -66,6 +66,11 @@ SOURCE_AB_SEQUENCE: list[dict[str, Any]] = [
     },
 ]
 
+STRATEGY_TEST_ALLOWLIST: dict[str, tuple[str, ...]] = {
+    "5m": ("cvd_divergence", "volume_profile"),
+    "15m": ("cvd_divergence", "volume_profile"),
+}
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
     # "sequential" = comportamento legacy before/after sulla stessa popolazione.
@@ -154,6 +159,23 @@ class AutoTuner:
         config = self._load_config(db)
         state = self._load_state(db)
 
+        queued_strategy_test = self._serialize_queued_strategy_test(
+            state.get("queued_strategy_test")
+        )
+        if (
+            bool(config.get("enabled", False))
+            and state.get("current_step_index") is None
+            and queued_strategy_test is not None
+        ):
+            return self._activate_strategy_test(
+                db,
+                state,
+                config,
+                queued_strategy_test["timeframe"],
+                queued_strategy_test["strategy"],
+                from_queue=True,
+            )
+
         if not bool(config.get("enabled", False)):
             return {"status": "disabled"}
 
@@ -174,7 +196,18 @@ class AutoTuner:
         sequence: list[dict[str, Any]],
     ) -> dict[str, Any]:
         history: list[dict[str, Any]] = list(state.get("step_history", []))
-        completed_keys = {entry.get("key") for entry in history if entry.get("status") in {"success", "reverted", "skipped", "promoted", "rejected"}}
+        completed_keys = {
+            entry.get("key")
+            for entry in history
+            if entry.get("status") in {
+                "success",
+                "reverted",
+                "skipped",
+                "promoted",
+                "rejected",
+                "evaluated",
+            }
+        }
 
         if state.get("current_step_index") is None:
             next_index = self._next_step_index(sequence, completed_keys)
@@ -225,7 +258,14 @@ class AutoTuner:
         completed_keys = {
             entry.get("key")
             for entry in history
-            if entry.get("status") in {"success", "reverted", "skipped", "promoted", "rejected"}
+            if entry.get("status") in {
+                "success",
+                "reverted",
+                "skipped",
+                "promoted",
+                "rejected",
+                "evaluated",
+            }
         }
 
         if state.get("current_step_index") is None:
@@ -452,6 +492,8 @@ class AutoTuner:
                 },
             }
         )
+        if isinstance(step.get("strategy_test"), dict):
+            new_state["queued_strategy_test"] = None
         self._persist_state(db, new_state)
         self._log_event(
             db,
@@ -512,6 +554,8 @@ class AutoTuner:
             ),
         )
         promoted = improvement > 0 and stats["p_one_tailed"] < alpha and not segment_failures
+        strategy_test_meta = step.get("strategy_test")
+        is_strategy_test = isinstance(strategy_test_meta, dict)
         sample_balance = (
             min(len(control_pnls), len(test_pnls)) / max(len(control_pnls), len(test_pnls))
             if control_pnls and test_pnls
@@ -523,7 +567,19 @@ class AutoTuner:
             else "deterministic_hash"
         )
 
-        if promoted:
+        recommendation = None
+        if is_strategy_test:
+            control_better_p_one_tailed = 1.0 - stats["p_one_tailed"]
+            if segment_failures:
+                recommendation = "inconclusive"
+            elif improvement > 0 and stats["p_one_tailed"] < alpha:
+                recommendation = "candidate_disable"
+            elif improvement < 0 and control_better_p_one_tailed < alpha:
+                recommendation = "keep_enabled"
+            else:
+                recommendation = "inconclusive"
+            outcome = "evaluated"
+        elif promoted:
             target_setting = str(step.get("target_setting", "risk"))
             self._apply_patch(
                 db, dict(step.get("patch", {})), target_setting=target_setting
@@ -555,6 +611,7 @@ class AutoTuner:
                     "mean_delta": improvement,
                     "sample_balance": sample_balance,
                     "assignment_method": assignment_method,
+                    "recommendation": recommendation,
                 },
                 "segment_metrics": segment_metrics,
                 "segment_failures": segment_failures,
@@ -592,6 +649,7 @@ class AutoTuner:
                 "sample_balance": sample_balance,
                 "assignment_method": assignment_method,
                 "evidence_type": "ab_test",
+                "recommendation": recommendation,
                 "segment_metrics": segment_metrics,
                 "segment_failures": segment_failures,
             },
@@ -608,6 +666,7 @@ class AutoTuner:
             "alpha": alpha,
             "sample_balance": sample_balance,
             "assignment_method": assignment_method,
+            "recommendation": recommendation,
             "segment_metrics": segment_metrics,
             "segment_failures": segment_failures,
         }
@@ -716,10 +775,25 @@ class AutoTuner:
         completed_keys = {
             entry.get("key")
             for entry in state.get("step_history", [])
-            if entry.get("status") in {"success", "reverted", "skipped", "promoted", "rejected"}
+            if entry.get("status") in {
+                "success",
+                "reverted",
+                "skipped",
+                "promoted",
+                "rejected",
+                "evaluated",
+            }
         }
         current_step_index = state.get("current_step_index")
         mode = str(config.get("mode", "sequential"))
+        current_step: dict[str, Any] | None = None
+        if current_step_index is not None:
+            try:
+                idx = int(current_step_index)
+            except (TypeError, ValueError):
+                idx = -1
+            if 0 <= idx < len(sequence):
+                current_step = sequence[idx]
         next_index = self._next_step_index(
             sequence, completed_keys, skip_sequential_only=(mode == "ab_test")
         )
@@ -730,6 +804,8 @@ class AutoTuner:
         progress: dict[str, Any] | None = None
         ab_progress: dict[str, Any] | None = None
         metrics_now: dict[str, Any] | None = None
+        target_timeframe: str | None = None
+        target_strategy: str | None = None
         if state.get("current_step_index") is not None:
             if str(state.get("mode", "")) == "ab_test":
                 step_key = str(state.get("current_step_key") or "")
@@ -755,6 +831,14 @@ class AutoTuner:
                 mean_test = sum(test_pnls) / n_test if n_test else 0.0
                 raw_ab_state = state.get("ab_test")
                 ab_state: dict[str, Any] = raw_ab_state if isinstance(raw_ab_state, dict) else {}
+                strategy_test = (
+                    current_step.get("strategy_test")
+                    if isinstance(current_step, dict)
+                    else None
+                )
+                if isinstance(strategy_test, dict):
+                    target_timeframe = str(strategy_test.get("timeframe") or "")
+                    target_strategy = str(strategy_test.get("strategy") or "")
                 ab_progress = {
                     "trades_control": n_control,
                     "trades_test": n_test,
@@ -796,6 +880,12 @@ class AutoTuner:
             "metrics_before": state.get("metrics_before"),
             "metrics_now": metrics_now,
             "ab_test_state": state.get("ab_test"),
+            "target_timeframe": target_timeframe,
+            "target_strategy": target_strategy,
+            "recommendation": None,
+            "queued_strategy_test": self._serialize_queued_strategy_test(
+                state.get("queued_strategy_test")
+            ),
             "next_step_key": sequence[next_index]["key"] if next_index is not None and next_index < len(sequence) else None,
             "trades_now": trades_now,
             "progress": progress,
@@ -905,6 +995,134 @@ class AutoTuner:
         result.update({"ok": True, "source": normalized})
         return result
 
+    def strategy_tests(self, db: Session) -> dict[str, Any]:
+        config = self._load_config(db)
+        state = self._load_state(db)
+        active_key = state.get("current_step_key")
+        active_mode = state.get("mode") or config.get("mode")
+        queued = self._serialize_queued_strategy_test(state.get("queued_strategy_test"))
+        tests = []
+        for timeframe, strategies in sorted(STRATEGY_TEST_ALLOWLIST.items()):
+            for strategy in strategies:
+                step_key = self._strategy_test_key(timeframe, strategy)
+                tests.append(
+                    {
+                        "timeframe": timeframe,
+                        "strategy": strategy,
+                        "key": step_key,
+                        "label": f"Strategy test {timeframe}/{strategy}",
+                        "control_overlay": {},
+                        "test_overlay": {
+                            "disabled_strategies_by_timeframe": {
+                                timeframe: [strategy]
+                            }
+                        },
+                        "active": active_key == step_key,
+                        "available": active_key in (None, step_key),
+                        "queued": bool(queued and queued.get("step_key") == step_key),
+                        "last_recommendation": self._last_strategy_test_recommendation(
+                            state.get("step_history", []), step_key
+                        ),
+                    }
+                )
+        return {
+            "enabled": bool(config.get("enabled", False)),
+            "mode": str(config.get("mode", "sequential")),
+            "active_step_key": active_key,
+            "active_mode": active_mode,
+            "blocked": active_key is not None,
+            "queued_strategy_test": queued,
+            "tests": tests,
+        }
+
+    def start_strategy_test(self, db: Session, timeframe: str, strategy: str) -> dict[str, Any]:
+        normalized_timeframe = timeframe.strip()
+        normalized_strategy = strategy.strip().lower().replace("-", "_")
+        return self._activate_strategy_test(
+            db,
+            self._load_state(db),
+            self._load_config(db),
+            normalized_timeframe,
+            normalized_strategy,
+            from_queue=False,
+        )
+
+    def queue_strategy_test(self, db: Session, timeframe: str, strategy: str) -> dict[str, Any]:
+        normalized_timeframe = timeframe.strip()
+        normalized_strategy = strategy.strip().lower().replace("-", "_")
+        if normalized_strategy not in STRATEGY_TEST_ALLOWLIST.get(normalized_timeframe, ()):
+            return {
+                "ok": False,
+                "status": "unsupported_strategy_test",
+                "timeframe": normalized_timeframe,
+                "strategy": normalized_strategy,
+                "supported": {
+                    key: list(value)
+                    for key, value in sorted(STRATEGY_TEST_ALLOWLIST.items())
+                },
+            }
+
+        state = self._load_state(db)
+        step_key = self._strategy_test_key(normalized_timeframe, normalized_strategy)
+        queued = self._serialize_queued_strategy_test(state.get("queued_strategy_test"))
+        if queued is not None and queued.get("step_key") == step_key:
+            return {
+                "ok": True,
+                "status": "queued",
+                "timeframe": normalized_timeframe,
+                "strategy": normalized_strategy,
+                "step_key": step_key,
+            }
+        if queued is not None:
+            return {
+                "ok": False,
+                "status": "queue_conflict",
+                "queued_strategy_test": queued,
+                "requested_step_key": step_key,
+                "recommended_actions": ["clear_queue"],
+            }
+        state["queued_strategy_test"] = {
+            "timeframe": normalized_timeframe,
+            "strategy": normalized_strategy,
+            "step_key": step_key,
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._persist_state(db, state)
+        self._log_event(
+            db,
+            event_type="auto_tuner_strategy_test_queued",
+            message=f"Queued strategy test '{step_key}'",
+            data={
+                "timeframe": normalized_timeframe,
+                "strategy": normalized_strategy,
+                "step_key": step_key,
+            },
+        )
+        db.commit()
+        return {
+            "ok": True,
+            "status": "queued",
+            "timeframe": normalized_timeframe,
+            "strategy": normalized_strategy,
+            "step_key": step_key,
+        }
+
+    def clear_queued_strategy_test(self, db: Session) -> dict[str, Any]:
+        state = self._load_state(db)
+        queued = self._serialize_queued_strategy_test(state.get("queued_strategy_test"))
+        if queued is None:
+            return {"ok": False, "status": "queue_empty"}
+        state["queued_strategy_test"] = None
+        self._persist_state(db, state)
+        self._log_event(
+            db,
+            event_type="auto_tuner_strategy_test_queue_cleared",
+            message=f"Cleared queued strategy test '{queued['step_key']}'",
+            data=queued,
+        )
+        db.commit()
+        return {"ok": True, "status": "queue_cleared", "cleared": queued}
+
     def _disabled_signal_sources(self, db: Session) -> list[str]:
         risk = self._snapshot_risk(db)
         disabled_sources = risk.get("disabled_signal_sources", [])
@@ -931,6 +1149,110 @@ class AutoTuner:
             "patch": {"disabled_signal_sources": test_sources},
             "revert": {"disabled_signal_sources": control_sources},
         }
+
+    @staticmethod
+    def _strategy_test_key(timeframe: str, strategy: str) -> str:
+        return f"strategy_test:{timeframe}:{strategy}"
+
+    def _strategy_test_step(self, timeframe: str, strategy: str) -> dict[str, Any]:
+        return {
+            "key": self._strategy_test_key(timeframe, strategy),
+            "label": f"Strategy test {timeframe}/{strategy}",
+            "patch": {"disabled_strategies_by_timeframe": {timeframe: [strategy]}},
+            "revert": {},
+            "strategy_test": {
+                "timeframe": timeframe,
+                "strategy": strategy,
+            },
+        }
+
+    @staticmethod
+    def _last_strategy_test_recommendation(history: object, step_key: str) -> str | None:
+        if not isinstance(history, list):
+            return None
+        for item in reversed(history):
+            if not isinstance(item, dict):
+                continue
+            if item.get("key") != step_key:
+                continue
+            ab_test = item.get("ab_test")
+            if isinstance(ab_test, dict):
+                recommendation = ab_test.get("recommendation")
+                if isinstance(recommendation, str) and recommendation:
+                    return recommendation
+        return None
+
+    def _activate_strategy_test(
+        self,
+        db: Session,
+        state: dict[str, Any],
+        config: dict[str, Any],
+        timeframe: str,
+        strategy: str,
+        *,
+        from_queue: bool,
+    ) -> dict[str, Any]:
+        if strategy not in STRATEGY_TEST_ALLOWLIST.get(timeframe, ()):
+            return {
+                "ok": False,
+                "status": "unsupported_strategy_test",
+                "timeframe": timeframe,
+                "strategy": strategy,
+                "supported": {
+                    key: list(value)
+                    for key, value in sorted(STRATEGY_TEST_ALLOWLIST.items())
+                },
+            }
+
+        active_key = state.get("current_step_key")
+        step_key = self._strategy_test_key(timeframe, strategy)
+        if active_key is not None:
+            return {
+                "ok": False,
+                "status": "conflict",
+                "active_step_key": active_key,
+                "requested_step_key": step_key,
+                "recommended_actions": ["wait", "rollback", "reset"],
+            }
+
+        dynamic_step = self._strategy_test_step(timeframe, strategy)
+        config.update(
+            {
+                "enabled": True,
+                "mode": "ab_test",
+                "sequence": [deepcopy(dynamic_step)],
+            }
+        )
+        self._persist_config(db, config)
+        result = self._start_ab_step(db, state, config, [dynamic_step], 0)
+        result.update(
+            {
+                "ok": True,
+                "timeframe": timeframe,
+                "strategy": strategy,
+                "queued": from_queue,
+            }
+        )
+        return result
+
+    @staticmethod
+    def _serialize_queued_strategy_test(raw: object) -> dict[str, str] | None:
+        if not isinstance(raw, dict):
+            return None
+        timeframe = raw.get("timeframe")
+        strategy = raw.get("strategy")
+        step_key = raw.get("step_key")
+        queued_at = raw.get("queued_at")
+        if not all(isinstance(item, str) and item for item in (timeframe, strategy, step_key)):
+            return None
+        payload: dict[str, str] = {
+            "timeframe": timeframe,
+            "strategy": strategy,
+            "step_key": step_key,
+        }
+        if isinstance(queued_at, str) and queued_at:
+            payload["queued_at"] = queued_at
+        return payload
 
     def _metrics_for(self, positions: list[Position]) -> dict[str, Any]:
         if not positions:

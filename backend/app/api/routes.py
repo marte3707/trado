@@ -1408,6 +1408,11 @@ def auto_tuner_source_tests(db: Session = Depends(get_db)) -> dict:
     return AutoTuner().source_tests(db)
 
 
+@router.get("/auto-tuner/strategy-tests")
+def auto_tuner_strategy_tests(db: Session = Depends(get_db)) -> dict:
+    return AutoTuner().strategy_tests(db)
+
+
 @router.post("/auto-tuner/source-tests/{source}/start")
 def auto_tuner_start_source_test(
     source: str = Path(..., pattern="^(whale_flow|fear_greed)$"),
@@ -1419,6 +1424,44 @@ def auto_tuner_start_source_test(
         raise HTTPException(status_code=404, detail=result)
     if status == "conflict":
         raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@router.post("/auto-tuner/strategy-tests/{timeframe}/{strategy}/start")
+def auto_tuner_start_strategy_test(
+    timeframe: str = Path(..., pattern="^[0-9a-zA-Z]+$"),
+    strategy: str = Path(..., pattern="^[a-zA-Z0-9_-]+$"),
+    db: Session = Depends(get_db),
+) -> dict:
+    result = AutoTuner().start_strategy_test(db, timeframe, strategy)
+    status = result.get("status")
+    if status == "unsupported_strategy_test":
+        raise HTTPException(status_code=404, detail=result)
+    if status == "conflict":
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@router.post("/auto-tuner/strategy-tests/{timeframe}/{strategy}/queue")
+def auto_tuner_queue_strategy_test(
+    timeframe: str = Path(..., pattern="^[0-9a-zA-Z]+$"),
+    strategy: str = Path(..., pattern="^[a-zA-Z0-9_-]+$"),
+    db: Session = Depends(get_db),
+) -> dict:
+    result = AutoTuner().queue_strategy_test(db, timeframe, strategy)
+    status = result.get("status")
+    if status == "unsupported_strategy_test":
+        raise HTTPException(status_code=404, detail=result)
+    if status == "queue_conflict":
+        raise HTTPException(status_code=409, detail=result)
+    return result
+
+
+@router.delete("/auto-tuner/strategy-tests/queue")
+def auto_tuner_clear_queued_strategy_test(db: Session = Depends(get_db)) -> dict:
+    result = AutoTuner().clear_queued_strategy_test(db)
+    if result.get("status") == "queue_empty":
+        raise HTTPException(status_code=404, detail=result)
     return result
 
 

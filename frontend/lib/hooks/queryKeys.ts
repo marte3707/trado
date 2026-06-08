@@ -22,6 +22,7 @@ export const qk = {
   outcomeProfile: (lookback: number) => ["outcome-profile", lookback] as const,
   tunerStatus: ["tuner", "status"] as const,
   tunerSourceTests: ["tuner", "source-tests"] as const,
+  tunerStrategyTests: ["tuner", "strategy-tests"] as const,
   workerCycles: (limit: number) => ["worker", "cycles", limit] as const,
   signalRejections: (limit: number) => ["signal-rejections", limit] as const,
   marketIntelligence: ["market-intelligence"] as const,
