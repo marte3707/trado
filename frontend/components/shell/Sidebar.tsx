@@ -1,6 +1,7 @@
 "use client";
 
-import { ChevronLeft, ChevronRight, Hexagon } from "lucide-react";
+import Image from "next/image";
+import { ChevronLeft } from "lucide-react";
 
 import { useHealth } from "@/lib/hooks/queries";
 import { ROUTE_GROUPS, ROUTES, type Route } from "@/components/shell/routes";
@@ -37,11 +38,17 @@ export function Sidebar({ route, setRoute, counts, collapsed, onToggleCollapsed 
       >
         {!collapsed && (
           <>
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-border bg-bg-1">
-              <Hexagon className="h-4 w-4 text-success" strokeWidth={2.2} />
+            <div className="flex h-8 w-[104px] shrink-0 items-center rounded-md bg-brand-light px-2">
+              <Image
+                src="/brand/trado_logo_horizontal.png"
+                alt="Trado"
+                width={180}
+                height={52}
+                className="h-5 w-full object-contain"
+              />
             </div>
             <div className="flex min-w-0 flex-col leading-tight">
-              <span className="text-sm font-semibold tracking-tight text-fg">Trado</span>
+              <span className="text-xs font-semibold text-fg">Trade smarter</span>
               <span className="font-mono text-[10px] uppercase tracking-wide text-fg-3">
                 {health?.network ?? "—"}
               </span>
@@ -57,11 +64,19 @@ export function Sidebar({ route, setRoute, counts, collapsed, onToggleCollapsed 
         )}
         {collapsed && (
           <button
-            className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-border text-fg-3 transition-colors hover:bg-bg-2 hover:text-fg"
+            className="inline-flex h-9 w-9 items-center justify-center rounded-md border border-border bg-bg-1 transition-colors hover:bg-bg-2"
             onClick={onToggleCollapsed}
             aria-label="Espandi menu"
+            title="Espandi menu"
           >
-            <ChevronRight className="h-3.5 w-3.5" />
+            <Image
+              src="/brand/trado_telegram_avatar.png"
+              alt=""
+              width={48}
+              height={48}
+              className="h-6 w-6 rounded-full"
+              aria-hidden="true"
+            />
           </button>
         )}
       </div>

@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1254" height="1254" viewBox="0 0 1254 1254" fill="none">
+  <rect width="1254" height="1254" fill="#FFFFFF"/>
+  <rect x="72" y="72" width="1110" height="1110" rx="36" fill="#FFFFFF"/>
+
+  <!-- Main hero logo -->
+  
+    <g transform="translate(270 150) scale(1.35)">
+      <path d="M22 12 H162 L162 42 L116 82 H86 V162 H50 V94 L18 126 V82 L60 42 H22 Z" fill="#0B132B"/>
+      <path d="M92 98 L178 32 V68 L112 120 V162 H78 V118 Z" fill="#00D09C"/>
+      <path d="M18 126 L50 94 V162 H18 Z" fill="#0B132B"/>
+    </g>
+    
+  <text x="520" y="286" font-family="Inter, Arial, sans-serif" font-size="124" font-weight="700" fill="#0B132B" letter-spacing="-4">Trado</text>
+
+  <!-- Upper usage row -->
+  <text x="110" y="445" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#4B5563" letter-spacing="6">MAIN LOGO</text>
+  <text x="625" y="445" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#4B5563" letter-spacing="6">ICON ONLY</text>
+  <text x="895" y="445" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#4B5563" letter-spacing="5">TELEGRAM AVATAR</text>
+
+  <line x1="525" y1="438" x2="525" y2="675" stroke="#E5E7EB" stroke-width="2"/>
+  <line x1="815" y1="438" x2="815" y2="675" stroke="#E5E7EB" stroke-width="2"/>
+
+  
+    <g transform="translate(108 520) scale(0.72)">
+      <path d="M22 12 H162 L162 42 L116 82 H86 V162 H50 V94 L18 126 V82 L60 42 H22 Z" fill="#0B132B"/>
+      <path d="M92 98 L178 32 V68 L112 120 V162 H78 V118 Z" fill="#00D09C"/>
+      <path d="M18 126 L50 94 V162 H18 Z" fill="#0B132B"/>
+    </g>
+    
+  <text x="255" y="632" font-family="Inter, Arial, sans-serif" font-size="70" font-weight="700" fill="#0B132B" letter-spacing="-2">Trado</text>
+
+  
+    <g transform="translate(610 505) scale(0.95)">
+      <path d="M22 12 H162 L162 42 L116 82 H86 V162 H50 V94 L18 126 V82 L60 42 H22 Z" fill="#0B132B"/>
+      <path d="M92 98 L178 32 V68 L112 120 V162 H78 V118 Z" fill="#00D09C"/>
+      <path d="M18 126 L50 94 V162 H18 Z" fill="#0B132B"/>
+    </g>
+    
+
+  <circle cx="1010" cy="590" r="112" fill="#0B132B"/>
+  <circle cx="1010" cy="590" r="104" stroke="#FFFFFF" stroke-width="8"/>
+  
+    <g transform="translate(935 525) scale(0.76)">
+      <path d="M22 12 H162 L162 42 L116 82 H86 V162 H50 V94 L18 126 V82 L60 42 H22 Z" fill="#FFFFFF"/>
+      <path d="M92 98 L178 32 V68 L112 120 V162 H78 V118 Z" fill="#00D09C"/>
+      <path d="M18 126 L50 94 V162 H18 Z" fill="#FFFFFF"/>
+    </g>
+    
+
+  <line x1="85" y1="730" x2="1169" y2="730" stroke="#E5E7EB" stroke-width="2"/>
+
+  <!-- Color palette -->
+  <text x="90" y="780" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#4B5563" letter-spacing="6">COLOR PALETTE</text>
+  <rect x="90" y="795" width="104" height="104" rx="12" fill="#0B132B"/>
+  <rect x="220" y="795" width="104" height="104" rx="12" fill="#00D09C"/>
+  <rect x="350" y="795" width="104" height="104" rx="12" fill="#E5E7EB"/>
+  <rect x="480" y="795" width="104" height="104" rx="12" fill="#F7F8FA" stroke="#E5E7EB"/>
+
+  <text x="90" y="940" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#0B132B">#0B132B</text>
+  <text x="90" y="965" font-family="Inter, Arial, sans-serif" font-size="16" fill="#4B5563">Deep Navy</text>
+  <text x="220" y="940" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#0B132B">#00D09C</text>
+  <text x="220" y="965" font-family="Inter, Arial, sans-serif" font-size="16" fill="#4B5563">Emerald Teal</text>
+  <text x="350" y="940" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#0B132B">#E5E7EB</text>
+  <text x="350" y="965" font-family="Inter, Arial, sans-serif" font-size="16" fill="#4B5563">Cool Gray</text>
+  <text x="480" y="940" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#0B132B">#F7F8FA</text>
+  <text x="480" y="965" font-family="Inter, Arial, sans-serif" font-size="16" fill="#4B5563">Light Gray</text>
+
+  <!-- Typography -->
+  <line x1="630" y1="760" x2="630" y2="985" stroke="#E5E7EB" stroke-width="2"/>
+  <text x="680" y="780" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#4B5563" letter-spacing="6">TYPOGRAPHY</text>
+  <text x="680" y="860" font-family="Inter, Arial, sans-serif" font-size="76" font-weight="700" fill="#0B132B" letter-spacing="-3">Trado</text>
+  <text x="685" y="912" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700" fill="#0B132B">Inter SemiBold</text>
+  <text x="685" y="950" font-family="Inter, Arial, sans-serif" font-size="18" fill="#4B5563">Aa Bb Cc Dd Ee Ff Gg Hh Ii Jj Kk Ll Mm</text>
+  <text x="685" y="978" font-family="Inter, Arial, sans-serif" font-size="18" fill="#4B5563">Nn Oo Pp Qq Rr Ss Tt Uu Vv Ww Xx Yy Zz</text>
+  <text x="685" y="1006" font-family="Inter, Arial, sans-serif" font-size="18" fill="#4B5563">0123456789</text>
+
+  <line x1="85" y1="1030" x2="1169" y2="1030" stroke="#E5E7EB" stroke-width="2"/>
+
+  <!-- Brand essence -->
+  <text x="90" y="1085" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#4B5563" letter-spacing="6">BRAND ESSENCE</text>
+
+  <circle cx="135" cy="1140" r="34" fill="#DDFBF3"/>
+  <text x="178" y="1132" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="700" fill="#0B132B">Trustworthy</text>
+  <text x="178" y="1160" font-family="Inter, Arial, sans-serif" font-size="15" fill="#4B5563">Reliable and secure</text>
+
+  <circle cx="405" cy="1140" r="34" fill="#DDFBF3"/>
+  <text x="448" y="1132" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="700" fill="#0B132B">Growth</text>
+  <text x="448" y="1160" font-family="Inter, Arial, sans-serif" font-size="15" fill="#4B5563">Built for progress</text>
+
+  <circle cx="675" cy="1140" r="34" fill="#DDFBF3"/>
+  <text x="718" y="1132" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="700" fill="#0B132B">Smart</text>
+  <text x="718" y="1160" font-family="Inter, Arial, sans-serif" font-size="15" fill="#4B5563">Data-driven insights</text>
+
+  <circle cx="945" cy="1140" r="34" fill="#DDFBF3"/>
+  <text x="988" y="1132" font-family="Inter, Arial, sans-serif" font-size="20" font-weight="700" fill="#0B132B">Fast</text>
+  <text x="988" y="1160" font-family="Inter, Arial, sans-serif" font-size="15" fill="#4B5563">Real-time execution</text>
+
+  <text x="438" y="1220" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#0B132B" letter-spacing="8">TRADO</text>
+  <circle cx="555" cy="1214" r="5" fill="#00D09C"/>
+  <text x="585" y="1220" font-family="Inter, Arial, sans-serif" font-size="18" font-weight="700" fill="#4B5563" letter-spacing="6">TRADE SMARTER. GROW FURTHER.</text>
+</svg>

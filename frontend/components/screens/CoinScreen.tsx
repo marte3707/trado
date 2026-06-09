@@ -1,13 +1,11 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Icon, ScoreChip, DirBadge, TfChip, MarketBadge, StratList, Kv, Seg, fmt, StatusBadge } from "@/components/atoms";
-import { Health, IndicatorSnapshot, Market, Position, Signal, apiGet } from "@/lib/api";
-import { ChartPanel, ChartOverlays, LiveChartUpdate } from "@/components/ChartPanel";
+import React, { useEffect, useMemo, useState } from "react";
 
-type Candle = {
-  open_time: string; open: string; high: string; low: string; close: string; volume: string;
-};
+import { DirBadge, Icon, Kv, MarketBadge, ScoreChip, StatusBadge, TfChip, fmt, normalizeDir } from "@/components/atoms";
+import { StrategyContributionsChart } from "@/components/signals/StrategyContributionsChart";
+import type { Candle, Health, IndicatorSnapshot, Market, Position, Signal } from "@/lib/api";
+import { useSignalSnapshot } from "@/lib/hooks/queries";
 
 interface Props {
   markets: Market[];
@@ -18,11 +16,24 @@ interface Props {
   initialCandles: Candle[];
   initialMarket: Market | null;
   initialTf: string;
+  focusSignalId?: number;
   focusMarketKey?: string;
   focusTf?: string;
 }
 
-function marketKey(m: Market) { return `${m.market_type}:${m.symbol}`; }
+type StrategyEntry = {
+  name: string;
+  direction: string;
+  confidence: number | null;
+  weight: number | null;
+  contribution: number | null;
+  reason: string;
+  indicatorValues: Record<string, unknown>;
+};
+
+function marketKey(market: Market) {
+  return `${market.market_type}:${market.symbol}`;
+}
 
 function asNumber(value: unknown): number | null {
   if (value == null || value === "") return null;
@@ -30,41 +41,45 @@ function asNumber(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function formatIndicatorScalar(value: unknown): string {
+function formatDateTime(value: string | null | undefined) {
+  if (!value) return "-";
+  return new Intl.DateTimeFormat("it-IT", { dateStyle: "short", timeStyle: "short" }).format(new Date(value));
+}
+
+function formatScalar(value: unknown): string {
   const n = asNumber(value);
-  if (n !== null) return n.toLocaleString("it-IT", { maximumFractionDigits: 4 });
+  if (n !== null) return n.toLocaleString("it-IT", { maximumFractionDigits: 5 });
   if (typeof value === "string" && value) return value;
-  return "—";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  return "-";
 }
 
-function formatCompactEur(value: number | null): string {
-  if (value == null) return "—";
-  if (Math.abs(value) >= 1e9) return `€${(value / 1e9).toFixed(2)}B`;
-  if (Math.abs(value) >= 1e6) return `€${(value / 1e6).toFixed(1)}M`;
-  if (Math.abs(value) >= 1e3) return `€${(value / 1e3).toFixed(1)}K`;
-  return fmt.money(value);
+function parseStrategyEntries(breakdown: Record<string, unknown>): StrategyEntry[] {
+  return Object.entries(breakdown ?? {})
+    .filter(([name, raw]) => !name.startsWith("_") && raw && typeof raw === "object")
+    .map(([name, raw]) => {
+      const obj = raw as Record<string, unknown>;
+      const indicatorValues = (
+        obj.indicator_values && typeof obj.indicator_values === "object"
+          ? obj.indicator_values
+          : {}
+      ) as Record<string, unknown>;
+      return {
+        name,
+        direction: typeof obj.direction === "string" ? obj.direction : "NEUTRAL",
+        confidence: asNumber(obj.confidence),
+        weight: asNumber(obj.weight),
+        contribution: asNumber(obj.contribution),
+        reason: typeof obj.reason === "string" ? obj.reason : "",
+        indicatorValues,
+      };
+    })
+    .sort((a, b) => (b.contribution ?? -1) - (a.contribution ?? -1));
 }
 
-function candleStats(candles: Candle[]) {
-  const parsed = candles
-    .map((candle) => ({
-      time: new Date(candle.open_time).getTime(),
-      open: asNumber(candle.open),
-      close: asNumber(candle.close),
-      volume: asNumber(candle.volume)
-    }))
-    .filter((candle): candle is { time: number; open: number; close: number; volume: number } =>
-      Number.isFinite(candle.time) && candle.open !== null && candle.close !== null && candle.volume !== null
-    );
-  const latest = parsed.at(-1);
-  if (!latest) return { price: null, change24: null, vol24: null };
-  const cutoff = latest.time - 24 * 60 * 60 * 1000;
-  const window = parsed.filter((candle) => candle.time >= cutoff);
-  const prior = [...parsed].reverse().find((candle) => candle.time <= cutoff);
-  const reference = prior?.close ?? window[0]?.open ?? null;
-  const change24 = reference && reference !== 0 ? ((latest.close - reference) / reference) * 100 : null;
-  const vol24 = window.reduce((sum, candle) => sum + candle.close * candle.volume, 0);
-  return { price: latest.close, change24, vol24 };
+function breakdownObject(signal: Signal | null, key: string): Record<string, unknown> | null {
+  const raw = signal?.strategy_breakdown?.[key];
+  return raw && typeof raw === "object" ? raw as Record<string, unknown> : null;
 }
 
 function positionSourceSignalId(position: Position) {
@@ -72,596 +87,491 @@ function positionSourceSignalId(position: Position) {
   return parsed === null ? null : Math.trunc(parsed);
 }
 
-function isSignalOpen(signal: Signal, positions: Position[]) {
-  const status = signal.status.toLowerCase();
-  if (status === "new" || status === "active") return true;
-  return positions.some((position) => (
-    position.status.toLowerCase() === "open" && positionSourceSignalId(position) === signal.id
-  ));
+function linkedPositionsForSignal(signal: Signal | null, fallbackPositions: Position[], snapshotPositions: Position[]) {
+  if (!signal) return [];
+  if (snapshotPositions.length > 0) return snapshotPositions;
+  return fallbackPositions.filter((position) => positionSourceSignalId(position) === signal.id);
 }
 
-function openPositionForSignal(signal: Signal, positions: Position[]) {
-  return positions.find((position) => (
-    position.status.toLowerCase() === "open" && positionSourceSignalId(position) === signal.id
-  )) ?? null;
+function selectedSignalFallback(
+  signals: Signal[],
+  focusSignalId: number | undefined,
+  selectedKey: string,
+  selectedTf: string,
+) {
+  if (focusSignalId != null) {
+    const focused = signals.find((signal) => signal.id === focusSignalId);
+    if (focused) return focused;
+  }
+  const marketSignals = signals.filter((signal) => signal.market && marketKey(signal.market) === selectedKey);
+  const timeframeMatch = marketSignals.find((signal) => !selectedTf || signal.timeframe === selectedTf);
+  return timeframeMatch ?? marketSignals[0] ?? signals[0] ?? null;
 }
 
-function displaySignalStatus(signal: Signal, positions: Position[]) {
-  const position = openPositionForSignal(signal, positions);
-  if (position) return { label: `${signal.status} · posizione aperta`, tone: "long" };
-  if (signal.status === "new" || signal.status === "active") return { label: signal.status, tone: "info" };
-  if (signal.status === "ignored" || signal.status === "closed") return { label: signal.status, tone: "muted" };
-  return { label: signal.status, tone: signal.status === "executed" ? "warn" : "muted" };
-}
-
-function preferredIndicatorValue(name: string, values: Record<string, unknown>) {
-  const keysByName: Record<string, string[]> = {
-    rsi: ["rsi"],
-    macd: ["histogram", "macd"],
-    ema_crossover: ["ema_9", "ema_21", "ema_200"],
-    supertrend: ["trend", "direction"],
-    bollinger_bands: ["percent_b", "middle"],
-    vwap: ["vwap"],
-    volume_spike: ["volume", "volume_ma"],
-    support_resistance: ["nearest_support", "nearest_resistance"],
-    fibonacci: ["nearest_level", "trend"],
-    candlestick_patterns: ["pattern", "confidence"]
-  };
-  const keys = keysByName[name] ?? [];
-  for (const key of keys) {
-    if (values[key] != null) return [key, values[key]] as const;
-  }
-  const scalar = Object.entries(values).find(([key, value]) =>
-    !key.startsWith("_") && (typeof value === "number" || typeof value === "string")
-  );
-  return scalar ?? null;
-}
-
-function indicatorImpliedBias(name: string, values: Record<string, unknown>): "long" | "short" | "neutral" {
-  const direction = String(values._direction ?? values.direction ?? values.trend ?? "").toLowerCase();
-  if (name === "rsi") {
-    const rsiVal = asNumber(values.rsi);
-    if (rsiVal === null) return "neutral";
-    if (rsiVal < 40) return "long";
-    if (rsiVal > 60) return "short";
-    return "neutral";
-  }
-  if (name === "macd") {
-    const hist = asNumber(values.histogram);
-    if (hist === null) return "neutral";
-    return hist > 0 ? "long" : hist < 0 ? "short" : "neutral";
-  }
-  if (name === "bollinger_bands") {
-    const pct = asNumber(values.percent_b);
-    if (pct !== null) {
-      if (pct < 0.2) return "long";
-      if (pct > 0.8) return "short";
-      return "neutral";
-    }
-  }
-  if (direction === "up" || direction.includes("long") || direction === "bullish") return "long";
-  if (direction === "down" || direction.includes("short") || direction === "bearish") return "short";
-  return "neutral";
-}
-
-function inferredIndicatorTone(name: string, values: Record<string, unknown>, signalDir?: string | null): "ok" | "warn" | "bad" {
-  const bias = indicatorImpliedBias(name, values);
-  const sigLong = typeof signalDir === "string" && signalDir.includes("LONG");
-  const sigShort = typeof signalDir === "string" && signalDir.includes("SHORT");
-  if (sigLong || sigShort) {
-    if (bias === "neutral") return "warn";
-    return (sigLong && bias === "long") || (sigShort && bias === "short") ? "ok" : "bad";
-  }
-  if (bias === "long") return "ok";
-  if (bias === "short") return "bad";
-  return "warn";
-}
-
-function rsiDetail(values: Record<string, unknown>): string {
-  const v = asNumber(values.rsi);
-  if (v === null) return "soglie 30 / 70";
-  const zone = v > 70 ? "ipercomprato" : v < 30 ? "ipervenduto" : v >= 50 ? "neutro rialzista" : "neutro ribassista";
-  return `${zone} · soglie 30 / 70`;
-}
-
-function fibonacciDetail(values: Record<string, unknown>): { value: string; detail: string } {
-  const nearestLevel = asNumber(values.nearest_level);
-  const levels = typeof values.levels === "object" && values.levels !== null
-    ? (values.levels as Record<string, unknown>)
-    : {};
-  const trend = typeof values.trend === "string" ? values.trend : null;
-  let ratioLabel: string | null = null;
-  if (nearestLevel !== null) {
-    for (const [key, price] of Object.entries(levels)) {
-      if (Math.abs((asNumber(price) ?? Infinity) - nearestLevel) < 1e-6) { ratioLabel = key; break; }
-    }
-  }
-  const pct = ratioLabel ? `${(parseFloat(ratioLabel) * 100).toFixed(1)}%` : null;
-  const swingHigh = asNumber(values.swing_high);
-  const swingLow = asNumber(values.swing_low);
-  const range = swingHigh !== null && swingLow !== null
-    ? `swing ${fmt.price(swingLow)} – ${fmt.price(swingHigh)}`
-    : null;
-  return {
-    value: pct ?? (nearestLevel !== null ? fmt.price(nearestLevel) : "—"),
-    detail: [trend ? `trend ${trend}` : null, range].filter(Boolean).join(" · ") || "nessun livello attivo",
-  };
-}
-
-function indicatorRow(row: IndicatorSnapshot, signalDir?: string | null) {
-  const values = row.values ?? {};
-  const name = row.indicator_name;
-
-  if (name === "rsi") {
-    const v = asNumber(values.rsi);
-    return {
-      name,
-      value: v !== null ? formatIndicatorScalar(v) : "—",
-      status: inferredIndicatorTone(name, values, signalDir),
-      detail: rsiDetail(values),
-    };
-  }
-
-  if (name === "fibonacci") {
-    const { value, detail } = fibonacciDetail(values);
-    return { name, value, status: inferredIndicatorTone(name, values, signalDir), detail };
-  }
-
-  const entries = Object.entries(values).filter(([key]) => !key.startsWith("_"));
-  const scalar = preferredIndicatorValue(name, values);
-  const confidence = asNumber(values._confidence ?? values.confidence);
-  const reason = typeof values._reason === "string" ? values._reason : "";
-  const detail = entries
-    .filter(([key]) => key !== scalar?.[0])
-    .slice(0, 3)
-    .map(([key, value]) => `${key}: ${formatIndicatorScalar(value)}`)
-    .join(" · ");
-  return {
-    name,
-    value: scalar ? formatIndicatorScalar(scalar[1]) : "—",
-    status: inferredIndicatorTone(name, values, signalDir),
-    detail: reason || (confidence !== null ? `confidence ${confidence}` : detail) || new Intl.DateTimeFormat("it-IT", { dateStyle: "short", timeStyle: "short" }).format(new Date(row.timestamp)),
-  };
-}
-
-export function CoinScreen({ markets, signals, positions, health, chartMarkets, initialCandles, initialMarket, initialTf, focusMarketKey, focusTf }: Props) {
-  const [selectedKey, setSelectedKey] = useState(focusMarketKey ?? (initialMarket ? marketKey(initialMarket) : ""));
-  const [tf, setTf] = useState(focusTf ?? (initialTf || signals[0]?.timeframe || ""));
-  const [candles, setCandles] = useState(initialCandles);
-  const [indicators, setIndicators] = useState<IndicatorSnapshot[]>([]);
-  const [loadingCandles, setLoadingCandles] = useState(false);
-  const [liveStats, setLiveStats] = useState<{ price: number | null; vol24: number | null; updatedAt: number | null }>({
-    price: null,
-    vol24: null,
-    updatedAt: null
-  });
-  const [overlays, setOverlays] = useState<ChartOverlays>({
-    ema: false,
-    bollinger: false,
-    vwap: false,
-    supertrend: false,
-    levels: false,
-    fibonacci: false,
-    signals: true,
-    rsi: false,
-    macd: false,
-    candlestick_patterns: false,
-  });
-  const [showIndicatorsMenu, setShowIndicatorsMenu] = useState(false);
-  const indicatorsMenuRef = useRef<HTMLDivElement | null>(null);
-  const candleLoadSeqRef = useRef(0);
-
-  useEffect(() => {
-    if (!showIndicatorsMenu) return;
-    function handleClickOutside(e: MouseEvent) {
-      if (indicatorsMenuRef.current && !indicatorsMenuRef.current.contains(e.target as Node)) {
-        setShowIndicatorsMenu(false);
-      }
-    }
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [showIndicatorsMenu]);
-
-  const allMarkets = useMemo(
-    () => chartMarkets.length > 0 ? chartMarkets : markets,
-    [chartMarkets, markets]
-  );
-  const selectedMarket = useMemo(
-    () => allMarkets.find(m => marketKey(m) === selectedKey) ?? allMarkets[0] ?? null,
-    [allMarkets, selectedKey]
-  );
-
-  const selectedMarketKey = selectedMarket ? marketKey(selectedMarket) : selectedKey;
-  const selectedSymbol = selectedMarket?.symbol ?? null;
-  const selectedMarketType = selectedMarket?.market_type ?? null;
-  const marketSignals = useMemo(
-    () => signals.filter(s => s.market && marketKey(s.market) === selectedMarketKey),
-    [signals, selectedMarketKey]
-  );
-  const openMarketSignals = useMemo(
-    () => marketSignals.filter(s => isSignalOpen(s, positions)),
-    [marketSignals, positions]
-  );
-  const activeSignal = openMarketSignals[0] ?? null;
-  const activePosition = activeSignal ? openPositionForSignal(activeSignal, positions) : null;
-  const timeframeOptions = useMemo(
-    () => Array.from(new Set([initialTf, ...signals.map(s => s.timeframe)].filter(Boolean))),
-    [initialTf, signals]
-  );
-  const derivedStats = useMemo(() => candleStats(candles), [candles]);
-  const meta = selectedMarket?.metadata_json ?? {};
-  const metaPrice = asNumber(meta.last_price ?? meta.mark_price);
-  const metaChange24 = asNumber(meta.price_change_24h_pct);
-  const metaVol24 = asNumber(meta.volume_24h_usd);
-  const price = liveStats.price ?? derivedStats.price ?? metaPrice;
-  const change24 = derivedStats.change24 ?? metaChange24;
-  const vol24 = liveStats.vol24 ?? derivedStats.vol24 ?? metaVol24;
-  const handleLiveUpdate = useCallback((update: LiveChartUpdate) => {
-    setLiveStats(prev => ({
-      price: update.price,
-      vol24: (prev.vol24 ?? 0) + update.quoteVolumeDelta,
-      updatedAt: Date.now()
-    }));
-  }, []);
-
-  async function loadCandles(
-    market: Pick<Market, "symbol" | "market_type"> | null,
-    timeframe: string,
-    options: { silent?: boolean; keepOnError?: boolean } = {}
-  ) {
-    if (!market) { setCandles([]); return; }
-    const seq = ++candleLoadSeqRef.current;
-    if (!options.silent) setLoadingCandles(true);
-    try {
-      const data = await apiGet<Candle[]>(
-        `/api/candles?symbol=${encodeURIComponent(market.symbol)}&market_type=${encodeURIComponent(market.market_type)}&timeframe=${encodeURIComponent(timeframe)}`
-      );
-      if (seq === candleLoadSeqRef.current) setCandles(data);
-    } catch {
-      if (!options.keepOnError && seq === candleLoadSeqRef.current) setCandles([]);
-    } finally {
-      if (!options.silent && seq === candleLoadSeqRef.current) setLoadingCandles(false);
-    }
-  }
-
-  async function loadIndicators(market: Pick<Market, "symbol" | "market_type"> | null, timeframe: string) {
-    if (!market) { setIndicators([]); return; }
-    try {
-      const data = await apiGet<IndicatorSnapshot[]>(
-        `/api/indicators?symbol=${encodeURIComponent(market.symbol)}&market_type=${encodeURIComponent(market.market_type)}&timeframe=${encodeURIComponent(timeframe)}`
-      );
-      setIndicators(data);
-    } catch {
-      setIndicators([]);
-    }
-  }
-
-  useEffect(() => {
-    if (!selectedSymbol || !selectedMarketType) return;
-    const market = { symbol: selectedSymbol, market_type: selectedMarketType };
-    loadCandles(market, tf);
-    loadIndicators(market, tf);
-    const timer = window.setInterval(() => {
-      loadCandles(market, tf, { silent: true, keepOnError: true });
-    }, 30000);
-    return () => window.clearInterval(timer);
-  }, [selectedSymbol, selectedMarketType, tf]);
+export function CoinScreen({
+  markets,
+  signals,
+  positions,
+  health,
+  chartMarkets,
+  initialCandles,
+  initialMarket,
+  initialTf,
+  focusSignalId,
+  focusMarketKey,
+  focusTf,
+}: Props) {
+  const allMarkets = useMemo(() => chartMarkets.length > 0 ? chartMarkets : markets, [chartMarkets, markets]);
+  const initialKey = focusMarketKey ?? (initialMarket ? marketKey(initialMarket) : signals[0]?.market ? marketKey(signals[0].market) : "");
+  const [selectedKey, setSelectedKey] = useState(initialKey);
+  const [selectedTf, setSelectedTf] = useState(focusTf ?? initialTf ?? signals[0]?.timeframe ?? "");
+  const [selectedSignalId, setSelectedSignalId] = useState<number | null>(focusSignalId ?? null);
 
   useEffect(() => {
     if (focusMarketKey) setSelectedKey(focusMarketKey);
-    if (focusTf) setTf(focusTf);
-  }, [focusMarketKey, focusTf]);
+    if (focusTf) setSelectedTf(focusTf);
+    if (focusSignalId != null) setSelectedSignalId(focusSignalId);
+  }, [focusMarketKey, focusSignalId, focusTf]);
+
+  const fallbackSignal = useMemo(
+    () => selectedSignalFallback(signals, selectedSignalId ?? undefined, selectedKey, selectedTf),
+    [selectedKey, selectedSignalId, selectedTf, signals],
+  );
+  const effectiveSignalId = selectedSignalId ?? fallbackSignal?.id ?? null;
+  const { data: snapshot, isFetching, isError } = useSignalSnapshot(effectiveSignalId);
+  const signal = snapshot?.signal ?? fallbackSignal;
+  const selectedMarket = signal?.market ?? allMarkets.find((market) => marketKey(market) === selectedKey) ?? initialMarket;
+  const sourceTime = snapshot?.source_candle_open_time ?? signal?.source_candle_open_time ?? null;
+  const candles = snapshot?.candles ?? (signal && initialMarket?.id === signal.market_id && initialTf === signal.timeframe ? initialCandles : []);
+  const indicators = snapshot?.indicators ?? [];
+  const linkedPositions = linkedPositionsForSignal(signal, positions, snapshot?.positions ?? []);
+  const signalLogs = snapshot?.decision_logs ?? [];
+  const strategyEntries = useMemo(() => parseStrategyEntries(signal?.strategy_breakdown ?? {}), [signal]);
+  const scoreMeta = breakdownObject(signal, "_score");
+  const activeMarketSignals = useMemo(() => {
+    if (!selectedMarket) return signals;
+    return signals.filter((item) => item.market && marketKey(item.market) === marketKey(selectedMarket));
+  }, [selectedMarket, signals]);
 
   useEffect(() => {
-    setLiveStats({ price: derivedStats.price, vol24: derivedStats.vol24, updatedAt: null });
-  }, [derivedStats.price, derivedStats.vol24, selectedMarketKey, tf]);
+    if (!signal?.market) return;
+    setSelectedKey(marketKey(signal.market));
+    setSelectedTf(signal.timeframe);
+  }, [signal?.id, signal?.market, signal?.timeframe]);
+
+  if (!signal) {
+    return (
+      <div className="page">
+        <div className="card">
+          <div className="card-body" style={{ padding: 28, textAlign: "center", color: "var(--fg-3)" }}>
+            Nessun segnale disponibile per costruire lo snapshot.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const primaryPosition = linkedPositions[0] ?? null;
+  const expectedR = signal.calibrated_expected_r;
+  const winRate = signal.calibrated_win_rate;
 
   return (
     <div className="page">
-      {/* Header */}
-      <div style={{ display: "flex", alignItems: "flex-end", gap: 18, marginBottom: "var(--gap)" }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 18, marginBottom: "var(--gap)" }}>
         <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
-            <h1 className="page-title" style={{ margin: 0 }}>
-              {selectedMarket?.symbol ?? "—"}
-              <span className="muted" style={{ fontWeight: 300 }}> / USDC</span>
-            </h1>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+            <h1 className="page-title" style={{ margin: 0 }}>{selectedMarket?.symbol ?? "-"}</h1>
             {selectedMarket && <MarketBadge market={selectedMarket.market_type} />}
-            <span className="badge muted">{selectedMarket?.base ?? "—"}</span>
+            <TfChip tf={signal.timeframe} />
+            <span className="badge muted">#{signal.id}</span>
           </div>
-          <div className="page-sub">Hyperliquid · {selectedMarket?.market_type === "perp" ? "Perpetual" : "Spot"}</div>
+          <div className="page-sub">
+            Snapshot generazione segnale · source candle {formatDateTime(sourceTime)} · creato {formatDateTime(signal.created_at)}
+          </div>
         </div>
-        <div style={{ marginLeft: 24 }}>
-          {price != null ? (
-            <>
-              <div className="mono" style={{ fontSize: "var(--fz-3xl)", fontWeight: 500, lineHeight: 1, letterSpacing: "-0.02em" }}>
-                €{fmt.price(price)}
-              </div>
-              {change24 != null && (
-                <div className={"mono " + (change24 >= 0 ? "up" : "down")} style={{ marginTop: 4, fontSize: "var(--fz-md)" }}>
-                  {fmt.pct(change24)} <span className="muted">24h</span>
-                </div>
-              )}
-            </>
-          ) : (
-            <div className="muted mono">—</div>
-          )}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", justifyContent: "flex-end" }}>
+          <DirBadge dir={signal.direction} />
+          <ScoreChip score={signal.score} dir={signal.direction} />
+          <StatusBadge status={primaryPosition?.status === "open" ? "active" : signal.status} />
         </div>
       </div>
 
-      {/* Stat strip */}
-      <div className="stat-grid" style={{ marginBottom: "var(--gap)", gridTemplateColumns: "repeat(5, 1fr)" }}>
-        <SmStat label="24h volume" value={formatCompactEur(vol24)} />
-        <SmStat label="24h change" value={change24 != null ? fmt.pct(change24) : "—"} tone={change24 != null ? (change24 >= 0 ? "up" : "down") : ""} />
-        <SmStat label="Prezzo live" value={price != null ? `€${fmt.price(price)}` : "—"} />
-        <SmStat label="Segnali aperti" value={`${openMarketSignals.length}`} />
+      <div className="stat-grid" style={{ marginBottom: "var(--gap)", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))" }}>
+        <SmStat label="Entry" value={fmt.price(signal.entry_price)} />
+        <SmStat label="Stop" value={fmt.price(signal.stop_loss)} tone="down" />
+        <SmStat label="TP1 / TP2" value={`${fmt.price(signal.take_profit_1)} / ${fmt.price(signal.take_profit_2)}`} tone="up" />
+        <SmStat label="Risk reward" value={signal.risk_reward ?? "-"} />
         <SmStat label="Network" value={health.network} />
       </div>
 
-      {/* Chart + indicators */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 300px", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
-        <div className="chart">
-          <div className="chart-head">
-            <span className="mono fg" style={{ fontSize: "var(--fz-md)" }}>
-              {selectedMarket?.symbol ?? "—"}/USDC · {tf}
-            </span>
-            <Seg
-              value={tf}
-              onChange={v => setTf(v)}
-              options={timeframeOptions.map(t => [t, t] as [string, string])}
-            />
-            {loadingCandles && <span className="muted mono" style={{ fontSize: "var(--fz-xs)" }}>loading…</span>}
-            <div ref={indicatorsMenuRef} style={{ marginLeft: "auto", position: "relative" }}>
-              <IndicatorsButton
-                overlays={overlays}
-                open={showIndicatorsMenu}
-                onToggle={() => setShowIndicatorsMenu(v => !v)}
-                onOverlayChange={(key) => setOverlays(o => ({ ...o, [key]: !o[key] }))}
-              />
-            </div>
+      {isError && (
+        <div className="card" style={{ marginBottom: "var(--gap)", borderColor: "var(--warn)" }}>
+          <div className="card-body" style={{ color: "var(--warn)", fontSize: "var(--fz-sm)" }}>
+            Snapshot API non disponibile. Mostro i dati gia presenti nel feed segnali.
           </div>
-          <ChartPanel
-            candles={candles}
-            signals={marketSignals}
-            market={selectedMarket}
-            timeframe={tf}
-            network={health.network}
-            overlays={overlays}
-            onLiveUpdate={handleLiveUpdate}
-          />
-        </div>
-
-        <div className="card">
-          <div className="card-head">
-            <span className="title">Indicatori</span>
-            <span className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>{tf}</span>
-          </div>
-          {indicators.length === 0 && (
-            <div style={{ padding: 24, textAlign: "center", color: "var(--fg-3)", fontSize: "var(--fz-sm)" }}>
-              Nessun indicatore salvato nel DB per questo mercato/timeframe
-            </div>
-          )}
-          {indicators.map(row => indicatorRow(row, activeSignal?.direction ?? null)).map((row, i) => (
-            <IndRow key={i} name={row.name} value={row.value} status={row.status} detail={row.detail} />
-          ))}
-        </div>
-      </div>
-
-      {/* Active signal + history on this coin */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "var(--gap)" }}>
-        <div className="card">
-          <div className="card-head">
-            <span className="title">Segnale attivo</span>
-            {activeSignal && <ScoreChip score={activeSignal.score} dir={activeSignal.direction} />}
-            <div className="right">
-              {activeSignal
-                ? <StatusBadge status={activePosition ? "active" : activeSignal.status} />
-                : <span className="badge muted">nessun segnale</span>
-              }
-            </div>
-          </div>
-          {activeSignal ? (
-            <div className="card-body">
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 14, marginBottom: 12 }}>
-                <Kv label="Entry" value={fmt.price(activeSignal.entry_price)} />
-                <Kv label="SL" value={fmt.price(activeSignal.stop_loss)} tone="short" />
-                <Kv label="TP1" value={fmt.price(activeSignal.take_profit_1)} tone="long" />
-                <Kv label="TP2" value={fmt.price(activeSignal.take_profit_2)} tone="long" />
-                {activeSignal.take_profit_3 && <Kv label="TP3" value={fmt.price(activeSignal.take_profit_3)} tone="long" />}
-                <Kv label="R/R" value={activeSignal.risk_reward ?? "—"} />
-                <Kv label="TF" value={activeSignal.timeframe} />
-                <Kv label="Score" value={String(activeSignal.score)} />
-                {activePosition && <Kv label="Position" value={`#${activePosition.id} open`} tone="long" />}
-              </div>
-              {activeSignal.reason && (
-                <div style={{ padding: 12, background: "var(--bg-2)", borderRadius: "var(--radius-sm)", fontSize: "var(--fz-sm)", color: "var(--fg-2)", marginBottom: 12 }}>
-                  {activeSignal.reason}
-                </div>
-              )}
-              <div style={{ display: "flex", gap: 6 }}>
-                <StratList strats={Object.keys(activeSignal.strategy_breakdown ?? {})} max={5} />
-              </div>
-            </div>
-          ) : (
-            <div style={{ padding: 24, textAlign: "center", color: "var(--fg-3)", fontSize: "var(--fz-sm)" }}>
-              Nessun segnale attivo su {selectedMarket?.symbol ?? "questo mercato"}
-            </div>
-          )}
-        </div>
-
-        <div className="card">
-          <div className="card-head">
-            <span className="title">Storico segnali</span>
-            <div className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>{selectedMarket?.symbol ?? "—"}</div>
-          </div>
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th>TF</th><th>Dir</th><th>Score</th><th style={{ textAlign: "right" }}>Entry</th><th>Status</th><th>Età</th>
-              </tr>
-            </thead>
-            <tbody>
-              {marketSignals.length === 0 && (
-                <tr><td colSpan={6} style={{ textAlign: "center", padding: "24px 0", color: "var(--fg-3)" }}>Nessun segnale</td></tr>
-              )}
-              {marketSignals.slice(0, 8).map(s => {
-                const status = displaySignalStatus(s, positions);
-                return (
-                  <tr key={s.id}>
-                    <td><TfChip tf={s.timeframe} /></td>
-                    <td><DirBadge dir={s.direction} /></td>
-                    <td><ScoreChip score={s.score} dir={s.direction} /></td>
-                    <td className="num fg">{fmt.price(s.entry_price)}</td>
-                    <td>
-                      <span className={"badge " + status.tone}>
-                        {status.label}
-                      </span>
-                    </td>
-                    <td className="muted mono">{fmt.relTime(s.created_at)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ── helpers ─────────────────────────────────────────────────────────────── */
-const INDICATOR_OPTIONS: [keyof ChartOverlays, string][] = [
-  ["signals", "Segnali"],
-  ["macd", "MACD"],
-  ["fibonacci", "Fibonacci"],
-  ["candlestick_patterns", "Candlestick patterns"],
-  ["ema", "EMA (9 · 21 · 200)"],
-  ["bollinger", "Bollinger Bands"],
-  ["vwap", "VWAP"],
-  ["supertrend", "Supertrend"],
-  ["levels", "Supporti / Resistenze"],
-  ["rsi", "RSI (14)"],
-];
-
-function IndicatorsButton({
-  overlays,
-  open,
-  onToggle,
-  onOverlayChange,
-}: {
-  overlays: ChartOverlays;
-  open: boolean;
-  onToggle: () => void;
-  onOverlayChange: (key: keyof ChartOverlays) => void;
-}) {
-  const activeCount = INDICATOR_OPTIONS.filter(([key]) => overlays[key]).length;
-  return (
-    <>
-      <button
-        className="btn ghost sm"
-        onClick={onToggle}
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          gap: 5,
-          borderColor: open || activeCount > 0 ? "var(--accent-border)" : "transparent",
-          color: open || activeCount > 0 ? "var(--accent)" : "var(--fg-3)",
-          background: open || activeCount > 0 ? "var(--accent-soft)" : "transparent",
-        }}
-      >
-        <Icon name="sliders-horizontal" size={12} />
-        Indicators
-        {activeCount > 0 && (
-          <span style={{
-            background: "var(--accent)",
-            color: "var(--bg-1)",
-            borderRadius: 99,
-            fontSize: 9,
-            fontWeight: 700,
-            lineHeight: 1,
-            padding: "2px 5px",
-            minWidth: 14,
-            textAlign: "center",
-          }}>
-            {activeCount}
-          </span>
-        )}
-        <Icon name={open ? "chevron-up" : "chevron-down"} size={10} />
-      </button>
-      {open && (
-        <div style={{
-          position: "absolute",
-          top: "calc(100% + 6px)",
-          right: 0,
-          zIndex: 100,
-          background: "var(--bg-2)",
-          border: "1px solid var(--border)",
-          borderRadius: "var(--radius)",
-          padding: "6px 0",
-          minWidth: 200,
-          boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
-        }}>
-          {INDICATOR_OPTIONS.map(([key, label]) => (
-            <button
-              key={key}
-              onClick={() => onOverlayChange(key)}
-              style={{
-                width: "100%",
-                display: "flex",
-                alignItems: "center",
-                gap: 10,
-                padding: "7px 14px",
-                background: "none",
-                border: "none",
-                cursor: "pointer",
-                color: overlays[key] ? "var(--fg)" : "var(--fg-3)",
-                fontSize: "var(--fz-sm)",
-                textAlign: "left",
-              }}
-            >
-              <span style={{
-                width: 14,
-                height: 14,
-                borderRadius: 3,
-                border: `1px solid ${overlays[key] ? "var(--accent)" : "var(--border)"}`,
-                background: overlays[key] ? "var(--accent)" : "transparent",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-                flexShrink: 0,
-              }}>
-                {overlays[key] && <Icon name="check" size={9} />}
-              </span>
-              {label}
-            </button>
-          ))}
         </div>
       )}
-    </>
-  );
-}
 
-function SmStat({ label, value, tone }: { label: string; value: string; tone?: string }) {
-  return (
-    <div className="stat" style={{ padding: "12px 14px" }}>
-      <div className="stat-label">{label}</div>
-      <div className={"mono " + (tone === "up" ? "up" : tone === "down" ? "down" : "")} style={{ fontSize: "var(--fz-lg)", fontWeight: 500 }}>
-        {value}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 360px), 1fr))", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
+        <div className="card">
+          <div className="card-head">
+            <span className="title">Signal context</span>
+            <span className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>
+              {isFetching ? "refresh..." : "DB snapshot"}
+            </span>
+          </div>
+          <SignalContextChart candles={candles} signal={signal} sourceTime={sourceTime} />
+        </div>
+
+        <div className="card">
+          <div className="card-head">
+            <span className="title">Trigger</span>
+            <span className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>{signal.confidence_label}</span>
+          </div>
+          <div className="card-body" style={{ display: "grid", gap: 14 }}>
+            <div style={{ padding: 12, background: "var(--bg-2)", borderRadius: "var(--radius-sm)", color: "var(--fg-2)", fontSize: "var(--fz-sm)", lineHeight: 1.45 }}>
+              {signal.reason || "Nessun trigger reason salvato."}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
+              <Kv label="Long raw" value={formatScalar(scoreMeta?.long_raw)} tone="long" />
+              <Kv label="Short raw" value={formatScalar(scoreMeta?.short_raw)} tone="short" />
+              <Kv label="Voting weight" value={formatScalar(scoreMeta?.voting_weight)} />
+              <Kv label="All weight" value={formatScalar(scoreMeta?.all_weight)} />
+              <Kv label="Expected R" value={expectedR != null ? expectedR.toFixed(2) : "-"} />
+              <Kv label="Win rate" value={winRate != null ? fmt.pct(winRate * 100) : "-"} />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 340px), 1fr))", gap: "var(--gap)", marginBottom: "var(--gap)" }}>
+        <div className="card">
+          <div className="card-head">
+            <span className="title">Strategy votes</span>
+            <span className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>{strategyEntries.length} strategie</span>
+          </div>
+          <div className="card-body">
+            <StrategyContributionsChart breakdown={signal.strategy_breakdown ?? {}} signalDirection={signal.direction} />
+            <StrategyTable entries={strategyEntries} signalDirection={signal.direction} />
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-head">
+            <span className="title">Indicator evidence</span>
+            <span className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>{formatDateTime(sourceTime)}</span>
+          </div>
+          <IndicatorEvidence indicators={indicators} strategyEntries={strategyEntries} />
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 340px), 1fr))", gap: "var(--gap)" }}>
+        <div className="card">
+          <div className="card-head">
+            <span className="title">Execution state</span>
+            <span className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>{linkedPositions.length} posizioni</span>
+          </div>
+          <ExecutionState signal={signal} positions={linkedPositions} />
+        </div>
+
+        <div className="card">
+          <div className="card-head">
+            <span className="title">Signal history</span>
+            <span className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>{selectedMarket?.symbol ?? "-"}</span>
+          </div>
+          <SignalHistory
+            signals={activeMarketSignals}
+            selectedId={signal.id}
+            onSelect={(next) => {
+              setSelectedSignalId(next.id);
+              setSelectedKey(marketKey(next.market));
+              setSelectedTf(next.timeframe);
+            }}
+          />
+        </div>
+      </div>
+
+      <div className="card" style={{ marginTop: "var(--gap)" }}>
+        <div className="card-head">
+          <span className="title">Decision timeline</span>
+          <span className="right muted mono" style={{ fontSize: "var(--fz-xs)" }}>{signalLogs.length} eventi</span>
+        </div>
+        <DecisionTimeline logs={signalLogs} />
       </div>
     </div>
   );
 }
 
-function IndRow({ name, value, status, detail }: { name: string; value: string | number; status: "ok" | "warn" | "bad"; detail: string }) {
-  const dot = status === "ok" ? "green" : status === "warn" ? "amber" : "red";
+function SmStat({ label, value, tone = "" }: { label: string; value: string; tone?: string }) {
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 16px", borderBottom: "1px solid var(--border)" }}>
-      <span className={"dot " + dot} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: "var(--fz-sm)" }}>{name}</div>
-        <div className="muted" style={{ fontSize: 10, marginTop: 1 }}>{detail}</div>
+    <div className="stat-card">
+      <span className="stat-label">{label}</span>
+      <strong className={"stat-value mono " + tone}>{value}</strong>
+    </div>
+  );
+}
+
+function StrategyTable({ entries, signalDirection }: { entries: StrategyEntry[]; signalDirection: string }) {
+  if (entries.length === 0) {
+    return <div style={{ padding: 20, textAlign: "center", color: "var(--fg-3)", fontSize: "var(--fz-sm)" }}>Nessun breakdown strategia disponibile.</div>;
+  }
+  const signalDir = normalizeDir(signalDirection);
+  return (
+    <div style={{ overflowX: "auto", marginTop: 12 }}>
+      <table className="tbl">
+        <thead>
+          <tr>
+            <th>Strategia</th>
+            <th>Dir</th>
+            <th className="num">Conf</th>
+            <th className="num">Peso</th>
+            <th className="num">Contrib</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.map((entry) => {
+            const dir = normalizeDir(entry.direction);
+            const tone = dir === "NEUTRAL" ? "muted" : dir === signalDir ? "long" : "short";
+            return (
+              <tr key={entry.name}>
+                <td className="mono fg">{entry.name}</td>
+                <td><span className={"badge " + tone}>{entry.direction}</span></td>
+                <td className="num mono">{entry.confidence != null ? `${entry.confidence}%` : "-"}</td>
+                <td className="num mono">{entry.weight ?? "-"}</td>
+                <td className="num mono">{entry.contribution != null ? entry.contribution.toFixed(2) : "-"}</td>
+                <td className="muted" style={{ minWidth: 220 }}>{entry.reason || "-"}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function IndicatorEvidence({ indicators, strategyEntries }: { indicators: IndicatorSnapshot[]; strategyEntries: StrategyEntry[] }) {
+  const rows = indicators.length > 0
+    ? indicators.map((indicator) => ({ name: indicator.indicator_name, values: indicator.values }))
+    : strategyEntries
+        .filter((entry) => Object.keys(entry.indicatorValues).length > 0)
+        .map((entry) => ({ name: entry.name, values: entry.indicatorValues }));
+
+  if (rows.length === 0) {
+    return (
+      <div style={{ padding: 24, textAlign: "center", color: "var(--fg-3)", fontSize: "var(--fz-sm)" }}>
+        Nessun indicatore persistito per la candela sorgente.
       </div>
-      <div className="mono fg" style={{ fontSize: "var(--fz-sm)" }}>{value}</div>
+    );
+  }
+
+  return (
+    <div className="card-body" style={{ display: "grid", gap: 10 }}>
+      {rows.map((row) => {
+        const entries = Object.entries(row.values ?? {}).filter(([key]) => !key.startsWith("_")).slice(0, 6);
+        return (
+          <div key={row.name} style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", padding: 10, background: "var(--bg-2)" }}>
+            <div className="mono fg" style={{ fontSize: "var(--fz-sm)", marginBottom: 8 }}>{row.name}</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
+              {entries.map(([key, value]) => (
+                <div key={key}>
+                  <div className="muted" style={{ fontSize: 10, textTransform: "uppercase" }}>{key}</div>
+                  <div className="mono" style={{ fontSize: "var(--fz-sm)" }}>{formatScalar(value)}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ExecutionState({ signal, positions }: { signal: Signal; positions: Position[] }) {
+  if (positions.length === 0) {
+    return (
+      <div className="card-body" style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
+        <Kv label="Status" value={signal.status} />
+        <Kv label="Mode" value="signal only" tone="muted" />
+        <Kv label="Entry" value={fmt.price(signal.entry_price)} />
+        <Kv label="R/R" value={signal.risk_reward ?? "-"} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="card-body" style={{ display: "grid", gap: 10 }}>
+      {positions.map((position) => {
+        const pnl = asNumber(position.realized_pnl ?? position.unrealized_pnl);
+        return (
+          <div key={position.id} style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", padding: 10, background: "var(--bg-2)" }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span className={"badge " + (position.side === "long" ? "long" : "short")}>{position.side}</span>
+                <span className="mono fg">#{position.id}</span>
+                <span className="muted mono" style={{ fontSize: "var(--fz-xs)" }}>{position.mode}</span>
+              </div>
+              <span className={"badge " + (position.status === "open" ? "long" : "muted")}>{position.status}</span>
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10, marginTop: 10 }}>
+              <Kv label="Entry" value={fmt.price(position.entry_price)} />
+              <Kv label="Size" value={fmt.price(position.size)} />
+              <Kv label="PnL" value={fmt.pnl(pnl)} tone={pnl != null && pnl >= 0 ? "long" : "short"} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SignalHistory({ signals, selectedId, onSelect }: { signals: Signal[]; selectedId: number; onSelect: (signal: Signal) => void }) {
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table className="tbl">
+        <thead>
+          <tr>
+            <th>Id</th>
+            <th>TF</th>
+            <th>Dir</th>
+            <th>Score</th>
+            <th>Status</th>
+            <th>Eta</th>
+          </tr>
+        </thead>
+        <tbody>
+          {signals.slice(0, 12).map((signal) => (
+            <tr
+              key={signal.id}
+              onClick={() => onSelect(signal)}
+              style={{ cursor: "pointer", background: signal.id === selectedId ? "var(--bg-2)" : undefined }}
+            >
+              <td className="mono fg">#{signal.id}</td>
+              <td><TfChip tf={signal.timeframe} /></td>
+              <td><DirBadge dir={signal.direction} /></td>
+              <td><ScoreChip score={signal.score} dir={signal.direction} /></td>
+              <td><StatusBadge status={signal.status} /></td>
+              <td className="muted mono">{fmt.relTime(signal.created_at)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function DecisionTimeline({ logs }: { logs: { id: number; timestamp: string; event_type: string; message: string; data: Record<string, unknown> }[] }) {
+  if (logs.length === 0) {
+    return <div className="card-body" style={{ color: "var(--fg-3)", fontSize: "var(--fz-sm)" }}>Nessun decision log collegato al segnale.</div>;
+  }
+  return (
+    <div className="card-body" style={{ display: "grid", gap: 8 }}>
+      {logs.map((log) => (
+        <div key={log.id} style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 12, borderBottom: "1px solid var(--border)", paddingBottom: 8 }}>
+          <div className="muted mono" style={{ fontSize: "var(--fz-xs)" }}>{formatDateTime(log.timestamp)}</div>
+          <div>
+            <div className="mono fg" style={{ fontSize: "var(--fz-sm)" }}>{log.event_type.replaceAll("_", " ")}</div>
+            {log.message && <div className="muted" style={{ fontSize: "var(--fz-sm)", marginTop: 2 }}>{log.message}</div>}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SignalContextChart({ candles, signal, sourceTime }: { candles: Candle[]; signal: Signal; sourceTime: string | null }) {
+  const parsed = useMemo(() => candles.map((candle) => ({
+    time: new Date(candle.open_time).getTime(),
+    open: asNumber(candle.open),
+    high: asNumber(candle.high),
+    low: asNumber(candle.low),
+    close: asNumber(candle.close),
+  })).filter((candle): candle is { time: number; open: number; high: number; low: number; close: number } =>
+    Number.isFinite(candle.time) && candle.open !== null && candle.high !== null && candle.low !== null && candle.close !== null
+  ), [candles]);
+
+  if (parsed.length === 0) {
+    return (
+      <div style={{ minHeight: 320, display: "grid", placeItems: "center", color: "var(--fg-3)", textAlign: "center", padding: 24 }}>
+        <div>
+          <Icon name="info" size={22} />
+          <div style={{ marginTop: 10, fontSize: "var(--fz-sm)" }}>Candele DB non disponibili per questo snapshot.</div>
+        </div>
+      </div>
+    );
+  }
+
+  const width = 920;
+  const height = 340;
+  const pad = { top: 22, right: 62, bottom: 28, left: 18 };
+  const prices = parsed.flatMap((candle) => [candle.high, candle.low]);
+  for (const value of [signal.entry_price, signal.stop_loss, signal.take_profit_1, signal.take_profit_2, signal.take_profit_3]) {
+    const n = asNumber(value);
+    if (n !== null) prices.push(n);
+  }
+  const min = Math.min(...prices);
+  const max = Math.max(...prices);
+  const range = max - min || 1;
+  const xStep = (width - pad.left - pad.right) / Math.max(1, parsed.length - 1);
+  const candleWidth = Math.max(3, Math.min(9, xStep * 0.58));
+  const y = (price: number) => pad.top + ((max - price) / range) * (height - pad.top - pad.bottom);
+  const sourceMs = sourceTime ? new Date(sourceTime).getTime() : null;
+  const sourceIndex = sourceMs === null ? -1 : parsed.findIndex((candle) => candle.time === sourceMs);
+  const markerIndex = sourceIndex >= 0 ? sourceIndex : Math.max(0, parsed.length - 1);
+  const markerX = pad.left + markerIndex * xStep;
+  const isLong = signal.direction.includes("LONG");
+
+  const line = (price: string | null, color: string, label: string) => {
+    const n = asNumber(price);
+    if (n === null) return null;
+    const yy = y(n);
+    return (
+      <g key={label}>
+        <line x1={pad.left} x2={width - pad.right + 10} y1={yy} y2={yy} stroke={color} strokeDasharray="5 5" strokeWidth="1" />
+        <text x={width - pad.right + 14} y={yy + 4} fill={color} fontSize="10" fontFamily="monospace">{label}</text>
+      </g>
+    );
+  };
+
+  return (
+    <div style={{ padding: 12 }}>
+      <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height: 360, display: "block" }} role="img" aria-label="Signal context chart">
+        <rect x="0" y="0" width={width} height={height} fill="var(--bg-1)" />
+        {[0, 0.25, 0.5, 0.75, 1].map((tick) => {
+          const yy = pad.top + tick * (height - pad.top - pad.bottom);
+          return <line key={tick} x1={pad.left} x2={width - pad.right} y1={yy} y2={yy} stroke="var(--border)" strokeWidth="1" opacity="0.55" />;
+        })}
+        {parsed.map((candle, index) => {
+          const x = pad.left + index * xStep;
+          const up = candle.close >= candle.open;
+          const color = up ? "var(--long)" : "var(--short)";
+          const bodyTop = y(Math.max(candle.open, candle.close));
+          const bodyBottom = y(Math.min(candle.open, candle.close));
+          const bodyHeight = Math.max(1, bodyBottom - bodyTop);
+          const isSource = index === sourceIndex;
+          return (
+            <g key={`${candle.time}-${index}`} opacity={isSource ? 1 : 0.78}>
+              {isSource && <rect x={x - xStep / 2} y={pad.top} width={xStep} height={height - pad.top - pad.bottom} fill="var(--accent-soft)" />}
+              <line x1={x} x2={x} y1={y(candle.high)} y2={y(candle.low)} stroke={color} strokeWidth="1" />
+              <rect x={x - candleWidth / 2} y={bodyTop} width={candleWidth} height={bodyHeight} fill={color} rx="1" />
+            </g>
+          );
+        })}
+        {line(signal.entry_price, "var(--fg)", "ENTRY")}
+        {line(signal.stop_loss, "var(--short)", "SL")}
+        {line(signal.take_profit_1, "var(--long)", "TP1")}
+        {line(signal.take_profit_2, "var(--long)", "TP2")}
+        {line(signal.take_profit_3, "var(--long)", "TP3")}
+        <g transform={`translate(${markerX}, ${isLong ? height - pad.bottom + 2 : pad.top - 4})`}>
+          <path d={isLong ? "M0,-18 L8,-6 L3,-6 L3,0 L-3,0 L-3,-6 L-8,-6 Z" : "M0,18 L8,6 L3,6 L3,0 L-3,0 L-3,6 L-8,6 Z"} fill={isLong ? "var(--long)" : "var(--short)"} />
+          <text x="12" y={isLong ? -7 : 12} fill="var(--fg)" fontSize="11" fontFamily="monospace">signal {signal.score}</text>
+        </g>
+      </svg>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, color: "var(--fg-3)", fontSize: "var(--fz-xs)" }}>
+        <span>{formatDateTime(candles[0]?.open_time)}</span>
+        <span>{sourceTime ? `source ${formatDateTime(sourceTime)}` : "source candle non salvata"}</span>
+        <span>{formatDateTime(candles.at(-1)?.open_time)}</span>
+      </div>
     </div>
   );
 }

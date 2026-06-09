@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import React from "react";
 import { Icon } from "@/components/atoms";
 import { Health } from "@/lib/api";
@@ -37,7 +38,13 @@ export const Sidebar = ({ route, setRoute, counts, wsLive, health, collapsed, on
     <aside className="sidebar">
       <div className="brand">
         <div className="brand-logo-wrap">
-          <img src="/csp.png" alt="Trado" className="brand-logo-img" />
+          <Image
+            src={collapsed ? "/brand/trado_telegram_avatar.png" : "/brand/trado_logo_horizontal.png"}
+            alt="Trado"
+            width={collapsed ? 64 : 180}
+            height={collapsed ? 64 : 52}
+            className="brand-logo-img"
+          />
         </div>
         <div className="brand-row">
           <div className="brand-name">Trado</div>

@@ -324,6 +324,7 @@ export type Signal = {
   reason: string;
   strategy_breakdown: Record<string, unknown>;
   status: string;
+  source_candle_open_time?: string | null;
   created_at: string;
   calibrated_expected_r?: number | null;
   calibrated_win_rate?: number | null;
@@ -336,6 +337,15 @@ export type IndicatorSnapshot = {
   timeframe: string;
   timestamp: string;
   values: Record<string, unknown>;
+};
+
+export type Candle = {
+  open_time: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
 };
 
 export type Position = {
@@ -419,6 +429,15 @@ export type DecisionLog = {
   position_id?: number | null;
   message: string;
   data: Record<string, unknown>;
+};
+
+export type SignalSnapshot = {
+  signal: Signal;
+  source_candle_open_time: string | null;
+  candles: Candle[];
+  indicators: IndicatorSnapshot[];
+  positions: Position[];
+  decision_logs: DecisionLog[];
 };
 
 export type AppSettings = Record<string, Record<string, unknown>>;

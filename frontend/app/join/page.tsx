@@ -20,9 +20,8 @@ async function loadBotInfo(): Promise<BotInfo> {
 }
 
 export const metadata: Metadata = {
-  title: "Trado · Free crypto signals on Hyperliquid",
-  description:
-    "Multi-strategy crypto signal engine. Free Telegram channel, no email, no promises.",
+  title: "Trado · Trade smarter. Grow further.",
+  description: "Crypto signals on Hyperliquid with the Trado Telegram channel.",
 };
 
 export default async function JoinPage({

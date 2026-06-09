@@ -22,7 +22,11 @@ import { MarketIntelligenceStrip } from "@/components/widgets/MarketIntelligence
 import { MacroCorrelationCard } from "@/components/widgets/MacroCorrelationCard";
 import { BitcoinNewsCard } from "@/components/widgets/BitcoinNewsCard";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import { useMarketDashboardSnapshot, useSignalRejections } from "@/lib/hooks/queries";
+import {
+  useMarketDashboardSnapshot,
+  usePositionHistory,
+  useSignalRejections,
+} from "@/lib/hooks/queries";
 
 type ModeFilter = "all" | "paper" | "live";
 
@@ -166,6 +170,17 @@ export function DashboardScreen({
   const { data: marketDashboard } = useMarketDashboardSnapshot();
   const paperEquity = asNumber(settings.paper?.equity) ?? 10_000;
 
+  // La curva CR-PnL deve usare lo storico COMPLETO dei trade chiusi, non le
+  // ultime 250 posizioni di /api/positions (cap per opened_at che mescola
+  // paper+live e troncava il cumulato). Vedi /positions/history.
+  const { data: history } = usePositionHistory({
+    mode,
+    period: "all",
+    market_type: "all",
+    limit: 5000,
+  });
+  const equityPositions = history?.positions ?? filteredPositions;
+
   useEffect(() => {
     setOpenPositionsPage(1);
   }, [mode]);
@@ -283,7 +298,7 @@ export function DashboardScreen({
       {/* Row 2 — Equity curve (8) + Signal funnel (4) */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <EquityChart
-          positions={filteredPositions}
+          positions={equityPositions}
           initialEquity={chartBaseline}
           className="lg:col-span-2"
           label={modeLabel(mode)}

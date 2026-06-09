@@ -70,7 +70,7 @@ export function StrategyContributionsChart({ breakdown, signalDirection, classNa
 
   const height = Math.max(140, sorted.length * 28);
   const COLOR = {
-    agree: "#3ecf8e",
+    agree: "#00D09C",
     oppose: "#f26d6d",
     neutral: "#72727b",
     axis: "#4b4b53",

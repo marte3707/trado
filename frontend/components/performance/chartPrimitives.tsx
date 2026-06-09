@@ -22,7 +22,7 @@ export const YAxis = Recharts.YAxis as unknown as AnyComp;
 
 /** Palette dark allineata ai chart esistenti (AccountMonitorScreen / EquityChart). */
 export const CHART_COLORS = {
-  success: "#3ecf8e",
+  success: "#00D09C",
   danger: "#f26d6d",
   neutral: "#7aa2f7",
   grid: "#1d1d22",

@@ -43,7 +43,7 @@ export function EquityChart({
   const isPnlOnly = initialEquity === 0;
 
   const CHART_COLOR = {
-    line: trendUp ? "#3ecf8e" : "#f26d6d",
+    line: trendUp ? "#00D09C" : "#f26d6d",
     grid: "#1d1d22",
     axis: "#4b4b53",
     cursor: "#2b2b32",

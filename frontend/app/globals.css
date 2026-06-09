@@ -2,52 +2,56 @@
 @plugin "tailwindcss-animate";
 
 /* ──────────────────────────────────────────────────────────────────────────
- *  Trado design tokens v2  (Linear/Vercel-like, dark only, desktop)
+ *  Trado design tokens v2  (brand navy/teal, dark only, desktop)
  *  Le classi storiche (.app .card .tbl .btn .badge .score .dir ...) sono
  *  preservate sotto per non rompere gli screen non ancora migrati.
  * ─────────────────────────────────────────────────────────────────────── */
 
 @theme {
   /* Tailwind theme — utilities `bg-bg-2 text-fg-3 border-border` etc. */
-  --color-bg:             #0b0b0d;
-  --color-bg-1:           #101013;
-  --color-bg-2:           #16161a;
-  --color-bg-3:           #1c1c22;
-  --color-bg-hover:       #1d1d24;
+  --color-bg:             #0B132B;
+  --color-bg-1:           #101A36;
+  --color-bg-2:           #162142;
+  --color-bg-3:           #1C2B52;
+  --color-bg-hover:       #1A2749;
+  --color-brand-navy:     #0B132B;
+  --color-brand-teal:     #00D09C;
+  --color-brand-gray:     #E5E7EB;
+  --color-brand-light:    #F7F8FA;
 
-  --color-fg:             #e9e9ec;
-  --color-fg-2:           #a4a4ad;
-  --color-fg-3:           #72727b;
-  --color-fg-4:           #4b4b53;
+  --color-fg:             #F7F8FA;
+  --color-fg-2:           #E5E7EB;
+  --color-fg-3:           #A7AFBE;
+  --color-fg-4:           #687186;
 
-  --color-border:         #1d1d22;
-  --color-border-strong:  #2b2b32;
-  --color-border-focus:   #3a3a44;
+  --color-border:         #1B294F;
+  --color-border-strong:  #2A3A67;
+  --color-border-focus:   #00D09C;
 
-  --color-success:        #3ecf8e;
+  --color-success:        #00D09C;
   --color-danger:         #f26d6d;
   --color-warn:           #e0b341;
   --color-info:           #7aa2f7;
 
   /* shadcn aliases — i suoi componenti generati cercano questi nomi */
-  --color-background:           #0b0b0d;
-  --color-foreground:           #e9e9ec;
-  --color-card:                 #101013;
-  --color-card-foreground:      #e9e9ec;
-  --color-popover:              #16161a;
-  --color-popover-foreground:   #e9e9ec;
-  --color-primary:              #3ecf8e;
-  --color-primary-foreground:   #08080a;
-  --color-secondary:            #16161a;
-  --color-secondary-foreground: #e9e9ec;
-  --color-muted:                #16161a;
-  --color-muted-foreground:     #a4a4ad;
-  --color-accent:               #1c1c22;
-  --color-accent-foreground:    #e9e9ec;
+  --color-background:           #0B132B;
+  --color-foreground:           #F7F8FA;
+  --color-card:                 #101A36;
+  --color-card-foreground:      #F7F8FA;
+  --color-popover:              #162142;
+  --color-popover-foreground:   #F7F8FA;
+  --color-primary:              #00D09C;
+  --color-primary-foreground:   #0B132B;
+  --color-secondary:            #162142;
+  --color-secondary-foreground: #F7F8FA;
+  --color-muted:                #162142;
+  --color-muted-foreground:     #A7AFBE;
+  --color-accent:               #1C2B52;
+  --color-accent-foreground:    #F7F8FA;
   --color-destructive:          #f26d6d;
-  --color-destructive-foreground: #08080a;
-  --color-input:                #1d1d22;
-  --color-ring:                 #3ecf8e;
+  --color-destructive-foreground: #0B132B;
+  --color-input:                #1B294F;
+  --color-ring:                 #00D09C;
 
   --radius-sm: 6px;
   --radius:    8px;
@@ -63,27 +67,32 @@
 /* ─── CSS custom properties (legacy compat) ────────────────────────────── */
 :root {
   /* surfaces */
-  --bg:            #0b0b0d;
-  --bg-1:          #101013;
-  --bg-2:          #16161a;
-  --bg-3:          #1c1c22;
-  --bg-hover:      #1d1d24;
+  --brand-navy:    #0B132B;
+  --brand-teal:    #00D09C;
+  --brand-gray:    #E5E7EB;
+  --brand-light:   #F7F8FA;
+
+  --bg:            var(--brand-navy);
+  --bg-1:          #101A36;
+  --bg-2:          #162142;
+  --bg-3:          #1C2B52;
+  --bg-hover:      #1A2749;
 
   /* foreground */
-  --fg:            #e9e9ec;
-  --fg-2:          #a4a4ad;
-  --fg-3:          #72727b;
-  --fg-4:          #4b4b53;
+  --fg:            var(--brand-light);
+  --fg-2:          var(--brand-gray);
+  --fg-3:          #A7AFBE;
+  --fg-4:          #687186;
 
   /* borders */
-  --border:        #1d1d22;
-  --border-strong: #2b2b32;
-  --border-focus:  #3a3a44;
+  --border:        #1B294F;
+  --border-strong: #2A3A67;
+  --border-focus:  var(--brand-teal);
 
   /* semantic — desaturati (Linear-like) */
-  --long:          #3ecf8e;
-  --long-soft:     #3ecf8e14;
-  --long-border:   #3ecf8e33;
+  --long:          var(--brand-teal);
+  --long-soft:     #00D09C14;
+  --long-border:   #00D09C33;
   --short:         #f26d6d;
   --short-soft:    #f26d6d14;
   --short-border:  #f26d6d33;
@@ -111,7 +120,7 @@
   --pad-x:  20px;
   --gap:    16px;
 
-  /* type scale (Geist variable) */
+  /* type scale */
   --fz-xs:  11px;
   --fz-sm:  12px;
   --fz-md:  13px;
@@ -123,8 +132,8 @@
   --lh-tight: 1.2;
   --lh-base:  1.5;
 
-  --font-sans: var(--font-geist-sans, "Geist"), -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-mono: var(--font-geist-mono, "Geist Mono"), "JetBrains Mono", ui-monospace, monospace;
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
   /* Compat ChartPanel (gli alias storici) */
   --bg-panel: var(--bg-1);
@@ -175,7 +184,7 @@ body {
   font-size: var(--fz-base);
   line-height: var(--lh-base);
   font-feature-settings: "cv11","ss01","ss03";
-  letter-spacing: -0.005em;
+  letter-spacing: 0;
   -webkit-font-smoothing: antialiased;
 }
 /* Reset minimale per <button> nativi: NON impostare padding: 0 qui
@@ -193,9 +202,9 @@ input, select, textarea { font: inherit; color: inherit; }
 .tnum { font-variant-numeric: tabular-nums; }
 
 /* Headings (utilizzati anche dai vecchi screen via .page-title etc.) */
-h1, h2, h3, h4, h5, h6 { font-weight: 600; letter-spacing: -0.015em; line-height: var(--lh-tight); }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; letter-spacing: 0; line-height: var(--lh-tight); }
 
-::selection { background: rgba(62, 207, 142, 0.18); color: var(--fg); }
+::selection { background: rgba(0, 208, 156, 0.22); color: var(--fg); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
@@ -210,7 +219,7 @@ h1, h2, h3, h4, h5, h6 { font-weight: 600; letter-spacing: -0.015em; line-height
   body::before {
     content: "Trado e' ottimizzato per schermi >= 1280px. Apri da desktop per la migliore esperienza.";
     position: fixed; inset: 0;
-    background: rgba(11,11,13,.96);
+    background: rgba(11,19,43,.96);
     color: var(--fg-2);
     z-index: 9999;
     display: grid; place-items: center;
@@ -263,10 +272,25 @@ h1, h2, h3, h4, h5, h6 { font-weight: 600; letter-spacing: -0.015em; line-height
   flex-shrink: 0;
   position: relative;
 }
-.brand-logo-wrap { display: flex; justify-content: center; align-items: center; width: 100%; }
-.brand-logo-img { width: auto; object-fit: contain; }
+.brand-logo-wrap {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  min-height: 38px;
+  padding: 8px 12px;
+}
+.brand-logo-img {
+  width: 128px;
+  max-width: 100%;
+  height: auto;
+  object-fit: contain;
+  border-radius: var(--radius-sm);
+  background: var(--brand-light);
+  padding: 6px 10px;
+}
 .brand-row { display: flex; align-items: center; gap: 8px; width: 100%; }
-.brand-name { font-weight: 600; font-size: var(--fz-base); letter-spacing: -0.01em; }
+.brand-name { font-weight: 600; font-size: var(--fz-base); letter-spacing: 0; }
 .brand-net {
   margin-left: auto;
   font-family: var(--font-mono);
@@ -288,7 +312,13 @@ h1, h2, h3, h4, h5, h6 { font-weight: 600; letter-spacing: -0.015em; line-height
 }
 .sidebar-toggle:hover { background: var(--bg-2); color: var(--fg); }
 .sidebar-collapsed .brand { padding: 12px 8px; gap: 4px; }
-.sidebar-collapsed .brand-logo-img { height: 32px; }
+.sidebar-collapsed .brand-logo-img {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 999px;
+  background: transparent;
+}
 .sidebar-collapsed .brand-row { display: none; }
 .sidebar-collapsed .sidebar-toggle {
   position: absolute; bottom: 8px; right: 50%;

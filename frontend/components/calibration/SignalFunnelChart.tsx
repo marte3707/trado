@@ -35,7 +35,7 @@ const COLOR = {
   generated: "#4b4b53",
   evaluated: "#7aa2f7",
   eligible: "#e0b341",
-  executed: "#3ecf8e",
+  executed: "#00D09C",
   closed: "#a4a4ad",
   axis: "#4b4b53",
   tooltipBg: "#16161a",

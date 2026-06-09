@@ -33,6 +33,7 @@ import {
   type ScoreCalibration,
   type Signal,
   type SignalRejections,
+  type SignalSnapshot,
   type Strategy,
   type WorkerCycle,
 } from "@/lib/api";
@@ -69,6 +70,16 @@ export function useSignals(filters?: string, opts?: QueryOpts<Signal[]>) {
     queryKey: qk.signals(filters),
     queryFn: () => apiGet<Signal[]>(`/api/signals${filters ? `?${filters}` : "?min_score=0"}`),
     refetchInterval: 15_000,
+    ...opts,
+  });
+}
+
+export function useSignalSnapshot(signalId: number | null | undefined, opts?: QueryOpts<SignalSnapshot>) {
+  return useQuery({
+    queryKey: qk.signalSnapshot(signalId),
+    queryFn: () => apiGet<SignalSnapshot>(`/api/signals/${signalId}/snapshot`),
+    enabled: signalId != null,
+    refetchInterval: 30_000,
     ...opts,
   });
 }
@@ -332,11 +343,12 @@ export function useBotFunnel(opts?: QueryOpts<BotFunnelStats>) {
   });
 }
 
-export function useAccountMonitor(opts?: QueryOpts<AccountMonitor | null>) {
+export function useAccountMonitor(opts?: QueryOpts<AccountMonitor>) {
   return useQuery({
     queryKey: qk.accountMonitor,
-    queryFn: () => apiGet<AccountMonitor>("/api/account/snapshot").catch(() => null),
+    queryFn: () => apiGet<AccountMonitor>("/api/account/snapshot"),
     refetchInterval: 5_000,
+    retry: 1,
     ...opts,
   });
 }

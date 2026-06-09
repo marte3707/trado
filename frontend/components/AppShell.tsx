@@ -44,6 +44,7 @@ import {
 } from "@/lib/hooks/queries";
 import { hydrateOpenPositionSourceSignals } from "@/lib/signalHydration";
 import type {
+  AccountPosition,
   AppSettings,
   Market,
   Position,
@@ -56,13 +57,15 @@ interface AppShellProps {
 
 type PnlTitleDirection = "up" | "down" | "flat" | null;
 
-type PnlTitleSample = {
-  ts: number;
-  value: number;
+type TradePnlCounts = {
+  positive: number;
+  negative: number;
 };
 
-const PNL_TITLE_LOOKBACK_MS = 5 * 60 * 1000;
-const PNL_TITLE_RETENTION_MS = 15 * 60 * 1000;
+type RealtimeTitleState = {
+  pnl: number | null;
+  counts: TradePnlCounts | null;
+};
 
 function envToMode(val: string | undefined): TradingMode {
   if (val === "PAPER_TRADING") return "paper";
@@ -90,45 +93,72 @@ function fmtBrowserTitlePnl(value: number): string {
   return formatted;
 }
 
-function readPnlTitleSamples(storageKey: string): PnlTitleSample[] {
-  try {
-    const raw = window.localStorage.getItem(storageKey);
-    const parsed = raw ? JSON.parse(raw) : [];
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (item): item is PnlTitleSample =>
-        item != null &&
-        typeof item === "object" &&
-        Number.isFinite((item as PnlTitleSample).ts) &&
-        Number.isFinite((item as PnlTitleSample).value),
-    );
-  } catch {
-    return [];
-  }
+function hyperliquidWsUrl(network: string | null | undefined): string {
+  return network === "mainnet"
+    ? "wss://api.hyperliquid.xyz/ws"
+    : "wss://api.hyperliquid-testnet.xyz/ws";
 }
 
-function writePnlTitleSamples(storageKey: string, samples: PnlTitleSample[]) {
-  try {
-    window.localStorage.setItem(storageKey, JSON.stringify(samples));
-  } catch {
-    // Best effort only: the tab title still updates without persistent history.
+function positionRealtimePnl(position: AccountPosition, mids: Record<string, number>): number | null {
+  const coin = position.coin ?? "";
+  const mid = mids[coin];
+  const entry = asNumber(position.entry_price);
+  const size = asNumber(position.size);
+  if (mid == null || entry == null || size == null || size <= 0) {
+    return asNumber(position.unrealized_pnl);
   }
+  const sideMultiplier = position.side === "short" ? -1 : 1;
+  return (mid - entry) * size * sideMultiplier;
 }
 
-function pnlSampleAtOrBefore(
-  samples: PnlTitleSample[],
-  timestamp: number,
-): PnlTitleSample | null {
-  let selected: PnlTitleSample | null = null;
-  for (const sample of samples) {
-    if (
-      sample.ts <= timestamp &&
-      (selected == null || sample.ts > selected.ts)
-    ) {
-      selected = sample;
+function accountRealtimePnl(positions: AccountPosition[], mids: Record<string, number>): number | null {
+  if (positions.length === 0) return null;
+  let total = 0;
+  let hasPnl = false;
+  for (const position of positions) {
+    const pnl = positionRealtimePnl(position, mids);
+    if (pnl != null) {
+      total += pnl;
+      hasPnl = true;
     }
   }
-  return selected;
+  return hasPnl ? total : null;
+}
+
+function accountTradePnlCounts(positions: AccountPosition[], mids: Record<string, number>): TradePnlCounts {
+  let positive = 0;
+  let negative = 0;
+  for (const position of positions) {
+    const pnl = positionRealtimePnl(position, mids);
+    if (pnl == null || Math.abs(pnl) < 0.000001) continue;
+    if (pnl > 0) positive += 1;
+    else negative += 1;
+  }
+  return { positive, negative };
+}
+
+function sameTradePnlCounts(a: TradePnlCounts | null, b: TradePnlCounts | null): boolean {
+  if (a == null || b == null) return a == null && b == null;
+  return a?.positive === b.positive && a.negative === b.negative;
+}
+
+function sameRealtimeTitleState(a: RealtimeTitleState, b: RealtimeTitleState): boolean {
+  const samePnl =
+    a.pnl === b.pnl ||
+    (a.pnl != null && b.pnl != null && Math.abs(a.pnl - b.pnl) < 0.000001);
+  return samePnl && sameTradePnlCounts(a.counts, b.counts);
+}
+
+function accountRealtimeTitleState(
+  positions: AccountPosition[],
+  mids: Record<string, number>,
+  fallbackPnl: number | null,
+): RealtimeTitleState {
+  if (positions.length === 0) return { pnl: fallbackPnl, counts: null };
+  return {
+    pnl: accountRealtimePnl(positions, mids) ?? fallbackPnl,
+    counts: accountTradePnlCounts(positions, mids),
+  };
 }
 
 function alertCount(logs: { event_type: string }[]): number {
@@ -146,8 +176,14 @@ export function AppShell({ initialData }: AppShellProps) {
   const [route, setRoute] = useState<Route>("dash");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [pnlTitleDirection, setPnlTitleDirection] = useState<PnlTitleDirection>(null);
+  const [realtimeTitle, setRealtimeTitle] = useState<RealtimeTitleState>({ pnl: null, counts: null });
   const originalTitleRef = useRef<string | null>(null);
-  const [coinFocus, setCoinFocus] = useState<{ marketKey: string; timeframe: string } | null>(() =>
+  const titlePnlIdentityRef = useRef<string | null>(null);
+  const previousTitlePnlRef = useRef<number | null>(null);
+  const accountPositionsRef = useRef<AccountPosition[]>([]);
+  const snapshotUnrealizedRef = useRef<number | null>(null);
+  const titleMidsRef = useRef<Record<string, number>>({});
+  const [coinFocus, setCoinFocus] = useState<{ signalId?: number; marketKey: string; timeframe: string } | null>(() =>
     initialData.chartMarket
       ? { marketKey: marketKey(initialData.chartMarket), timeframe: initialData.chartTimeframe }
       : null,
@@ -205,52 +241,85 @@ export function AppShell({ initialData }: AppShellProps) {
 
   const settingsObj = (settings ?? {}) as AppSettings;
   const threshold = asNumber(settingsObj.risk?.min_signal_score) ?? 60;
-  const totalUnrealized = useMemo(
+  const snapshotUnrealized = useMemo(
     () => accountSnapshot?.positions.reduce((sum, p) => sum + (asNumber(p.unrealized_pnl) ?? 0), 0) ?? null,
     [accountSnapshot],
   );
-  const pnlTitleStorageKey = useMemo(() => {
+  const pnlTitleIdentity = useMemo(() => {
     const network = health?.network ?? "unknown";
     const accountKey = accountSnapshot?.account.address ?? "unconfigured";
     return `trado:account-monitor:unrealized-pnl:${network}:${accountKey}`;
   }, [accountSnapshot?.account.address, health?.network]);
+  const titlePnl = realtimeTitle.pnl ?? snapshotUnrealized;
   const pnlTitleText = useMemo(
-    () => (totalUnrealized == null ? null : fmtBrowserTitlePnl(totalUnrealized)),
-    [totalUnrealized],
+    () => (titlePnl == null ? null : fmtBrowserTitlePnl(titlePnl)),
+    [titlePnl],
   );
+  const pnlTitleCountsText = realtimeTitle.counts == null
+    ? null
+    : `${realtimeTitle.counts.positive}▲ ${realtimeTitle.counts.negative}▼`;
 
   useEffect(() => {
-    if (totalUnrealized == null || !accountSnapshot?.checked_at) {
+    snapshotUnrealizedRef.current = snapshotUnrealized;
+    accountPositionsRef.current = accountSnapshot?.positions ?? [];
+    const nextTitle = accountRealtimeTitleState(accountPositionsRef.current, titleMidsRef.current, snapshotUnrealized);
+    setRealtimeTitle((current) => (sameRealtimeTitleState(current, nextTitle) ? current : nextTitle));
+  }, [accountSnapshot?.positions, snapshotUnrealized]);
+
+  useEffect(() => {
+    if (titlePnlIdentityRef.current !== pnlTitleIdentity) {
+      titlePnlIdentityRef.current = pnlTitleIdentity;
+      previousTitlePnlRef.current = null;
+      setPnlTitleDirection(null);
+    }
+    if (titlePnl == null) {
+      previousTitlePnlRef.current = null;
       setPnlTitleDirection(null);
       return;
     }
-
-    const checkedAtMs = Date.parse(accountSnapshot.checked_at);
-    const sampleTime = Number.isFinite(checkedAtMs) ? checkedAtMs : Date.now();
-    const existingSamples = readPnlTitleSamples(pnlTitleStorageKey);
-    const retainedSamples = existingSamples.filter(
-      (sample) =>
-        sample.ts >= sampleTime - PNL_TITLE_RETENTION_MS &&
-        sample.ts <= sampleTime + 30_000,
-    );
-    const previousTarget = sampleTime - PNL_TITLE_LOOKBACK_MS;
-    const previousSample = pnlSampleAtOrBefore(retainedSamples, previousTarget);
-    const nextSamples = [...retainedSamples, { ts: sampleTime, value: totalUnrealized }]
-      .sort((a, b) => a.ts - b.ts)
-      .filter((sample, index, samples) => index === 0 || sample.ts !== samples[index - 1].ts);
-
-    writePnlTitleSamples(pnlTitleStorageKey, nextSamples);
-
-    if (previousSample == null) {
-      setPnlTitleDirection(null);
-    } else if (totalUnrealized > previousSample.value) {
+    const previous = previousTitlePnlRef.current;
+    previousTitlePnlRef.current = titlePnl;
+    if (previous == null || Math.abs(titlePnl - previous) < 0.000001) {
+      if (previous == null) setPnlTitleDirection(null);
+      else setPnlTitleDirection("flat");
+    } else if (titlePnl > previous) {
       setPnlTitleDirection("up");
-    } else if (totalUnrealized < previousSample.value) {
-      setPnlTitleDirection("down");
     } else {
-      setPnlTitleDirection("flat");
+      setPnlTitleDirection("down");
     }
-  }, [accountSnapshot?.checked_at, pnlTitleStorageKey, totalUnrealized]);
+  }, [pnlTitleIdentity, titlePnl]);
+
+  useEffect(() => {
+    const socket = new WebSocket(hyperliquidWsUrl(health?.network));
+    let active = true;
+
+    socket.addEventListener("open", () => {
+      if (!active) return;
+      socket.send(JSON.stringify({ method: "subscribe", subscription: { type: "allMids" } }));
+    });
+    socket.addEventListener("message", (event) => {
+      if (!active) return;
+      try {
+        const data = JSON.parse(event.data as string) as { data?: { mids?: Record<string, string> } };
+        if (!data?.data?.mids) return;
+        const nextMids = { ...titleMidsRef.current };
+        for (const [coin, price] of Object.entries(data.data.mids)) {
+          const mid = Number(price);
+          if (Number.isFinite(mid)) nextMids[coin] = mid;
+        }
+        titleMidsRef.current = nextMids;
+        const nextTitle = accountRealtimeTitleState(accountPositionsRef.current, nextMids, snapshotUnrealizedRef.current);
+        setRealtimeTitle((current) => (sameRealtimeTitleState(current, nextTitle) ? current : nextTitle));
+      } catch {
+        // Ignore malformed WS frames; the polled snapshot remains the fallback.
+      }
+    });
+
+    return () => {
+      active = false;
+      socket.close();
+    };
+  }, [health?.network]);
 
   useEffect(() => {
     if (originalTitleRef.current == null) {
@@ -272,8 +341,9 @@ export function AppShell({ initialData }: AppShellProps) {
         : pnlTitleDirection === "down"
           ? "▼"
           : "";
-    document.title = arrow ? `${pnlTitleText} ${arrow} Trado` : `${pnlTitleText} Trado`;
-  }, [pnlTitleDirection, pnlTitleText]);
+    const tradeCounts = pnlTitleCountsText ? ` ${pnlTitleCountsText}` : "";
+    document.title = arrow ? `${pnlTitleText} ${arrow} Trado${tradeCounts}` : `${pnlTitleText} Trado${tradeCounts}`;
+  }, [pnlTitleCountsText, pnlTitleDirection, pnlTitleText]);
 
   /* ── refresh callback (legacy interface per gli screens non ancora migrati) ── */
   const refresh = useCallback(() => {
@@ -281,15 +351,15 @@ export function AppShell({ initialData }: AppShellProps) {
   }, [queryClient]);
 
   /* ── chart navigation helpers ── */
-  const openMarket = useCallback((market: Market, timeframe?: string) => {
-    setCoinFocus({ marketKey: marketKey(market), timeframe: timeframe ?? "" });
+  const openMarket = useCallback((market: Market, timeframe?: string, signalId?: number) => {
+    setCoinFocus({ signalId, marketKey: marketKey(market), timeframe: timeframe ?? "" });
     setRoute("coin");
   }, []);
 
   const openSignalChart = useCallback(
     (signal: Signal) => {
       if (!signal.market) return;
-      openMarket(signal.market, signal.timeframe);
+      openMarket(signal.market, signal.timeframe, signal.id);
     },
     [openMarket],
   );
@@ -303,7 +373,7 @@ export function AppShell({ initialData }: AppShellProps) {
         linked?.timeframe ??
         hydratedSignals.find((s) => s.market && marketKey(s.market) === marketKey(position.market!))?.timeframe ??
         "";
-      openMarket(position.market, tf);
+      openMarket(position.market, tf, linked?.id);
     },
     [hydratedSignals, openMarket],
   );
@@ -401,6 +471,7 @@ export function AppShell({ initialData }: AppShellProps) {
             initialCandles={initialData.candles}
             initialMarket={initialData.chartMarket}
             initialTf={initialData.chartTimeframe}
+            focusSignalId={coinFocus?.signalId}
             focusMarketKey={coinFocus?.marketKey}
             focusTf={coinFocus?.timeframe}
           />

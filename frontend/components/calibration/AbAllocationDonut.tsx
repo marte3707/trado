@@ -29,7 +29,7 @@ interface Props {
 
 const COLOR = {
   control: "#a4a4ad",
-  test: "#3ecf8e",
+  test: "#00D09C",
   tooltipBg: "#16161a",
   border: "#1d1d22",
   fg: "#e9e9ec",

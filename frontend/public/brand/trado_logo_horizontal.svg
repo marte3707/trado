@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="260" viewBox="0 0 900 260" fill="none">
+  <rect width="900" height="260" fill="transparent"/>
+  
+    <g transform="translate(40 38) scale(1.05)">
+      <path d="M22 12 H162 L162 42 L116 82 H86 V162 H50 V94 L18 126 V82 L60 42 H22 Z" fill="#0B132B"/>
+      <path d="M92 98 L178 32 V68 L112 120 V162 H78 V118 Z" fill="#00D09C"/>
+      <path d="M18 126 L50 94 V162 H18 Z" fill="#0B132B"/>
+    </g>
+    
+  <text x="285" y="155" font-family="Inter, Arial, sans-serif" font-size="112" font-weight="700" fill="#0B132B" letter-spacing="-3">Trado</text>
+</svg>

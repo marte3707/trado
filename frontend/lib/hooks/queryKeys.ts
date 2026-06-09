@@ -10,6 +10,7 @@ export const qk = {
   health: ["health"] as const,
   markets: (filters?: string) => ["markets", filters ?? ""] as const,
   signals: (filters?: string) => ["signals", filters ?? ""] as const,
+  signalSnapshot: (signalId: number | null | undefined) => ["signals", signalId ?? "none", "snapshot"] as const,
   positions: ["positions"] as const,
   positionHistory: (filters: string) => ["positions", "history", filters] as const,
   orders: ["orders"] as const,

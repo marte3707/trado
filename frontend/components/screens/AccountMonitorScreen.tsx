@@ -22,6 +22,7 @@ import {
   AccountOpenOrder,
   AccountPosition,
   AccountSpotBalance,
+  ApiError,
   Health,
   apiPost,
 } from "@/lib/api";
@@ -50,6 +51,8 @@ type TradingSummary = {
   openOrderNotional: number;
   longPositions: number;
   shortPositions: number;
+  positivePositions: number;
+  negativePositions: number;
 };
 
 type ConfirmDialog = {
@@ -142,6 +145,23 @@ function fmtTime(ms: number | null | undefined): string {
     day: "2-digit",
     month: "2-digit",
   }).format(new Date(ms));
+}
+
+function accountSnapshotErrorMessage(error: Error | null, hasStaleData: boolean): string {
+  const prefix = hasStaleData
+    ? "Ultimo refresh account non riuscito, mostro lo snapshot precedente."
+    : "Snapshot account non disponibile.";
+  if (error instanceof ApiError) {
+    const detail = error.detail ? `: ${error.detail}` : "";
+    return `${prefix} Backend HTTP ${error.status}${detail}`;
+  }
+  if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+    return `${prefix} Timeout dopo 15s verso il backend.`;
+  }
+  if (error instanceof TypeError) {
+    return `${prefix} Backend non raggiungibile su ${process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000"}.`;
+  }
+  return error?.message ? `${prefix} ${error.message}` : `${prefix} Verifica backend e log API.`;
 }
 
 function protectionTone(protection: AccountPosition["protection"]): "ok" | "warn" | "muted" {
@@ -251,17 +271,33 @@ function expectedLimitPnl(row: AccountOpenOrder, position: AccountPosition | und
   return (limit - entry) * size * multiplier;
 }
 
-function summarizeTrading(positions: AccountPosition[], orders: AccountOpenOrder[]): TradingSummary {
+function positionRealtimePnl(position: AccountPosition, midPrices: Record<string, number>): number | null {
+  const coin = position.coin ?? "";
+  const mid = midPrices[coin];
+  const entry = asNumber(position.entry_price);
+  const size = asNumber(position.size);
+  if (mid == null || entry == null || size == null || size <= 0) {
+    return asNumber(position.unrealized_pnl);
+  }
+  const sideMultiplier = position.side === "short" ? -1 : 1;
+  return (mid - entry) * size * sideMultiplier;
+}
+
+function summarizeTrading(positions: AccountPosition[], orders: AccountOpenOrder[], midPrices: Record<string, number>): TradingSummary {
   const positionsMap = positionByCoin(positions);
   let longPnl: number | null = null;
   let shortPnl: number | null = null;
+  let positivePositions = 0;
+  let negativePositions = 0;
   for (const pos of positions) {
-    const pnl = asNumber(pos.unrealized_pnl) ?? 0;
+    const pnl = positionRealtimePnl(pos, midPrices) ?? 0;
+    if (pnl > 0.000001) positivePositions += 1;
+    else if (pnl < -0.000001) negativePositions += 1;
     if (pos.side === "long") longPnl = (longPnl ?? 0) + pnl;
     else if (pos.side === "short") shortPnl = (shortPnl ?? 0) + pnl;
   }
   const openPnl = positions.length > 0
-    ? positions.reduce((sum, p) => sum + (asNumber(p.unrealized_pnl) ?? 0), 0)
+    ? positions.reduce((sum, p) => sum + (positionRealtimePnl(p, midPrices) ?? 0), 0)
     : null;
   const expectedValues = orders
     .map((o) => expectedLimitPnl(o, positionsMap.get(String(o.coin ?? ""))))
@@ -280,6 +316,8 @@ function summarizeTrading(positions: AccountPosition[], orders: AccountOpenOrder
     openOrderNotional,
     longPositions: positions.filter((p) => p.side === "long").length,
     shortPositions: positions.filter((p) => p.side === "short").length,
+    positivePositions,
+    negativePositions,
   };
 }
 
@@ -319,7 +357,7 @@ function statusToDot(status: string): DotStatus {
 // ── Main component ───────────────────────────────────────────────────────────
 
 export function AccountMonitorScreen({ health }: { health: Health }) {
-  const { data: snapshot, isFetching, refetch } = useAccountMonitor();
+  const { data: snapshot, error: snapshotError, isError: hasSnapshotError, isFetching, refetch } = useAccountMonitor();
   const [ws, setWs] = useState<WsState>(WS_INITIAL);
   const [midPrices, setMidPrices] = useState<Record<string, number>>({});
   const [action, setAction] = useState<ActionState>(ACTION_INITIAL);
@@ -428,12 +466,12 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
   }, [health.network]);
 
   const totalUnrealized = useMemo(
-    () => snapshot?.positions.reduce((sum, p) => sum + (asNumber(p.unrealized_pnl) ?? 0), 0) ?? null,
-    [snapshot],
+    () => snapshot?.positions.reduce((sum, p) => sum + (positionRealtimePnl(p, midPrices) ?? 0), 0) ?? null,
+    [midPrices, snapshot?.positions],
   );
   const tradingSummary = useMemo(
-    () => summarizeTrading(snapshot?.positions ?? [], snapshot?.open_orders ?? []),
-    [snapshot],
+    () => summarizeTrading(snapshot?.positions ?? [], snapshot?.open_orders ?? [], midPrices),
+    [midPrices, snapshot?.open_orders, snapshot?.positions],
   );
   const positionsNeedingIntervention = useMemo(
     () => (snapshot?.positions ?? []).filter((position) => position.protection?.needs_intervention),
@@ -480,9 +518,10 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
     return hasData ? total : null;
   }, [snapshot?.positions, fundingByCoin]);
 
-  const isInitialLoading = snapshot === undefined;
-  const hasDataError = snapshot === null;
+  const isInitialLoading = snapshot === undefined && !hasSnapshotError;
+  const hasDataError = hasSnapshotError;
   const isStale = snapshot != null && isFetching;
+  const snapshotErrorText = hasDataError ? accountSnapshotErrorMessage(snapshotError, snapshot != null) : null;
 
   return (
     <div className="space-y-6 px-7 py-7">
@@ -537,7 +576,7 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
       {/* Banners */}
       {hasDataError && (
         <Card className="border-danger/40 bg-danger/5 p-4 text-sm text-danger">
-          Snapshot account non disponibile. Verifica la connessione al backend.
+          {snapshotErrorText}
         </Card>
       )}
       {action.error && (
@@ -586,7 +625,7 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
               label="Unrealized PnL"
               value={fmtUsd(totalUnrealized)}
               tone={(totalUnrealized ?? 0) >= 0 ? "success" : "danger"}
-              hint={`${tradingSummary.longPositions} long · ${tradingSummary.shortPositions} short`}
+              hint={`${tradingSummary.positivePositions}▲ positivi · ${tradingSummary.negativePositions}▼ negativi · ${tradingSummary.longPositions} long · ${tradingSummary.shortPositions} short`}
             />
             <KpiTile
               label="Margin used"

@@ -52,7 +52,18 @@ from app.engine.score_calibration import (
     cached_calibration_table,
     serialize_table,
 )
-from app.schemas import CandleOut, IndicatorOut, MarketOut, PushSubscribePayload, PushUnsubscribePayload, SettingsPatch, SignalOut, StrategyPatch
+from app.schemas import (
+    CandleOut,
+    DecisionLogOut,
+    IndicatorOut,
+    MarketOut,
+    PushSubscribePayload,
+    PushUnsubscribePayload,
+    SettingsPatch,
+    SignalOut,
+    SignalSnapshotOut,
+    StrategyPatch,
+)
 from app.services.candle_sync import TIMEFRAME_MS
 from app.services.coinmarketcap import CoinMarketCapClient
 from app.services.hyperliquid import HyperliquidClient, HyperliquidError, HyperliquidTradingClient, parse_hl_candle
@@ -802,6 +813,19 @@ def _enrich_signal_with_calibration(signal: Signal, db: Session) -> SignalOut:
     )
 
 
+def _serialize_decision_log(row: DecisionLog) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "timestamp": row.timestamp,
+        "event_type": row.event_type,
+        "market_id": row.market_id,
+        "signal_id": row.signal_id,
+        "position_id": row.position_id,
+        "message": row.message,
+        "data": row.data,
+    }
+
+
 @router.get("/signals", response_model=list[SignalOut])
 def signals(
     status: str | None = None,
@@ -829,6 +853,113 @@ def signal_detail(signal_id: int, db: Session = Depends(get_db)) -> SignalOut:
     if signal is None:
         raise HTTPException(status_code=404, detail="Signal not found")
     return _enrich_signal_with_calibration(signal, db)
+
+
+@router.get("/signals/{signal_id}/snapshot", response_model=SignalSnapshotOut)
+def signal_snapshot(signal_id: int, db: Session = Depends(get_db)) -> SignalSnapshotOut:
+    signal = db.query(Signal).options(joinedload(Signal.market)).filter(Signal.id == signal_id).first()
+    if signal is None:
+        raise HTTPException(status_code=404, detail="Signal not found")
+
+    source_time = signal.source_candle_open_time
+    candles: list[Candle] = []
+    indicators: list[IndicatorOut] = []
+
+    if source_time is not None:
+        before = (
+            db.query(Candle)
+            .filter(
+                Candle.market_id == signal.market_id,
+                Candle.timeframe == signal.timeframe,
+                Candle.open_time <= source_time,
+            )
+            .order_by(Candle.open_time.desc())
+            .limit(160)
+            .all()
+        )
+        after = (
+            db.query(Candle)
+            .filter(
+                Candle.market_id == signal.market_id,
+                Candle.timeframe == signal.timeframe,
+                Candle.open_time > source_time,
+            )
+            .order_by(Candle.open_time.asc())
+            .limit(40)
+            .all()
+        )
+        candles = [*reversed(before), *after]
+
+        indicator_row = (
+            db.query(Indicator)
+            .filter(
+                Indicator.market_id == signal.market_id,
+                Indicator.timeframe == signal.timeframe,
+                Indicator.timestamp == source_time,
+            )
+            .first()
+        )
+        if indicator_row is not None:
+            indicators = [
+                IndicatorOut(
+                    indicator_name=name,
+                    timeframe=indicator_row.timeframe,
+                    timestamp=indicator_row.timestamp,
+                    values=vals,
+                )
+                for name, vals in sorted(indicator_row.values.items())
+            ]
+
+    candidate_positions = (
+        db.query(Position)
+        .options(joinedload(Position.market))
+        .filter(Position.market_id == signal.market_id)
+        .order_by(Position.opened_at.desc())
+        .all()
+    )
+    linked_positions = [
+        row
+        for row in candidate_positions
+        if str((row.metadata_json or {}).get("source_signal_id")) == str(signal.id)
+    ]
+    position_ids = [row.id for row in linked_positions]
+    orders_by_position: dict[int, list[Order]] = {position_id: [] for position_id in position_ids}
+    if position_ids:
+        position_orders = (
+            db.query(Order)
+            .filter(Order.position_id.in_(position_ids))
+            .order_by(Order.created_at.asc())
+            .all()
+        )
+        for order in position_orders:
+            if order.position_id is not None:
+                orders_by_position.setdefault(order.position_id, []).append(order)
+
+    logs = (
+        db.query(DecisionLog)
+        .filter(DecisionLog.signal_id == signal.id)
+        .order_by(DecisionLog.timestamp.desc())
+        .limit(100)
+        .all()
+    )
+
+    now_utc = datetime.now(timezone.utc)
+    return SignalSnapshotOut(
+        signal=_enrich_signal_with_calibration(signal, db),
+        source_candle_open_time=source_time,
+        candles=candles,
+        indicators=indicators,
+        positions=[
+            _serialize_position(
+                db,
+                row,
+                orders_by_position.get(row.id, []),
+                now_utc=now_utc,
+            )
+            for row in linked_positions
+        ],
+        decision_logs=[DecisionLogOut(**_serialize_decision_log(row)) for row in logs],
+    )
 
 
 @router.post("/signals/{signal_id}/ignore")

@@ -57,12 +57,33 @@ class SignalOut(BaseModel):
     reason: str
     strategy_breakdown: dict[str, Any]
     status: str
+    source_candle_open_time: datetime | None = None
     created_at: datetime
     updated_at: datetime
     calibrated_expected_r: float | None = None
     calibrated_win_rate: float | None = None
     calibration_n_samples: int | None = None
     calibration_confidence: str | None = None
+
+
+class DecisionLogOut(BaseModel):
+    id: int
+    timestamp: datetime
+    event_type: str
+    market_id: int | None = None
+    signal_id: int | None = None
+    position_id: int | None = None
+    message: str
+    data: dict[str, Any]
+
+
+class SignalSnapshotOut(BaseModel):
+    signal: SignalOut
+    source_candle_open_time: datetime | None
+    candles: list[CandleOut]
+    indicators: list[IndicatorOut]
+    positions: list[dict[str, Any]]
+    decision_logs: list[DecisionLogOut]
 
 
 class SettingsPatch(BaseModel):

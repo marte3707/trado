@@ -3,7 +3,7 @@ self.addEventListener("push", event => {
   event.waitUntil(
     self.registration.showNotification(data.title ?? "Trado", {
       body: data.body ?? "",
-      icon: "/favicon.ico",
+      icon: "/brand/trado_telegram_avatar.png",
       tag: data.tag ?? "trado",
       renotify: true,
       data: { url: data.url ?? "/" },

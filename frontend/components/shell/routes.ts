@@ -42,7 +42,7 @@ export interface RouteMeta {
 export const ROUTES: RouteMeta[] = [
   { id: "dash",        label: "Dashboard",  group: "workspace", icon: LayoutDashboard,   description: "Panoramica operativa" },
   { id: "signals",     label: "Segnali",    group: "workspace", icon: Activity,          description: "Feed segnali live" },
-  { id: "coin",        label: "Mercati",    group: "workspace", icon: LineChart,         description: "Chart e indicatori per mercato" },
+  { id: "coin",        label: "Dettaglio",    group: "workspace", icon: LineChart,         description: "Chart e indicatori per mercato" },
   { id: "account",     label: "Account",    group: "workspace", icon: Wallet,            description: "Posizioni e ordini Hyperliquid" },
 
   { id: "strategy-lab",label: "Analisi",    group: "analytics", icon: Beaker,            description: "Strategy lab: ranking e combinazioni" },

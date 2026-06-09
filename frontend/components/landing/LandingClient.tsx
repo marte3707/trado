@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { useEffect, useMemo, useState } from "react";
 
 import { MESSAGES, type Lang } from "@/lib/landing-i18n";
@@ -33,7 +34,20 @@ export function LandingClient({ botUsername, configured, source, initialLang }: 
     <div className="min-h-screen bg-bg text-fg">
       <header className="border-b border-border">
         <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-4">
-          <div className="text-lg font-semibold tracking-tight">Trado</div>
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-[118px] items-center rounded-md bg-brand-light px-2">
+              <Image
+                src="/brand/trado_logo_horizontal.png"
+                alt="Trado"
+                width={180}
+                height={52}
+                className="h-6 w-full object-contain"
+              />
+            </div>
+            <span className="hidden text-xs font-medium text-fg-3 sm:inline">
+              {t.brandTagline}
+            </span>
+          </div>
           <div className="flex items-center gap-2 text-sm">
             <span className="text-fg-3">{t.langSwitcherLabel}:</span>
             <button
@@ -50,8 +64,21 @@ export function LandingClient({ botUsername, configured, source, initialLang }: 
       <main className="mx-auto max-w-5xl px-6 pb-24">
         {/* Hero */}
         <section className="pt-16 pb-12">
-          <div className="text-xs font-medium uppercase tracking-widest text-primary">
-            {t.heroEyebrow}
+          <div className="flex items-center gap-3">
+            <Image
+              src="/brand/trado_telegram_avatar.png"
+              alt=""
+              width={96}
+              height={96}
+              className="h-12 w-12 rounded-full"
+              aria-hidden="true"
+            />
+            <div>
+              <div className="text-xs font-medium uppercase tracking-widest text-primary">
+                {t.heroEyebrow}
+              </div>
+              <div className="mt-1 text-sm font-semibold text-fg-2">{t.brandTagline}</div>
+            </div>
           </div>
           <h1 className="mt-4 text-4xl font-semibold leading-tight tracking-tight sm:text-5xl">
             {t.heroTitle}

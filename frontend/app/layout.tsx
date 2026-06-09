@@ -1,22 +1,20 @@
 import type { Metadata } from "next";
-import { GeistSans } from "geist/font/sans";
-import { GeistMono } from "geist/font/mono";
 import { SwRegistrar } from "@/components/SwRegistrar";
 import { Providers } from "@/app/providers";
 import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Trado",
-  description: "Personal Hyperliquid signal dashboard",
+  description: "Trade smarter. Grow further.",
   icons: {
-    icon: "/csp.png",
-    apple: "/csp.png",
+    icon: "/brand/trado_telegram_avatar.png",
+    apple: "/brand/trado_telegram_avatar.png",
   },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="it" className={`${GeistSans.variable} ${GeistMono.variable}`}>
+    <html lang="it">
       <body>
         <SwRegistrar />
         <Providers>{children}</Providers>
