@@ -17,7 +17,6 @@ import {
 import { StatusDot, type DotStatus } from "@/components/shell/StatusDot";
 import { cn } from "@/lib/utils";
 import {
-  AccountEquityHistory,
   AccountFunding,
   AccountMonitor,
   AccountOpenOrder,
@@ -26,16 +25,7 @@ import {
   Health,
   apiPost,
 } from "@/lib/api";
-import { useAccountEquityHistory, useAccountMonitor } from "@/lib/hooks/queries";
-import * as Recharts from "recharts";
-
-const RArea = Recharts.Area as unknown as React.ComponentType<Record<string, unknown>>;
-const RCartesianGrid = Recharts.CartesianGrid as unknown as React.ComponentType<Record<string, unknown>>;
-const RComposedChart = Recharts.ComposedChart as unknown as React.ComponentType<Record<string, unknown> & { children?: React.ReactNode }>;
-const RResponsiveContainer = Recharts.ResponsiveContainer as unknown as React.ComponentType<Record<string, unknown> & { children?: React.ReactNode }>;
-const RTooltip = Recharts.Tooltip as unknown as React.ComponentType<Record<string, unknown>>;
-const RXAxis = Recharts.XAxis as unknown as React.ComponentType<Record<string, unknown>>;
-const RYAxis = Recharts.YAxis as unknown as React.ComponentType<Record<string, unknown>>;
+import { useAccountMonitor } from "@/lib/hooks/queries";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -330,8 +320,6 @@ function statusToDot(status: string): DotStatus {
 
 export function AccountMonitorScreen({ health }: { health: Health }) {
   const { data: snapshot, isFetching, refetch } = useAccountMonitor();
-  const [equityDays, setEquityDays] = useState(30);
-  const { data: equityHistory } = useAccountEquityHistory(equityDays);
   const [ws, setWs] = useState<WsState>(WS_INITIAL);
   const [midPrices, setMidPrices] = useState<Record<string, number>>({});
   const [action, setAction] = useState<ActionState>(ACTION_INITIAL);
@@ -628,13 +616,6 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
             />
           </div>
 
-          {/* Equity Line + Drawdown */}
-          <AccountEquityPanel
-            history={equityHistory ?? null}
-            days={equityDays}
-            onDaysChange={setEquityDays}
-          />
-
           {/* Margin Analysis + P&L/Funding */}
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             <CrossMarginHealth account={snapshot?.account ?? null} />
@@ -733,229 +714,6 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
         </DialogContent>
       </Dialog>
     </div>
-  );
-}
-
-// ── AccountEquityPanel ────────────────────────────────────────────────────────
-
-const CHART_COLORS = {
-  equity: "#3ecf8e",
-  drawdown: "#f26d6d",
-  grid: "#1d1d22",
-  axis: "#4b4b53",
-  tooltipBg: "#16161a",
-  fg: "#e9e9ec",
-  fgMuted: "#a4a4ad",
-};
-
-const DAYS_OPTIONS = [7, 14, 30, 90] as const;
-
-function AccountEquityPanel({
-  history,
-  days,
-  onDaysChange,
-}: {
-  history: AccountEquityHistory | null;
-  days: number;
-  onDaysChange: (d: number) => void;
-}) {
-  const points = useMemo(() => history?.points ?? [], [history]);
-  const maxDd = history?.max_drawdown_pct ?? 0;
-  const peak = history?.peak_equity;
-  const current = history?.current_equity;
-  const currentDd = points.at(-1)?.drawdown_pct ?? 0;
-
-  const chartData = useMemo(
-    () =>
-      points.map((p) => ({
-        label: new Intl.DateTimeFormat("it-IT", { day: "2-digit", month: "2-digit" }).format(
-          new Date(p.ts),
-        ),
-        equity: p.equity,
-        drawdown: -p.drawdown_pct,
-      })),
-    [points],
-  );
-
-  const equityMin = useMemo(() => {
-    if (chartData.length === 0) return 0;
-    const min = Math.min(...chartData.map((d) => d.equity));
-    const max = Math.max(...chartData.map((d) => d.equity));
-    const pad = (max - min) * 0.05 || 1;
-    return Math.floor(min - pad);
-  }, [chartData]);
-
-  return (
-    <Card className="overflow-hidden">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-6 py-4">
-        <div className="flex items-center gap-4">
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
-              Equity line &amp; Drawdown
-            </span>
-            {history?.source === "local" && (
-              <span className="rounded-full bg-warn/10 px-1.5 py-0.5 text-[9px] font-medium text-warn" title="Dati HL non disponibili — usando snapshot locali">
-                local
-              </span>
-            )}
-          </div>
-          {current != null && (
-            <span className="font-mono text-sm font-semibold text-fg">{fmtUsd(current)}</span>
-          )}
-          {peak != null && current != null && (
-            <span className="font-mono text-xs text-fg-3">
-              peak {fmtUsd(peak)}
-            </span>
-          )}
-        </div>
-        <div className="flex items-center gap-2">
-          {/* Max drawdown badge */}
-          <span
-            className={cn(
-              "rounded-full px-2 py-0.5 font-mono text-[10px] font-medium",
-              maxDd === 0
-                ? "bg-fg-4/20 text-fg-3"
-                : maxDd > 15
-                  ? "bg-danger/10 text-danger"
-                  : maxDd > 8
-                    ? "bg-warn/10 text-warn"
-                    : "bg-success/10 text-success",
-            )}
-            title="Max drawdown nel periodo"
-          >
-            Max DD {maxDd.toFixed(2)}%
-          </span>
-          {currentDd > 0 && (
-            <span
-              className={cn(
-                "rounded-full px-2 py-0.5 font-mono text-[10px] font-medium",
-                currentDd > 15
-                  ? "bg-danger/10 text-danger"
-                  : currentDd > 8
-                    ? "bg-warn/10 text-warn"
-                    : "bg-success/10 text-success",
-              )}
-              title="Drawdown corrente dal picco"
-            >
-              Attuale {currentDd.toFixed(2)}%
-            </span>
-          )}
-          {/* Days selector */}
-          <div className="flex rounded-md border border-border overflow-hidden">
-            {DAYS_OPTIONS.map((d) => (
-              <button
-                key={d}
-                onClick={() => onDaysChange(d)}
-                className={cn(
-                  "px-2.5 py-1 text-[10px] font-mono font-medium transition-colors",
-                  d === days
-                    ? "bg-fg-4/30 text-fg"
-                    : "text-fg-3 hover:text-fg",
-                )}
-              >
-                {d}d
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-
-      {chartData.length === 0 ? (
-        <div className="grid h-40 place-items-center text-xs text-fg-3">
-          Nessun snapshot equity disponibile per il periodo.
-        </div>
-      ) : (
-        <div className="p-4" style={{ height: 260 }}>
-          <RResponsiveContainer width="100%" height="100%">
-            <RComposedChart data={chartData} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
-              <defs>
-                <linearGradient id="eqFill" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={CHART_COLORS.equity} stopOpacity={0.25} />
-                  <stop offset="100%" stopColor={CHART_COLORS.equity} stopOpacity={0} />
-                </linearGradient>
-                <linearGradient id="ddFill" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stopColor={CHART_COLORS.drawdown} stopOpacity={0} />
-                  <stop offset="100%" stopColor={CHART_COLORS.drawdown} stopOpacity={0.3} />
-                </linearGradient>
-              </defs>
-              <RCartesianGrid
-                stroke={CHART_COLORS.grid}
-                strokeDasharray="2 4"
-                vertical={false}
-              />
-              <RXAxis
-                dataKey="label"
-                stroke={CHART_COLORS.axis}
-                fontSize={10}
-                tickLine={false}
-                axisLine={false}
-                interval="preserveStartEnd"
-              />
-              <RYAxis
-                yAxisId="eq"
-                stroke={CHART_COLORS.axis}
-                fontSize={10}
-                tickLine={false}
-                axisLine={false}
-                width={56}
-                domain={[equityMin, "auto"]}
-                tickFormatter={(v: number) =>
-                  v >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0)
-                }
-              />
-              <RYAxis
-                yAxisId="dd"
-                orientation="right"
-                stroke={CHART_COLORS.axis}
-                fontSize={10}
-                tickLine={false}
-                axisLine={false}
-                width={38}
-                domain={[-(maxDd * 1.4 || 5), 0]}
-                tickFormatter={(v: number) => `${Math.abs(v).toFixed(1)}%`}
-              />
-              <RTooltip
-                cursor={{ stroke: "#2b2b32", strokeDasharray: "2 4" }}
-                contentStyle={{
-                  background: CHART_COLORS.tooltipBg,
-                  border: `1px solid ${CHART_COLORS.grid}`,
-                  borderRadius: 8,
-                  fontSize: 12,
-                  color: CHART_COLORS.fg,
-                }}
-                labelStyle={{ color: CHART_COLORS.fgMuted, fontSize: 10, textTransform: "uppercase" }}
-                formatter={(value: number, name: string) => {
-                  if (name === "equity") return [fmtUsd(value), "Equity"];
-                  return [`${Math.abs(value).toFixed(2)}%`, "Drawdown"];
-                }}
-              />
-              <RArea
-                yAxisId="eq"
-                type="monotone"
-                dataKey="equity"
-                stroke={CHART_COLORS.equity}
-                strokeWidth={1.8}
-                fill="url(#eqFill)"
-                dot={false}
-                activeDot={{ r: 3, fill: CHART_COLORS.equity }}
-                isAnimationActive={false}
-              />
-              <RArea
-                yAxisId="dd"
-                type="monotone"
-                dataKey="drawdown"
-                stroke={CHART_COLORS.drawdown}
-                strokeWidth={1.2}
-                fill="url(#ddFill)"
-                dot={false}
-                activeDot={{ r: 3, fill: CHART_COLORS.drawdown }}
-                isAnimationActive={false}
-              />
-            </RComposedChart>
-          </RResponsiveContainer>
-        </div>
-      )}
-    </Card>
   );
 }
 

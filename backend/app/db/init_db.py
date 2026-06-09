@@ -2,7 +2,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.runtime_settings import DEFAULT_POSITION_MANAGEMENT_SETTINGS
-from app.db.models import AppSetting, Base, StrategyConfig
+from app.db.models import AppSetting, Base, Market, StrategyConfig
 from app.db.session import engine
 from app.services.unified_account_ratio import DEFAULT_UAR_RISK_SETTINGS
 
@@ -77,6 +77,21 @@ DEFAULT_EDGE_RISK_SETTINGS = {
     "entry_quality_short_ob_imbalance_max": 0.0,
     "max_combined_score_adjustment": 15,
 }
+
+
+# Market osservati solo a scopo macro: sincronizzano candele ma NON generano
+# segnali né posizioni (vedi guard `monitoring_only` nel worker). XYZ100 è il
+# perp HIP-3 di trade[XYZ] su Hyperliquid che traccia il Nasdaq-100 (coin API
+# `xyz:XYZ100`); non compare nella meta() standard, quindi va seedato a parte.
+MONITORING_MARKETS = [
+    {
+        "symbol": "XYZ100",
+        "base": "XYZ100",
+        "quote": "USDC",
+        "market_type": "perp",
+        "metadata_json": {"hl_coin": "xyz:XYZ100", "monitoring_only": True, "dex": "xyz"},
+    },
+]
 
 
 def create_schema() -> None:
@@ -250,6 +265,11 @@ def seed_defaults(db: Session) -> None:
                     "require_ema_confirmation": True,
                     "confirmation_timeframe": "1h",
                     "confirmation_ema_period": 200,
+                    "require_flow_confirmation": False,
+                    "flow_lookback_hours": 6,
+                    "flow_exchange": "BINANCE_FUTURES",
+                    "flow_symbol": "BTCUSDT",
+                    "flow_cache_ttl_seconds": 600,
                     "_last_btc_trend": "NEUTRAL",
                     "_last_directional_trend": "NEUTRAL",
                     "_last_reversal_at": None,
@@ -274,6 +294,11 @@ def seed_defaults(db: Session) -> None:
                 "reverse_signal_flip_max_age_minutes": 60,
                 "reverse_signal_flip_min_score": 50,
                 "_reverse_history": {},
+                "require_flow_confirmation": False,
+                "flow_lookback_hours": 6,
+                "flow_exchange": "BINANCE_FUTURES",
+                "flow_symbol": "BTCUSDT",
+                "flow_cache_ttl_seconds": 600,
             }
             for key, default in reverse_defaults.items():
                 if key not in updated:
@@ -283,7 +308,39 @@ def seed_defaults(db: Session) -> None:
                 existing.value = updated
     for timeframe in settings.enabled_timeframes:
         seed_timeframe(db, timeframe)
+    seed_monitoring_markets(db)
     db.commit()
+
+
+def seed_monitoring_markets(db: Session) -> None:
+    """Inserisce (se assenti) i market di solo monitoraggio macro.
+
+    Idempotente: non sovrascrive righe esistenti, così eventuali modifiche
+    manuali (es. disattivazione) vengono preservate. `MarketSyncService` non
+    tocca questi market perché non compaiono nella meta() standard di HL.
+    """
+    for entry in MONITORING_MARKETS:
+        exists = (
+            db.query(Market)
+            .filter(
+                Market.exchange == "hyperliquid",
+                Market.symbol == entry["symbol"],
+                Market.market_type == entry["market_type"],
+            )
+            .first()
+        )
+        if exists is None:
+            db.add(
+                Market(
+                    exchange="hyperliquid",
+                    symbol=entry["symbol"],
+                    base=entry["base"],
+                    quote=entry["quote"],
+                    market_type=entry["market_type"],
+                    active=True,
+                    metadata_json=entry["metadata_json"],
+                )
+            )
 
 
 def seed_timeframe(db: Session, timeframe: str) -> None:

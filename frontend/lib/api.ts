@@ -802,6 +802,18 @@ export type ScoreCalibration = {
   by_week: ScoreCalibrationPeriod[];
 };
 
+export type MacroCorrelation = {
+  base: string;
+  ref: string;
+  timeframe: string;
+  lookback: number;
+  samples: number;
+  correlation: number | null;
+  beta: number | null;
+  base_last_close: number | null;
+  ref_last_close: number | null;
+};
+
 export type ExpectedRBucket = {
   key: string;
   direction: "LONG" | "SHORT";

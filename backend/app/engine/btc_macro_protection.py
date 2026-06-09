@@ -13,6 +13,7 @@ from app.core.enums import Direction, OrderMode, SignalStatus
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Position, Signal
 from app.engine.position_management import PositionManagementEngine, StopCandidate
 from app.indicators.core import ema
+from app.services.kiotaka import KiotakaClient
 
 logger = structlog.get_logger()
 
@@ -29,6 +30,7 @@ class BtcMacroProtectionEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._position_manager = PositionManagementEngine(settings)
+        self._kiotaka = KiotakaClient(settings)
 
     def run(
         self,
@@ -87,6 +89,21 @@ class BtcMacroProtectionEngine:
                 )
                 current_trend = BtcTrendState.NEUTRAL
 
+        # Conferma con flusso reale BTC (kiyotaka): se il CVD reale contraddice il trend
+        # candidato, declassa a NEUTRAL. Fail-open: dato assente/errore => non blocca.
+        flow_info: dict[str, Any] = {}
+        if current_trend != BtcTrendState.NEUTRAL and bool(
+            config.get("require_flow_confirmation", False)
+        ):
+            flow_confirmed, flow_info = self._check_flow_confluence(current_trend, config)
+            if not flow_confirmed:
+                logger.debug(
+                    "btc_macro_protection_flow_confirmation_failed",
+                    candidate_trend=current_trend.value,
+                    flow=flow_info,
+                )
+                current_trend = BtcTrendState.NEUTRAL
+
         # Read last *directional* trend (NEUTRAL non lo sovrascrive). Fallback al
         # vecchio "_last_btc_trend" per backward compatibility con setup esistenti.
         last_directional_str = str(
@@ -137,6 +154,7 @@ class BtcMacroProtectionEngine:
                     "vol_ratio": round(vol_ratio, 4),
                     "timeframe": timeframe,
                     "lookback_candles": lookback,
+                    "flow": flow_info or None,
                 },
             )
         )
@@ -273,6 +291,46 @@ class BtcMacroProtectionEngine:
         if candidate == BtcTrendState.BEARISH and last_close < ema_value:
             return True
         return False
+
+    def _check_flow_confluence(
+        self,
+        candidate: BtcTrendState,
+        config: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        """Conferma il trend candidato col flusso reale BTC (CVD da kiyotaka).
+
+        Blocca (ritorna False) solo quando il CVD reale contraddice nettamente la
+        direzione: BULLISH con CVD netto < 0, o BEARISH con CVD netto > 0. Fail-open:
+        se il dato non è disponibile (free tier giù, no key, errore) il reversal passa.
+        """
+        lookback_hours = int(config.get("flow_lookback_hours", 6))
+        exchange = str(config.get("flow_exchange", "BINANCE_FUTURES"))
+        symbol = str(config.get("flow_symbol", "BTCUSDT"))
+        ttl = int(config.get("flow_cache_ttl_seconds", 600))
+
+        snapshot = self._kiotaka.btc_flow(
+            lookback_hours=lookback_hours, exchange=exchange, symbol=symbol, ttl_seconds=ttl
+        )
+        if snapshot is None or snapshot.points < 2:
+            # Dato assente o insufficiente: non blocchiamo (degradazione sicura).
+            return True, {"flow_available": False}
+
+        info = {
+            "flow_available": True,
+            "cvd_net": round(snapshot.cvd_net, 2),
+            "cvd_direction": snapshot.cvd_direction,
+            "oi_change_pct": round(snapshot.oi_change_pct, 3),
+            "liq_long": round(snapshot.liq_long, 3),
+            "liq_short": round(snapshot.liq_short, 3),
+            "lookback_hours": lookback_hours,
+        }
+
+        contradicts = (
+            (candidate == BtcTrendState.BULLISH and snapshot.cvd_net < 0)
+            or (candidate == BtcTrendState.BEARISH and snapshot.cvd_net > 0)
+        )
+        info["confirmed"] = not contradicts
+        return (not contradicts), info
 
     def _latest_close(self, db: Session, market_id: int) -> Decimal | None:
         row = (

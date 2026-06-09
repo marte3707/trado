@@ -3,6 +3,7 @@ import shlex
 import subprocess
 import uuid
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -1325,16 +1326,7 @@ def analytics_score_calibration(
 
     scores_list = [p[0] for p in pairs]
     pnls_list = [p[1] for p in pairs]
-    n = len(scores_list)
-    correlation: float | None = None
-    if n >= 2:
-        mean_s = sum(scores_list) / n
-        mean_p = sum(pnls_list) / n
-        cov = sum((s - mean_s) * (p - mean_p) for s, p in zip(scores_list, pnls_list)) / n
-        std_s = (sum((s - mean_s) ** 2 for s in scores_list) / n) ** 0.5
-        std_p = (sum((p - mean_p) ** 2 for p in pnls_list) / n) ** 0.5
-        if std_s > 0 and std_p > 0:
-            correlation = round(cov / (std_s * std_p), 3)
+    correlation = _pearson(scores_list, pnls_list)
 
     now = datetime.now(timezone.utc)
     period_days = 14
@@ -1365,6 +1357,97 @@ def analytics_score_calibration(
         "correlation": correlation,
         "total_trades": len(pairs),
         "by_week": by_week,
+    }
+
+
+def _pearson(xs: Sequence[float], ys: Sequence[float]) -> float | None:
+    """Correlazione di Pearson; None se < 2 campioni o varianza nulla."""
+    n = len(xs)
+    if n < 2 or n != len(ys):
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / n
+    std_x = (sum((x - mean_x) ** 2 for x in xs) / n) ** 0.5
+    std_y = (sum((y - mean_y) ** 2 for y in ys) / n) ** 0.5
+    if std_x > 0 and std_y > 0:
+        return round(cov / (std_x * std_y), 3)
+    return None
+
+
+def _beta(dependent: Sequence[float], independent: Sequence[float]) -> float | None:
+    """Beta del dependent rispetto all'independent: cov(d, i) / var(i)."""
+    n = len(dependent)
+    if n < 2 or n != len(independent):
+        return None
+    mean_d = sum(dependent) / n
+    mean_i = sum(independent) / n
+    cov = sum((d - mean_d) * (i - mean_i) for d, i in zip(dependent, independent)) / n
+    var_i = sum((i - mean_i) ** 2 for i in independent) / n
+    if var_i <= 0:
+        return None
+    return round(cov / var_i, 3)
+
+
+@router.get("/macro/correlation")
+def macro_correlation(
+    base: str = Query("XYZ100", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._\-/:]+$"),
+    ref: str = Query("BTC", min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._\-/:]+$"),
+    timeframe: str = Query("1h", pattern=r"^(5m|15m|30m|1h|4h|1d)$"),
+    lookback: int = Query(200, ge=2, le=1000),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Correlazione/beta rolling tra due market, calcolate sui rendimenti.
+
+    `base` è l'indipendente (es. XYZ100/Nasdaq-100), `ref` il dipendente
+    (es. BTC). La correlazione è su rendimenti percentuali (non sui prezzi
+    assoluti, che per serie in trend sono spuriamente correlati); `beta` è
+    quanto si muove `ref` per unità di movimento di `base`. Fail-soft:
+    `correlation`/`beta` = null se i campioni comuni sono insufficienti.
+    """
+    base_market = db.query(Market).filter(Market.symbol == base).first()
+    ref_market = db.query(Market).filter(Market.symbol == ref).first()
+    if base_market is None or ref_market is None:
+        raise HTTPException(status_code=404, detail="Market not found")
+
+    def _closes(market: Market) -> dict[datetime, float]:
+        rows = (
+            db.query(Candle.open_time, Candle.close)
+            .filter(Candle.market_id == market.id, Candle.timeframe == timeframe)
+            .order_by(Candle.open_time.desc())
+            .limit(lookback)
+            .all()
+        )
+        return {row.open_time: float(row.close) for row in rows}
+
+    base_closes = _closes(base_market)
+    ref_closes = _closes(ref_market)
+
+    # Inner join sui timestamp comuni: XYZ100 e BTC devono avere la barra allo
+    # stesso open_time per essere confrontati.
+    common = sorted(set(base_closes) & set(ref_closes))
+    base_series = [base_closes[t] for t in common]
+    ref_series = [ref_closes[t] for t in common]
+
+    base_returns: list[float] = []
+    ref_returns: list[float] = []
+    for i in range(1, len(common)):
+        b_prev, r_prev = base_series[i - 1], ref_series[i - 1]
+        if b_prev <= 0 or r_prev <= 0:
+            continue
+        base_returns.append(base_series[i] / b_prev - 1.0)
+        ref_returns.append(ref_series[i] / r_prev - 1.0)
+
+    return {
+        "base": base,
+        "ref": ref,
+        "timeframe": timeframe,
+        "lookback": lookback,
+        "samples": len(base_returns),
+        "correlation": _pearson(ref_returns, base_returns),
+        "beta": _beta(ref_returns, base_returns),
+        "base_last_close": base_series[-1] if base_series else None,
+        "ref_last_close": ref_series[-1] if ref_series else None,
     }
 
 

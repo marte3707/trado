@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { DashboardData } from "@/components/Dashboard";
@@ -10,6 +10,7 @@ import { CoinScreen } from "@/components/screens/CoinScreen";
 import { AccountMonitorScreen } from "@/components/screens/AccountMonitorScreen";
 import { StrategiesScreen } from "@/components/screens/StrategiesScreen";
 import { CalibrationScreen } from "@/components/screens/CalibrationScreen";
+import { PerformanceScreen } from "@/components/screens/PerformanceScreen";
 import { HistoryScreen } from "@/components/screens/HistoryScreen";
 import { FunnelScreen } from "@/components/screens/FunnelScreen";
 import { AlertsScreen } from "@/components/screens/AlertsScreen";
@@ -25,6 +26,7 @@ import type { TradingMode } from "@/components/shell/ModeBadge";
 import { buildNavBindings, useChordHotkey } from "@/lib/hotkeys";
 
 import {
+  useAccountMonitor,
   useCalibration,
   useCalibrationHistory,
   useDecisionLogs,
@@ -52,6 +54,16 @@ interface AppShellProps {
   initialData: DashboardData;
 }
 
+type PnlTitleDirection = "up" | "down" | "flat" | null;
+
+type PnlTitleSample = {
+  ts: number;
+  value: number;
+};
+
+const PNL_TITLE_LOOKBACK_MS = 5 * 60 * 1000;
+const PNL_TITLE_RETENTION_MS = 15 * 60 * 1000;
+
 function envToMode(val: string | undefined): TradingMode {
   if (val === "PAPER_TRADING") return "paper";
   if (val === "AUTO_TRADE") return "live";
@@ -59,8 +71,64 @@ function envToMode(val: string | undefined): TradingMode {
 }
 
 function asNumber(value: unknown): number | null {
+  if (value == null || value === "") return null;
   const parsed = typeof value === "number" ? value : Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function fmtBrowserTitlePnl(value: number): string {
+  const abs = Math.abs(value);
+  const digits = abs < 1 ? 3 : 2;
+  const formatted = abs.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+  if (value > 0) return `+${formatted}`;
+  if (value < 0) return `-${formatted}`;
+  return formatted;
+}
+
+function readPnlTitleSamples(storageKey: string): PnlTitleSample[] {
+  try {
+    const raw = window.localStorage.getItem(storageKey);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (item): item is PnlTitleSample =>
+        item != null &&
+        typeof item === "object" &&
+        Number.isFinite((item as PnlTitleSample).ts) &&
+        Number.isFinite((item as PnlTitleSample).value),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writePnlTitleSamples(storageKey: string, samples: PnlTitleSample[]) {
+  try {
+    window.localStorage.setItem(storageKey, JSON.stringify(samples));
+  } catch {
+    // Best effort only: the tab title still updates without persistent history.
+  }
+}
+
+function pnlSampleAtOrBefore(
+  samples: PnlTitleSample[],
+  timestamp: number,
+): PnlTitleSample | null {
+  let selected: PnlTitleSample | null = null;
+  for (const sample of samples) {
+    if (
+      sample.ts <= timestamp &&
+      (selected == null || sample.ts > selected.ts)
+    ) {
+      selected = sample;
+    }
+  }
+  return selected;
 }
 
 function alertCount(logs: { event_type: string }[]): number {
@@ -77,6 +145,8 @@ function marketKey(market: Market) {
 export function AppShell({ initialData }: AppShellProps) {
   const [route, setRoute] = useState<Route>("dash");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [pnlTitleDirection, setPnlTitleDirection] = useState<PnlTitleDirection>(null);
+  const originalTitleRef = useRef<string | null>(null);
   const [coinFocus, setCoinFocus] = useState<{ marketKey: string; timeframe: string } | null>(() =>
     initialData.chartMarket
       ? { marketKey: marketKey(initialData.chartMarket), timeframe: initialData.chartTimeframe }
@@ -88,6 +158,7 @@ export function AppShell({ initialData }: AppShellProps) {
 
   /* ── live queries (poll handled by TanStack staleTime + refetchInterval) ── */
   const { data: health = initialData.health } = useHealth({ initialData: initialData.health });
+  const { data: accountSnapshot } = useAccountMonitor();
   const { data: markets = initialData.markets } = useMarkets("", { initialData: initialData.markets });
   const { data: signalsRaw = initialData.signals } = useSignals("min_score=0", {
     initialData: initialData.signals,
@@ -134,6 +205,75 @@ export function AppShell({ initialData }: AppShellProps) {
 
   const settingsObj = (settings ?? {}) as AppSettings;
   const threshold = asNumber(settingsObj.risk?.min_signal_score) ?? 60;
+  const totalUnrealized = useMemo(
+    () => accountSnapshot?.positions.reduce((sum, p) => sum + (asNumber(p.unrealized_pnl) ?? 0), 0) ?? null,
+    [accountSnapshot],
+  );
+  const pnlTitleStorageKey = useMemo(() => {
+    const network = health?.network ?? "unknown";
+    const accountKey = accountSnapshot?.account.address ?? "unconfigured";
+    return `trado:account-monitor:unrealized-pnl:${network}:${accountKey}`;
+  }, [accountSnapshot?.account.address, health?.network]);
+  const pnlTitleText = useMemo(
+    () => (totalUnrealized == null ? null : fmtBrowserTitlePnl(totalUnrealized)),
+    [totalUnrealized],
+  );
+
+  useEffect(() => {
+    if (totalUnrealized == null || !accountSnapshot?.checked_at) {
+      setPnlTitleDirection(null);
+      return;
+    }
+
+    const checkedAtMs = Date.parse(accountSnapshot.checked_at);
+    const sampleTime = Number.isFinite(checkedAtMs) ? checkedAtMs : Date.now();
+    const existingSamples = readPnlTitleSamples(pnlTitleStorageKey);
+    const retainedSamples = existingSamples.filter(
+      (sample) =>
+        sample.ts >= sampleTime - PNL_TITLE_RETENTION_MS &&
+        sample.ts <= sampleTime + 30_000,
+    );
+    const previousTarget = sampleTime - PNL_TITLE_LOOKBACK_MS;
+    const previousSample = pnlSampleAtOrBefore(retainedSamples, previousTarget);
+    const nextSamples = [...retainedSamples, { ts: sampleTime, value: totalUnrealized }]
+      .sort((a, b) => a.ts - b.ts)
+      .filter((sample, index, samples) => index === 0 || sample.ts !== samples[index - 1].ts);
+
+    writePnlTitleSamples(pnlTitleStorageKey, nextSamples);
+
+    if (previousSample == null) {
+      setPnlTitleDirection(null);
+    } else if (totalUnrealized > previousSample.value) {
+      setPnlTitleDirection("up");
+    } else if (totalUnrealized < previousSample.value) {
+      setPnlTitleDirection("down");
+    } else {
+      setPnlTitleDirection("flat");
+    }
+  }, [accountSnapshot?.checked_at, pnlTitleStorageKey, totalUnrealized]);
+
+  useEffect(() => {
+    if (originalTitleRef.current == null) {
+      originalTitleRef.current = document.title;
+    }
+    return () => {
+      document.title = originalTitleRef.current ?? "Trado";
+    };
+  }, []);
+
+  useEffect(() => {
+    if (pnlTitleText == null) {
+      document.title = originalTitleRef.current ?? "Trado";
+      return;
+    }
+    const arrow =
+      pnlTitleDirection === "up"
+        ? "▲"
+        : pnlTitleDirection === "down"
+          ? "▼"
+          : "";
+    document.title = arrow ? `${pnlTitleText} ${arrow} Trado` : `${pnlTitleText} Trado`;
+  }, [pnlTitleDirection, pnlTitleText]);
 
   /* ── refresh callback (legacy interface per gli screens non ancora migrati) ── */
   const refresh = useCallback(() => {
@@ -291,6 +431,8 @@ export function AppShell({ initialData }: AppShellProps) {
             onRefresh={refresh}
           />
         )}
+
+        {route === "performance" && <PerformanceScreen health={health} />}
 
         {route === "history" && <HistoryScreen fallbackPositions={positions} fallbackOrders={orders} />}
 

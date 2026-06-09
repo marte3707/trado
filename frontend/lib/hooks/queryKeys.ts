@@ -27,6 +27,8 @@ export const qk = {
   signalRejections: (limit: number) => ["signal-rejections", limit] as const,
   marketIntelligence: ["market-intelligence"] as const,
   marketDashboard: ["market-intelligence", "dashboard"] as const,
+  macroCorrelation: (base: string, ref: string, timeframe: string) =>
+    ["macro-correlation", base, ref, timeframe] as const,
   equitySlope: ["equity-slope"] as const,
   scoreCalibration: ["score-calibration"] as const,
   expectedRCalibration: ["expected-r-calibration"] as const,

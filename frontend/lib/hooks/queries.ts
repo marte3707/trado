@@ -22,6 +22,7 @@ import {
   type ExpectedRCalibration,
   type Health,
   type Market,
+  type MacroCorrelation,
   type MarketDashboardSnapshot,
   type MarketIntelligence,
   type Order,
@@ -262,6 +263,24 @@ export function useMarketDashboardSnapshot(opts?: QueryOpts<MarketDashboardSnaps
     queryKey: qk.marketDashboard,
     queryFn: () =>
       apiGet<MarketDashboardSnapshot>("/api/market-intelligence/dashboard").catch(() => null),
+    refetchInterval: 5 * 60_000,
+    ...opts,
+  });
+}
+
+export function useMacroCorrelation(
+  base = "XYZ100",
+  ref = "BTC",
+  timeframe = "1h",
+  lookback = 200,
+  opts?: QueryOpts<MacroCorrelation | null>,
+) {
+  return useQuery({
+    queryKey: qk.macroCorrelation(base, ref, timeframe),
+    queryFn: () =>
+      apiGet<MacroCorrelation>(
+        `/api/macro/correlation?base=${encodeURIComponent(base)}&ref=${encodeURIComponent(ref)}&timeframe=${timeframe}&lookback=${lookback}`,
+      ).catch(() => null),
     refetchInterval: 5 * 60_000,
     ...opts,
   });

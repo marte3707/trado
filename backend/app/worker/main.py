@@ -985,6 +985,10 @@ async def run_once(
                     db.rollback()
                     continue
                 synced += 1
+                if (market.metadata_json or {}).get("monitoring_only"):
+                    # Market osservato solo a scopo macro (es. XYZ100): candele
+                    # sincronizzate sopra, ma nessun segnale né posizione.
+                    continue
                 closed += await asyncio.to_thread(
                     executor.close_paper_positions_for_timeframe, db, market, timeframe
                 )

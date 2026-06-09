@@ -549,3 +549,6 @@ Parametri in `AppSetting("risk_controls")`:
 ```
 
 Le metriche calcolate (es. `hurst`, `garch`, `adx`) e i sub-regimi finiscono nel breakdown `_regime` del segnale, visibile nella UI di analisi sotto "Filtri di sistema".
+
+
+grep -i "_liquidation_pressure\|liquidation_pressure_failed" ~/Library/Logs/trado-worker.out.log

@@ -20,7 +20,7 @@ from app.engine.performance import SignalPerformanceAnalyzer
 from app.engine.regime import apply_regime_filter
 from app.engine.risk import RiskManager
 from app.engine.score_calibration import cached_calibration_table, serialize_metrics
-from app.engine.scoring import SignalScoringEngine
+from app.engine.scoring import ScoreResult, SignalScoringEngine
 from app.engine.volatility import evaluate_volatility
 from app.indicators.core import ema
 from app.services.coinmarketcap import (
@@ -30,6 +30,7 @@ from app.services.coinmarketcap import (
     MarketQuote,
 )
 from app.services.hyperliquid import fetch_l2_book, fetch_l2_book_async, fetch_predicted_fundings
+from app.services.kiotaka import KiotakaClient
 from app.services.whale_alert import WhaleAlertClient, WhaleFlow
 from app.strategies.base import CandleInput, StrategyContext
 from app.strategies.base import StrategyResult
@@ -69,6 +70,7 @@ class SignalEngine:
         settings = get_settings()
         self.market_data = CoinMarketCapClient(settings)
         self.whales = WhaleAlertClient(settings)
+        self._kiotaka = KiotakaClient(settings)
         # Cache valida per la durata di un worker tick: il worker chiama
         # `begin_cycle()` ad ogni nuovo tick per invalidare. Evita chiamate HTTP
         # ripetute (fundings/orderbook) per market × timeframe nello stesso tick.
@@ -404,6 +406,61 @@ class SignalEngine:
         return (left in long_directions and right in short_directions) or (
             left in short_directions and right in long_directions
         )
+
+    def _liquidation_pressure_penalty(
+        self,
+        market: Market,
+        score: ScoreResult,
+        risk_value: dict[str, Any],
+    ) -> int:
+        """Penalità (punti di soglia) quando le liquidazioni recenti vanno *contro*
+        la direzione del segnale. Misura l'intensità oraria recente (default 1h)
+        rapportata alla media sul baseline (default 24h) per il lato che si oppone
+        alla direzione; sopra `liq_pressure_ratio_threshold` la penalità sale
+        linearmente fino a `liq_max_penalty` (a 2× la soglia). Fail-open: dato
+        assente/errore o asset non coperto => 0.
+        """
+        max_penalty = int(risk_value.get("liq_max_penalty", 15))
+        if max_penalty <= 0:
+            return 0
+        recent_hours = int(risk_value.get("liq_recent_hours", 1))
+        baseline_hours = int(risk_value.get("liq_baseline_hours", 24))
+        ratio_threshold = float(risk_value.get("liq_pressure_ratio_threshold", 3.0))
+
+        pressure = self._kiotaka.liquidation_pressure(
+            coin=str(market.base),
+            recent_hours=recent_hours,
+            baseline_hours=baseline_hours,
+        )
+        if pressure is None or pressure.points < 2:
+            return 0
+
+        if score.direction in {Direction.SHORT, Direction.STRONG_SHORT}:
+            contra_ratio = pressure.short_pressure_ratio
+            contra_side = "short_squeeze"
+        elif score.direction in {Direction.LONG, Direction.STRONG_LONG}:
+            contra_ratio = pressure.long_pressure_ratio
+            contra_side = "long_flush"
+        else:
+            return 0
+
+        penalty = 0
+        if ratio_threshold > 0 and contra_ratio > ratio_threshold:
+            scaled = (contra_ratio - ratio_threshold) / ratio_threshold
+            penalty = min(max_penalty, round(max_penalty * scaled))
+
+        score.breakdown["_liquidation_pressure"] = {
+            "coin": market.base,
+            "contra_side": contra_side,
+            "contra_ratio": round(contra_ratio, 2),
+            "ratio_threshold": ratio_threshold,
+            "short_recent_usd": round(pressure.short_recent, 0),
+            "long_recent_usd": round(pressure.long_recent, 0),
+            "recent_hours": recent_hours,
+            "baseline_hours": baseline_hours,
+            "penalty_applied": penalty,
+        }
+        return penalty
 
     def _global_volume_quote(self, market: Market) -> MarketQuote | None:
         if not get_settings().external_quote_enrichment_enabled:
@@ -1024,6 +1081,19 @@ class SignalEngine:
                 "market_adjustment": components.get("market", 0) if isinstance(components, dict) else 0,
                 "timeframe_adjustment": components.get("timeframe", 0) if isinstance(components, dict) else 0,
             }
+        # Liquidation pressure penalty (kiyotaka): se le liquidazioni recenti vanno
+        # *contro* la direzione del segnale (short squeeze in corso vs un SHORT,
+        # long-flush vs un LONG) alziamo la soglia invece di bloccare. La fetch
+        # avviene SOLO per candidati che passerebbero la soglia corrente, così le
+        # chiamate restano nel budget free-tier (≈1 per candidato reale). Fail-open.
+        if (
+            bool(risk_value.get("liquidation_gate_enabled", False))
+            and score.direction != Direction.NEUTRAL
+            and score.score >= effective_min_signal_score
+        ):
+            liq_penalty = self._liquidation_pressure_penalty(market, score, risk_value)
+            if liq_penalty > 0:
+                effective_min_signal_score += liq_penalty
         if score.direction == Direction.NEUTRAL or score.score < effective_min_signal_score:
             components = edge_adjustment.get("components", {})
             skip_reason = "low_score"

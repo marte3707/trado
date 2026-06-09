@@ -19,6 +19,7 @@ import { Card } from "@/components/ui/card";
 import { fmt } from "@/components/atoms";
 import { cn } from "@/lib/utils";
 import type { Position } from "@/lib/api";
+import { deriveEquitySeries } from "@/lib/performance";
 
 interface EquityChartProps {
   positions: Position[];
@@ -27,49 +28,13 @@ interface EquityChartProps {
   label?: string;
 }
 
-interface SeriesPoint {
-  time: number;
-  label: string;
-  equity: number;
-}
-
-function asNumber(v: unknown): number | null {
-  if (v == null || v === "") return null;
-  const n = typeof v === "number" ? v : Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function buildEquitySeries(positions: Position[], initialEquity: number): SeriesPoint[] {
-  const closed = positions
-    .filter((p) => p.status.toLowerCase() === "closed" && p.closed_at)
-    .map((p) => ({
-      time: new Date(p.closed_at!).getTime(),
-      pnl: asNumber(p.realized_pnl) ?? 0,
-    }))
-    .filter((p) => Number.isFinite(p.time))
-    .sort((a, b) => a.time - b.time);
-
-  if (closed.length === 0) return [];
-
-  let cum = initialEquity;
-  const fmtter = new Intl.DateTimeFormat("it-IT", { day: "2-digit", month: "2-digit" });
-  return closed.map((p) => {
-    cum += p.pnl;
-    return {
-      time: p.time,
-      label: fmtter.format(new Date(p.time)),
-      equity: Math.round(cum * 100) / 100,
-    };
-  });
-}
-
 export function EquityChart({
   positions,
   className,
   initialEquity = 10_000,
   label,
 }: EquityChartProps) {
-  const data = useMemo(() => buildEquitySeries(positions, initialEquity), [positions, initialEquity]);
+  const data = useMemo(() => deriveEquitySeries(positions, initialEquity), [positions, initialEquity]);
 
   const last = data.at(-1)?.equity ?? initialEquity;
   const totalDelta = last - initialEquity;

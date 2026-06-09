@@ -19,6 +19,7 @@ import { SignalFunnel } from "@/components/widgets/SignalFunnel";
 import { TopSignalsList } from "@/components/widgets/TopSignalsList";
 import { OpenPositionsLive } from "@/components/widgets/OpenPositionsLive";
 import { MarketIntelligenceStrip } from "@/components/widgets/MarketIntelligenceStrip";
+import { MacroCorrelationCard } from "@/components/widgets/MacroCorrelationCard";
 import { BitcoinNewsCard } from "@/components/widgets/BitcoinNewsCard";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { useMarketDashboardSnapshot, useSignalRejections } from "@/lib/hooks/queries";
@@ -324,7 +325,12 @@ export function DashboardScreen({
         settings={settings}
         snapshot={marketDashboard}
       />
-      <BitcoinNewsCard snapshot={marketDashboard} />
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <MacroCorrelationCard />
+        <div className="lg:col-span-2">
+          <BitcoinNewsCard snapshot={marketDashboard} />
+        </div>
+      </div>
     </div>
   );
 }

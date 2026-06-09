@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     fear_greed_weight: int = 4
     altcoin_season_weight: int = 4
 
+    kiotaka_api_key: str | None = None
+    kiotaka_base_url: str = "https://api.kiyotaka.ai/v1"
+
     whale_alert_api_key: str | None = None
     whale_alert_base_url: str = "https://api.whale-alert.io/v1"
     whale_alert_public_url: str = "https://whale-alert.io/data.json"
