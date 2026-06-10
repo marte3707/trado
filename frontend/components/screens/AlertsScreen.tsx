@@ -7,7 +7,7 @@ import { AlertConfigPanel } from "@/components/alerts/AlertConfigPanel";
 import { AlertFeed } from "@/components/alerts/AlertFeed";
 import { AlertDetailDrawer } from "@/components/alerts/AlertDetailDrawer";
 import type { AlertItem } from "@/components/alerts/alertHelpers";
-import { useDecisionLogs, usePositions, useSignals } from "@/lib/hooks/queries";
+import { usePositions, useSignals } from "@/lib/hooks/queries";
 import type { AppSettings, DecisionLog, Market, Position, Signal } from "@/lib/api";
 
 interface Props {
@@ -21,14 +21,13 @@ interface Props {
 }
 
 export function AlertsScreen({
-  logs: initialLogs,
+  logs,
   markets,
   settings,
   onOpenSignal,
   onOpenPosition,
   onOpenMarket,
 }: Props) {
-  const { data: logs = initialLogs } = useDecisionLogs({ initialData: initialLogs });
   const { data: signals = [] } = useSignals("min_score=0");
   const { data: positions = [] } = usePositions();
   const [selected, setSelected] = useState<AlertItem | null>(null);

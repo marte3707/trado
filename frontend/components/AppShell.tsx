@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 
 import { DashboardData } from "@/components/Dashboard";
 import { DashboardScreen } from "@/components/screens/DashboardScreen";
@@ -25,6 +26,7 @@ import type { Route } from "@/components/shell/routes";
 import type { TradingMode } from "@/components/shell/ModeBadge";
 import { buildNavBindings, useChordHotkey } from "@/lib/hotkeys";
 import { unrealizedPnl } from "@/lib/pnl";
+import { collectNewLiveAlerts, liveAlertToastContent } from "@/components/alerts/alertHelpers";
 
 import {
   useAccountMonitor,
@@ -67,6 +69,8 @@ type RealtimeTitleState = {
   pnl: number | null;
   counts: TradePnlCounts | null;
 };
+
+const LIVE_ALERT_DISMISS_ALL_THRESHOLD = 3;
 
 function envToMode(val: string | undefined): TradingMode {
   if (val === "PAPER_TRADING") return "paper";
@@ -183,6 +187,8 @@ export function AppShell({ initialData }: AppShellProps) {
   const originalTitleRef = useRef<string | null>(null);
   const titlePnlIdentityRef = useRef<string | null>(null);
   const previousTitlePnlRef = useRef<number | null>(null);
+  const seenLiveAlertLogIdsRef = useRef<Set<number> | null>(null);
+  const activeLiveToastIdsRef = useRef<Set<number>>(new Set());
   const accountPositionsRef = useRef<AccountPosition[]>([]);
   const snapshotUnrealizedRef = useRef<number | null>(null);
   const titleMidsRef = useRef<Record<string, number>>({});
@@ -206,7 +212,12 @@ export function AppShell({ initialData }: AppShellProps) {
   const { data: orders = initialData.orders } = useOrders({ initialData: initialData.orders });
   const { data: settings = initialData.settings } = useSettings({ initialData: initialData.settings });
   const { data: strategies = initialData.strategies } = useStrategies({ initialData: initialData.strategies });
-  const { data: logs = initialData.logs } = useDecisionLogs({ initialData: initialData.logs });
+  const { data: logs = initialData.logs } = useDecisionLogs({
+    initialData: initialData.logs,
+    refetchInterval: 5_000,
+    refetchIntervalInBackground: true,
+    refetchOnMount: "always",
+  });
   const { data: calibration = initialData.calibration } = useCalibration({ initialData: initialData.calibration });
   const { data: calibrationHistory = initialData.calibrationHistory } = useCalibrationHistory({
     initialData: initialData.calibrationHistory,
@@ -241,6 +252,10 @@ export function AppShell({ initialData }: AppShellProps) {
   const newSignalsCount = hydratedSignals.filter((s) => s.status === "new").length;
   const alertsCount = alertCount(logs ?? []);
   const wsLive = health?.status === "ok";
+  const marketSymbolById = useMemo(() => {
+    const entries = markets.map((market) => [market.id, market.symbol] as const);
+    return new Map(entries);
+  }, [markets]);
 
   const settingsObj = (settings ?? {}) as AppSettings;
   const threshold = asNumber(settingsObj.risk?.min_signal_score) ?? 60;
@@ -261,6 +276,50 @@ export function AppShell({ initialData }: AppShellProps) {
   const pnlTitleCountsText = realtimeTitle.counts == null
     ? null
     : `${realtimeTitle.counts.positive}▲ ${realtimeTitle.counts.negative}▼`;
+
+  useEffect(() => {
+    const seenIds = seenLiveAlertLogIdsRef.current;
+    if (seenIds == null) {
+      seenLiveAlertLogIdsRef.current = new Set((logs ?? []).map((log) => log.id));
+      return;
+    }
+
+    const alerts = collectNewLiveAlerts(logs ?? [], seenIds);
+    const showDismissAll =
+      activeLiveToastIdsRef.current.size + alerts.length >= LIVE_ALERT_DISMISS_ALL_THRESHOLD;
+    for (const alert of alerts) {
+      const { title, description } = liveAlertToastContent(alert, {
+        marketSymbol: alert.marketId == null ? null : marketSymbolById.get(alert.marketId),
+      });
+      const duration = alert.level === "risk" ? 12_000 : 8_000;
+      const options = {
+        id: `live-alert-${alert.id}`,
+        description,
+        duration,
+        action: showDismissAll
+          ? {
+              label: "Chiudi tutte",
+              onClick: () => {
+                activeLiveToastIdsRef.current.clear();
+                toast.dismiss();
+              },
+            }
+          : undefined,
+      };
+      activeLiveToastIdsRef.current.add(alert.id);
+      window.setTimeout(() => {
+        activeLiveToastIdsRef.current.delete(alert.id);
+      }, duration + 1_000);
+
+      if (alert.level === "risk") {
+        toast.error(title, options);
+      } else if (alert.level === "good" || alert.level === "strong") {
+        toast.success(title, options);
+      } else {
+        toast(title, options);
+      }
+    }
+  }, [logs, marketSymbolById]);
 
   useEffect(() => {
     snapshotUnrealizedRef.current = snapshotUnrealized;

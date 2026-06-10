@@ -108,6 +108,94 @@ export function logToAlert(log: DecisionLog): AlertItem {
   };
 }
 
+export function collectNewLiveAlerts(logs: DecisionLog[], seenIds: Set<number>): AlertItem[] {
+  const alerts = logs
+    .filter((log) => !seenIds.has(log.id))
+    .map(logToAlert)
+    .filter((alert) => alert.mode === "live")
+    .sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+
+  logs.forEach((log) => seenIds.add(log.id));
+  return alerts;
+}
+
+export function liveAlertToastContent(
+  alert: AlertItem,
+  context: { marketSymbol?: string | null } = {},
+): { title: string; description: string } {
+  const message = alert.message.trim();
+  const details = liveAlertDetails(alert, context);
+  const description = [...details, message || alert.eventType].join(" · ");
+  return {
+    title: `LIVE · ${alert.title}`,
+    description,
+  };
+}
+
+function liveAlertDetails(alert: AlertItem, context: { marketSymbol?: string | null }): string[] {
+  const data = alert.data;
+  const details: string[] = [];
+  const ticker = stringField(data.coin ?? data.ticker ?? data.symbol ?? data.market ?? context.marketSymbol);
+  const side = sideLabel(data.side ?? data.position_side ?? data.order_side ?? data.is_buy);
+  const notional = notionalUsd(data);
+
+  if (ticker) details.push(ticker);
+  if (side) details.push(side);
+  if (notional != null) details.push(formatUsd(notional));
+  return details;
+}
+
+function stringField(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function sideLabel(value: unknown): string | null {
+  if (typeof value === "boolean") return value ? "LONG" : "SHORT";
+  const side = stringField(value)?.toLowerCase();
+  if (!side) return null;
+  if (side === "long") return "LONG";
+  if (side === "short") return "SHORT";
+  if (side === "buy" || side === "b") return "BUY";
+  if (side === "sell" || side === "s") return "SELL";
+  return side.toUpperCase();
+}
+
+function notionalUsd(data: Record<string, unknown>): number | null {
+  const direct =
+    numberField(data.notional_usd) ??
+    numberField(data.notional) ??
+    numberField(data.position_value_usd) ??
+    numberField(data.position_value);
+  if (direct != null) return direct;
+
+  const size = numberField(data.size) ?? numberField(data.filled_size);
+  const price =
+    numberField(data.entry_price) ??
+    numberField(data.avg_price) ??
+    numberField(data.price) ??
+    numberField(data.filled_price);
+  if (size == null || price == null) return null;
+  return Math.abs(size * price);
+}
+
+function numberField(value: unknown): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value !== "string") return null;
+  const parsed = Number(value.replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatUsd(value: number): string {
+  return value.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: value >= 100 ? 0 : 2,
+    maximumFractionDigits: value >= 100 ? 0 : 2,
+  });
+}
+
 function humanize(s: string): string {
   return s.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }

@@ -79,6 +79,47 @@ class Indicator(Base):
     )
 
 
+class VolumeProfileCache(Base):
+    __tablename__ = "volume_profile_cache"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    market_id: Mapped[int] = mapped_column(ForeignKey("markets.id", ondelete="CASCADE"), index=True)
+    timeframe: Mapped[str] = mapped_column(String(8), index=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    source: Mapped[str] = mapped_column(String(32), default="ohlcv", index=True)
+    levels: Mapped[list] = mapped_column(JSONB, default=list)
+    poc_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    vah_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    val_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    total_volume: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    market: Mapped[Market] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "market_id",
+            "timeframe",
+            "window_start",
+            "window_end",
+            "source",
+            name="uq_volume_profile_cache_window",
+        ),
+        Index(
+            "ix_volume_profile_cache_market_tf_source_end",
+            "market_id",
+            "timeframe",
+            "source",
+            "window_end",
+        ),
+    )
+
+
 class Signal(Base):
     __tablename__ = "signals"
 

@@ -14,12 +14,13 @@ chiamante mantiene il comportamento attuale (OHLCV-only).
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 import structlog
 
 from app.core.config import Settings
+from app.indicators.volume_profile import VolumeProfileResult, build_volume_profile_from_triplets
 
 logger = structlog.get_logger()
 
@@ -86,6 +87,7 @@ class KiotakaClient:
         self.cache_ttl_seconds = cache_ttl_seconds
         self._cache: dict[tuple[str, str, int], BtcFlowSnapshot] = {}
         self._liq_cache: dict[tuple[str, str, int], LiqPressure] = {}
+        self._volume_profile_cache: dict[tuple[str, str, str, int, int, bool, float, float, float], VolumeProfileResult] = {}
 
     @property
     def enabled(self) -> bool:
@@ -214,6 +216,157 @@ class KiotakaClient:
             fetched_at=time.monotonic(),
         )
 
+    def volume_profile(
+        self,
+        *,
+        exchange: str,
+        raw_symbol: str | None = None,
+        coin: str | None = None,
+        interval: str = "HOUR",
+        from_s: int,
+        period_s: int,
+        normalize_usd: bool = False,
+        value_area_pct: float = 0.70,
+        hvn_percentile: float = 0.80,
+        lvn_percentile: float = 0.20,
+        ttl_seconds: int | None = None,
+    ) -> VolumeProfileResult | None:
+        """Kiyotaka VOLUME_PROFILE_AGG aggregato sulla finestra richiesta.
+
+        Fail-open: senza API key, senza simbolo/coin o su errore ritorna None.
+        Il chiamante può quindi usare il profilo OHLCV locale come fallback.
+        """
+        if (
+            not self.enabled
+            or not self.settings.kiotaka_volume_profile_enabled
+            or (not raw_symbol and not coin)
+        ):
+            return None
+        ttl = (
+            self.settings.kiotaka_volume_profile_cache_ttl_seconds
+            if ttl_seconds is None
+            else ttl_seconds
+        )
+        subject = raw_symbol or f"coin:{coin}"
+        cache_key = (
+            exchange,
+            str(subject),
+            interval,
+            from_s,
+            period_s,
+            normalize_usd,
+            value_area_pct,
+            hvn_percentile,
+            lvn_percentile,
+        )
+        cached = self._volume_profile_cache.get(cache_key)
+        if cached is not None and (time.monotonic() - _profile_fetched_at(cached)) < ttl:
+            return cached
+
+        try:
+            profile = self._fetch_volume_profile(
+                exchange=exchange,
+                raw_symbol=raw_symbol,
+                coin=coin,
+                interval=interval,
+                from_s=from_s,
+                period_s=period_s,
+                normalize_usd=normalize_usd,
+                value_area_pct=value_area_pct,
+                hvn_percentile=hvn_percentile,
+                lvn_percentile=lvn_percentile,
+            )
+        except Exception as exc:  # noqa: BLE001 — enrichment opzionale, non blocca segnali
+            logger.warning(
+                "kiotaka_volume_profile_failed",
+                exchange=exchange,
+                raw_symbol=raw_symbol,
+                coin=coin,
+                error=str(exc),
+            )
+            return None
+        if profile is not None:
+            self._volume_profile_cache[cache_key] = profile
+        return profile
+
+    def _fetch_volume_profile(
+        self,
+        *,
+        exchange: str,
+        raw_symbol: str | None,
+        coin: str | None,
+        interval: str,
+        from_s: int,
+        period_s: int,
+        normalize_usd: bool,
+        value_area_pct: float,
+        hvn_percentile: float,
+        lvn_percentile: float,
+    ) -> VolumeProfileResult | None:
+        base = self.settings.kiotaka_base_url.rstrip("/")
+        headers = {"X-Kiyotaka-Key": self.settings.kiotaka_api_key or ""}
+        params: dict[str, str | int] = {
+            "type": "VOLUME_PROFILE_AGG",
+            "exchange": exchange,
+            "interval": interval,
+            "from": from_s,
+            "period": max(1, period_s),
+        }
+        if raw_symbol:
+            params["rawSymbol"] = raw_symbol
+        elif coin:
+            params["coin"] = coin
+        if normalize_usd:
+            params["transform.normalize.quote"] = "USD"
+
+        with httpx.Client(timeout=20.0) as client:
+            series = self._request_points(client, base, headers, params)
+        return self._profile_from_series(
+            series,
+            value_area_pct=value_area_pct,
+            hvn_percentile=hvn_percentile,
+            lvn_percentile=lvn_percentile,
+        )
+
+    @staticmethod
+    def _profile_from_series(
+        series: list[dict],
+        *,
+        value_area_pct: float = 0.70,
+        hvn_percentile: float = 0.80,
+        lvn_percentile: float = 0.20,
+    ) -> VolumeProfileResult | None:
+        volume_by_price: dict[float, list[float]] = {}
+        for item in series:
+            for point in item.get("points", []):
+                profile = point.get("Point", point).get("profile", [])
+                if not isinstance(profile, list):
+                    continue
+                for index in range(0, len(profile) - 2, 3):
+                    try:
+                        price = float(profile[index])
+                        buy_volume = float(profile[index + 1])
+                        sell_volume = float(profile[index + 2])
+                    except (TypeError, ValueError):
+                        continue
+                    bucket = volume_by_price.setdefault(price, [0.0, 0.0])
+                    bucket[0] += buy_volume
+                    bucket[1] += sell_volume
+        triplets = [
+            (price, volumes[0], volumes[1])
+            for price, volumes in volume_by_price.items()
+        ]
+        result = build_volume_profile_from_triplets(
+            triplets,
+            value_area_pct=value_area_pct,
+            hvn_percentile=hvn_percentile,
+            lvn_percentile=lvn_percentile,
+            source="kiotaka",
+        )
+        if result is None:
+            return None
+        return replace(result, fetched_at=time.monotonic())
+
     @staticmethod
     def _request_points(
         client: httpx.Client, base: str, headers: dict[str, str],
@@ -246,3 +399,7 @@ class KiotakaClient:
                 for p in s.get("points", [])
             ]
         return []
+
+
+def _profile_fetched_at(profile: VolumeProfileResult) -> float:
+    return profile.fetched_at

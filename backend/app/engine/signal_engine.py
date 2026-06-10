@@ -1,4 +1,5 @@
 import asyncio
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -22,6 +23,7 @@ from app.engine.score_calibration import cached_calibration_table, serialize_met
 from app.engine.scoring import ScoreResult, SignalScoringEngine
 from app.engine.volatility import evaluate_volatility
 from app.indicators.core import ema
+from app.indicators.volume_profile import VolumeProfileResult
 from app.services.coinmarketcap import (
     AltcoinSeasonIndex,
     CoinMarketCapClient,
@@ -81,6 +83,8 @@ class SignalEngine:
         # Cache del funding breadth per ciclo: frazione di mercati con funding
         # estremo nella direzione short/long. Calcolata una sola volta per tick.
         self._cycle_funding_breadth: dict[str, float] | None = None
+        self._cycle_btc_volume_profile_loaded = False
+        self._cycle_btc_volume_profile_context: dict[str, Any] | None = None
 
     def begin_cycle(self) -> None:
         """Invalidate per-cycle caches at the start of each worker tick."""
@@ -88,6 +92,8 @@ class SignalEngine:
         self._cycle_l2_cache = {}
         self._cycle_skip_counts = {}
         self._cycle_funding_breadth = None
+        self._cycle_btc_volume_profile_loaded = False
+        self._cycle_btc_volume_profile_context = None
         # Abilita/invalida la cache per-cycle degli aggregati di performance
         # (global/timeframe stats + conteggi per market) usati da adjusted_weights.
         self.performance.begin_cycle()
@@ -459,6 +465,161 @@ class SignalEngine:
             "penalty_applied": penalty,
         }
         return penalty
+
+    def _btc_volume_profile_penalty(
+        self,
+        db: Session,
+        score: ScoreResult,
+        risk_value: dict[str, Any],
+    ) -> int:
+        """Macro BTC VPVR gate: usa solo il volume profile BTC come contesto
+        risk-on/risk-off per i segnali direzionali sulle alt. Non abbassa mai la
+        soglia minima: applica solo penalità conservative e fail-open."""
+        if not bool(risk_value.get("btc_volume_profile_gate_enabled", True)):
+            return 0
+        if score.direction not in {
+            Direction.LONG,
+            Direction.STRONG_LONG,
+            Direction.SHORT,
+            Direction.STRONG_SHORT,
+        }:
+            return 0
+        context = self._btc_volume_profile_context(db, risk_value)
+        if context is None:
+            return 0
+
+        profile: VolumeProfileResult = context["profile"]
+        current_price = float(context["current_price"])
+        previous_price = context.get("previous_price")
+        previous_price = float(previous_price) if previous_price is not None else None
+        proximity_pct = float(risk_value.get("btc_volume_profile_proximity_pct", 0.004))
+        distance_poc = self._distance_pct(current_price, profile.poc_price)
+        distance_vah = self._distance_pct(current_price, profile.vah_price)
+        distance_val = self._distance_pct(current_price, profile.val_price)
+        near_poc = distance_poc <= proximity_pct
+        state = "inside_value_area"
+        if current_price > profile.vah_price:
+            state = "above_vah"
+        elif current_price < profile.val_price:
+            state = "below_val"
+        elif near_poc:
+            state = "near_poc"
+
+        is_long = score.direction in {Direction.LONG, Direction.STRONG_LONG}
+        is_short = score.direction in {Direction.SHORT, Direction.STRONG_SHORT}
+        vah_rejection = (
+            previous_price is not None
+            and previous_price > profile.vah_price
+            and current_price < profile.vah_price
+        )
+        val_rejection = (
+            previous_price is not None
+            and previous_price < profile.val_price
+            and current_price > profile.val_price
+        )
+
+        penalty = 0
+        reason = "context_only"
+        if is_long and state == "below_val":
+            penalty = int(risk_value.get("btc_volume_profile_risk_off_long_penalty", 6))
+            reason = "btc_below_val_risk_off"
+        elif is_short and state == "above_vah":
+            penalty = int(risk_value.get("btc_volume_profile_risk_on_short_penalty", 6))
+            reason = "btc_above_vah_risk_on"
+        elif is_long and vah_rejection:
+            penalty = int(risk_value.get("btc_volume_profile_rejection_penalty", 4))
+            reason = "btc_vah_rejection_against_long"
+        elif is_short and val_rejection:
+            penalty = int(risk_value.get("btc_volume_profile_rejection_penalty", 4))
+            reason = "btc_val_rejection_against_short"
+        elif near_poc:
+            penalty = int(risk_value.get("btc_volume_profile_poc_chop_penalty", 0))
+            reason = "btc_near_poc_chop"
+        penalty = max(0, penalty)
+
+        score.breakdown["_btc_volume_profile"] = {
+            "source": profile.source,
+            "exchange": context.get("exchange"),
+            "raw_symbol": context.get("raw_symbol"),
+            "interval": context.get("interval"),
+            "lookback_hours": context.get("lookback_hours"),
+            "price_timeframe": context.get("price_timeframe"),
+            "current_price": round(current_price, 6),
+            "previous_price": round(previous_price, 6) if previous_price is not None else None,
+            "state": state,
+            "poc": round(profile.poc_price, 6),
+            "vah": round(profile.vah_price, 6),
+            "val": round(profile.val_price, 6),
+            "distance_from_poc_pct": round(distance_poc * 100, 3),
+            "distance_from_vah_pct": round(distance_vah * 100, 3),
+            "distance_from_val_pct": round(distance_val * 100, 3),
+            "vah_rejection": vah_rejection,
+            "val_rejection": val_rejection,
+            "reason": reason,
+            "penalty_applied": penalty,
+        }
+        return penalty
+
+    def _btc_volume_profile_context(
+        self,
+        db: Session,
+        risk_value: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if self._cycle_btc_volume_profile_loaded:
+            return self._cycle_btc_volume_profile_context
+        self._cycle_btc_volume_profile_loaded = True
+
+        exchange = str(risk_value.get("btc_volume_profile_exchange", "HYPERLIQUID_FUTURES"))
+        raw_symbol = str(risk_value.get("btc_volume_profile_raw_symbol", "BTC"))
+        interval = str(risk_value.get("btc_volume_profile_interval", "HOUR"))
+        lookback_hours = max(1, int(risk_value.get("btc_volume_profile_lookback_hours", 48)))
+        price_timeframe = str(risk_value.get("btc_volume_profile_price_timeframe", "1h"))
+        period_s = lookback_hours * 3600
+        from_s = int(time.time()) - period_s
+        profile = self._kiotaka.volume_profile(
+            exchange=exchange,
+            raw_symbol=raw_symbol,
+            interval=interval,
+            from_s=from_s,
+            period_s=period_s,
+            value_area_pct=float(risk_value.get("btc_volume_profile_value_area_pct", 0.70)),
+            hvn_percentile=float(risk_value.get("btc_volume_profile_hvn_percentile", 0.80)),
+            lvn_percentile=float(risk_value.get("btc_volume_profile_lvn_percentile", 0.20)),
+        )
+        if profile is None:
+            return None
+
+        btc_candles = (
+            db.query(Candle)
+            .join(Market, Market.id == Candle.market_id)
+            .filter(
+                Market.base == "BTC",
+                Market.market_type == "perp",
+                Candle.timeframe == price_timeframe,
+            )
+            .order_by(Candle.open_time.desc())
+            .limit(2)
+            .all()
+        )
+        if not btc_candles:
+            return None
+        current_price = float(btc_candles[0].close)
+        previous_price = float(btc_candles[1].close) if len(btc_candles) > 1 else None
+        self._cycle_btc_volume_profile_context = {
+            "profile": profile,
+            "exchange": exchange,
+            "raw_symbol": raw_symbol,
+            "interval": interval,
+            "lookback_hours": lookback_hours,
+            "price_timeframe": price_timeframe,
+            "current_price": current_price,
+            "previous_price": previous_price,
+        }
+        return self._cycle_btc_volume_profile_context
+
+    @staticmethod
+    def _distance_pct(price: float, level: float) -> float:
+        return abs(price - level) / price if price else 0.0
 
     def _global_volume_quote(self, market: Market) -> MarketQuote | None:
         if not get_settings().external_quote_enrichment_enabled:
@@ -1061,6 +1222,14 @@ class SignalEngine:
                     "penalty_applied": penalty_applied,
                     "effective_min_signal_score": effective_min_signal_score,
                 }
+        btc_volume_profile_penalty = 0
+        if score.direction != Direction.NEUTRAL and score.score >= effective_min_signal_score:
+            btc_volume_profile_penalty = self._btc_volume_profile_penalty(db, score, risk_value)
+            if btc_volume_profile_penalty > 0:
+                effective_min_signal_score += btc_volume_profile_penalty
+                score.breakdown["_btc_volume_profile"][
+                    "effective_min_signal_score"
+                ] = effective_min_signal_score
         if int(edge_adjustment["total"]) > 0:
             score_bucket = edge_adjustment.get("score_bucket")
             score_bucket_key = f"{direction_family}:{score_bucket}"
@@ -1114,6 +1283,8 @@ class SignalEngine:
                 skip_reason = "score_reliability_filter"
             elif int(edge_adjustment["total"]) > 0:
                 skip_reason = "edge_probation_filter"
+            elif btc_volume_profile_penalty > 0:
+                skip_reason = "btc_volume_profile_filter"
             logger.debug(
                 "signal_skipped_low_score",
                 market=market.symbol,

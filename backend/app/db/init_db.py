@@ -32,6 +32,8 @@ DEFAULT_STRATEGIES = {
         "bins": 30,
         "proximity_pct": 0.004,
         "hvn_percentile": 0.80,
+        "lvn_percentile": 0.20,
+        "value_area_pct": 0.70,
     },
 }
 
@@ -75,6 +77,17 @@ DEFAULT_EDGE_RISK_SETTINGS = {
     "entry_quality_long_ob_imbalance_min": 0.05,
     "entry_quality_short_ob_imbalance_max": 0.0,
     "max_combined_score_adjustment": 15,
+    "btc_volume_profile_gate_enabled": True,
+    "btc_volume_profile_exchange": "HYPERLIQUID_FUTURES",
+    "btc_volume_profile_raw_symbol": "BTC",
+    "btc_volume_profile_interval": "HOUR",
+    "btc_volume_profile_lookback_hours": 48,
+    "btc_volume_profile_price_timeframe": "1h",
+    "btc_volume_profile_proximity_pct": 0.004,
+    "btc_volume_profile_risk_off_long_penalty": 6,
+    "btc_volume_profile_risk_on_short_penalty": 6,
+    "btc_volume_profile_rejection_penalty": 4,
+    "btc_volume_profile_poc_chop_penalty": 0,
 }
 
 

@@ -75,6 +75,8 @@ class Settings(BaseSettings):
 
     kiotaka_api_key: str | None = None
     kiotaka_base_url: str = "https://api.kiyotaka.ai/v1"
+    kiotaka_volume_profile_enabled: bool = True
+    kiotaka_volume_profile_cache_ttl_seconds: int = 14_400
 
     whale_alert_api_key: str | None = None
     whale_alert_base_url: str = "https://api.whale-alert.io/v1"

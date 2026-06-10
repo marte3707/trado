@@ -272,4 +272,54 @@ def test_volume_profile_neutral_when_far_from_poc() -> None:
     )
 
     assert result.direction == Direction.NEUTRAL
-    assert "lontano dal POC" in result.reason
+    assert "lontano da POC/VA" in result.reason
+
+
+def _profile_candles_with_value_area_above_poc() -> list[CandleInput]:
+    candles: list[CandleInput] = []
+    for i in range(40):
+        candles.append(_candle(i, 100.0, 100.04, 99.96, 100.0, 100.0))
+    for i in range(40, 75):
+        candles.append(_candle(i, 101.0, 101.04, 100.96, 101.0, 80.0))
+    for i in range(75, 100):
+        candles.append(_candle(i, 102.0, 102.04, 101.96, 102.0, 10.0))
+    return candles
+
+
+def _profile_candles_with_value_area_below_poc() -> list[CandleInput]:
+    candles: list[CandleInput] = []
+    for i in range(40):
+        candles.append(_candle(i, 100.0, 100.04, 99.96, 100.0, 100.0))
+    for i in range(40, 75):
+        candles.append(_candle(i, 99.0, 99.04, 98.96, 99.0, 80.0))
+    for i in range(75, 100):
+        candles.append(_candle(i, 98.0, 98.04, 97.96, 98.0, 10.0))
+    return candles
+
+
+def test_volume_profile_vah_breakout_long() -> None:
+    candles = _profile_candles_with_value_area_above_poc()
+    candles.append(_candle(100, 100.8, 100.9, 100.7, 100.8, 5.0))
+    candles.append(_candle(101, 100.9, 101.2, 100.8, 101.1, 5.0))
+
+    result = VolumeProfileStrategy().evaluate(
+        _make_context(candles),
+        {"lookback": 100, "bins": 40, "proximity_pct": 0.01},
+    )
+
+    assert result.direction == Direction.LONG
+    assert "VAH breakout" in result.reason
+
+
+def test_volume_profile_val_loss_short() -> None:
+    candles = _profile_candles_with_value_area_below_poc()
+    candles.append(_candle(100, 99.2, 99.3, 99.1, 99.2, 5.0))
+    candles.append(_candle(101, 99.1, 99.2, 98.8, 98.9, 5.0))
+
+    result = VolumeProfileStrategy().evaluate(
+        _make_context(candles),
+        {"lookback": 100, "bins": 40, "proximity_pct": 0.01},
+    )
+
+    assert result.direction == Direction.SHORT
+    assert "VAL loss" in result.reason
