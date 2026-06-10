@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from app.db.models import Market
-from app.services.candle_sync import CandleSyncService, TIMEFRAME_MS
+from app.services.candle_sync import TIMEFRAME_MS, CandleSyncService
 
 
 @dataclass

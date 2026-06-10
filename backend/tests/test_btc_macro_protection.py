@@ -11,7 +11,6 @@ from app.db.models import AppSetting, Candle, DecisionLog, Market, Position, Sig
 from app.engine.btc_macro_protection import BtcMacroProtectionEngine
 from app.engine.position_management import StopCandidate
 
-
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------

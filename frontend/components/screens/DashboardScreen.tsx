@@ -8,6 +8,7 @@ import {
   DecisionLog,
   Health,
   MarketIntelligence,
+  Order,
   Position,
   Signal,
   Strategy,
@@ -23,12 +24,27 @@ import { MacroCorrelationCard } from "@/components/widgets/MacroCorrelationCard"
 import { BitcoinNewsCard } from "@/components/widgets/BitcoinNewsCard";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
+  useAccountMonitor,
   useMarketDashboardSnapshot,
   usePositionHistory,
   useSignalRejections,
 } from "@/lib/hooks/queries";
+import { unrealizedPnl } from "@/lib/pnl";
 
 type ModeFilter = "all" | "paper" | "live";
+
+const EXIT_ORDER_TYPES = new Set([
+  "tp1",
+  "tp2",
+  "tp3",
+  "take_profit",
+  "stop_loss",
+  "manual",
+  "time_stop",
+  "btc_macro_protection_loss_exit",
+  "liquidation_guard_failed",
+]);
+const EMPTY_ORDERS: Order[] = [];
 
 interface Props {
   health: Health;
@@ -53,11 +69,46 @@ function asNumber(v: unknown): number | null {
 function unrealized(position: Position): number {
   const direct = asNumber(position.unrealized_pnl);
   if (direct !== null) return direct;
-  const mark = asNumber(position.metadata_json?.last_mark_price);
+  return (
+    unrealizedPnl({
+      entryPrice: position.entry_price,
+      size: position.size,
+      markPrice: position.metadata_json?.last_mark_price,
+      side: position.side,
+    }) ?? 0
+  );
+}
+
+function sideMultiplier(side: string): 1 | -1 {
+  return side.toLowerCase() === "short" ? -1 : 1;
+}
+
+function exitOrdersFor(position: Position, orders: Order[]): Order[] {
+  return orders
+    .filter((order) => order.position_id === position.id && EXIT_ORDER_TYPES.has(order.order_type) && order.status === "filled")
+    .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+}
+
+function exitPnl(position: Position, order: Order): number | null {
   const entry = asNumber(position.entry_price);
-  const size = asNumber(position.size);
-  if (mark == null || entry == null || size == null) return 0;
-  return (mark - entry) * Math.abs(size) * (position.side.toLowerCase() === "short" ? -1 : 1);
+  const price = asNumber(order.price);
+  const size = asNumber(order.size);
+  if (entry == null || price == null || size == null) return null;
+  return (price - entry) * size * sideMultiplier(position.side);
+}
+
+function realizedPnl(position: Position, orders: Order[] = []): number | null {
+  const stored = asNumber(position.realized_pnl);
+  if (stored !== null) return stored;
+  const exitPnls = orders.map((order) => exitPnl(position, order)).filter((value): value is number => value !== null);
+  if (exitPnls.length === 0) return null;
+  return exitPnls.reduce((sum, value) => sum + value, 0);
+}
+
+function sourceSignalId(position: Position): number | null {
+  const raw = position.metadata_json?.source_signal_id;
+  const parsed = asNumber(raw);
+  return parsed == null ? null : parsed;
 }
 
 interface Kpis {
@@ -76,15 +127,24 @@ function modeLabel(mode: ModeFilter): string {
   return "Paper + Live";
 }
 
-function computeKpis(positions: Position[]): Kpis {
+function computeOpenPnl(positions: Position[]): Pick<Kpis, "openPnl" | "openCount"> {
+  let openPnl = 0;
+  let openCount = 0;
+  for (const p of positions) {
+    if (p.status.toLowerCase() !== "open") continue;
+    openPnl += unrealized(p);
+    openCount += 1;
+  }
+  return { openPnl, openCount };
+}
+
+function computeClosedKpis(positions: Position[], orders: Order[]): Omit<Kpis, "openPnl" | "openCount"> {
   const now = Date.now();
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
   const todayMs = todayStart.getTime();
   const cut30 = now - 30 * 24 * 60 * 60 * 1000;
 
-  let openPnl = 0;
-  let openCount = 0;
   let todayPnl = 0;
   let todayCount = 0;
   let wins30 = 0;
@@ -92,24 +152,21 @@ function computeKpis(positions: Position[]): Kpis {
   const closed30: { time: number; pnl: number }[] = [];
 
   for (const p of positions) {
-    if (p.status.toLowerCase() === "open") {
-      openPnl += unrealized(p);
-      openCount += 1;
-      continue;
-    }
-    if (!p.closed_at) continue;
-    const closedTime = new Date(p.closed_at).getTime();
+    const pnl = realizedPnl(p, exitOrdersFor(p, orders));
+    if (pnl === null) continue;
+    const eventAt = p.closed_at ?? p.opened_at;
+    if (!eventAt) continue;
+    const closedTime = new Date(eventAt).getTime();
     if (!Number.isFinite(closedTime)) continue;
-    const pnl = asNumber(p.realized_pnl) ?? 0;
+    if (closedTime < cut30) continue;
+
+    closed30.push({ time: closedTime, pnl });
+    if (pnl > 0) wins30 += 1;
+    else losses30 += 1;
 
     if (closedTime >= todayMs) {
       todayPnl += pnl;
       todayCount += 1;
-    }
-    if (closedTime >= cut30) {
-      closed30.push({ time: closedTime, pnl });
-      if (pnl > 0) wins30 += 1;
-      else if (pnl < 0) losses30 += 1;
     }
   }
 
@@ -124,8 +181,6 @@ function computeKpis(positions: Position[]): Kpis {
   });
 
   return {
-    openPnl,
-    openCount,
     todayPnl,
     todayCount,
     winRate30,
@@ -161,13 +216,9 @@ export function DashboardScreen({
     [positions],
   );
 
-  const kpis = useMemo(() => computeKpis(filteredPositions), [filteredPositions]);
-  const openPositionsCount = useMemo(
-    () => filteredPositions.filter((p) => p.status.toLowerCase() === "open").length,
-    [filteredPositions],
-  );
   const { data: rejections } = useSignalRejections(50);
   const { data: marketDashboard } = useMarketDashboardSnapshot();
+  const { data: accountSnapshot } = useAccountMonitor();
   const paperEquity = asNumber(settings.paper?.equity) ?? 10_000;
 
   // La curva CR-PnL deve usare lo storico COMPLETO dei trade chiusi, non le
@@ -179,7 +230,47 @@ export function DashboardScreen({
     market_type: "all",
     limit: 5000,
   });
+  const { data: history30 } = usePositionHistory({
+    mode,
+    period: "30d",
+    market_type: "all",
+    limit: 5000,
+  });
   const equityPositions = history?.positions ?? filteredPositions;
+  const history30Positions = history30?.positions ?? filteredPositions;
+  const history30Orders = history30?.orders ?? EMPTY_ORDERS;
+
+  const localOpenKpis = useMemo(() => computeOpenPnl(filteredPositions), [filteredPositions]);
+  const liveOpenPnl = useMemo(
+    () => accountSnapshot?.positions.reduce((sum, position) => sum + (asNumber(position.unrealized_pnl) ?? 0), 0) ?? null,
+    [accountSnapshot?.positions],
+  );
+  const liveOpenCount = accountSnapshot?.positions.length ?? null;
+  const kpis = useMemo(() => {
+    const closed = computeClosedKpis(history30Positions, history30Orders);
+    if (mode === "live" && liveOpenPnl != null) {
+      return { ...closed, openPnl: liveOpenPnl, openCount: liveOpenCount ?? localOpenKpis.openCount };
+    }
+    if (mode === "all" && liveOpenPnl != null) {
+      const paperOpen = computeOpenPnl(paperPositions);
+      return { ...closed, openPnl: paperOpen.openPnl + liveOpenPnl, openCount: paperOpen.openCount + (liveOpenCount ?? 0) };
+    }
+    return { ...closed, ...localOpenKpis };
+  }, [history30Orders, history30Positions, liveOpenCount, liveOpenPnl, localOpenKpis, mode, paperPositions]);
+  const openPositionsCount = kpis.openCount;
+  const filteredSignalIds = useMemo(() => {
+    if (mode === "all") return null;
+    const ids = new Set<number>();
+    for (const position of filteredPositions) {
+      const id = sourceSignalId(position);
+      if (id != null) ids.add(id);
+    }
+    return ids;
+  }, [filteredPositions, mode]);
+  const filteredSignals = useMemo(
+    () => filteredSignalIds == null ? signals : signals.filter((signal) => filteredSignalIds.has(signal.id)),
+    [filteredSignalIds, signals],
+  );
 
   useEffect(() => {
     setOpenPositionsPage(1);
@@ -285,11 +376,11 @@ export function DashboardScreen({
         />
         <KpiCard
           label="Segnali attivi"
-          value={String(signals.filter((s) => s.status === "new").length)}
+          value={String(filteredSignals.filter((s) => s.status === "new").length)}
           icon={BarChart3}
           hint={`Soglia ≥ ${threshold}`}
           delta={{
-            value: `${signals.length} totali`,
+            value: `${filteredSignals.length} totali`,
             tone: "muted",
           }}
         />
@@ -304,7 +395,7 @@ export function DashboardScreen({
           label={modeLabel(mode)}
         />
         <SignalFunnel
-          signals={signals}
+          signals={filteredSignals}
           rejections={rejections ?? { total: 0, by_reason: {}, recent: [] }}
         />
       </div>
@@ -326,7 +417,7 @@ export function DashboardScreen({
           className="h-104"
         />
         <TopSignalsList
-          signals={signals}
+          signals={filteredSignals}
           threshold={threshold}
           limit={6}
           onOpen={onOpenSignal}

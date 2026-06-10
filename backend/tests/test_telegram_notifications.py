@@ -1,20 +1,20 @@
-from decimal import Decimal
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
 from app.core.config import Settings
+from app.db.models import AppSetting, Market, Order, Position, Signal
 from app.notifications import telegram as telegram_module
 from app.notifications.telegram import (
     _DAILY_RECAP_STATE_KEY,
-    _build_daily_recap_message,
     TelegramNotifier,
     _build_channel_strategy_message,
-    _build_message,
+    _build_daily_recap_message,
     _build_live_close_message,
+    _build_message,
     _daily_recap_summary,
 )
-from app.db.models import AppSetting, Market, Order, Position, Signal
 
 
 class RecordingNotifier(TelegramNotifier):

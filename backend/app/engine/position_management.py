@@ -18,7 +18,16 @@ from app.core.runtime_settings import (
     effective_operation_mode,
     effective_position_management_settings,
 )
-from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, PositionStopUpdate, Signal
+from app.db.models import (
+    AppSetting,
+    Candle,
+    DecisionLog,
+    Market,
+    Order,
+    Position,
+    PositionStopUpdate,
+    Signal,
+)
 from app.indicators.core import atr, ema
 from app.services.candle_sync import TIMEFRAME_MS
 from app.services.hyperliquid import HyperliquidTradingClient

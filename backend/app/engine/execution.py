@@ -7,9 +7,11 @@ import structlog
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.enums import Direction, OrderMode, SignalStatus
+from app.core.enums import Direction, OperationMode, OrderMode, SignalStatus
 from app.core.runtime_settings import (
     effective_live_execution_settings,
+    effective_live_trading_enabled,
+    effective_operation_mode,
     effective_paper_equity,
     effective_position_management_settings,
 )
@@ -39,6 +41,21 @@ def coin_for_market(market: Market) -> str:
     if not isinstance(coin, str) or not coin:
         raise ValueError("market has no Hyperliquid coin mapping")
     return coin
+
+
+def _live_guard_block_reason(db: Session, settings: Settings) -> str | None:
+    """Re-check, just before submitting a live market order, the runtime guards an
+    operator could have toggled during the network-bound pre-flight window (kill
+    switch / operation mode / live-trading flag). Returns a human-readable reason
+    when the order must be aborted, or None when it may proceed."""
+    if effective_operation_mode(db, settings) != OperationMode.AUTO_TRADE:
+        return "operation mode is not AUTO_TRADE"
+    if not effective_live_trading_enabled(db, settings):
+        return "ENABLE_LIVE_TRADING is false"
+    kill_switch = db.get(AppSetting, "kill_switch")
+    if kill_switch and kill_switch.value.get("enabled"):
+        return "kill switch enabled"
+    return None
 
 
 TIMEFRAME_MS = {
@@ -361,18 +378,45 @@ class OrderExecutionEngine:
         try:
             trading.set_leverage(coin, safe_leverage, is_cross=False)
         except Exception as exc:
+            # Il fallback non deve mai AUMENTARE il leverage oltre quello inteso:
+            # se safe_leverage < _FALLBACK_LEVERAGE usiamo il valore più conservativo.
+            fallback_leverage = min(safe_leverage, _FALLBACK_LEVERAGE)
             db.add(
                 DecisionLog(
                     event_type="live_set_leverage_failed",
                     market_id=signal.market_id,
                     signal_id=signal.id,
-                    message=f"set_leverage({safe_leverage}) failed, retrying with fallback {_FALLBACK_LEVERAGE}x",
-                    data={"coin": coin, "leverage": safe_leverage, "is_cross": False, "error": str(exc)},
+                    message=f"set_leverage({safe_leverage}) failed, retrying with fallback {fallback_leverage}x",
+                    data={
+                        "coin": coin,
+                        "leverage": safe_leverage,
+                        "fallback_leverage": fallback_leverage,
+                        "is_cross": False,
+                        "error": str(exc),
+                    },
                 )
             )
             db.commit()
-            trading.set_leverage(coin, _FALLBACK_LEVERAGE, is_cross=False)
-            safe_leverage = _FALLBACK_LEVERAGE
+            trading.set_leverage(coin, fallback_leverage, is_cross=False)
+            safe_leverage = fallback_leverage
+
+        # Re-check dei guardrail runtime appena prima del submit: kill switch,
+        # operation mode e flag di live trading possono essere stati cambiati a
+        # runtime durante i pre-flight di rete (finestra tra la validazione iniziale
+        # e l'invio dell'ordine).
+        guard_reason = _live_guard_block_reason(db, self.settings)
+        if guard_reason is not None:
+            db.add(
+                DecisionLog(
+                    event_type="live_order_aborted_kill_switch",
+                    market_id=signal.market_id,
+                    signal_id=signal.id,
+                    message=f"Live order abortito prima del submit: {guard_reason}",
+                    data={"reason": guard_reason, "coin": coin},
+                )
+            )
+            db.commit()
+            raise PermissionError(f"live order aborted before submit: {guard_reason}")
         entry_result = trading.submit_market_order(
             coin=coin,
             is_buy=is_long,
@@ -395,10 +439,10 @@ class OrderExecutionEngine:
             raise HyperliquidError("live order rejected by Hyperliquid")
         # Post-fill safety net: se nonostante il pre-flight check HL ha
         # restituito un partial fill sotto il minimo (race condition, book
-        # cambiato nel frattempo), tracciamo la posizione nel DB con flag
-        # tiny_fill=True per poterla identificare e chiudere manualmente.
-        # NON chiudiamo qui per evitare doppia fee — la posizione rimane
-        # tracciata per la riconciliazione.
+        # cambiato nel frattempo), chiudiamo SUBITO la posizione. Una size sotto
+        # il min-notional vale pochi dollari: la doppia fee è trascurabile rispetto
+        # al rischio di lasciare aperta una posizione live senza ordini di
+        # protezione (gli SL/TP non sono ancora stati piazzati a questo punto).
         actual_filled = entry_result.filled_size or order_size
         actual_price = entry_result.avg_price or signal.entry_price
         actual_notional = actual_filled * actual_price
@@ -427,7 +471,7 @@ class OrderExecutionEngine:
                     message=(
                         f"ATTENZIONE: partial fill sotto il minimo nonostante il pre-flight check "
                         f"(race condition) — filled ${float(actual_notional):.4f} < min ${float(min_notional_dec):.2f}. "
-                        f"Posizione tracciata con tiny_fill=True, chiudere manualmente."
+                        f"Chiusura immediata della posizione tiny_fill per non lasciarla scoperta."
                     ),
                     data={
                         "requested_size": str(order_size),
@@ -446,10 +490,42 @@ class OrderExecutionEngine:
                 actual_notional=str(actual_notional),
                 min_notional=str(min_notional_dec),
             )
+            db.commit()
+            db.refresh(position)
+            # Niente _submit_live_protection_orders su una posizione tiny scoperta:
+            # la chiudiamo direttamente. Se la chiusura fallisce, la posizione resta
+            # tracciata con tiny_fill=True per la riconciliazione / intervento manuale.
+            try:
+                self.close_live_position(
+                    db,
+                    position,
+                    reason="tiny_fill_below_min_notional",
+                    trading_client=trading,
+                )
+            except Exception as exc:
+                logger.error(
+                    "live_order_tiny_fill_auto_close_failed",
+                    coin=coin,
+                    signal_id=signal.id,
+                    error=str(exc),
+                )
+                db.add(
+                    DecisionLog(
+                        event_type="live_order_tiny_fill_auto_close_failed",
+                        market_id=signal.market_id,
+                        signal_id=signal.id,
+                        message=(
+                            "Chiusura automatica della posizione tiny_fill fallita: "
+                            "intervento manuale necessario."
+                        ),
+                        data={"coin": coin, "error": str(exc)},
+                    )
+                )
+                db.commit()
+            return position
         db.commit()
         db.refresh(position)
-        if not _post_fill_tiny:
-            self._submit_live_protection_orders(db, trading, position, signal, coin, sz_dec)
+        self._submit_live_protection_orders(db, trading, position, signal, coin, sz_dec)
         return position
 
     def _validate_or_reject(self, db: Session, signal: Signal, plan: LiveOrderPlan) -> bool:

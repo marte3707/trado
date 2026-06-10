@@ -1,10 +1,10 @@
 from pathlib import Path
 
 import structlog
+from alembic.config import Config
 from sqlalchemy import create_engine, inspect
 
 from alembic import command
-from alembic.config import Config
 from app.core.config import get_settings
 
 logger = structlog.get_logger()

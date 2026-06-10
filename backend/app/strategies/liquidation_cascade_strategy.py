@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from app.core.enums import Direction
-from app.strategies.base import StrategyContext, StrategyResult
 from app.indicators.core import atr
+from app.strategies.base import StrategyContext, StrategyResult
 
 
 class LiquidationCascadeStrategy:

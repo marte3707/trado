@@ -6,8 +6,8 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import structlog
-from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.config import get_settings
 from app.core.enums import OrderMode, SignalStatus

@@ -14,7 +14,11 @@ from app.services.coinmarketcap import (
     symbol_candidates,
 )
 from app.services.market_dashboard import MarketDashboardService, parse_coinmarketcap_bitcoin_news
-from app.services.whale_alert import parse_public_alert, summarize_public_alerts, summarize_transactions
+from app.services.whale_alert import (
+    parse_public_alert,
+    summarize_public_alerts,
+    summarize_transactions,
+)
 from app.strategies.base import CandleInput, StrategyContext
 
 

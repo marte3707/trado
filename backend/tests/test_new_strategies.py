@@ -8,7 +8,6 @@ from app.strategies.cvd_divergence_strategy import CvdDivergenceStrategy
 from app.strategies.liquidation_cascade_strategy import LiquidationCascadeStrategy
 from app.strategies.volume_profile_strategy import VolumeProfileStrategy
 
-
 BASE_TIME = datetime(2025, 1, 1, tzinfo=timezone.utc)
 
 

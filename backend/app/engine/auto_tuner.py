@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import math
 import hashlib
+import math
 import random
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -1243,7 +1243,11 @@ class AutoTuner:
         strategy = raw.get("strategy")
         step_key = raw.get("step_key")
         queued_at = raw.get("queued_at")
-        if not all(isinstance(item, str) and item for item in (timeframe, strategy, step_key)):
+        if not (
+            isinstance(timeframe, str) and timeframe
+            and isinstance(strategy, str) and strategy
+            and isinstance(step_key, str) and step_key
+        ):
             return None
         payload: dict[str, str] = {
             "timeframe": timeframe,

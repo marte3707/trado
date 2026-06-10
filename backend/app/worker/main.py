@@ -28,9 +28,13 @@ from app.engine.execution import OrderExecutionEngine
 from app.engine.signal_engine import SignalEngine
 from app.notifications.diagnostic_report import DiagnosticReporter
 from app.notifications.telegram import TelegramNotifier
-from app.services.candle_sync import CandleSyncService, TIMEFRAME_MS
+from app.services.candle_sync import TIMEFRAME_MS, CandleSyncService
 from app.services.data_retention import prune_old_data
-from app.services.hyperliquid import HyperliquidTradingClient, HyperliquidTransientError, fetch_perp_open_interests
+from app.services.hyperliquid import (
+    HyperliquidTradingClient,
+    HyperliquidTransientError,
+    fetch_perp_open_interests,
+)
 from app.services.live_reconciliation import reconcile_live_positions
 from app.services.market_sync import MarketSyncService
 from app.services.position_pnl import refresh_open_position_pnls

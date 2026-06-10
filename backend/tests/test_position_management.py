@@ -6,7 +6,16 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.config import Settings
-from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, PositionStopUpdate, Signal
+from app.db.models import (
+    AppSetting,
+    Candle,
+    DecisionLog,
+    Market,
+    Order,
+    Position,
+    PositionStopUpdate,
+    Signal,
+)
 from app.engine.execution import OrderExecutionEngine
 from app.engine.position_management import (
     PositionManagementEngine,

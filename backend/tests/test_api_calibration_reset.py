@@ -1,5 +1,5 @@
-from app.db.models import AppSetting, DecisionLog
 from app.api.routes import reset_calibration_baseline
+from app.db.models import AppSetting, DecisionLog
 
 
 class FakeQuery:

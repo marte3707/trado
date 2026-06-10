@@ -679,3 +679,72 @@ def test_execute_live_skips_when_hl_position_already_exists(monkeypatch: pytest.
     assert trading.leverage_calls == []
     events = [row.event_type for row in db.added_of(DecisionLog)]
     assert "live_order_skipped_hl_position_exists" in events
+
+
+def test_execute_live_closes_position_on_tiny_partial_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Se HL restituisce un fill sotto il min-notional (race del book dopo il
+    pre-flight), la posizione viene chiusa subito invece di restare scoperta,
+    e nessun ordine di protezione viene piazzato."""
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(
+        signal=signal,
+        market=_build_market(),
+        live_execution_settings={"min_order_notional_usd": 10.0},
+    )
+
+    class TinyFillTradingClient(FakeTradingClient):
+        def submit_market_order(  # type: ignore[override]
+            self,
+            coin: str,
+            is_buy: bool,
+            size: Decimal,
+            max_slippage_pct: float,
+            expires_after_seconds: int,
+            cloid: str | None = None,
+        ) -> HyperliquidOrderResult:
+            self.market_orders.append(
+                {"coin": coin, "is_buy": is_buy, "size": size, "cloid": cloid}
+            )
+            # filled notional = 0.0001 * 100 = 0.01 USD << min_order_notional (10)
+            return HyperliquidOrderResult(
+                status="ok",
+                oid="mkt-tiny",
+                avg_price=Decimal("100"),
+                filled_size=Decimal("0.0001"),
+                raw_response={"status": "ok"},
+            )
+
+    trading = TinyFillTradingClient()
+
+    position = OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert position.metadata_json.get("tiny_fill") is True
+    # Nessun ordine di protezione su una posizione tiny scoperta
+    assert trading.trigger_orders == []
+    # La posizione è stata chiusa immediatamente
+    assert trading.close_orders != []
+    assert position.status == "closed"
+    events = [row.event_type for row in db.added_of(DecisionLog)]
+    assert "live_order_partial_fill_below_min_notional" in events
+
+
+def test_execute_live_aborts_before_submit_when_kill_switch_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Un kill switch attivato a runtime (dopo la validazione iniziale, durante i
+    pre-flight di rete) deve bloccare l'ordine PRIMA del submit del market order."""
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(signal=signal, market=_build_market(), kill_switch={"enabled": True})
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="kill switch enabled"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    # Nessun market order deve partire
+    assert trading.market_orders == []
+    events = [row.event_type for row in db.added_of(DecisionLog)]
+    assert "live_order_aborted_kill_switch" in events

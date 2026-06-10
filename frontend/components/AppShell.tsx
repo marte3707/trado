@@ -24,6 +24,7 @@ import { HelpModal } from "@/components/shell/HelpModal";
 import type { Route } from "@/components/shell/routes";
 import type { TradingMode } from "@/components/shell/ModeBadge";
 import { buildNavBindings, useChordHotkey } from "@/lib/hotkeys";
+import { unrealizedPnl } from "@/lib/pnl";
 
 import {
   useAccountMonitor,
@@ -100,15 +101,17 @@ function hyperliquidWsUrl(network: string | null | undefined): string {
 }
 
 function positionRealtimePnl(position: AccountPosition, mids: Record<string, number>): number | null {
-  const coin = position.coin ?? "";
-  const mid = mids[coin];
-  const entry = asNumber(position.entry_price);
   const size = asNumber(position.size);
-  if (mid == null || entry == null || size == null || size <= 0) {
-    return asNumber(position.unrealized_pnl);
-  }
-  const sideMultiplier = position.side === "short" ? -1 : 1;
-  return (mid - entry) * size * sideMultiplier;
+  if (size == null || size <= 0) return asNumber(position.unrealized_pnl);
+  const mid = mids[position.coin ?? ""];
+  return (
+    unrealizedPnl({
+      entryPrice: position.entry_price,
+      size,
+      markPrice: mid,
+      side: position.side ?? "",
+    }) ?? asNumber(position.unrealized_pnl)
+  );
 }
 
 function accountRealtimePnl(positions: AccountPosition[], mids: Record<string, number>): number | null {

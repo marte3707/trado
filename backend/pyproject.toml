@@ -27,6 +27,7 @@ dependencies = [
 dev = [
   "pytest==9.0.3",
   "pytest-asyncio==1.3.0",
+  "pytest-cov>=6.0",
   "ruff==0.15.12",
   "mypy==2.0.0",
   # Supply chain hygiene: run `pip-audit` in CI to scan pinned versions for
@@ -41,7 +42,29 @@ exclude = ["alembic*", "tests*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+asyncio_mode = "auto"
+markers = [
+  "integration: test che toccano risorse esterne (DB reale, rete)",
+  "slow: test lenti, esclusi dai run rapidi",
+]
+
+[tool.coverage.run]
+source = ["app"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+# Default ruff (E4/E7/E9, F) + import sorting (I) e regole comprehension/warning
+# a basso rischio. UP/B/SIM rimandate: introdurrebbero ~400 fix di stile diffusi
+# su tutta la codebase, da affrontare separatamente.
+select = ["E4", "E7", "E9", "F", "I", "W", "C4"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

@@ -3,10 +3,9 @@ from decimal import Decimal
 from typing import Any
 
 import structlog
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.config import get_settings
 from app.core.enums import Direction, SignalStatus
@@ -32,8 +31,7 @@ from app.services.coinmarketcap import (
 from app.services.hyperliquid import fetch_l2_book, fetch_l2_book_async, fetch_predicted_fundings
 from app.services.kiotaka import KiotakaClient
 from app.services.whale_alert import WhaleAlertClient, WhaleFlow
-from app.strategies.base import CandleInput, StrategyContext
-from app.strategies.base import StrategyResult
+from app.strategies.base import CandleInput, StrategyContext, StrategyResult
 from app.strategies.registry import strategy_registry
 
 logger = structlog.get_logger()
@@ -728,7 +726,18 @@ class SignalEngine:
             strategy = self.registry.get(config.strategy_name)
             if strategy is None:
                 continue
-            result = strategy.evaluate(context, config.params)
+            try:
+                result = strategy.evaluate(context, config.params)
+            except Exception:
+                # Una strategia che solleva non deve uccidere l'intero segnale:
+                # la saltiamo e lasciamo che le altre contribuiscano allo scoring.
+                logger.exception(
+                    "strategy_evaluate_failed",
+                    strategy=config.strategy_name,
+                    timeframe=timeframe,
+                )
+                self._record_skip("strategy_error")
+                continue
             results.append(result)
             weight = config.weight
             direction_key = (

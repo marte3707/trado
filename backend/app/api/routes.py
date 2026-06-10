@@ -14,6 +14,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, ValidationError
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
@@ -48,6 +49,8 @@ from app.engine.execution import OrderExecutionEngine
 from app.engine.performance import SignalPerformanceAnalyzer, serialize_stats
 from app.engine.score_calibration import (
     DEFAULT_LOOKBACK as CALIBRATION_DEFAULT_LOOKBACK,
+)
+from app.engine.score_calibration import (
     build_calibration_table_from_db,
     cached_calibration_table,
     serialize_table,
@@ -56,9 +59,11 @@ from app.schemas import (
     CandleOut,
     DecisionLogOut,
     IndicatorOut,
+    LiveExecutionSettings,
     MarketOut,
     PushSubscribePayload,
     PushUnsubscribePayload,
+    RiskControlsSettings,
     SettingsPatch,
     SignalOut,
     SignalSnapshotOut,
@@ -66,7 +71,12 @@ from app.schemas import (
 )
 from app.services.candle_sync import TIMEFRAME_MS
 from app.services.coinmarketcap import CoinMarketCapClient
-from app.services.hyperliquid import HyperliquidClient, HyperliquidError, HyperliquidTradingClient, parse_hl_candle
+from app.services.hyperliquid import (
+    HyperliquidClient,
+    HyperliquidError,
+    HyperliquidTradingClient,
+    parse_hl_candle,
+)
 from app.services.market_dashboard import MarketDashboardService
 from app.services.market_sync import MarketSyncService
 from app.services.position_pnl import calculate_unrealized_pnl as _calculate_unrealized_pnl
@@ -947,7 +957,7 @@ def signal_snapshot(signal_id: int, db: Session = Depends(get_db)) -> SignalSnap
     return SignalSnapshotOut(
         signal=_enrich_signal_with_calibration(signal, db),
         source_candle_open_time=source_time,
-        candles=candles,
+        candles=[CandleOut.model_validate(c) for c in candles],
         indicators=indicators,
         positions=[
             _serialize_position(
@@ -1912,9 +1922,24 @@ def settings(db: Session = Depends(get_db)) -> dict:
     return {row.key: row.value for row in db.query(AppSetting).all()}
 
 
+_SETTINGS_VALIDATORS: dict[str, type[BaseModel]] = {
+    "risk": RiskControlsSettings,
+    "live_execution": LiveExecutionSettings,
+}
+
+
 @router.patch("/settings")
 def patch_settings(payload: dict[str, SettingsPatch], db: Session = Depends(get_db)) -> dict:
     for key, patch in payload.items():
+        validator = _SETTINGS_VALIDATORS.get(key)
+        if validator is not None:
+            try:
+                validator.model_validate(patch.value)
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"key": key, "errors": exc.errors(include_url=False)},
+                ) from exc
         setting = db.get(AppSetting, key)
         if setting is None:
             setting = AppSetting(key=key, value=patch.value)
@@ -2553,8 +2578,12 @@ def patch_missing_exit_data(db: Session = Depends(get_db)) -> dict:
     address = settings.hyperliquid_account_address
     if not address:
         raise HTTPException(status_code=400, detail="HYPERLIQUID_ACCOUNT_ADDRESS is required")
-    from app.services.live_reconciliation import _index_fills, _index_fills_by_coin, _find_close_fill
     from app.engine.execution import coin_for_market
+    from app.services.live_reconciliation import (
+        _find_close_fill,
+        _index_fills,
+        _index_fills_by_coin,
+    )
     trading = HyperliquidTradingClient(settings)
     try:
         raw_fills = trading.user_fills(address)

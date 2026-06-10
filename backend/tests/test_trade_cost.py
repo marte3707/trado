@@ -1,9 +1,7 @@
 from decimal import Decimal
 
 from app.db.models import Order, Position, Signal
-from app.services.trade_cost import compute_trade_cost, serialize_live_cost_report
-from app.services.trade_cost import LiveCostReport
-
+from app.services.trade_cost import LiveCostReport, compute_trade_cost, serialize_live_cost_report
 
 TAKER = 0.00045
 

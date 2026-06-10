@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from math import log, sqrt
-from typing import cast, Any
+from typing import Any, cast
 
 
 def ema(values: Sequence[float], period: int) -> list[float | None]:

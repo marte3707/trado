@@ -9,7 +9,6 @@ from app.core.config import get_settings
 from app.db.models import Candle, Market
 from app.services.hyperliquid import HyperliquidClient, parse_hl_candle
 
-
 TIMEFRAME_MS = {
     "1m": 60 * 1000,
     "3m": 3 * 60 * 1000,

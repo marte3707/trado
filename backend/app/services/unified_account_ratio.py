@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-
 DEFAULT_UAR_RISK_SETTINGS: dict[str, Any] = {
     "unified_account_ratio_warn_pct": 80,
     "unified_account_ratio_block_pct": 90,

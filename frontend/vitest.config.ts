@@ -1,0 +1,14 @@
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  resolve: {
+    // Allinea l'alias "@/..." usato dai moduli applicativi (vedi tsconfig paths).
+    alias: { "@": new URL(".", import.meta.url).pathname },
+  },
+  test: {
+    environment: "jsdom",
+    globals: true,
+    include: ["**/*.test.{ts,tsx}"],
+    exclude: ["node_modules", ".next"],
+  },
+});

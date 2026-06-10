@@ -142,6 +142,12 @@ class Position(Base):
 
     market: Mapped[Market] = relationship()
 
+    __table_args__ = (
+        # Copre il count posizioni live aperte nell'OrderValidator (status+mode)
+        # e i filtri per stato/modalità della dashboard.
+        Index("ix_positions_status_mode", "status", "mode"),
+    )
+
 
 class PositionStopUpdate(Base):
     __tablename__ = "position_stop_updates"
@@ -185,6 +191,11 @@ class Order(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        # Join orders→position filtrati per stato (reconciliation, dashboard).
+        Index("ix_orders_position_status", "position_id", "status"),
     )
 
 

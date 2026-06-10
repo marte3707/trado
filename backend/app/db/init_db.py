@@ -6,7 +6,6 @@ from app.db.models import AppSetting, Base, Market, StrategyConfig
 from app.db.session import engine
 from app.services.unified_account_ratio import DEFAULT_UAR_RISK_SETTINGS
 
-
 DEFAULT_STRATEGIES = {
     "ema_crossover": {"fast": 9, "slow": 21, "trend": 200},
     "rsi": {"period": 14, "oversold": 30, "overbought": 70},

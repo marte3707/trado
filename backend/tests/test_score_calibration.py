@@ -6,9 +6,9 @@ from app.db.models import Position, Signal
 from app.engine.score_calibration import (
     DEFAULT_MIN_SAMPLES_FOR_USE,
     CalibrationTable,
-    compute_calibration_table,
     _pool_adjacent_violators,
     _position_r_multiple,
+    compute_calibration_table,
     serialize_table,
 )
 

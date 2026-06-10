@@ -6,7 +6,6 @@ from typing import Iterable
 
 from app.db.models import Order, Position
 
-
 EXIT_ORDER_TYPES = {"tp1", "tp2", "tp3", "take_profit", "stop_loss", "manual"}
 
 
