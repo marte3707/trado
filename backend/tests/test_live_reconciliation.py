@@ -1,6 +1,6 @@
 import copy
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -172,7 +172,7 @@ def _make_position(size: str = "1") -> Position:
         stop_loss=None,
         take_profit=None,
         status="open",
-        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, tzinfo=UTC),
         metadata_json={},
     )
     p.market = _make_market()
@@ -787,7 +787,7 @@ def test_resubmit_missing_tp1_skips_recent_successful_retry_cooldown() -> None:
     tp1_order.raw_response = {
         "resubmits": [
             {
-                "attempted_at": datetime.now(timezone.utc).isoformat(),
+                "attempted_at": datetime.now(UTC).isoformat(),
                 "old_oid": "9999",
                 "new_oid": "77777",
                 "status": "ok",
@@ -812,7 +812,7 @@ def test_resubmit_missing_tp1_skips_recent_successful_retry_cooldown() -> None:
 
 
 def test_resubmit_missing_tp1_stops_after_total_retry_cap() -> None:
-    old_attempt = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    old_attempt = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     position = _make_position(size="1.0")
     tp1_order = _make_tp_order(oid_str="33333")
     tp1_order.raw_response = {
@@ -844,7 +844,7 @@ def test_resubmit_missing_tp1_stops_after_total_retry_cap() -> None:
 
 
 def test_force_repair_bypasses_total_retry_cap() -> None:
-    old_attempt = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    old_attempt = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     position = _make_position(size="1.0")
     tp1_order = _make_tp_order(oid_str="33333")
     tp1_order.raw_response = {
@@ -1232,7 +1232,7 @@ def _make_paper_with_signal(signal_id: int = 42, entry: str = "100") -> Position
         stop_loss=None,
         take_profit=None,
         status="open",
-        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, tzinfo=UTC),
         metadata_json={"source_signal_id": signal_id},
     )
     return p
@@ -1241,7 +1241,7 @@ def _make_paper_with_signal(signal_id: int = 42, entry: str = "100") -> Position
 def test_companion_paper_closed_when_live_reconciled() -> None:
     live = _make_live_with_signal(42)
     paper = _make_paper_with_signal(42, entry="100")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     db = _CompanionDb(paper_positions=[paper])
 
     _close_companion_paper_position(db, live, exit_price=Decimal("110"), now=now)
@@ -1263,7 +1263,7 @@ def test_companion_paper_left_open_by_default_after_live_reconcile() -> None:
         db,
         live,
         exit_price=Decimal("110"),
-        now=datetime.now(timezone.utc),
+        now=datetime.now(UTC),
         close_companion=False,
     )
 
@@ -1284,7 +1284,7 @@ def test_companion_paper_can_still_mirror_live_reconcile_when_enabled() -> None:
         db,
         live,
         exit_price=Decimal("110"),
-        now=datetime.now(timezone.utc),
+        now=datetime.now(UTC),
         close_companion=True,
     )
 
@@ -1298,7 +1298,7 @@ def test_companion_no_paper_position_is_noop() -> None:
     live = _make_live_with_signal(42)
     db = _CompanionDb(paper_positions=[])
 
-    _close_companion_paper_position(db, live, exit_price=Decimal("110"), now=datetime.now(timezone.utc))
+    _close_companion_paper_position(db, live, exit_price=Decimal("110"), now=datetime.now(UTC))
 
     assert db.added == []
 
@@ -1309,7 +1309,7 @@ def test_companion_no_signal_id_is_noop() -> None:
     paper = _make_paper_with_signal(42)
     db = _CompanionDb(paper_positions=[paper])
 
-    _close_companion_paper_position(db, live, exit_price=Decimal("110"), now=datetime.now(timezone.utc))
+    _close_companion_paper_position(db, live, exit_price=Decimal("110"), now=datetime.now(UTC))
 
     assert paper.status == "open"
     assert db.added == []
@@ -1320,7 +1320,7 @@ def test_companion_exit_price_none_uses_entry() -> None:
     paper = _make_paper_with_signal(42, entry="95")
     db = _CompanionDb(paper_positions=[paper])
 
-    _close_companion_paper_position(db, live, exit_price=None, now=datetime.now(timezone.utc))
+    _close_companion_paper_position(db, live, exit_price=None, now=datetime.now(UTC))
 
     assert paper.status == "closed"
     assert paper.realized_pnl == Decimal("0")  # exit at entry → zero PnL
@@ -1340,10 +1340,7 @@ def _make_position_with_tp_plan(
     tp1_price: str = "110",
     tp2_price: str = "120",
 ) -> Position:
-    if side == "long":
-        position = _make_position(size="1.0")
-    else:
-        position = _make_short_position(size="1.0")
+    position = _make_position(size="1.0") if side == "long" else _make_short_position(size="1.0")
     position.entry_price = Decimal(entry)
     position.stop_loss = Decimal(stop)
     position.metadata_json = {
@@ -1524,7 +1521,7 @@ def test_rescue_bypasses_max_total_attempts_cap_and_resets_state() -> None:
     tp1_order.raw_response = {
         "resubmits": [
             {
-                "attempted_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+                "attempted_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
                 "old_oid": str(i),
                 "status": "error",
             }

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 
@@ -309,7 +309,7 @@ def test_market_dashboard_snapshot_uses_15_minute_cache(monkeypatch) -> None:
 def test_signal_liquidity_filter_uses_average_quote_volume() -> None:
     candles = [
         CandleInput(
-            open_time=datetime.now(timezone.utc),
+            open_time=datetime.now(UTC),
             open=1,
             high=1,
             low=1,
@@ -320,7 +320,7 @@ def test_signal_liquidity_filter_uses_average_quote_volume() -> None:
     ]
     candles.append(
         CandleInput(
-            open_time=datetime.now(timezone.utc),
+            open_time=datetime.now(UTC),
             open=1,
             high=1,
             low=1,
@@ -436,7 +436,7 @@ def test_fear_greed_result_is_low_confidence_context_signal() -> None:
         market_type="perp",
         candles=[
             CandleInput(
-                open_time=datetime.now(timezone.utc),
+                open_time=datetime.now(UTC),
                 open=100,
                 high=102,
                 low=99,
@@ -465,7 +465,7 @@ def test_altcoin_season_result_supports_altcoins_above_75() -> None:
         market_type="perp",
         candles=[
             CandleInput(
-                open_time=datetime.now(timezone.utc),
+                open_time=datetime.now(UTC),
                 open=100,
                 high=102,
                 low=99,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -75,7 +75,7 @@ def equity_slope(positions: list[Position]) -> float:
     xs = list(range(n))
     sx = sum(xs)
     sy = sum(cum)
-    num = n * sum(x * y for x, y in zip(xs, cum)) - sx * sy
+    num = n * sum(x * y for x, y in zip(xs, cum, strict=False)) - sx * sy
     den = n * sum(x * x for x in xs) - sx * sx
     return num / den if den else 0.0
 
@@ -173,7 +173,7 @@ def build_equity_slope_diagnostics(
     else:
         status = "neutral"
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     since = now - timedelta(hours=24)
     time_stop_rows = (
         db.query(DecisionLog)

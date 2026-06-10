@@ -5,7 +5,7 @@ Only the methods needed by the onboarding flow are exposed.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -111,7 +111,7 @@ class TelegramBotAPI:
         expire_seconds: int = 24 * 3600,
         member_limit: int = 1,
     ) -> str:
-        expire_date = int((datetime.now(timezone.utc) + timedelta(seconds=expire_seconds)).timestamp())
+        expire_date = int((datetime.now(UTC) + timedelta(seconds=expire_seconds)).timestamp())
         params: dict[str, Any] = {
             "chat_id": chat_id,
             "expire_date": expire_date,

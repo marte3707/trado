@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from app.api.routes import _calculate_unrealized_pnl
@@ -156,13 +156,13 @@ def test_candle_containing_position_open_can_trigger_exit() -> None:
         stop_loss=Decimal("95"),
         take_profit=Decimal("110"),
         status="open",
-        opened_at=datetime(2026, 1, 1, 12, 2, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, 12, 2, tzinfo=UTC),
         metadata_json={},
     )
     candle = Candle(
         market_id=1,
         timeframe="5m",
-        open_time=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
         open=Decimal("100"),
         high=Decimal("111"),
         low=Decimal("99"),
@@ -185,13 +185,13 @@ def test_candle_closed_before_position_open_is_ignored() -> None:
         stop_loss=Decimal("95"),
         take_profit=Decimal("110"),
         status="open",
-        opened_at=datetime(2026, 1, 1, 12, 5, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, 12, 5, tzinfo=UTC),
         metadata_json={},
     )
     candle = Candle(
         market_id=1,
         timeframe="5m",
-        open_time=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
         open=Decimal("100"),
         high=Decimal("111"),
         low=Decimal("99"),
@@ -372,7 +372,7 @@ def test_take_profit_plan_closes_half_at_tp1() -> None:
         size=Decimal("10"),
         stop_loss=Decimal("95"),
         status="open",
-        opened_at=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
         metadata_json={
             "source_signal_id": "11",
             "initial_size": "10",
@@ -386,7 +386,7 @@ def test_take_profit_plan_closes_half_at_tp1() -> None:
     candle = Candle(
         market_id=1,
         timeframe="5m",
-        open_time=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
         open=Decimal("100"),
         high=Decimal("105"),
         low=Decimal("99"),
@@ -416,7 +416,7 @@ def test_close_paper_positions_for_candle_moves_stop_to_breakeven_after_tp1() ->
         size=Decimal("1"),
         stop_loss=Decimal("90"),
         status="open",
-        opened_at=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
         metadata_json={
             "source_timeframe": "5m",
             "initial_size": "1",
@@ -432,7 +432,7 @@ def test_close_paper_positions_for_candle_moves_stop_to_breakeven_after_tp1() ->
     candle = Candle(
         market_id=1,
         timeframe="5m",
-        open_time=datetime(2026, 1, 1, 12, 5, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, 12, 5, tzinfo=UTC),
         open=Decimal("100"),
         high=Decimal("111"),
         low=Decimal("99"),
@@ -473,7 +473,7 @@ def test_take_profit_plan_can_fill_all_targets_in_one_candle() -> None:
         size=Decimal("10"),
         stop_loss=Decimal("95"),
         status="open",
-        opened_at=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
         metadata_json={
             "source_signal_id": "12",
             "initial_size": "10",
@@ -487,7 +487,7 @@ def test_take_profit_plan_can_fill_all_targets_in_one_candle() -> None:
     candle = Candle(
         market_id=1,
         timeframe="5m",
-        open_time=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
         open=Decimal("100"),
         high=Decimal("116"),
         low=Decimal("99"),
@@ -508,8 +508,8 @@ def test_take_profit_plan_can_fill_all_targets_in_one_candle() -> None:
 
 def test_time_stop_closes_stale_unprofitable_paper_position_at_latest_candle_close() -> None:
     engine = OrderExecutionEngine(Settings())
-    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
-    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    opened_at = datetime.now(UTC) - timedelta(hours=9)
+    candle_open = datetime.now(UTC) - timedelta(minutes=5)
     position = Position(
         id=10,
         market_id=1,
@@ -560,8 +560,8 @@ def test_time_stop_closes_stale_unprofitable_paper_position_at_latest_candle_clo
 
 def test_time_stop_skips_losing_paper_position_by_default() -> None:
     engine = OrderExecutionEngine(Settings())
-    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
-    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    opened_at = datetime.now(UTC) - timedelta(hours=9)
+    candle_open = datetime.now(UTC) - timedelta(minutes=5)
     position = Position(
         id=12,
         market_id=1,
@@ -608,8 +608,8 @@ def test_time_stop_skips_losing_paper_position_by_default() -> None:
 
 def test_time_stop_skips_profitable_paper_position() -> None:
     engine = OrderExecutionEngine(Settings())
-    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
-    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    opened_at = datetime.now(UTC) - timedelta(hours=9)
+    candle_open = datetime.now(UTC) - timedelta(minutes=5)
     position = Position(
         id=20,
         market_id=1,
@@ -652,8 +652,8 @@ def test_time_stop_skips_profitable_paper_position() -> None:
 
 def test_time_stop_skips_paper_position_with_tp1_hit() -> None:
     engine = OrderExecutionEngine(Settings())
-    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
-    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    opened_at = datetime.now(UTC) - timedelta(hours=9)
+    candle_open = datetime.now(UTC) - timedelta(minutes=5)
     position = Position(
         id=21,
         market_id=1,
@@ -696,8 +696,8 @@ def test_time_stop_skips_paper_position_with_tp1_hit() -> None:
 
 def test_time_stop_skips_paper_position_with_tp2_hit() -> None:
     engine = OrderExecutionEngine(Settings())
-    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
-    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    opened_at = datetime.now(UTC) - timedelta(hours=9)
+    candle_open = datetime.now(UTC) - timedelta(minutes=5)
     position = Position(
         id=22,
         market_id=1,
@@ -754,7 +754,7 @@ def test_time_stop_skips_live_alert_when_tp1_hit() -> None:
         entry_price=Decimal("100"),
         size=Decimal("1"),
         status="open",
-        opened_at=datetime.now(timezone.utc) - timedelta(hours=9),
+        opened_at=datetime.now(UTC) - timedelta(hours=9),
         metadata_json={"source_timeframe": "5m", "tp1_hit": True},
     )
     db = FakeTimeStopDb(
@@ -781,8 +781,8 @@ def test_time_stop_skips_live_alert_when_tp1_hit() -> None:
 
 def test_time_stop_skips_live_alert_when_profitable() -> None:
     engine = OrderExecutionEngine(Settings())
-    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
-    candle_open = datetime.now(timezone.utc) - timedelta(minutes=5)
+    opened_at = datetime.now(UTC) - timedelta(hours=9)
+    candle_open = datetime.now(UTC) - timedelta(minutes=5)
     position = Position(
         id=24,
         market_id=1,
@@ -837,7 +837,7 @@ def test_time_stop_keeps_recent_paper_position_open() -> None:
         entry_price=Decimal("100"),
         size=Decimal("1"),
         status="open",
-        opened_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        opened_at=datetime.now(UTC) - timedelta(hours=2),
         metadata_json={"source_timeframe": "5m"},
     )
     db = FakeTimeStopDb(
@@ -860,7 +860,7 @@ def test_time_stop_keeps_recent_paper_position_open() -> None:
 
 def test_time_stop_does_not_close_without_candle_after_open() -> None:
     engine = OrderExecutionEngine(Settings())
-    opened_at = datetime.now(timezone.utc) - timedelta(hours=9)
+    opened_at = datetime.now(UTC) - timedelta(hours=9)
     stale_candle_open = opened_at - timedelta(hours=1)
     position = Position(
         id=14,
@@ -913,7 +913,7 @@ def test_time_stop_alerts_stale_live_position_without_closing() -> None:
         entry_price=Decimal("100"),
         size=Decimal("1"),
         status="open",
-        opened_at=datetime.now(timezone.utc) - timedelta(hours=9),
+        opened_at=datetime.now(UTC) - timedelta(hours=9),
         metadata_json={"source_timeframe": "5m"},
     )
     db = FakeTimeStopDb(
@@ -949,10 +949,10 @@ def test_time_stop_does_not_duplicate_recent_live_alert() -> None:
         entry_price=Decimal("100"),
         size=Decimal("1"),
         status="open",
-        opened_at=datetime.now(timezone.utc) - timedelta(hours=9),
+        opened_at=datetime.now(UTC) - timedelta(hours=9),
         metadata_json={
             "source_timeframe": "5m",
-            "last_time_stop_alert_at": datetime.now(timezone.utc).isoformat(),
+            "last_time_stop_alert_at": datetime.now(UTC).isoformat(),
         },
     )
     db = FakeTimeStopDb(

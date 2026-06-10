@@ -11,7 +11,7 @@ riprogramma la prossima esecuzione — così il loop principale resta privo di s
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 RECAP_INTERVAL_SECONDS = 10800  # ogni 3 ore
@@ -34,7 +34,7 @@ def next_daily_recap_timestamp(now: datetime | None = None) -> float:
     )
     if current >= target:
         target += timedelta(days=1)
-    return target.astimezone(timezone.utc).timestamp()
+    return target.astimezone(UTC).timestamp()
 
 
 class PeriodicScheduler:
@@ -65,7 +65,7 @@ class PeriodicScheduler:
     def due_daily_recap(self, now: float) -> bool:
         if now >= self.next_daily_recap:
             self.next_daily_recap = next_daily_recap_timestamp(
-                datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(seconds=1)
+                datetime.fromtimestamp(now, tz=UTC) + timedelta(seconds=1)
             )
             return True
         return False

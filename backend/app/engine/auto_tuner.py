@@ -4,7 +4,7 @@ import hashlib
 import math
 import random
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -328,7 +328,7 @@ class AutoTuner:
         risk_snapshot = self._snapshot_risk(db)
         target_setting = str(step.get("target_setting", "risk"))
         self._apply_patch(db, dict(step.get("patch", {})), target_setting=target_setting)
-        activated_at = datetime.now(timezone.utc).isoformat()
+        activated_at = datetime.now(UTC).isoformat()
         new_state = dict(state)
         new_state.update(
             {
@@ -401,7 +401,7 @@ class AutoTuner:
                 db, dict(step.get("revert", {})), target_setting=target_setting
             )
 
-        evaluated_at = datetime.now(timezone.utc).isoformat()
+        evaluated_at = datetime.now(UTC).isoformat()
         history.append(
             {
                 "key": step.get("key"),
@@ -445,10 +445,7 @@ class AutoTuner:
             },
         )
         db.commit()
-        if outcome == "success":
-            status_payload = "advanced"
-        else:
-            status_payload = "reverted"
+        status_payload = "advanced" if outcome == "success" else "reverted"
         return {
             "status": status_payload,
             "step": step.get("key"),
@@ -473,7 +470,7 @@ class AutoTuner:
         test_overlay = dict(step.get("patch", {}))
         allocation = float(config.get("ab_test_allocation", 0.5))
         allocation = max(0.0, min(1.0, allocation))
-        activated_at = datetime.now(timezone.utc).isoformat()
+        activated_at = datetime.now(UTC).isoformat()
         new_state = dict(state)
         new_state.update(
             {
@@ -588,7 +585,7 @@ class AutoTuner:
         else:
             outcome = "rejected"
 
-        evaluated_at = datetime.now(timezone.utc).isoformat()
+        evaluated_at = datetime.now(UTC).isoformat()
         history.append(
             {
                 "key": step.get("key"),
@@ -726,7 +723,7 @@ class AutoTuner:
                 "metrics_before": state.get("metrics_before"),
                 "metrics_after": None,
                 "trades_evaluated": 0,
-                "evaluated_at": datetime.now(timezone.utc).isoformat(),
+                "evaluated_at": datetime.now(UTC).isoformat(),
                 "manual": True,
             }
         )
@@ -1085,7 +1082,7 @@ class AutoTuner:
             "timeframe": normalized_timeframe,
             "strategy": normalized_strategy,
             "step_key": step_key,
-            "queued_at": datetime.now(timezone.utc).isoformat(),
+            "queued_at": datetime.now(UTC).isoformat(),
         }
         self._persist_state(db, state)
         self._log_event(
@@ -1345,13 +1342,13 @@ class AutoTuner:
         except ValueError:
             return out
         if cutoff.tzinfo is None:
-            cutoff = cutoff.replace(tzinfo=timezone.utc)
+            cutoff = cutoff.replace(tzinfo=UTC)
         for position in positions:
             closed_at = position.closed_at
             if closed_at is None:
                 continue
             if closed_at.tzinfo is None:
-                closed_at = closed_at.replace(tzinfo=timezone.utc)
+                closed_at = closed_at.replace(tzinfo=UTC)
             if closed_at <= cutoff:
                 continue
             meta = position.metadata_json or {}
@@ -1425,14 +1422,14 @@ class AutoTuner:
         except ValueError:
             return []
         if cutoff.tzinfo is None:
-            cutoff = cutoff.replace(tzinfo=timezone.utc)
+            cutoff = cutoff.replace(tzinfo=UTC)
         result: list[Position] = []
         for position in positions:
             closed_at = position.closed_at
             if closed_at is None:
                 continue
             if closed_at.tzinfo is None:
-                closed_at = closed_at.replace(tzinfo=timezone.utc)
+                closed_at = closed_at.replace(tzinfo=UTC)
             if closed_at > cutoff:
                 result.append(position)
         return result

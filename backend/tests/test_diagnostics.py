@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from app.db.models import AppSetting, DecisionLog, Position, Signal
@@ -161,7 +161,7 @@ def test_planned_stop_pct_summary_returns_none_when_empty() -> None:
 
 
 def test_equity_slope_is_negative_for_declining_pnl() -> None:
-    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 1, tzinfo=UTC)
     positions = [
         _position(pnl=-1.0, closed_at=base + timedelta(minutes=i))
         for i in range(12)
@@ -173,7 +173,7 @@ def test_equity_slope_is_negative_for_declining_pnl() -> None:
 
 
 def test_equity_slope_is_positive_for_growing_pnl() -> None:
-    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 1, tzinfo=UTC)
     positions = [
         _position(pnl=2.0, closed_at=base + timedelta(minutes=i))
         for i in range(12)
@@ -185,7 +185,7 @@ def test_equity_slope_is_positive_for_growing_pnl() -> None:
 
 
 def test_equity_slope_zero_when_insufficient_history() -> None:
-    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 1, tzinfo=UTC)
     positions = [
         _position(pnl=-1.0, closed_at=base + timedelta(minutes=i))
         for i in range(5)
@@ -195,7 +195,7 @@ def test_equity_slope_zero_when_insufficient_history() -> None:
 
 
 def test_build_equity_slope_diagnostics_exposes_status_and_time_stop_impact(monkeypatch) -> None:
-    base = datetime(2026, 5, 1, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 1, tzinfo=UTC)
     positions = [
         _position(pnl=-2.0, closed_at=base + timedelta(minutes=i))
         for i in range(60)
@@ -205,7 +205,7 @@ def test_build_equity_slope_diagnostics_exposes_status_and_time_stop_impact(monk
         message="closed",
         data={"realized_pnl": "-12.5"},
     )
-    log.timestamp = datetime.now(timezone.utc)
+    log.timestamp = datetime.now(UTC)
     db = FakeDiagnosticsDb(positions, [log])
     monkeypatch.setattr(
         "app.engine.diagnostics.SignalPerformanceAnalyzer.closed_paper_positions",

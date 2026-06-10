@@ -1,5 +1,5 @@
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from app.db.models import AppSetting, DecisionLog, Position
@@ -132,7 +132,7 @@ def test_run_starts_first_step_when_idle() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _config()
     db.app_settings["risk"] = AppSetting(key="risk", value={"min_signal_score": 70})
-    positions = _positions_with_slope(20, -1.0, datetime(2026, 5, 14, tzinfo=timezone.utc))
+    positions = _positions_with_slope(20, -1.0, datetime(2026, 5, 14, tzinfo=UTC))
     # ordine: closed_paper_positions ritorna ordinato desc per closed_at — qui inverto per simulare
     positions.reverse()
     tuner = AutoTuner(analyzer=FakeAnalyzer(positions))
@@ -151,7 +151,7 @@ def test_run_starts_first_step_when_idle() -> None:
 def test_run_in_progress_when_not_enough_trades() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _config()
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -179,7 +179,7 @@ def test_run_in_progress_when_not_enough_trades() -> None:
 def test_run_advances_when_slope_improves() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _config(min_trades_per_step=10)
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -216,7 +216,7 @@ def test_run_advances_when_slope_improves() -> None:
 def test_run_reverts_when_slope_worsens() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _config(min_trades_per_step=10)
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -312,7 +312,7 @@ def test_rollback_current_reverts_active_step() -> None:
 def test_status_returns_progress_when_step_active() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _config(min_trades_per_step=10)
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -349,7 +349,7 @@ def test_status_next_step_skips_active_step() -> None:
         sequence=sequence,
         ab_test_min_trades_per_arm=30,
     )
-    activated = datetime(2026, 5, 22, 15, 20, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 22, 15, 20, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -381,7 +381,7 @@ def test_positions_after_returns_empty_when_state_corrupt() -> None:
     """F-10: senza `activated_at` ritorniamo lista vuota, non l'intera collezione.
     Altrimenti `metrics_after` includerebbe le posizioni pre-attivazione."""
     tuner = AutoTuner(analyzer=FakeAnalyzer([]))
-    positions = _positions_with_slope(5, 1.0, datetime(2026, 1, 1, tzinfo=timezone.utc))
+    positions = _positions_with_slope(5, 1.0, datetime(2026, 1, 1, tzinfo=UTC))
     assert tuner._positions_after(positions, None) == []
     assert tuner._positions_after(positions, "") == []
     # Stringa malformata → lista vuota (non solleva)
@@ -457,7 +457,7 @@ def test_ab_mode_start_does_not_modify_risk_setting() -> None:
 def test_ab_mode_in_progress_until_min_trades_per_arm() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _ab_config(ab_test_min_trades_per_arm=10)
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -496,7 +496,7 @@ def test_ab_mode_promotes_when_test_significantly_better() -> None:
     db.app_settings["auto_tuner_config"] = _ab_config(
         ab_test_min_trades_per_arm=10, ab_test_significance_level=0.05
     )
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -556,7 +556,7 @@ def test_ab_mode_rejects_when_not_significant() -> None:
     db.app_settings["auto_tuner_config"] = _ab_config(
         ab_test_min_trades_per_arm=10, ab_test_significance_level=0.05
     )
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -609,7 +609,7 @@ def test_ab_mode_ignores_untagged_positions_in_partition() -> None:
     """Posizioni senza `_auto_tuner` metadata (es. trade pre-attivazione o di
     altri step) non devono essere conteggiate in nessun arm."""
     tuner = AutoTuner(analyzer=FakeAnalyzer([]))
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     positions = [
         # Senza tag → escluso
         _position(pnl=1.0, closed_at=activated + timedelta(minutes=1), arm=None),
@@ -693,7 +693,7 @@ def test_active_ab_overlay_is_deterministic_with_signal_context() -> None:
             },
         },
     )
-    candle_time = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    candle_time = datetime(2026, 5, 14, 12, tzinfo=UTC)
 
     first = active_ab_overlay(
         db,
@@ -728,7 +728,7 @@ def test_active_ab_overlay_hash_assignment_is_roughly_balanced() -> None:
             },
         },
     )
-    base = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    base = datetime(2026, 5, 14, 12, tzinfo=UTC)
 
     arms = [
         active_ab_overlay(
@@ -747,7 +747,7 @@ def test_active_ab_overlay_hash_assignment_is_roughly_balanced() -> None:
 def test_status_exposes_ab_assignment_method() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _ab_config()
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -776,7 +776,7 @@ def test_status_exposes_ab_assignment_method() -> None:
 def test_status_exposes_ab_progress_metrics() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _ab_config(ab_test_min_trades_per_arm=10)
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -941,7 +941,7 @@ def test_ab_strategy_test_evaluates_without_mutating_risk_and_sets_recommendatio
         ab_test_min_trades_per_arm=10,
         ab_test_significance_level=0.05,
     )
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={
@@ -1019,7 +1019,7 @@ def test_status_exposes_active_strategy_test_target() -> None:
             "strategy_test": {"timeframe": "15m", "strategy": "volume_profile"},
         }
     ]
-    activated = datetime(2026, 5, 14, 12, tzinfo=timezone.utc)
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
     db.app_settings["auto_tuner_state"] = AppSetting(
         key="auto_tuner_state",
         value={

@@ -33,10 +33,7 @@ class FakeDb:
         self.committed = False
 
     def query(self, model):
-        if model is AppSetting:
-            store = self.app_settings
-        else:
-            store = {}
+        store = self.app_settings if model is AppSetting else {}
         return FakeQuery(store, model)
 
     def add(self, row) -> None:

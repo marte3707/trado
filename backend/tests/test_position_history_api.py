@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import FastAPI
@@ -36,7 +36,7 @@ def _position(
     status: str = "closed",
     closed_at: datetime | None,
 ) -> Position:
-    opened_at = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=idx)
+    opened_at = datetime(2026, 1, 1, tzinfo=UTC) + timedelta(minutes=idx)
     return Position(
         market_id=market.id,
         mode=mode,
@@ -72,7 +72,7 @@ def test_position_history_returns_full_history_without_realtime_limit() -> None:
     )
     db.add(market)
     db.flush()
-    base_closed = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    base_closed = datetime(2026, 2, 1, tzinfo=UTC)
     positions = [
         _position(market, idx, closed_at=base_closed + timedelta(minutes=idx))
         for idx in range(routes.POSITION_HISTORY_LIMIT + 10)
@@ -137,7 +137,7 @@ def test_position_history_filters_mode_market_type_and_limit() -> None:
     )
     db.add_all([perp, spot])
     db.flush()
-    closed_at = datetime.now(timezone.utc)
+    closed_at = datetime.now(UTC)
     db.add_all(
         [
             _position(perp, 1, mode="paper", closed_at=closed_at),

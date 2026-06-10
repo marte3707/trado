@@ -497,6 +497,35 @@ class SignalEngine:
         )
         db.execute(stmt)
 
+    @staticmethod
+    def _regime_filter_kwargs(risk_value: dict[str, Any]) -> dict[str, Any]:
+        """Parametri del regime filter estratti da AppSetting "risk".
+
+        Restituisce un dict pronto per `apply_regime_filter(**kwargs)`. Isolato da
+        generate() per essere testabile e ridurne la dimensione; `method` invalido
+        viene normalizzato ad "adx"."""
+        method = str(risk_value.get("regime_method", "adx")).lower()
+        if method not in ("adx", "hurst", "garch", "hybrid"):
+            method = "adx"
+        return {
+            "method": method,
+            "adx_trending": float(risk_value.get("regime_adx_trending", 25.0)),
+            "adx_ranging": float(risk_value.get("regime_adx_ranging", 18.0)),
+            "confirm_candles": int(risk_value.get("regime_confirm_candles", 2)),
+            "off_regime_weight_multiplier": float(
+                risk_value.get("regime_off_weight_multiplier", 0.5)
+            ),
+            "hurst_trending": float(risk_value.get("regime_hurst_trending", 0.55)),
+            "hurst_ranging": float(risk_value.get("regime_hurst_ranging", 0.45)),
+            "hurst_min_lag": int(risk_value.get("regime_hurst_min_lag", 2)),
+            "hurst_max_lag": int(risk_value.get("regime_hurst_max_lag", 20)),
+            "garch_window": int(risk_value.get("regime_garch_window", 50)),
+            "garch_lag": int(risk_value.get("regime_garch_lag", 1)),
+            "garch_cluster_threshold": float(
+                risk_value.get("regime_garch_cluster_threshold", 0.2)
+            ),
+        }
+
     def generate(self, db: Session, market: Market, timeframe: str, limit: int = 250) -> Signal | None:
         settings = get_settings()
         rows = (
@@ -598,22 +627,6 @@ class SignalEngine:
                 strong_score_threshold=strong_threshold,
             )
         regime_filter_enabled = bool(risk_value.get("regime_filter_enabled", False))
-        regime_method_raw = str(risk_value.get("regime_method", "adx")).lower()
-        if regime_method_raw not in ("adx", "hurst", "garch", "hybrid"):
-            regime_method_raw = "adx"
-        regime_adx_trending = float(risk_value.get("regime_adx_trending", 25.0))
-        regime_adx_ranging = float(risk_value.get("regime_adx_ranging", 18.0))
-        regime_confirm_candles = int(risk_value.get("regime_confirm_candles", 2))
-        regime_off_multiplier = float(risk_value.get("regime_off_weight_multiplier", 0.5))
-        regime_hurst_trending = float(risk_value.get("regime_hurst_trending", 0.55))
-        regime_hurst_ranging = float(risk_value.get("regime_hurst_ranging", 0.45))
-        regime_hurst_min_lag = int(risk_value.get("regime_hurst_min_lag", 2))
-        regime_hurst_max_lag = int(risk_value.get("regime_hurst_max_lag", 20))
-        regime_garch_window = int(risk_value.get("regime_garch_window", 50))
-        regime_garch_lag = int(risk_value.get("regime_garch_lag", 1))
-        regime_garch_cluster_threshold = float(
-            risk_value.get("regime_garch_cluster_threshold", 0.2)
-        )
         participation_ratio = float(risk_value.get("participation_ratio", 0.35))
         volatility_filter_enabled = bool(risk_value.get("volatility_filter_enabled", False))
         # Default 25-90: 10-95 era 85% della distribuzione — filtro decorativo. 25-90
@@ -831,18 +844,7 @@ class SignalEngine:
             weights,
             candles,
             enabled=regime_filter_enabled,
-            method=regime_method_raw,  # type: ignore[arg-type]
-            adx_trending=regime_adx_trending,
-            adx_ranging=regime_adx_ranging,
-            confirm_candles=regime_confirm_candles,
-            off_regime_weight_multiplier=regime_off_multiplier,
-            hurst_trending=regime_hurst_trending,
-            hurst_ranging=regime_hurst_ranging,
-            hurst_min_lag=regime_hurst_min_lag,
-            hurst_max_lag=regime_hurst_max_lag,
-            garch_window=regime_garch_window,
-            garch_lag=regime_garch_lag,
-            garch_cluster_threshold=regime_garch_cluster_threshold,
+            **self._regime_filter_kwargs(risk_value),  # type: ignore[arg-type]
         )
         if regime_info is not None and regime_info["neutralized"]:
             logger.debug(

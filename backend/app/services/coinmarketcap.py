@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -853,9 +853,9 @@ def _parse_timestamp(value: Any) -> float | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.timestamp()
 
 
 def _iso_from_epoch(value: float) -> str:
-    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.fromtimestamp(value, tz=UTC).isoformat().replace("+00:00", "Z")

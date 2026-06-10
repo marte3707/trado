@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.core.enums import Direction
 from app.engine.mtf import check_mtf_confluence, higher_timeframe
@@ -8,7 +8,7 @@ from app.strategies.base import CandleInput
 def _candles(prices: list[float]) -> list[CandleInput]:
     return [
         CandleInput(
-            datetime.now(timezone.utc),
+            datetime.now(UTC),
             price - 0.1,
             price + 0.3,
             price - 0.3,

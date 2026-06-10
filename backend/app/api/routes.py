@@ -1,3 +1,4 @@
+import contextlib
 import os
 import shlex
 import subprocess
@@ -5,7 +6,7 @@ import uuid
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import asdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path as FilePath
 from time import perf_counter
@@ -264,7 +265,7 @@ def _serialize_position(
     def serialize_decimal(value: object | None) -> str | None:
         return str(value) if value is not None else None
 
-    now_utc = now_utc or datetime.now(timezone.utc)
+    now_utc = now_utc or datetime.now(UTC)
     unrealized_pnl = row.unrealized_pnl
     # Single source of truth: trust the worker-updated unrealized_pnl unless
     # it is missing or stale. Falling back to a candle-based recompute keeps
@@ -277,10 +278,8 @@ def _serialize_position(
         if unrealized_pnl is None:
             mark_str = (row.metadata_json or {}).get("last_mark_price")
             if mark_str:
-                try:
+                with contextlib.suppress(Exception):
                     unrealized_pnl = _calculate_unrealized_pnl(row, Decimal(str(mark_str)))
-                except Exception:
-                    pass
     elif row.status == "open" and (unrealized_pnl is None or is_stale):
         latest_candle = _latest_candle_for_position(db, row)
         unrealized_pnl = _calculate_unrealized_pnl(row, latest_candle.close if latest_candle else None)
@@ -389,7 +388,7 @@ def admin_bot_funnel(db: Session = Depends(get_db)) -> dict:
     completed = 0
     declined = 0
     paused = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     completed_last_24h = 0
     completed_last_7d = 0
     for row in rows:
@@ -549,7 +548,7 @@ def _worker_status(db: Session) -> dict:
         .order_by(DecisionLog.timestamp.desc())
         .first()
     )
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     last_run_at = last_heartbeat_at or (last_cycle.timestamp if last_cycle else None)
     seconds_since = (now - last_run_at).total_seconds() if last_run_at else None
     return {
@@ -620,7 +619,7 @@ def _tail_error_log(path: FilePath, limit: int) -> dict:
     return {
         "path": str(path),
         "exists": True,
-        "updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat(),
+        "updated_at": datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).isoformat(),
         "lines": [line.decode("utf-8", errors="replace").rstrip("\n") for line in lines],
     }
 
@@ -730,7 +729,7 @@ async def candles(
     interval_ms = TIMEFRAME_MS.get(timeframe)
     if interval_ms is not None:
         try:
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             end_ms = int(now.timestamp() * 1000)
             start_ms = end_ms - interval_ms * limit
             live_rows = await HyperliquidClient(get_settings()).candles(
@@ -953,7 +952,7 @@ def signal_snapshot(signal_id: int, db: Session = Depends(get_db)) -> SignalSnap
         .all()
     )
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     return SignalSnapshotOut(
         signal=_enrich_signal_with_calibration(signal, db),
         source_candle_open_time=source_time,
@@ -1083,7 +1082,7 @@ def positions(db: Session = Depends(get_db)) -> list[dict]:
             if order.position_id is not None:
                 orders_by_position.setdefault(order.position_id, []).append(order)
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     return [
         _serialize_position(
             db,
@@ -1120,7 +1119,7 @@ def position_history(
         .filter(or_(Position.status != "open", Position.realized_pnl.is_not(None)))
     )
     if period != "all":
-        cutoff = datetime.now(timezone.utc) - {
+        cutoff = datetime.now(UTC) - {
             "1d": timedelta(days=1),
             "7d": timedelta(days=7),
             "30d": timedelta(days=30),
@@ -1159,7 +1158,7 @@ def position_history(
             if order.position_id is not None:
                 orders_by_position.setdefault(order.position_id, []).append(order)
 
-    now_utc = datetime.now(timezone.utc)
+    now_utc = datetime.now(UTC)
     positions_payload = [
         _serialize_position(
             db,
@@ -1469,7 +1468,7 @@ def analytics_score_calibration(
     pnls_list = [p[1] for p in pairs]
     correlation = _pearson(scores_list, pnls_list)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     period_days = 14
     n_periods = 8
     by_week = []
@@ -1480,7 +1479,7 @@ def analytics_score_calibration(
         for s, p, dt in pairs:
             if dt is None:
                 continue
-            dt_utc = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+            dt_utc = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
             if period_start <= dt_utc < period_end:
                 period_pairs.append((s, p))
         if not period_pairs:
@@ -1508,7 +1507,7 @@ def _pearson(xs: Sequence[float], ys: Sequence[float]) -> float | None:
         return None
     mean_x = sum(xs) / n
     mean_y = sum(ys) / n
-    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=False)) / n
     std_x = (sum((x - mean_x) ** 2 for x in xs) / n) ** 0.5
     std_y = (sum((y - mean_y) ** 2 for y in ys) / n) ** 0.5
     if std_x > 0 and std_y > 0:
@@ -1523,7 +1522,7 @@ def _beta(dependent: Sequence[float], independent: Sequence[float]) -> float | N
         return None
     mean_d = sum(dependent) / n
     mean_i = sum(independent) / n
-    cov = sum((d - mean_d) * (i - mean_i) for d, i in zip(dependent, independent)) / n
+    cov = sum((d - mean_d) * (i - mean_i) for d, i in zip(dependent, independent, strict=False)) / n
     var_i = sum((i - mean_i) ** 2 for i in independent) / n
     if var_i <= 0:
         return None
@@ -2231,7 +2230,7 @@ def _compute_equity_points(raw_pairs: list[tuple[float, float]]) -> list[dict]:
         if peak is None or equity > peak:
             peak = equity
         dd = ((peak - equity) / peak * 100) if peak and peak > 0 else 0.0
-        ts_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        ts_dt = datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
         points.append({"ts": ts_dt.isoformat(), "equity": round(equity, 4), "drawdown_pct": round(dd, 4)})
     return points
 
@@ -2248,7 +2247,7 @@ async def account_equity_history(
     """
     settings = get_settings()
     address = settings.hyperliquid_account_address
-    since_ms = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
+    since_ms = (datetime.now(UTC) - timedelta(days=days)).timestamp() * 1000
 
     # ── Fetch from HL ──────────────────────────────────────────────────────────
     hl_pairs: list[tuple[float, float]] = []
@@ -2271,7 +2270,7 @@ async def account_equity_history(
     # ── Fallback: local snapshots (new records with effective_account_value) ──
     local_pairs: list[tuple[float, float]] = []
     if not hl_pairs:
-        since_dt = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc)
+        since_dt = datetime.fromtimestamp(since_ms / 1000, tz=UTC)
         rows = (
             db.query(AccountSnapshot)
             .filter(
@@ -2308,7 +2307,7 @@ async def account_equity_history(
 async def account_snapshot(db: Session = Depends(get_db)) -> dict:
     settings = get_settings()
     client = HyperliquidClient(settings)
-    checked_at = datetime.now(timezone.utc)
+    checked_at = datetime.now(UTC)
     started = perf_counter()
     meta, mids, api_error = await _fetch_market_meta(client)
     api_latency_ms = round((perf_counter() - started) * 1000, 1)

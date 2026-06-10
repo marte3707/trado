@@ -147,7 +147,7 @@ def test_atr_finite_for_diverse_series() -> None:
     lows = [h - 1.0 - abs(math.cos(i / 5)) for i, h in enumerate(highs)]
     closes = [
         (high + low) / 2 + math.sin(i / 6) * 0.3
-        for i, (high, low) in enumerate(zip(highs, lows))
+        for i, (high, low) in enumerate(zip(highs, lows, strict=False))
     ]
 
     result = atr(highs, lows, closes, 14)

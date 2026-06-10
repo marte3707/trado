@@ -5,7 +5,7 @@ import json
 import re
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urljoin
 
@@ -475,4 +475,4 @@ def _as_float(value: Any) -> float | None:
 
 
 def _iso_from_epoch(value: float) -> str:
-    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.fromtimestamp(value, tz=UTC).isoformat().replace("+00:00", "Z")

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.engine.volatility import atr_percentile_rank, evaluate_volatility
 from app.strategies.base import CandleInput
@@ -7,7 +7,7 @@ from app.strategies.base import CandleInput
 def _candles(prices: list[float]) -> list[CandleInput]:
     return [
         CandleInput(
-            datetime.now(timezone.utc),
+            datetime.now(UTC),
             price - 0.1,
             price + 0.4,
             price - 0.4,
@@ -45,7 +45,7 @@ def _variable_atr_candles(count: int = 80) -> list[CandleInput]:
         range_pct = 0.04 if i < count - 5 else 0.0005
         candles.append(
             CandleInput(
-                datetime.now(timezone.utc),
+                datetime.now(UTC),
                 close - range_pct * 0.4,
                 close + range_pct * 0.5,
                 close - range_pct * 0.5,

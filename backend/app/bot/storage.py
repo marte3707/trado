@@ -1,7 +1,7 @@
 """Persistence helpers for the onboarding bot. Thin layer over BotUser ORM."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
@@ -75,7 +75,7 @@ def set_trade_capital(db: Session, user: BotUser, trade_capital: str | None) -> 
 
 
 def record_risk_ack(db: Session, user: BotUser, *, invite_link: str | None) -> BotUser:
-    user.risk_ack_at = datetime.now(timezone.utc)
+    user.risk_ack_at = datetime.now(UTC)
     user.invite_link = invite_link
     user.onboarding_stage = "completed" if invite_link else "ack_no_link"
     db.commit()

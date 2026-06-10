@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.core.enums import Direction
 from app.engine.risk import RiskManager, calculate_position_size
@@ -15,7 +15,7 @@ def build_market_candles(direction: Direction) -> list[CandleInput]:
             close = 120 - (index * 0.12) - (pattern[index % len(pattern)] * 0.8)
         candles.append(
             CandleInput(
-                datetime.now(timezone.utc),
+                datetime.now(UTC),
                 close - 0.25,
                 close + 0.7,
                 close - 0.7,
@@ -94,7 +94,7 @@ def test_short_plan_clips_ambitious_target_before_it_turns_negative() -> None:
         close = 0.6 - (index * 0.002) - (pattern[index % len(pattern)] * 0.02)
         candles.append(
             CandleInput(
-                datetime.now(timezone.utc),
+                datetime.now(UTC),
                 close - 0.002,
                 close + 0.04,
                 max(0.001, close - 0.04),
@@ -121,7 +121,7 @@ def test_short_plan_is_rejected_when_minimum_target_would_be_negative() -> None:
         close = 0.3 - (index * 0.001) - (pattern[index % len(pattern)] * 0.025)
         candles.append(
             CandleInput(
-                datetime.now(timezone.utc),
+                datetime.now(UTC),
                 close - 0.002,
                 close + 0.05,
                 max(0.001, close - 0.05),

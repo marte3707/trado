@@ -1,7 +1,7 @@
 import asyncio
 import dataclasses
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -289,7 +289,7 @@ def _uar_int_setting(risk: dict[str, Any], key: str) -> int:
 
 
 def _arm_uar_kill_switch(db, ratio_pct: Decimal, block_pct: Decimal) -> None:
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     setting = db.get(AppSetting, "kill_switch") or AppSetting(key="kill_switch", value={})
     value = dict(setting.value) if isinstance(setting.value, dict) else {}
     value.update(
@@ -627,11 +627,10 @@ def _calc_close_card_extras(
 
     duration: int | None = None
     if position.opened_at:
-        ref = position.closed_at or datetime.now(timezone.utc)
+        ref = position.closed_at or datetime.now(UTC)
         opened = position.opened_at
         if opened.tzinfo is None:
-            from datetime import timezone as _tz
-            opened = opened.replace(tzinfo=_tz.utc)
+            opened = opened.replace(tzinfo=UTC)
         duration = int((ref - opened).total_seconds())
 
     return pnl_pct, duration
@@ -835,7 +834,7 @@ async def run_once(
     executor: OrderExecutionEngine,
     btc_protection: BtcMacroProtectionEngine | None = None,
 ) -> tuple[int, int]:
-    tick_start = datetime.now(timezone.utc)
+    tick_start = datetime.now(UTC)
     settings = get_settings()
     db = SessionLocal()
     # Invalida le cache per-cycle del signal_engine (fundings, L2 book): evitano
@@ -1172,7 +1171,7 @@ async def main() -> None:
         if scheduler.due_daily_recap(now):
             recap_db = SessionLocal()
             try:
-                window_end = datetime.fromtimestamp(now, tz=timezone.utc)
+                window_end = datetime.fromtimestamp(now, tz=UTC)
                 window_start = window_end - timedelta(hours=24)
                 await notifier.send_daily_recap(
                     recap_db,
@@ -1240,7 +1239,7 @@ async def main() -> None:
 def _record_heartbeat(phase: str) -> None:
     db = SessionLocal()
     try:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         setting = db.get(AppSetting, "worker_heartbeat")
         if setting is None:
             db.add(AppSetting(key="worker_heartbeat", value={"timestamp": now, "phase": phase}))

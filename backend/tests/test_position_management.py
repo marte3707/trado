@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -29,10 +29,10 @@ from app.services.hyperliquid import HyperliquidOrderResult
 class _Query:
     rows: list[Any]
 
-    def filter(self, *_args: Any, **_kwargs: Any) -> "_Query":
+    def filter(self, *_args: Any, **_kwargs: Any) -> _Query:
         return self
 
-    def order_by(self, *_args: Any, **_kwargs: Any) -> "_Query":
+    def order_by(self, *_args: Any, **_kwargs: Any) -> _Query:
         return self
 
     def all(self) -> list[Any]:
@@ -166,7 +166,7 @@ def _position(side: str = "long", stop: str = "90", mode: str = "paper") -> Posi
         size=Decimal("10"),
         stop_loss=Decimal(stop),
         status="open",
-        opened_at=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
         metadata_json={
             "source_timeframe": "5m",
             "initial_size": "10",
@@ -215,7 +215,7 @@ def test_take_profit_plan_skips_non_positive_short_targets() -> None:
 
 
 def _candles(close: str = "112", count: int = 30) -> list[Candle]:
-    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
     rows: list[Candle] = []
     for idx in range(count):
         base = Decimal("100") + Decimal(idx) * Decimal("0.3")

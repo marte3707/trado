@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
@@ -62,7 +62,7 @@ class CandleSyncService:
         persist. Mantenuto per i percorsi che sincronizzano una coppia per volta
         (es. test). Il worker usa `prefetch` + `persist_candles` per parallelizzare
         i fetch HTTP su molte coppie."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         interval_ms = TIMEFRAME_MS[timeframe]
         end_ms = int(now.timestamp() * 1000)
         latest_open = (
@@ -92,7 +92,7 @@ class CandleSyncService:
         """Scrive (upsert) le candele chiuse di una coppia e committa. Sincrono:
         nel worker viene invocato via `asyncio.to_thread` sulla sessione condivisa,
         coerentemente con gli altri accessi DB serializzati del ciclo."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         interval_ms = TIMEFRAME_MS[timeframe]
         cutoff = now - timedelta(milliseconds=interval_ms)
         inserted = 0
@@ -162,7 +162,7 @@ class CandleSyncService:
         chiamante. La query per le ultime open_time è batchata in un'unica SELECT."""
         if not pairs:
             return {}
-        end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        end_ms = int(datetime.now(UTC).timestamp() * 1000)
         market_ids = list({market.id for market, _ in pairs})
         timeframes = list({timeframe for _, timeframe in pairs})
         latest_map = await asyncio.to_thread(

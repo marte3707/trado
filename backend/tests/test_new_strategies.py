@@ -1,6 +1,6 @@
 """Test per le strategie nuove §4.8: CVD, Liquidation Cascade, Volume Profile."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from app.core.enums import Direction
 from app.strategies.base import CandleInput, StrategyContext
@@ -8,7 +8,7 @@ from app.strategies.cvd_divergence_strategy import CvdDivergenceStrategy
 from app.strategies.liquidation_cascade_strategy import LiquidationCascadeStrategy
 from app.strategies.volume_profile_strategy import VolumeProfileStrategy
 
-BASE_TIME = datetime(2025, 1, 1, tzinfo=timezone.utc)
+BASE_TIME = datetime(2025, 1, 1, tzinfo=UTC)
 
 
 def _candle(

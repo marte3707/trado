@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from importlib import import_module
 from typing import Any
@@ -105,10 +106,8 @@ def fetch_predicted_fundings(info_url: str) -> dict[str, float]:
                     continue
                 for venue_entry in venues:
                     if isinstance(venue_entry, list) and len(venue_entry) >= 2:
-                        try:
+                        with contextlib.suppress(ValueError, TypeError):
                             result[coin] = float(venue_entry[1])
-                        except (ValueError, TypeError):
-                            pass
                         break
             return result
     except Exception:
@@ -128,14 +127,12 @@ def fetch_perp_open_interests(info_url: str) -> dict[str, float]:
             meta, asset_ctxs = data[0], data[1]
             universe = meta.get("universe", [])
             result: dict[str, float] = {}
-            for asset, ctx in zip(universe, asset_ctxs):
+            for asset, ctx in zip(universe, asset_ctxs, strict=False):
                 coin = asset.get("name", "")
                 oi_str = ctx.get("openInterest")
                 if coin and oi_str is not None:
-                    try:
+                    with contextlib.suppress(ValueError, TypeError):
                         result[coin] = float(oi_str)
-                    except (ValueError, TypeError):
-                        pass
             return result
     except Exception:
         return {}
@@ -672,7 +669,7 @@ def _decimal(value: str | int | float | Decimal | None) -> Decimal | None:
 
 def parse_hl_candle(row: dict[str, Any]) -> dict[str, Any]:
     return {
-        "open_time": datetime.fromtimestamp(int(row["t"]) / 1000, tz=timezone.utc),
+        "open_time": datetime.fromtimestamp(int(row["t"]) / 1000, tz=UTC),
         "open": Decimal(str(row["o"])),
         "high": Decimal(str(row["h"])),
         "low": Decimal(str(row["l"])),

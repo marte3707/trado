@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Iterable
 
 from app.db.models import Order, Position
 

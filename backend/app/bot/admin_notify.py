@@ -9,7 +9,7 @@ to know about the second token.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 import structlog
@@ -44,7 +44,7 @@ async def _send_admin(settings: Settings, text: str) -> bool:
 
 
 async def send_bot_online(settings: Settings, db: Session) -> None:
-    now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+    now = datetime.now(UTC).strftime("%d/%m/%Y %H:%M UTC")
     total_users = db.query(func.count(BotUser.id)).scalar() or 0
     completed = (
         db.query(func.count(BotUser.id))
@@ -101,7 +101,7 @@ async def send_bot_heartbeat(
 
 
 async def send_bot_fatal(settings: Settings, context: str, exc: Exception) -> None:
-    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    now = datetime.now(UTC).strftime("%H:%M UTC")
     error_type = type(exc).__name__
     error_msg = str(exc)[:300]
     await _send_admin(

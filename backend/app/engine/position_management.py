@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any, Sequence
+from typing import Any
 
 import structlog
 from sqlalchemy.orm import Session
@@ -255,9 +257,9 @@ class PositionManagementEngine:
             interval_ms = TIMEFRAME_MS.get(candle.timeframe)
             if interval_ms is not None:
                 expected_close = candle.open_time + timedelta(milliseconds=interval_ms)
-                now = datetime.now(timezone.utc)
+                now = datetime.now(UTC)
                 if expected_close.tzinfo is None:
-                    expected_close = expected_close.replace(tzinfo=timezone.utc)
+                    expected_close = expected_close.replace(tzinfo=UTC)
                 if now < expected_close:
                     return None
 
@@ -420,7 +422,7 @@ class PositionManagementEngine:
         old_stop = position.stop_loss
         position.stop_loss = candidate.price
         metadata = dict(position.metadata_json or {})
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         if candidate.reason == "breakeven" or (
             position.side.lower() == "long"
             and candidate.price >= position.entry_price
@@ -490,7 +492,7 @@ class PositionManagementEngine:
         metadata["stop_replacement_attempts"] = attempts
         metadata["last_stop_replacement_failure"] = {
             "reason": reason,
-            "at": datetime.now(timezone.utc).isoformat(),
+            "at": datetime.now(UTC).isoformat(),
         }
         position.metadata_json = metadata
         db.add(
@@ -875,7 +877,7 @@ class PositionManagementEngine:
         source: str,
     ) -> LiquidationGuardResult:
         metadata = dict(position.metadata_json or {})
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         metadata.update(
             {
                 "last_liquidation_guard_check_at": now,
@@ -965,10 +967,8 @@ class PositionManagementEngine:
                 Order.status.notin_(TERMINAL_ORDER_STATUSES),
             )
         )
-        try:
+        with contextlib.suppress(AttributeError):
             query = query.order_by(Order.created_at.desc())
-        except AttributeError:
-            pass
         return query.first()
 
 

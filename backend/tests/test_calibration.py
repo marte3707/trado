@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -17,7 +17,7 @@ def _positions_matching(target: PerformanceStats) -> list[Position]:
     senza dover persistere oggetti reali in DB."""
     win_pnl = target.gross_profit / target.wins if target.wins else 0.0
     loss_pnl = -target.gross_loss / target.losses if target.losses else 0.0
-    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    base = datetime(2025, 1, 1, tzinfo=UTC)
     positions: list[Position] = []
     for i in range(target.wins):
         positions.append(
@@ -646,7 +646,7 @@ def test_defensive_mode_stays_when_recent_profit_factor_below_one() -> None:
 
 def _make_positions_sequence(pnls: list[float]) -> list[Position]:
     """Crea positions in ordine temporale (pnls[0] = più vecchia), ritorna desc."""
-    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    base = datetime(2025, 1, 1, tzinfo=UTC)
     positions = [
         Position(realized_pnl=Decimal(str(pnl)), closed_at=base + timedelta(hours=i))
         for i, pnl in enumerate(pnls)

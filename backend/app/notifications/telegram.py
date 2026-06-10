@@ -1,5 +1,5 @@
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -648,7 +648,7 @@ class TelegramNotifier:
         }
 
     async def send_worker_online(self, db: Session) -> None:
-        now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+        now = datetime.now(UTC).strftime("%d/%m/%Y %H:%M UTC")
         mode = "—"
         score = "—"
         defensive = False
@@ -673,7 +673,7 @@ class TelegramNotifier:
         )
 
     async def send_worker_error(self, context: str, exc: Exception) -> None:
-        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        now = datetime.now(UTC).strftime("%H:%M UTC")
         error_type = type(exc).__name__
         error_msg = str(exc)[:300]
         await self._send_text(
@@ -726,7 +726,7 @@ class TelegramNotifier:
             )
             period_start_ts = stats.get("period_start")
             if period_start_ts is not None:
-                period_start_dt = datetime.fromtimestamp(period_start_ts, tz=timezone.utc)
+                period_start_dt = datetime.fromtimestamp(period_start_ts, tz=UTC)
                 new_positions = (
                     db.query(func.count(Position.id))
                     .filter(
@@ -784,7 +784,7 @@ class TelegramNotifier:
     ) -> dict[str, Any]:
         if not self.settings.telegram_signal_chat_id:
             return {"status": "skipped", "reason": "telegram_signal_chat_id_not_configured"}
-        end = window_end or datetime.now(timezone.utc)
+        end = window_end or datetime.now(UTC)
         start = window_start or (end - timedelta(hours=24))
         opened_trades = 0
         closed_positions: list[Position] = []
@@ -887,7 +887,7 @@ class TelegramNotifier:
         notional = float(position.size) * float(position.entry_price)
         contract_lev = (position.metadata_json or {}).get("contract_leverage")
         leverage = f"{int(contract_lev)}x" if contract_lev is not None else "—"
-        now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        now_str = datetime.now(UTC).strftime("%H:%M UTC")
         await self._send_text(
             f"{icon} <b>Posizione LIVE aperta</b>\n"
             f"<code>{now_str}</code>\n\n"
@@ -1092,7 +1092,7 @@ class TelegramNotifier:
             logger.warning("telegram_signal_channel_send_failed", error=str(exc))
 
         alert.status = "sent" if success else "failed"
-        alert.sent_at = datetime.now(timezone.utc) if success else None
+        alert.sent_at = datetime.now(UTC) if success else None
         alert.payload = {
             **payload,
             "telegram_status": response_status,

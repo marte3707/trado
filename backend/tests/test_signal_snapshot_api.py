@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import FastAPI
@@ -56,7 +56,7 @@ def test_signal_snapshot_returns_source_context_in_chronological_order() -> None
     db.add(market)
     db.flush()
 
-    base = datetime(2026, 6, 9, 10, 0, tzinfo=timezone.utc)
+    base = datetime(2026, 6, 9, 10, 0, tzinfo=UTC)
     source_time = base + timedelta(minutes=10)
     for index in range(6):
         open_time = base + timedelta(minutes=5 * index)

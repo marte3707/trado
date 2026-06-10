@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.orm import Session
@@ -123,11 +123,11 @@ class DiagnosticReporter:
             "anomalies": anomalies,
             "top_strategies": [{"name": k, **v} for k, v in top],
             "bottom_strategies": [{"name": k, **v} for k, v in bottom],
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(UTC).isoformat(),
         }
 
     def format_telegram(self, report: dict[str, Any]) -> str:
-        now = datetime.now(timezone.utc).strftime("%d/%m/%Y")
+        now = datetime.now(UTC).strftime("%d/%m/%Y")
         trades = report.get("trade_count", 0)
         overall = report.get("overall", {})
         calibration_state = report.get("calibration_state", {})
@@ -215,7 +215,7 @@ class DiagnosticReporter:
     async def send(
         self,
         db: Session,
-        telegram: "TelegramNotifier",
+        telegram: TelegramNotifier,
         lookback: int = 200,
     ) -> dict[str, Any]:
         report = self.build_report(db, lookback)

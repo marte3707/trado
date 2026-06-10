@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from fastapi import FastAPI
@@ -102,7 +102,7 @@ def test_beta_scaling() -> None:
 
 def test_macro_correlation_returns_based() -> None:
     db = _session()
-    start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    start = datetime(2026, 6, 1, tzinfo=UTC)
     xyz = _market(db, "XYZ100", monitoring_only=True)
     btc = _market(db, "BTC")
     # rendimenti XYZ = [0.01, 0.02, 0.03]; BTC = [0.02, 0.04, 0.06] = 2× XYZ
@@ -130,7 +130,7 @@ def test_macro_correlation_missing_market_404() -> None:
 
 def test_macro_correlation_insufficient_overlap_is_null() -> None:
     db = _session()
-    start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    start = datetime(2026, 6, 1, tzinfo=UTC)
     xyz = _market(db, "XYZ100", monitoring_only=True)
     btc = _market(db, "BTC")
     # un solo timestamp in comune (t1) → 0 rendimenti calcolabili

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -81,12 +82,10 @@ def _decimal(value: object) -> Decimal | None:
 
 def _set_order_raw_response(order: Order, raw: dict) -> None:
     order.raw_response = raw
-    try:
+    # Test doubles and detached ORM objects do not always have an instrumented
+    # attribute state. Assignment above is still enough for those cases.
+    with contextlib.suppress(Exception):
         flag_modified(order, "raw_response")
-    except Exception:
-        # Test doubles and detached ORM objects do not always have an instrumented
-        # attribute state. Assignment above is still enough for those cases.
-        pass
 
 
 def _price_match_tolerance(raw_price: object) -> Decimal:
@@ -121,7 +120,7 @@ def _parse_iso(value: object) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 
@@ -622,7 +621,7 @@ def _sync_order_from_frontend_open_order(
         db.add(position)
     raw = dict(order.raw_response or {})
     raw["frontend_open_order_sync"] = {
-        "synced_at": datetime.now(timezone.utc).isoformat(),
+        "synced_at": datetime.now(UTC).isoformat(),
         "old_oid": old_oid,
         "new_oid": order.hyperliquid_order_id,
         "old_price": str(old_price) if old_price is not None else None,
@@ -1071,10 +1070,8 @@ def _resubmit_missing_protection_orders(
 
         oid_int: int | None = None
         if order.hyperliquid_order_id:
-            try:
+            with contextlib.suppress(TypeError, ValueError):
                 oid_int = int(order.hyperliquid_order_id)
-            except (TypeError, ValueError):
-                pass
 
         normalised_cloid = (order.cloid or "").lower().removeprefix("0x")
 
@@ -1095,7 +1092,7 @@ def _resubmit_missing_protection_orders(
         if tpsl is None:
             continue
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
 
         # TP rescue check PRIMA dei cap di retry: se il mark price ha già superato
         # il target del TP (HL rifiuterebbe), proviamo a riposizionare il TP oltre
@@ -1470,7 +1467,7 @@ def _resubmit_missing_protection_orders(
         except Exception as exc:
             resubmits.append(
                 {
-                    "attempted_at": datetime.now(timezone.utc).isoformat(),
+                    "attempted_at": datetime.now(UTC).isoformat(),
                     "old_oid": order.hyperliquid_order_id,
                     "status": "error",
                     "error": str(exc),
@@ -1839,10 +1836,7 @@ def _compute_rescued_tp_price(
         indicators["buffer_floor_applied"] = True
     indicators["buffer"] = str(buffer)
 
-    if side == "long":
-        new_price = mark_price + buffer
-    else:
-        new_price = mark_price - buffer
+    new_price = mark_price + buffer if side == "long" else mark_price - buffer
 
     if new_price <= 0:
         indicators["reject_reason"] = "non_positive_price"
@@ -1894,7 +1888,7 @@ def _apply_tp_rescue(
                     rescue_count = 0
                 entry["rescue_count"] = rescue_count + 1
                 entry["last_rescue_mark_price"] = str(mark_price)
-                entry["last_rescue_at"] = datetime.now(timezone.utc).isoformat()
+                entry["last_rescue_at"] = datetime.now(UTC).isoformat()
                 entry["rescued"] = True
                 break
     position.metadata_json = metadata
@@ -2030,7 +2024,7 @@ def reconcile_live_positions(
     expires_after_seconds = int(live_settings["order_expires_after_seconds"])
 
     updated = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     for position in positions:
         if position.market is None:
             continue

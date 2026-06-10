@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from unittest.mock import patch
@@ -20,7 +20,7 @@ from app.engine.position_management import StopCandidate
 class _Query:
     rows: list[Any]
 
-    def filter(self, *args: Any, **_kwargs: Any) -> "_Query":
+    def filter(self, *args: Any, **_kwargs: Any) -> _Query:
         # Riconosce filtri "Candle.market_id == X" e applica il filtraggio sui rows.
         # Necessario perché `_is_position_in_profit` interroga le candele del
         # market specifico della posizione, non un dataset globale.
@@ -35,10 +35,10 @@ class _Query:
                     return _Query(filtered)
         return self
 
-    def order_by(self, *_args: Any, **_kwargs: Any) -> "_Query":
+    def order_by(self, *_args: Any, **_kwargs: Any) -> _Query:
         return self
 
-    def limit(self, n: int) -> "_Query":
+    def limit(self, n: int) -> _Query:
         return _Query(self.rows[:n])
 
     def all(self) -> list[Any]:
@@ -231,7 +231,7 @@ def _candles(
                 id=i + 1,
                 market_id=1,
                 timeframe="5m",
-                open_time=datetime(2026, 1, 1, 0, i * 5, tzinfo=timezone.utc),
+                open_time=datetime(2026, 1, 1, 0, i * 5, tzinfo=UTC),
                 open=Decimal(str(close)),
                 high=Decimal(str(close * 1.001)),
                 low=Decimal(str(close * 0.999)),
@@ -262,7 +262,7 @@ def _position(
         stop_loss=Decimal(stop) if stop else None,
         status="open",
         unrealized_pnl=Decimal(str(unrealized_pnl)),
-        opened_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        opened_at=datetime(2026, 1, 1, tzinfo=UTC),
         metadata_json={},
     )
 
@@ -717,7 +717,7 @@ def _signal(
         reason="test",
         strategy_breakdown={},
         status=status,
-        created_at=created_at or datetime.now(timezone.utc),
+        created_at=created_at or datetime.now(UTC),
     )
 
 
@@ -819,7 +819,7 @@ def test_reverse_respects_cooldown() -> None:
     market = _btc_market()
     flip = _signal(direction="LONG", market_id=pos.market_id, signal_id=510)
     # Reverse fatto 10 minuti fa, cooldown 240 minuti → bloccato
-    recent = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    recent = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     history = {str(pos.market_id): [{"reversed_at": recent, "from_side": "long", "to_side": "short"}]}
 
     db = FakeDb(
@@ -854,7 +854,7 @@ def test_reverse_respects_max_per_day() -> None:
     pos = _position(side="short", entry="200", mode="paper")
     market = _btc_market()
     flip = _signal(direction="LONG", market_id=pos.market_id, signal_id=520)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     # 3 reverse nelle ultime 24h, ma il più recente è oltre il cooldown (>4h fa)
     # così il blocco scatta solo per max_per_day, non per cooldown.
     history = {

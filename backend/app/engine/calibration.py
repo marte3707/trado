@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -656,7 +656,7 @@ class AutoCalibrationEngine:
             cooldown_trade_count = overall.trades
             cooldown_started = True
             state_value["deep_defensive_cooldown_started_at"] = datetime.now(
-                timezone.utc
+                UTC
             ).isoformat()
             state_value["deep_defensive_cooldown_trade_count"] = cooldown_trade_count
 
@@ -1144,7 +1144,7 @@ class AutoCalibrationEngine:
         reason: str,
         status: str,
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         serialized_changes = [change.__dict__ for change in changes]
         state = db.get(AppSetting, "auto_calibration_state") or AppSetting(
             key="auto_calibration_state",

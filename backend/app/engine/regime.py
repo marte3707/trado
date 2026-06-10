@@ -112,25 +112,24 @@ def detect_regime(
     metrics: dict[str, Any] = {"method": method}
     candidates: list[RegimeLabel] = []
 
-    if method in ("adx", "hybrid"):
-        if len(candles) >= adx_period * 2 + 1:
-            adx_series = adx_indicator(
-                [c.high for c in candles],
-                [c.low for c in candles],
-                closes,
-                adx_period,
+    if method in ("adx", "hybrid") and len(candles) >= adx_period * 2 + 1:
+        adx_series = adx_indicator(
+            [c.high for c in candles],
+            [c.low for c in candles],
+            closes,
+            adx_period,
+        )
+        latest_adx = adx_series[-1] if adx_series else None
+        if latest_adx is not None:
+            adx_label = _classify_regime_with_hysteresis(
+                adx_series,
+                trending=adx_trending,
+                ranging=adx_ranging,
+                confirm_candles=max(1, int(adx_confirm_candles)),
             )
-            latest_adx = adx_series[-1] if adx_series else None
-            if latest_adx is not None:
-                adx_label = _classify_regime_with_hysteresis(
-                    adx_series,
-                    trending=adx_trending,
-                    ranging=adx_ranging,
-                    confirm_candles=max(1, int(adx_confirm_candles)),
-                )
-                metrics["adx"] = latest_adx
-                metrics["adx_regime"] = adx_label
-                candidates.append(adx_label)
+            metrics["adx"] = latest_adx
+            metrics["adx_regime"] = adx_label
+            candidates.append(adx_label)
 
     if method in ("hurst", "hybrid"):
         h_value = hurst_exponent(
@@ -208,12 +207,7 @@ def apply_regime_filter(
     neutralized: list[str] = []
     for name in list(filtered.keys()):
         original = filtered[name]
-        if regime == "ranging" and name in TREND_FOLLOWING_STRATEGIES:
-            scaled = int(round(original * multiplier))
-            filtered[name] = scaled
-            if scaled < original:
-                neutralized.append(name)
-        elif regime == "trending" and name in MEAN_REVERTING_STRATEGIES:
+        if regime == "ranging" and name in TREND_FOLLOWING_STRATEGIES or regime == "trending" and name in MEAN_REVERTING_STRATEGIES:
             scaled = int(round(original * multiplier))
             filtered[name] = scaled
             if scaled < original:

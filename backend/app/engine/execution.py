@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
@@ -1154,7 +1154,7 @@ class OrderExecutionEngine:
             )
             .all()
         )
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         alerted = 0
         for position in positions:
             timeframe = self._source_timeframe(db, position)
@@ -1344,7 +1344,7 @@ class OrderExecutionEngine:
         remaining_size = position.size - exit_size
         if close_position or remaining_size <= POSITION_DUST_THRESHOLD:
             position.status = "closed"
-            position.closed_at = datetime.now(timezone.utc)
+            position.closed_at = datetime.now(UTC)
             position.size = Decimal("0")
             position.unrealized_pnl = Decimal("0")
             close_position = True
@@ -1844,8 +1844,8 @@ def _position_age_exceeded(position: Position, max_age_hours: float) -> bool:
     if opened_at is None:
         return False
     if opened_at.tzinfo is None:
-        opened_at = opened_at.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) - opened_at >= timedelta(hours=max_age_hours)
+        opened_at = opened_at.replace(tzinfo=UTC)
+    return datetime.now(UTC) - opened_at >= timedelta(hours=max_age_hours)
 
 
 def _parse_dt(value: object | None) -> datetime | None:
@@ -1856,7 +1856,7 @@ def _parse_dt(value: object | None) -> datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 

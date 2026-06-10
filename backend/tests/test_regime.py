@@ -1,6 +1,6 @@
 import math
 import random
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.engine.regime import apply_regime_filter, classify_regime, detect_regime
 from app.strategies.base import CandleInput
@@ -12,7 +12,7 @@ def _trending_candles(count: int = 60) -> list[CandleInput]:
         close = 100.0 + i * 0.5
         candles.append(
             CandleInput(
-                datetime.now(timezone.utc),
+                datetime.now(UTC),
                 close - 0.1,
                 close + 0.3,
                 close - 0.3,
@@ -36,7 +36,7 @@ def _persistent_returns_candles(count: int = 250, seed: int = 42) -> list[Candle
     for c in closes:
         candles.append(
             CandleInput(
-                datetime.now(timezone.utc),
+                datetime.now(UTC),
                 c - 0.1,
                 c + 0.3,
                 c - 0.3,
@@ -53,7 +53,7 @@ def _choppy_candles(count: int = 60) -> list[CandleInput]:
         close = 100.0 + ((-1) ** i) * 0.2
         candles.append(
             CandleInput(
-                datetime.now(timezone.utc),
+                datetime.now(UTC),
                 close - 0.1,
                 close + 0.4,
                 close - 0.4,

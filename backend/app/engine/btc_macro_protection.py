@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any
@@ -224,7 +224,7 @@ class BtcMacroProtectionEngine:
         updated["_last_directional_trend"] = directional.value
         updated["_last_delta_pct"] = round(delta_pct, 4)
         updated["_last_vol_ratio"] = round(vol_ratio, 4)
-        updated["_last_checked_at"] = datetime.now(timezone.utc).isoformat()
+        updated["_last_checked_at"] = datetime.now(UTC).isoformat()
         setting.value = updated
         db.add(setting)
 
@@ -288,9 +288,7 @@ class BtcMacroProtectionEngine:
         last_close = closes[-1]
         if candidate == BtcTrendState.BULLISH and last_close > ema_value:
             return True
-        if candidate == BtcTrendState.BEARISH and last_close < ema_value:
-            return True
-        return False
+        return bool(candidate == BtcTrendState.BEARISH and last_close < ema_value)
 
     def _check_flow_confluence(
         self,
@@ -521,7 +519,7 @@ class BtcMacroProtectionEngine:
 
         # 2. Cooldown e max/day per market.
         history = self._reverse_history_for_market(config, position.market_id)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         cooldown_minutes = int(config.get("reverse_cooldown_minutes", 240))
         max_per_day = int(config.get("reverse_max_per_day", 3))
         if history:
@@ -740,7 +738,7 @@ class BtcMacroProtectionEngine:
         except ValueError:
             return None
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
         return parsed
 
 

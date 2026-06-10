@@ -150,7 +150,7 @@ async def run() -> None:
                 try:
                     await asyncio.wait_for(stop_event.wait(), timeout=backoff)
                     break
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 backoff = min(backoff * 2, 60.0)
                 continue

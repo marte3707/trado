@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from app.core.enums import OperationMode, SignalStatus
@@ -114,20 +114,20 @@ def test_active_timeframes_do_not_run_unknown_timeframes() -> None:
 
 
 def test_next_daily_recap_timestamp_targets_10am_rome() -> None:
-    before = datetime(2026, 6, 5, 7, 30, tzinfo=timezone.utc)  # 09:30 Rome
-    after = datetime(2026, 6, 5, 8, 30, tzinfo=timezone.utc)   # 10:30 Rome
+    before = datetime(2026, 6, 5, 7, 30, tzinfo=UTC)  # 09:30 Rome
+    after = datetime(2026, 6, 5, 8, 30, tzinfo=UTC)   # 10:30 Rome
 
     next_before = datetime.fromtimestamp(
         worker.next_daily_recap_timestamp(before),
-        tz=timezone.utc,
+        tz=UTC,
     )
     next_after = datetime.fromtimestamp(
         worker.next_daily_recap_timestamp(after),
-        tz=timezone.utc,
+        tz=UTC,
     )
 
-    assert next_before == datetime(2026, 6, 5, 8, 0, tzinfo=timezone.utc)
-    assert next_after == datetime(2026, 6, 6, 8, 0, tzinfo=timezone.utc)
+    assert next_before == datetime(2026, 6, 5, 8, 0, tzinfo=UTC)
+    assert next_after == datetime(2026, 6, 6, 8, 0, tzinfo=UTC)
 
 
 def test_paper_management_timeframes_include_open_position_timeframes() -> None:

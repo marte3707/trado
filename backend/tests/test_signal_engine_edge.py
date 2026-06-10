@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.core.enums import Direction
 from app.db.models import StrategyConfig
@@ -9,7 +9,7 @@ from app.strategies.base import CandleInput
 def _candles(closes: list[float]) -> list[CandleInput]:
     return [
         CandleInput(
-            open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            open_time=datetime(2026, 1, 1, tzinfo=UTC),
             open=close,
             high=close + 1,
             low=close - 1,
@@ -24,7 +24,7 @@ def _candles(closes: list[float]) -> list[CandleInput]:
 def test_entry_quality_long_accepts_close_in_upper_half() -> None:
     candles = _candles([100.0] * 25)
     candles[-1] = CandleInput(
-        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, tzinfo=UTC),
         open=100,
         high=106,
         low=98,
@@ -42,7 +42,7 @@ def test_entry_quality_long_accepts_close_in_upper_half() -> None:
 def test_entry_quality_long_rejects_low_close_below_ema_without_orderbook() -> None:
     candles = _candles([100.0] * 25)
     candles[-1] = CandleInput(
-        open_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        open_time=datetime(2026, 1, 1, tzinfo=UTC),
         open=100,
         high=102,
         low=90,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Protocol
 
 from app.core.enums import Direction
@@ -41,7 +41,7 @@ class StrategyResult:
     suggested_stop_loss: float | None = None
     suggested_take_profit: float | None = None
     invalidation_level: float | None = None
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    timestamp: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class Strategy(Protocol):

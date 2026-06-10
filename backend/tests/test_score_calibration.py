@@ -224,7 +224,7 @@ def test_pool_adjacent_violators_enforces_monotonic() -> None:
 def test_pool_adjacent_violators_preserves_already_monotonic() -> None:
     values = [0.1, 0.3, 0.5, 0.7]
     smoothed = _pool_adjacent_violators(values, [1.0] * 4)
-    for v_in, v_out in zip(values, smoothed):
+    for v_in, v_out in zip(values, smoothed, strict=False):
         assert v_out == pytest.approx(v_in)
 
 

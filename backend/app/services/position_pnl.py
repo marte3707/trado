@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from typing import Mapping
 
 from sqlalchemy.orm import Session, joinedload
 
@@ -67,7 +67,7 @@ async def refresh_open_position_pnls(
 
     mids = await (client or HyperliquidClient(get_settings())).mids()
     updated = 0
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     updated_at = now.isoformat()
     for position in positions:
         if position.market is None:

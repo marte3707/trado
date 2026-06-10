@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -238,7 +238,7 @@ def compute_calibration_table(
 
     return CalibrationTable(
         buckets=buckets,
-        computed_at=datetime.now(timezone.utc),
+        computed_at=datetime.now(UTC),
         lookback_positions=lookback_positions,
         excluded_count=excluded,
         prior_strength=prior_strength,
@@ -261,7 +261,7 @@ def _enforce_monotonic(buckets: dict[str, CalibratedMetrics]) -> dict[str, Calib
         by_dir_tf.setdefault((metrics.direction, metrics.timeframe), []).append(metrics)
 
     adjusted: dict[str, CalibratedMetrics] = {}
-    for (direction, timeframe), entries in by_dir_tf.items():
+    for (_direction, _timeframe), entries in by_dir_tf.items():
         ordered = sorted(
             entries,
             key=lambda m: _BUCKET_ORDER.index(m.score_bucket) if m.score_bucket in _BUCKET_ORDER else -1,
@@ -269,7 +269,7 @@ def _enforce_monotonic(buckets: dict[str, CalibratedMetrics]) -> dict[str, Calib
         values = [m.expected_r for m in ordered]
         weights = [float(m.n_samples) for m in ordered]
         smoothed = _pool_adjacent_violators(values, weights)
-        for original, new_er in zip(ordered, smoothed):
+        for original, new_er in zip(ordered, smoothed, strict=False):
             adjusted[original.key] = CalibratedMetrics(
                 key=original.key,
                 direction=original.direction,
@@ -296,7 +296,7 @@ def _pool_adjacent_violators(values: list[float], weights: list[float]) -> list[
     if not values:
         return []
     blocks: list[tuple[float, float, int]] = [
-        (v, max(w, 1e-9), 1) for v, w in zip(values, weights)
+        (v, max(w, 1e-9), 1) for v, w in zip(values, weights, strict=False)
     ]
     i = 0
     while i < len(blocks) - 1:
@@ -395,7 +395,7 @@ def cached_calibration_table(
     prior_strength: float = DEFAULT_PRIOR_STRENGTH,
     min_samples_for_use: int = DEFAULT_MIN_SAMPLES_FOR_USE,
 ) -> CalibrationTable:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     table: CalibrationTable | None = _CACHE.get("table")
     computed_at: datetime | None = _CACHE.get("computed_at")
     is_stale = (

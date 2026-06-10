@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import func
@@ -179,7 +179,7 @@ def live_open_risk(db: Session) -> Decimal:
 
 
 def live_daily_realized_loss(db: Session) -> Decimal:
-    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     total = (
         db.query(func.coalesce(func.sum(Position.realized_pnl), 0))
         .filter(

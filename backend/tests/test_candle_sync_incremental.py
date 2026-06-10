@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -81,7 +81,7 @@ async def test_sync_uses_full_lookback_when_table_is_empty() -> None:
 
 @pytest.mark.asyncio
 async def test_sync_uses_incremental_window_when_db_has_data() -> None:
-    last = datetime.now(timezone.utc) - timedelta(minutes=10)
+    last = datetime.now(UTC) - timedelta(minutes=10)
     db = FakeDb(latest_open=last)
     service = CandleSyncService()
     spy = _SpyClient()

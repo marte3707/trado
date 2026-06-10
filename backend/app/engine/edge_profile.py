@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from sqlalchemy.orm import Session, joinedload
 
@@ -68,15 +69,13 @@ def edge_adjustment_for_stats(
     if stats.trades >= severe_trades and (
         (stats.profit_factor is not None and stats.profit_factor < severe_pf)
         or (severe_wr is not None and stats.win_rate < severe_wr)
-    ):
-        if not require_negative_pnl or stats.realized_pnl < 0:
-            return severe_adjustment
+    ) and (not require_negative_pnl or stats.realized_pnl < 0):
+        return severe_adjustment
     if stats.trades >= weak_trades and (
         (stats.profit_factor is not None and stats.profit_factor < weak_pf)
         or (weak_wr is not None and stats.win_rate < weak_wr)
-    ):
-        if not require_negative_pnl or stats.realized_pnl < 0:
-            return weak_adjustment
+    ) and (not require_negative_pnl or stats.realized_pnl < 0):
+        return weak_adjustment
     return 0
 
 

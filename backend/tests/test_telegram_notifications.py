@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -196,7 +196,7 @@ def _closed_position(
         entry_price=Decimal(entry_price),
         size=Decimal(size),
         realized_pnl=Decimal(realized_pnl),
-        closed_at=datetime(2026, 6, 5, 8, 0, tzinfo=timezone.utc),
+        closed_at=datetime(2026, 6, 5, 8, 0, tzinfo=UTC),
         metadata_json={
             "initial_size": size,
             "initial_stop_loss": initial_stop,
@@ -324,8 +324,8 @@ def test_daily_recap_summary_and_message() -> None:
         total_return_pct=summary["total_return_pct"],
         win_rate=summary["win_rate"],
         avg_r_multiple=summary["avg_r_multiple"],
-        window_start=datetime(2026, 6, 4, 8, 0, tzinfo=timezone.utc),
-        window_end=datetime(2026, 6, 5, 8, 0, tzinfo=timezone.utc),
+        window_start=datetime(2026, 6, 4, 8, 0, tzinfo=UTC),
+        window_end=datetime(2026, 6, 5, 8, 0, tzinfo=UTC),
     )
     assert "Opened trades: <b>3</b>" in message
     assert "Total P&amp;L 24h: <code>-3.33%</code>" in message
@@ -444,8 +444,8 @@ async def test_send_daily_recap_posts_to_public_channel_and_replaces_pin() -> No
 
     result = await notifier.send_daily_recap(
         db,
-        window_start=datetime(2026, 6, 4, 8, 0, tzinfo=timezone.utc),
-        window_end=datetime(2026, 6, 5, 8, 0, tzinfo=timezone.utc),
+        window_start=datetime(2026, 6, 4, 8, 0, tzinfo=UTC),
+        window_end=datetime(2026, 6, 5, 8, 0, tzinfo=UTC),
     )
 
     assert result == {
