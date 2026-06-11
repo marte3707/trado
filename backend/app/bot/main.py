@@ -26,7 +26,7 @@ logger = structlog.get_logger()
 
 # Periodic heartbeat to the admin chat. 1 hour keeps the signal tight enough
 # to notice silent crashes early without spamming.
-_HEARTBEAT_INTERVAL_SECONDS = 3600
+_HEARTBEAT_INTERVAL_SECONDS = 43200
 
 
 _BOT_COMMANDS = [

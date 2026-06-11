@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
 import { useUpdateSettings } from "@/lib/hooks/mutations";
 import type { AppSettings } from "@/lib/api";
 
@@ -20,8 +21,33 @@ function toNum(v: unknown, fallback: number) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function toBool(v: unknown, fallback: boolean) {
+  return typeof v === "boolean" ? v : fallback;
+}
+
+function toRecord(v: unknown): Record<string, unknown> {
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+}
+
+function toCsv(v: unknown, fallback: string[]) {
+  return Array.isArray(v) ? v.map(String).join(", ") : fallback.join(", ");
+}
+
+function fromCsv(v: string) {
+  return v
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 export function RiskTab({ settings }: Props) {
   const risk = (settings.risk ?? {}) as Record<string, unknown>;
+  const portfolioGuard = toRecord(risk.portfolio_guard);
+  const maxDirectionalOpen = toRecord(portfolioGuard.max_directional_open_positions);
+  const maxDirectionalRisk = toRecord(portfolioGuard.max_directional_risk_r);
+  const lowTfDirectional = toRecord(portfolioGuard.max_low_tf_directional_positions);
+  const circuitBreaker = toRecord(risk.circuit_breaker);
+  const macroRiskMode = toRecord(risk.macro_risk_mode);
 
   const persisted = {
     minScore: toNum(risk.min_signal_score, 60),
@@ -32,6 +58,30 @@ export function RiskTab({ settings }: Props) {
     maxPositions: toNum(risk.max_open_positions, 5),
     maxExposurePct: toNum(risk.max_total_exposure_pct, 25),
     maxLeverage: toNum(risk.max_leverage, 3),
+    portfolioGuard: {
+      enabled: toBool(portfolioGuard.enabled, true),
+      maxDirectionalOpenPaper: toNum(maxDirectionalOpen.paper, 20),
+      maxDirectionalOpenLive: toNum(maxDirectionalOpen.live, 12),
+      maxDirectionalRiskPaper: toNum(maxDirectionalRisk.paper, 12),
+      maxDirectionalRiskLive: toNum(maxDirectionalRisk.live, 6),
+      lowTfTimeframes: toCsv(lowTfDirectional.timeframes, ["5m", "15m"]),
+      lowTfMaxPaper: toNum(lowTfDirectional.paper, 12),
+      lowTfMaxLive: toNum(lowTfDirectional.live, 6),
+    },
+    circuitBreaker: {
+      enabled: toBool(circuitBreaker.enabled, true),
+      windowMinutes: toNum(circuitBreaker.window_minutes, 90),
+      maxLossR: toNum(circuitBreaker.max_loss_r, 5),
+      maxStopLosses: toNum(circuitBreaker.max_stop_losses, 8),
+      pauseMinutes: toNum(circuitBreaker.pause_minutes, 180),
+    },
+    macroRiskMode: {
+      enabled: toBool(macroRiskMode.enabled, false),
+      sizeMultiplier: toNum(macroRiskMode.size_multiplier, 0.5),
+      minScoreAdd: toNum(macroRiskMode.min_score_add, 8),
+      disabledTimeframes: toCsv(macroRiskMode.disable_timeframes, ["5m"]),
+      requireMtfConfluence: toBool(macroRiskMode.require_mtf_confluence, true),
+    },
   };
 
   const [local, setLocal] = useState(persisted);
@@ -49,11 +99,27 @@ export function RiskTab({ settings }: Props) {
     persisted.maxPositions,
     persisted.maxExposurePct,
     persisted.maxLeverage,
+    persisted.portfolioGuard.enabled,
+    persisted.portfolioGuard.maxDirectionalOpenPaper,
+    persisted.portfolioGuard.maxDirectionalOpenLive,
+    persisted.portfolioGuard.maxDirectionalRiskPaper,
+    persisted.portfolioGuard.maxDirectionalRiskLive,
+    persisted.portfolioGuard.lowTfTimeframes,
+    persisted.portfolioGuard.lowTfMaxPaper,
+    persisted.portfolioGuard.lowTfMaxLive,
+    persisted.circuitBreaker.enabled,
+    persisted.circuitBreaker.windowMinutes,
+    persisted.circuitBreaker.maxLossR,
+    persisted.circuitBreaker.maxStopLosses,
+    persisted.circuitBreaker.pauseMinutes,
+    persisted.macroRiskMode.enabled,
+    persisted.macroRiskMode.sizeMultiplier,
+    persisted.macroRiskMode.minScoreAdd,
+    persisted.macroRiskMode.disabledTimeframes,
+    persisted.macroRiskMode.requireMtfConfluence,
   ]);
 
-  const dirty = Object.keys(persisted).some(
-    (k) => local[k as keyof typeof local] !== persisted[k as keyof typeof persisted],
-  );
+  const dirty = JSON.stringify(local) !== JSON.stringify(persisted);
 
   function handleSave() {
     const nextRisk = {
@@ -66,8 +132,51 @@ export function RiskTab({ settings }: Props) {
       max_open_positions: local.maxPositions,
       max_total_exposure_pct: local.maxExposurePct,
       max_leverage: local.maxLeverage,
+      portfolio_guard: {
+        enabled: local.portfolioGuard.enabled,
+        max_directional_open_positions: {
+          paper: local.portfolioGuard.maxDirectionalOpenPaper,
+          live: local.portfolioGuard.maxDirectionalOpenLive,
+        },
+        max_directional_risk_r: {
+          paper: local.portfolioGuard.maxDirectionalRiskPaper,
+          live: local.portfolioGuard.maxDirectionalRiskLive,
+        },
+        max_low_tf_directional_positions: {
+          timeframes: fromCsv(local.portfolioGuard.lowTfTimeframes),
+          paper: local.portfolioGuard.lowTfMaxPaper,
+          live: local.portfolioGuard.lowTfMaxLive,
+        },
+      },
+      circuit_breaker: {
+        enabled: local.circuitBreaker.enabled,
+        window_minutes: local.circuitBreaker.windowMinutes,
+        max_loss_r: local.circuitBreaker.maxLossR,
+        max_stop_losses: local.circuitBreaker.maxStopLosses,
+        pause_minutes: local.circuitBreaker.pauseMinutes,
+        scope: "new_entries_only",
+      },
+      macro_risk_mode: {
+        enabled: local.macroRiskMode.enabled,
+        size_multiplier: local.macroRiskMode.sizeMultiplier,
+        min_score_add: local.macroRiskMode.minScoreAdd,
+        disable_timeframes: fromCsv(local.macroRiskMode.disabledTimeframes),
+        require_mtf_confluence: local.macroRiskMode.requireMtfConfluence,
+      },
     };
     updateSettings({ risk: { value: nextRisk } } as Partial<AppSettings>);
+  }
+
+  function setPortfolioGuard(patch: Partial<typeof persisted.portfolioGuard>) {
+    setLocal((s) => ({ ...s, portfolioGuard: { ...s.portfolioGuard, ...patch } }));
+  }
+
+  function setCircuitBreaker(patch: Partial<typeof persisted.circuitBreaker>) {
+    setLocal((s) => ({ ...s, circuitBreaker: { ...s.circuitBreaker, ...patch } }));
+  }
+
+  function setMacroRiskMode(patch: Partial<typeof persisted.macroRiskMode>) {
+    setLocal((s) => ({ ...s, macroRiskMode: { ...s.macroRiskMode, ...patch } }));
   }
 
   return (
@@ -171,6 +280,164 @@ export function RiskTab({ settings }: Props) {
         </div>
       </Card>
 
+      <Card className="p-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <SectionTitle
+            title="Portfolio guard"
+            hint="Cap direzionali separati per paper e live prima di nuove aperture"
+          />
+          <ToggleInline
+            label={local.portfolioGuard.enabled ? "Enabled" : "Disabled"}
+            checked={local.portfolioGuard.enabled}
+            onChange={(enabled) => setPortfolioGuard({ enabled })}
+          />
+        </div>
+        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+          <Field
+            label="Directional open paper"
+            hint="Max posizioni paper nella stessa direzione"
+            value={local.portfolioGuard.maxDirectionalOpenPaper}
+            step={1}
+            onChange={(v) => setPortfolioGuard({ maxDirectionalOpenPaper: v })}
+          />
+          <Field
+            label="Directional open live"
+            hint="Max posizioni live nella stessa direzione"
+            value={local.portfolioGuard.maxDirectionalOpenLive}
+            step={1}
+            onChange={(v) => setPortfolioGuard({ maxDirectionalOpenLive: v })}
+          />
+          <Field
+            label="Directional risk paper"
+            hint="Cap R paper nella stessa direzione"
+            value={local.portfolioGuard.maxDirectionalRiskPaper}
+            step={0.5}
+            suffix="R"
+            onChange={(v) => setPortfolioGuard({ maxDirectionalRiskPaper: v })}
+          />
+          <Field
+            label="Directional risk live"
+            hint="Cap R live nella stessa direzione"
+            value={local.portfolioGuard.maxDirectionalRiskLive}
+            step={0.5}
+            suffix="R"
+            onChange={(v) => setPortfolioGuard({ maxDirectionalRiskLive: v })}
+          />
+        </div>
+        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-[minmax(0,1fr)_160px_160px]">
+          <TextField
+            label="Low TF list"
+            hint="Timeframe separati da virgola"
+            value={local.portfolioGuard.lowTfTimeframes}
+            onChange={(v) => setPortfolioGuard({ lowTfTimeframes: v })}
+          />
+          <Field
+            label="Low TF paper"
+            hint="Max cluster paper"
+            value={local.portfolioGuard.lowTfMaxPaper}
+            step={1}
+            onChange={(v) => setPortfolioGuard({ lowTfMaxPaper: v })}
+          />
+          <Field
+            label="Low TF live"
+            hint="Max cluster live"
+            value={local.portfolioGuard.lowTfMaxLive}
+            step={1}
+            onChange={(v) => setPortfolioGuard({ lowTfMaxLive: v })}
+          />
+        </div>
+      </Card>
+
+      <Card className="p-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <SectionTitle
+            title="Circuit breaker"
+            hint="Pausa nuove aperture dopo sequenze recenti di stop/loss"
+          />
+          <ToggleInline
+            label={local.circuitBreaker.enabled ? "Enabled" : "Disabled"}
+            checked={local.circuitBreaker.enabled}
+            onChange={(enabled) => setCircuitBreaker({ enabled })}
+          />
+        </div>
+        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+          <Field
+            label="Window"
+            hint="Finestra di osservazione"
+            value={local.circuitBreaker.windowMinutes}
+            step={5}
+            suffix="min"
+            onChange={(v) => setCircuitBreaker({ windowMinutes: v })}
+          />
+          <Field
+            label="Max loss"
+            hint="Perdita R che attiva la pausa"
+            value={local.circuitBreaker.maxLossR}
+            step={0.5}
+            suffix="R"
+            onChange={(v) => setCircuitBreaker({ maxLossR: v })}
+          />
+          <Field
+            label="Max stop losses"
+            hint="Numero stop recenti consentiti"
+            value={local.circuitBreaker.maxStopLosses}
+            step={1}
+            onChange={(v) => setCircuitBreaker({ maxStopLosses: v })}
+          />
+          <Field
+            label="Pause"
+            hint="Durata blocco nuove entrate"
+            value={local.circuitBreaker.pauseMinutes}
+            step={15}
+            suffix="min"
+            onChange={(v) => setCircuitBreaker({ pauseMinutes: v })}
+          />
+        </div>
+      </Card>
+
+      <Card className="p-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <SectionTitle
+            title="Macro risk mode"
+            hint="Modalita' difensiva manuale per shock news-driven"
+          />
+          <ToggleInline
+            label={local.macroRiskMode.enabled ? "Enabled" : "Disabled"}
+            checked={local.macroRiskMode.enabled}
+            onChange={(enabled) => setMacroRiskMode({ enabled })}
+          />
+        </div>
+        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
+          <Field
+            label="Size multiplier"
+            hint="Moltiplicatore rischio per trade"
+            value={local.macroRiskMode.sizeMultiplier}
+            step={0.05}
+            suffix="x"
+            onChange={(v) => setMacroRiskMode({ sizeMultiplier: v })}
+          />
+          <Field
+            label="Score add"
+            hint="Extra score minimo richiesto"
+            value={local.macroRiskMode.minScoreAdd}
+            step={1}
+            onChange={(v) => setMacroRiskMode({ minScoreAdd: v })}
+          />
+          <TextField
+            label="Disabled TF"
+            hint="Timeframe separati da virgola"
+            value={local.macroRiskMode.disabledTimeframes}
+            onChange={(v) => setMacroRiskMode({ disabledTimeframes: v })}
+          />
+          <ToggleBlock
+            label="Require MTF"
+            hint="Richiede conferma multi-timeframe"
+            checked={local.macroRiskMode.requireMtfConfluence}
+            onChange={(requireMtfConfluence) => setMacroRiskMode({ requireMtfConfluence })}
+          />
+        </div>
+      </Card>
+
       {dirty && (
         <Card className="sticky bottom-4 z-10 flex items-center gap-3 border-warn/40 bg-warn/10 px-5 py-3">
           <span className="text-sm text-warn">Modifiche non salvate</span>
@@ -181,6 +448,45 @@ export function RiskTab({ settings }: Props) {
           </Button>
         </Card>
       )}
+    </div>
+  );
+}
+
+function ToggleInline({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <label className="flex items-center gap-2 text-xs font-medium text-fg-2">
+      <span>{label}</span>
+      <Switch checked={checked} onCheckedChange={onChange} />
+    </label>
+  );
+}
+
+function ToggleBlock({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-bg-2 px-3 py-2.5">
+      <div className="flex items-center justify-between gap-3">
+        <Label className="text-[10px] font-medium uppercase tracking-wider text-fg-3">{label}</Label>
+        <Switch checked={checked} onCheckedChange={onChange} />
+      </div>
+      <div className="mt-1.5 text-[11px] text-fg-3">{hint}</div>
     </div>
   );
 }
@@ -212,6 +518,33 @@ function Field({
           className="font-mono"
         />
         {suffix && <span className="font-mono text-sm text-fg-3">{suffix}</span>}
+      </div>
+      <div className="mt-1.5 text-[11px] text-fg-3">{hint}</div>
+    </div>
+  );
+}
+
+function TextField({
+  label,
+  hint,
+  value,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div>
+      <Label className="text-[10px] font-medium uppercase tracking-wider text-fg-3">{label}</Label>
+      <div className="mt-2">
+        <Input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="font-mono"
+        />
       </div>
       <div className="mt-1.5 text-[11px] text-fg-3">{hint}</div>
     </div>

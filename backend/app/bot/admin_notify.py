@@ -91,7 +91,7 @@ async def send_bot_heartbeat(
     err_line = f"\n⚠️ Errori nel periodo: <b>{errors}</b>" if errors > 0 else ""
     await _send_admin(
         settings,
-        f"💓 <b>Trado Bot — heartbeat</b>\n"
+        f"💙 <b>Trado Bot — heartbeat</b>\n"
         f"Uptime: <code>{uptime_str}</code>\n\n"
         f"Update gestiti nel periodo: <b>{updates_handled}</b>\n"
         f"Utenti: <b>{total_users}</b> totali · "

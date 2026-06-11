@@ -17,6 +17,7 @@ from app.core.runtime_settings import (
 )
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, Signal
 from app.engine.order_validation import LiveOrderPlan, OrderValidator
+from app.engine.portfolio_guard import PortfolioGuard, PortfolioGuardDecision
 from app.engine.position_management import LiquidationGuardResult, PositionManagementEngine
 from app.engine.risk import calculate_position_size
 from app.services.hyperliquid import HyperliquidError, HyperliquidTradingClient
@@ -91,6 +92,7 @@ class OrderExecutionEngine:
         self.settings = settings
         self.validator = OrderValidator()
         self.position_manager = PositionManagementEngine(settings)
+        self.portfolio_guard = PortfolioGuard(settings)
 
     def execute_paper(self, db: Session, signal: Signal) -> Position | None:
         existing_order = (
@@ -162,6 +164,7 @@ class OrderExecutionEngine:
                 risk_settings.value.get("max_risk_per_trade_pct", max_risk_per_trade_pct)
             )
             max_leverage = float(risk_settings.value.get("max_leverage", max_leverage))
+        max_risk_per_trade_pct *= self.portfolio_guard.position_size_multiplier(db, signal)
         equity = effective_paper_equity(db, self.settings)
         size = calculate_position_size(
             equity=equity,
@@ -189,6 +192,21 @@ class OrderExecutionEngine:
                     message=f"Paper position skipped: notional ${float(notional):.2f} below minimum ${float(min_notional):.2f}",
                     data={"notional": str(notional), "min_notional": str(min_notional)},
                 )
+            )
+            db.commit()
+            return None
+        decision = self.portfolio_guard.evaluate_entry(
+            db,
+            signal,
+            mode=OrderMode.PAPER.value,
+            side=side,
+        )
+        if not decision.allowed:
+            self._record_portfolio_guard_rejection(
+                db,
+                signal,
+                decision,
+                mode=OrderMode.PAPER.value,
             )
             db.commit()
             return None
@@ -292,6 +310,21 @@ class OrderExecutionEngine:
         existing_position = self._find_idempotent_position(db, signal, market_cloid)
         if existing_position is not None:
             return existing_position
+        decision = self.portfolio_guard.evaluate_entry(
+            db,
+            signal,
+            mode=OrderMode.LIVE.value,
+            side=plan.side,
+        )
+        if not decision.allowed:
+            self._record_portfolio_guard_rejection(
+                db,
+                signal,
+                decision,
+                mode=OrderMode.LIVE.value,
+            )
+            db.commit()
+            raise PermissionError(decision.reason or "portfolio guard rejected live entry")
         # Pre-flight: se esiste già una posizione HL su questo coin, set_leverage
         # non cambierà il leverage effettivo (HL lo mantiene per posizioni aperte).
         # Meglio saltare il trade ora piuttosto che aprire al leverage sbagliato e
@@ -339,34 +372,61 @@ class OrderExecutionEngine:
                 slippage_pct=float(live_settings["max_slippage_pct"]),
                 mid_price=float(signal.entry_price),
             )
-            if fillable < depth_threshold:
-                db.add(
-                    DecisionLog(
-                        event_type="live_order_skipped_insufficient_depth",
-                        market_id=signal.market_id,
-                        signal_id=signal.id,
-                        message=(
-                            f"Trade skippato: depth book insufficiente per {coin} "
-                            f"(fillable ${float(fillable):.2f} < soglia ${float(depth_threshold):.2f})"
-                        ),
-                        data={
-                            "coin": coin,
-                            "fillable_notional": str(fillable),
-                            "order_notional": str(order_notional),
-                            "depth_threshold": str(depth_threshold),
-                            "min_notional": str(min_notional_dec),
-                            "is_long": is_long,
-                        },
-                    )
-                )
-                db.commit()
-                raise PermissionError(
-                    f"insufficient book depth for {coin}: fillable ${float(fillable):.2f} < threshold ${float(depth_threshold):.2f}"
-                )
-        except PermissionError:
-            raise
         except Exception as exc:
-            logger.warning("live_preflight_depth_check_failed", coin=coin, error=str(exc))
+            db.add(
+                DecisionLog(
+                    event_type="live_order_skipped_depth_unavailable",
+                    market_id=signal.market_id,
+                    signal_id=signal.id,
+                    message=f"Trade skippato: depth book non disponibile per {coin}",
+                    data={"coin": coin, "error": str(exc), "is_long": is_long},
+                )
+            )
+            db.commit()
+            raise PermissionError(f"book depth unavailable for {coin}") from exc
+        if not fillable.is_finite():
+            db.add(
+                DecisionLog(
+                    event_type="live_order_skipped_depth_unavailable",
+                    market_id=signal.market_id,
+                    signal_id=signal.id,
+                    message=f"Trade skippato: depth book non disponibile per {coin}",
+                    data={
+                        "coin": coin,
+                        "fillable_notional": str(fillable),
+                        "order_notional": str(order_notional),
+                        "depth_threshold": str(depth_threshold),
+                        "min_notional": str(min_notional_dec),
+                        "is_long": is_long,
+                    },
+                )
+            )
+            db.commit()
+            raise PermissionError(f"book depth unavailable for {coin}")
+        if fillable < depth_threshold:
+            db.add(
+                DecisionLog(
+                    event_type="live_order_skipped_insufficient_depth",
+                    market_id=signal.market_id,
+                    signal_id=signal.id,
+                    message=(
+                        f"Trade skippato: depth book insufficiente per {coin} "
+                        f"(fillable ${float(fillable):.2f} < soglia ${float(depth_threshold):.2f})"
+                    ),
+                    data={
+                        "coin": coin,
+                        "fillable_notional": str(fillable),
+                        "order_notional": str(order_notional),
+                        "depth_threshold": str(depth_threshold),
+                        "min_notional": str(min_notional_dec),
+                        "is_long": is_long,
+                    },
+                )
+            )
+            db.commit()
+            raise PermissionError(
+                f"insufficient book depth for {coin}: fillable ${float(fillable):.2f} < threshold ${float(depth_threshold):.2f}"
+            )
 
         hl_max_lev = (market.metadata_json or {}).get("raw", {}).get("maxLeverage")
         safe_leverage = (
@@ -439,10 +499,10 @@ class OrderExecutionEngine:
             raise HyperliquidError("live order rejected by Hyperliquid")
         # Post-fill safety net: se nonostante il pre-flight check HL ha
         # restituito un partial fill sotto il minimo (race condition, book
-        # cambiato nel frattempo), chiudiamo SUBITO la posizione. Una size sotto
-        # il min-notional vale pochi dollari: la doppia fee è trascurabile rispetto
-        # al rischio di lasciare aperta una posizione live senza ordini di
-        # protezione (gli SL/TP non sono ancora stati piazzati a questo punto).
+        # cambiato nel frattempo), tracciamo la posizione con tiny_fill=True.
+        # Non la chiudiamo subito: una chiusura immediata cristallizza solo fee e
+        # slippage. La size reale viene persistita e gestita dagli ordini di
+        # protezione quando piazzabili.
         actual_filled = entry_result.filled_size or order_size
         actual_price = entry_result.avg_price or signal.entry_price
         actual_notional = actual_filled * actual_price
@@ -471,7 +531,7 @@ class OrderExecutionEngine:
                     message=(
                         f"ATTENZIONE: partial fill sotto il minimo nonostante il pre-flight check "
                         f"(race condition) — filled ${float(actual_notional):.4f} < min ${float(min_notional_dec):.2f}. "
-                        f"Chiusura immediata della posizione tiny_fill per non lasciarla scoperta."
+                        f"Posizione tracciata con tiny_fill=True e gestita senza chiusura automatica."
                     ),
                     data={
                         "requested_size": str(order_size),
@@ -490,39 +550,6 @@ class OrderExecutionEngine:
                 actual_notional=str(actual_notional),
                 min_notional=str(min_notional_dec),
             )
-            db.commit()
-            db.refresh(position)
-            # Niente _submit_live_protection_orders su una posizione tiny scoperta:
-            # la chiudiamo direttamente. Se la chiusura fallisce, la posizione resta
-            # tracciata con tiny_fill=True per la riconciliazione / intervento manuale.
-            try:
-                self.close_live_position(
-                    db,
-                    position,
-                    reason="tiny_fill_below_min_notional",
-                    trading_client=trading,
-                )
-            except Exception as exc:
-                logger.error(
-                    "live_order_tiny_fill_auto_close_failed",
-                    coin=coin,
-                    signal_id=signal.id,
-                    error=str(exc),
-                )
-                db.add(
-                    DecisionLog(
-                        event_type="live_order_tiny_fill_auto_close_failed",
-                        market_id=signal.market_id,
-                        signal_id=signal.id,
-                        message=(
-                            "Chiusura automatica della posizione tiny_fill fallita: "
-                            "intervento manuale necessario."
-                        ),
-                        data={"coin": coin, "error": str(exc)},
-                    )
-                )
-                db.commit()
-            return position
         db.commit()
         db.refresh(position)
         self._submit_live_protection_orders(db, trading, position, signal, coin, sz_dec)
@@ -680,6 +707,7 @@ class OrderExecutionEngine:
         if risk_settings:
             risk_pct = float(risk_settings.value.get("max_risk_per_trade_pct", risk_pct))
             max_leverage = float(risk_settings.value.get("max_leverage", max_leverage))
+        risk_pct *= self.portfolio_guard.position_size_multiplier(db, signal)
         stop_loss = signal.stop_loss or signal.entry_price
         size = Decimal(
             str(
@@ -734,6 +762,27 @@ class OrderExecutionEngine:
             max_leverage=target_leverage,
             risk_amount=risk_amount,
             available_margin=equity_for_sizing,
+        )
+
+    def _record_portfolio_guard_rejection(
+        self,
+        db: Session,
+        signal: Signal,
+        decision: PortfolioGuardDecision,
+        *,
+        mode: str,
+    ) -> None:
+        db.add(
+            DecisionLog(
+                event_type=f"{mode}_order_rejected_portfolio_guard",
+                market_id=signal.market_id,
+                signal_id=signal.id,
+                message=f"{mode.capitalize()} entry rejected by portfolio guard",
+                data={
+                    "reason": decision.reason,
+                    "details": decision.details or {},
+                },
+            )
         )
 
     def _submit_live_protection_orders(

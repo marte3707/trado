@@ -53,6 +53,48 @@ DEFAULT_POSITION_MANAGEMENT_SETTINGS: dict[str, Any] = {
     },
 }
 
+DEFAULT_PORTFOLIO_GUARD_SETTINGS: dict[str, Any] = {
+    "enabled": True,
+    "max_directional_open_positions": {
+        "paper": 20,
+        "live": 12,
+    },
+    "max_directional_risk_r": {
+        "paper": 12,
+        "live": 6,
+    },
+    "max_low_tf_directional_positions": {
+        "timeframes": ["5m", "15m"],
+        "paper": 12,
+        "live": 6,
+    },
+}
+
+DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS: dict[str, Any] = {
+    "enabled": True,
+    "window_minutes": 90,
+    "max_loss_r": 5,
+    "max_stop_losses": 8,
+    "pause_minutes": 180,
+    "scope": "new_entries_only",
+}
+
+DEFAULT_MACRO_RISK_MODE_SETTINGS: dict[str, Any] = {
+    "enabled": False,
+    "size_multiplier": 0.5,
+    "min_score_add": 8,
+    "disable_timeframes": ["5m"],
+    "require_mtf_confluence": True,
+}
+
+DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE: dict[str, Any] = {
+    "active_until": None,
+    "triggered_at": None,
+    "reason": None,
+    "last_window_loss_r": 0,
+    "last_window_stop_losses": 0,
+}
+
 
 def setting_value(db: Session, key: str) -> dict:
     row = db.get(AppSetting, key)
@@ -133,6 +175,24 @@ def effective_live_execution_settings(db: Session, settings: Settings) -> dict:
 def effective_position_management_settings(db: Session) -> dict[str, Any]:
     value = setting_value(db, "position_management")
     return _deep_merge(DEFAULT_POSITION_MANAGEMENT_SETTINGS, value)
+
+
+def effective_portfolio_guard_settings(db: Session) -> dict[str, Any]:
+    value = setting_value(db, "risk").get("portfolio_guard")
+    overrides = value if isinstance(value, dict) else {}
+    return _deep_merge(DEFAULT_PORTFOLIO_GUARD_SETTINGS, overrides)
+
+
+def effective_portfolio_circuit_breaker_settings(db: Session) -> dict[str, Any]:
+    value = setting_value(db, "risk").get("circuit_breaker")
+    overrides = value if isinstance(value, dict) else {}
+    return _deep_merge(DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS, overrides)
+
+
+def effective_macro_risk_mode_settings(db: Session) -> dict[str, Any]:
+    value = setting_value(db, "risk").get("macro_risk_mode")
+    overrides = value if isinstance(value, dict) else {}
+    return _deep_merge(DEFAULT_MACRO_RISK_MODE_SETTINGS, overrides)
 
 
 def effective_alert_min_score(db: Session, settings: Settings) -> int:

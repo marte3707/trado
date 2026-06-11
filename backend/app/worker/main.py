@@ -253,10 +253,38 @@ def calibration_min_closed_trades(db) -> int:
 def last_calibration_trade_count(db) -> int | None:
     state = db.get(AppSetting, "auto_calibration_state")
     value = state.value if state is not None and isinstance(state.value, dict) else {}
-    try:
-        return int(value["last_trade_count"])
-    except (KeyError, TypeError, ValueError):
+    # `last_trade_count` is the calibration lookback sample size and caps at
+    # `lookback_trades`; the worker needs the unbounded closed-trade total.
+    for key in ("last_total_closed_trade_count", "last_trade_count"):
+        try:
+            return int(value[key])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
+
+
+def _auto_calibration_state(db) -> dict[str, Any]:
+    state = db.get(AppSetting, "auto_calibration_state")
+    return dict(state.value) if state is not None and isinstance(state.value, dict) else {}
+
+
+def _state_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if not isinstance(value, str):
         return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _state_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _starvation_soft_threshold(db) -> int:
@@ -266,6 +294,15 @@ def _starvation_soft_threshold(db) -> int:
         return int(value.get("starvation_soft_cycles", 10))
     except (TypeError, ValueError):
         return 10
+
+
+def _starvation_hard_threshold(db) -> int:
+    setting = db.get(AppSetting, "auto_calibration")
+    value = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+    try:
+        return int(value.get("starvation_hard_cycles", 15))
+    except (TypeError, ValueError):
+        return 15
 
 
 def _consecutive_zero_signal_cycles_from_log(db) -> int:
@@ -298,6 +335,67 @@ def _consecutive_zero_signal_cycles_from_log(db) -> int:
     return streak
 
 
+def _last_active_worker_cycle(db) -> DecisionLog | None:
+    recent = (
+        db.query(DecisionLog)
+        .filter(DecisionLog.event_type.in_(["worker_cycle", "worker_cycle_failed"]))
+        .order_by(DecisionLog.timestamp.desc())
+        .limit(120)
+        .all()
+    )
+    for entry in recent:
+        if entry.event_type == "worker_cycle_failed":
+            return entry
+        if not isinstance(entry.data, dict):
+            return entry
+        active_tf = entry.data.get("active_timeframes")
+        if isinstance(active_tf, list) and not active_tf:
+            continue
+        return entry
+    return None
+
+
+def _worker_cycle_generated(entry: DecisionLog) -> bool:
+    if entry.event_type == "worker_cycle_failed" or not isinstance(entry.data, dict):
+        return False
+    return _state_int(entry.data.get("generated"), 0) > 0
+
+
+def _starvation_calibration_due(db, zero_cycles: int) -> bool:
+    state = _auto_calibration_state(db)
+
+    if bool(state.get("starvation_override_active")):
+        last_active_cycle = _last_active_worker_cycle(db)
+        if last_active_cycle is None or not _worker_cycle_generated(last_active_cycle):
+            return False
+        last_run_at = _state_datetime(state.get("last_run_at"))
+        cycle_at = _state_datetime(last_active_cycle.timestamp)
+        return last_run_at is None or (cycle_at is not None and cycle_at > last_run_at)
+
+    if not bool(state.get("deep_defensive_active")):
+        return False
+
+    previous_zero_cycles = _state_int(state.get("consecutive_zero_signal_cycles"), 0)
+    soft_threshold = _starvation_soft_threshold(db)
+    hard_threshold = _starvation_hard_threshold(db)
+    return (
+        previous_zero_cycles < soft_threshold <= zero_cycles
+        or previous_zero_cycles < hard_threshold <= zero_cycles
+    )
+
+
+def _record_calibration_total_closed_trade_count(db, total_closed: int) -> None:
+    state = db.get(AppSetting, "auto_calibration_state") or AppSetting(
+        key="auto_calibration_state",
+        value={},
+    )
+    value = dict(state.value) if isinstance(state.value, dict) else {}
+    value["last_total_closed_trade_count"] = total_closed
+    state.value = value
+    db.add(state)
+    db.commit()
+
+
 def should_run_calibration(db, closed_this_cycle: int) -> bool:
     if closed_this_cycle > 0:
         return True
@@ -309,12 +407,18 @@ def should_run_calibration(db, closed_this_cycle: int) -> bool:
         return True
     # Trigger anche senza nuovi trade se la starvation è attiva: la calibrazione
     # deve poter aggiornare consecutive_zero_signal_cycles e applicare l'attenuazione.
-    return _consecutive_zero_signal_cycles_from_log(db) >= _starvation_soft_threshold(db)
+    return _starvation_calibration_due(
+        db,
+        _consecutive_zero_signal_cycles_from_log(db),
+    )
 
 
 def run_calibration(db, calibration_engine: AutoCalibrationEngine) -> bool:
     try:
-        return calibration_engine.run(db).eligible
+        total_closed = closed_paper_trade_count(db)
+        result = calibration_engine.run(db)
+        _record_calibration_total_closed_trade_count(db, total_closed)
+        return result.eligible
     except Exception as exc:
         db.rollback()
         db.add(
@@ -1095,6 +1199,7 @@ async def run_once(
     )
     time_stop_result = await asyncio.to_thread(executor.apply_time_stops, db)
     closed += int(time_stop_result.get("paper_closed", 0))
+    portfolio_breaker_result = executor.portfolio_guard.update_circuit_breaker(db)
     calibrated = False
     calibration_attempted = False
     if should_run_calibration(db, closed):
@@ -1125,6 +1230,7 @@ async def run_once(
                     "btc_protection_updates": btc_protection_updates,
                     "time_stop_paper_closed": time_stop_result.get("paper_closed", 0),
                     "time_stop_live_alerted": time_stop_result.get("live_alerted", 0),
+                    "portfolio_circuit_breaker": portfolio_breaker_result,
                     "calibrated": calibrated,
                     "active_timeframes": [],
                     "paper_active_timeframes": [],
@@ -1286,6 +1392,7 @@ async def run_once(
                     "btc_protection_updates": btc_protection_updates,
                     "time_stop_paper_closed": time_stop_result.get("paper_closed", 0),
                     "time_stop_live_alerted": time_stop_result.get("live_alerted", 0),
+                    "portfolio_circuit_breaker": portfolio_breaker_result,
                     "calibrated": calibrated,
                     # Aggregato dei motivi per cui i segnali non sono stati emessi —
                     # in produzione gli eventi debug per skip sono filtrati, qui

@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -44,6 +45,7 @@ class FakeDb:
     operation_mode_setting: dict[str, Any] = field(default_factory=lambda: {"value": "AUTO_TRADE"})
     enable_live_setting: dict[str, Any] = field(default_factory=lambda: {"value": True})
     kill_switch: dict[str, Any] | None = None
+    portfolio_circuit_state: dict[str, Any] | None = None
     added: list[Any] = field(default_factory=list)
     committed: int = 0
     rolled_back: int = 0
@@ -66,6 +68,12 @@ class FakeDb:
                 return AppSetting(key="enable_live_trading", value=self.enable_live_setting)
             if pk == "kill_switch":
                 return AppSetting(key="kill_switch", value=self.kill_switch) if self.kill_switch else None
+            if pk == "portfolio_circuit_breaker_state":
+                return (
+                    AppSetting(key="portfolio_circuit_breaker_state", value=self.portfolio_circuit_state)
+                    if self.portfolio_circuit_state
+                    else None
+                )
         return None
 
     def query(self, *_args, **_kwargs) -> _FakeQuery:
@@ -108,6 +116,8 @@ class FakeTradingClient:
         trigger_failures: set[str] | None = None,
         user_state_positions: list[dict[str, Any]] | None = None,
         pre_existing_positions: list[dict[str, Any]] | None = None,
+        fillable_notional: Decimal = Decimal("1000000"),
+        depth_error: Exception | None = None,
     ) -> None:
         self._account_value = account_value
         self.market_status = market_status
@@ -120,6 +130,8 @@ class FakeTradingClient:
         self.close_orders: list[dict[str, Any]] = []
         self.trigger_orders: list[dict[str, Any]] = []
         self.leverage_calls: list[dict[str, Any]] = []
+        self.fillable_notional = fillable_notional
+        self.depth_error = depth_error
 
     def account_value(self) -> Decimal:
         return self._account_value
@@ -129,6 +141,17 @@ class FakeTradingClient:
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> None:
         self.leverage_calls.append({"coin": coin, "leverage": leverage, "is_cross": is_cross})
+
+    def available_fill_notional(
+        self,
+        coin: str,  # noqa: ARG002
+        is_buy: bool,  # noqa: ARG002
+        slippage_pct: float,  # noqa: ARG002
+        mid_price: float,  # noqa: ARG002
+    ) -> Decimal:
+        if self.depth_error is not None:
+            raise self.depth_error
+        return self.fillable_notional
 
     def submit_market_order(
         self,
@@ -469,6 +492,36 @@ def test_execute_live_raises_permission_error_when_validation_fails(monkeypatch:
     assert db.added_of(Position) == []
 
 
+def test_execute_live_blocks_before_submit_when_portfolio_breaker_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    active_until = datetime.now(UTC) + timedelta(hours=1)
+    db = FakeDb(
+        signal=signal,
+        market=_build_market(),
+        portfolio_circuit_state={
+            "active_until": active_until.isoformat(),
+            "triggered_at": datetime.now(UTC).isoformat(),
+            "reason": "window_loss_r",
+            "last_window_loss_r": "-5.2",
+            "last_window_stop_losses": 9,
+        },
+    )
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="portfolio circuit breaker active"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.market_orders == []
+    assert trading.leverage_calls == []
+    assert db.added_of(Position) == []
+    events = [row.event_type for row in db.added_of(DecisionLog)]
+    assert "live_order_rejected_portfolio_guard" in events
+
+
 def test_execute_live_sets_leverage_before_submitting_order(monkeypatch: pytest.MonkeyPatch) -> None:
     _force_validator_ok(monkeypatch)
     settings = _build_settings()
@@ -681,10 +734,10 @@ def test_execute_live_skips_when_hl_position_already_exists(monkeypatch: pytest.
     assert "live_order_skipped_hl_position_exists" in events
 
 
-def test_execute_live_closes_position_on_tiny_partial_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_live_keeps_tiny_partial_fill_open(monkeypatch: pytest.MonkeyPatch) -> None:
     """Se HL restituisce un fill sotto il min-notional (race del book dopo il
-    pre-flight), la posizione viene chiusa subito invece di restare scoperta,
-    e nessun ordine di protezione viene piazzato."""
+    pre-flight), la posizione resta aperta: chiuderla subito cristallizza solo
+    fee e slippage."""
     _force_validator_ok(monkeypatch)
     settings = _build_settings()
     signal = _build_signal()
@@ -721,13 +774,28 @@ def test_execute_live_closes_position_on_tiny_partial_fill(monkeypatch: pytest.M
     position = OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
 
     assert position.metadata_json.get("tiny_fill") is True
-    # Nessun ordine di protezione su una posizione tiny scoperta
-    assert trading.trigger_orders == []
-    # La posizione è stata chiusa immediatamente
-    assert trading.close_orders != []
-    assert position.status == "closed"
+    assert trading.close_orders == []
+    assert position.status == "open"
+    assert any(order["tpsl"] == "sl" for order in trading.trigger_orders)
     events = [row.event_type for row in db.added_of(DecisionLog)]
     assert "live_order_partial_fill_below_min_notional" in events
+
+
+def test_execute_live_skips_when_depth_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient(fillable_notional=Decimal("Inf"))
+
+    with pytest.raises(PermissionError, match="book depth unavailable"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.market_orders == []
+    assert trading.leverage_calls == []
+    events = [row.event_type for row in db.added_of(DecisionLog)]
+    assert "live_order_skipped_depth_unavailable" in events
+    assert "live_order_partial_fill_below_min_notional" not in events
 
 
 def test_execute_live_aborts_before_submit_when_kill_switch_enabled(

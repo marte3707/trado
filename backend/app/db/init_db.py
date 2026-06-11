@@ -1,7 +1,13 @@
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.runtime_settings import DEFAULT_POSITION_MANAGEMENT_SETTINGS
+from app.core.runtime_settings import (
+    DEFAULT_MACRO_RISK_MODE_SETTINGS,
+    DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
+    DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE,
+    DEFAULT_PORTFOLIO_GUARD_SETTINGS,
+    DEFAULT_POSITION_MANAGEMENT_SETTINGS,
+)
 from app.db.models import AppSetting, Base, Market, StrategyConfig
 from app.db.session import engine
 from app.services.unified_account_ratio import DEFAULT_UAR_RISK_SETTINGS
@@ -161,6 +167,9 @@ def seed_defaults(db: Session) -> None:
                     "max_open_positions": settings.max_open_positions,
                     "max_total_exposure_pct": settings.max_total_exposure_pct,
                     "max_leverage": settings.max_leverage,
+                    "portfolio_guard": DEFAULT_PORTFOLIO_GUARD_SETTINGS,
+                    "circuit_breaker": DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
+                    "macro_risk_mode": DEFAULT_MACRO_RISK_MODE_SETTINGS,
                     **DEFAULT_EDGE_RISK_SETTINGS,
                     **DEFAULT_UAR_RISK_SETTINGS,
                 },
@@ -179,8 +188,24 @@ def seed_defaults(db: Session) -> None:
                 if key not in value:
                     value[key] = default
                     mutated = True
+            portfolio_defaults = {
+                "portfolio_guard": DEFAULT_PORTFOLIO_GUARD_SETTINGS,
+                "circuit_breaker": DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
+                "macro_risk_mode": DEFAULT_MACRO_RISK_MODE_SETTINGS,
+            }
+            for key, default in portfolio_defaults.items():
+                if key not in value:
+                    value[key] = default
+                    mutated = True
             if mutated:
                 risk_setting.value = value
+    if db.get(AppSetting, "portfolio_circuit_breaker_state") is None:
+        db.add(
+            AppSetting(
+                key="portfolio_circuit_breaker_state",
+                value=DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE,
+            )
+        )
     if db.get(AppSetting, "position_management") is None:
         db.add(
             AppSetting(

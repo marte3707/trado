@@ -383,7 +383,8 @@ class HyperliquidTradingClient:
         Per un SHORT (is_buy=False): somma i bid con px >= limit_px.
         Per un LONG (is_buy=True): somma gli ask con px <= limit_px.
         Restituisce il notional totale fillabile. Ritorna Decimal('Inf') in
-        caso di errore per non bloccare il trade in modo conservativo.
+        caso di errore; il caller live tratta questo valore come depth non
+        verificabile e deve skippare l'ordine.
         """
         try:
             info = self._info()
