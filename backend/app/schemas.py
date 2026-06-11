@@ -90,6 +90,34 @@ class SettingsPatch(BaseModel):
     value: dict[str, Any]
 
 
+class MacroRiskModeSettings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    enabled: bool | None = None
+    size_multiplier: float | None = Field(default=None, ge=0, le=1)
+    min_score_add: int | None = Field(default=None, ge=0, le=100)
+    disable_timeframes: list[str] | None = None
+    require_mtf_confluence: bool | None = None
+
+
+class MacroRiskMonitorSettings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    enabled: bool | None = None
+    actions_enabled: bool | None = None
+    news_enabled: bool | None = None
+    market_stress_enabled: bool | None = None
+    news_feed_urls: list[str] | None = None
+    news_fetch_cooldown_minutes: int | None = Field(default=None, ge=1)
+    news_lookback_hours: int | None = Field(default=None, ge=1, le=168)
+    market_lookback_minutes: int | None = Field(default=None, ge=30, le=1440)
+    watch_score: int | None = Field(default=None, ge=0, le=100)
+    high_score: int | None = Field(default=None, ge=0, le=100)
+    extreme_score: int | None = Field(default=None, ge=0, le=100)
+    ttl_minutes_by_level: dict[str, int] | None = None
+    policies: dict[str, dict[str, Any]] | None = None
+
+
 class RiskControlsSettings(BaseModel):
     """Validazione non distruttiva dei campi di sicurezza di AppSetting "risk".
 
@@ -105,6 +133,8 @@ class RiskControlsSettings(BaseModel):
     max_daily_loss_pct: float | None = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: float | None = Field(default=None, ge=0, le=100)
     max_leverage: float | None = Field(default=None, gt=0, le=100)
+    macro_risk_mode: MacroRiskModeSettings | None = None
+    macro_risk_monitor: MacroRiskMonitorSettings | None = None
 
 
 class LiveExecutionSettings(BaseModel):

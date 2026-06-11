@@ -1,6 +1,7 @@
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from html import escape
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -1031,6 +1032,37 @@ class TelegramNotifier:
             await self._send_text(text, chat_id=self.settings.telegram_signal_chat_id)
         except Exception as exc:
             logger.warning("telegram_btc_macro_send_failed", error=str(exc))
+
+    async def send_macro_risk_state_changed(self, state: dict[str, Any]) -> None:
+        if not self.settings.telegram_signal_chat_id:
+            return
+        level = str(state.get("level") or "off").upper()
+        active = "ACTIVE" if state.get("active") else "OFF"
+        summary = escape(str(state.get("summary") or "Macro risk state changed"))
+        reason = escape(str(state.get("reason") or "n/a"))
+        active_until = escape(str(state.get("active_until") or "n/a"))
+        raw_policy = state.get("policy")
+        policy: dict[str, Any] = raw_policy if isinstance(raw_policy, dict) else {}
+        disabled_tfs = ", ".join(str(item) for item in policy.get("disable_timeframes", []) or []) or "none"
+        lines = [
+            f"<b>Macro Risk {level}</b> · {active}",
+            summary,
+            "",
+            f"<b>Reason:</b> {reason}",
+            f"<b>Score:</b> {state.get('combined_score', 0)}/100 "
+            f"(news {state.get('news_score', 0)}, market {state.get('market_stress_score', 0)})",
+            f"<b>Policy:</b> size x{policy.get('size_multiplier', 1)}, "
+            f"score +{policy.get('min_score_add', 0)}, disabled TF {escape(disabled_tfs)}, "
+            f"MTF {'required' if policy.get('require_mtf_confluence') else 'not required'}",
+            f"<b>Active until:</b> {active_until}",
+        ]
+        try:
+            await self._send_text(
+                "\n".join(lines),
+                chat_id=self.settings.telegram_signal_chat_id,
+            )
+        except Exception as exc:
+            logger.warning("telegram_macro_risk_send_failed", error=str(exc))
 
     async def send_signal(self, db: Session, signal: Signal) -> None:
         """Publish a new signal to the public channel only.

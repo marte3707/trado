@@ -248,6 +248,39 @@ def test_macro_risk_mode_blocks_disabled_timeframe_and_reduces_size() -> None:
     assert decision.reason == "macro risk mode disabled this timeframe"
 
 
+def test_auto_macro_risk_state_blocks_disabled_timeframe() -> None:
+    db = FakeDb(
+        settings={
+            "risk": _risk_settings(),
+            "macro_risk_state": {
+                "active": True,
+                "level": "high",
+                "reason": "geopolitical_escalation",
+                "active_until": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+                "sources": ["news", "market_stress"],
+                "policy": {
+                    "size_multiplier": 0.25,
+                    "min_score_add": 12,
+                    "disable_timeframes": ["5m", "15m"],
+                    "require_mtf_confluence": True,
+                },
+            },
+        },
+    )
+    guard = PortfolioGuard(Settings())
+
+    decision = guard.evaluate_entry(
+        db,  # type: ignore[arg-type]
+        _signal(timeframe="5m", score=90),
+        mode="paper",
+        side="short",
+    )
+
+    assert guard.position_size_multiplier(db, _signal(timeframe="1h")) == 0.25  # type: ignore[arg-type]
+    assert not decision.allowed
+    assert decision.reason == "macro risk mode disabled this timeframe"
+
+
 def test_circuit_breaker_activates_and_blocks_new_entries() -> None:
     now = datetime(2026, 6, 11, 8, 0, tzinfo=UTC)
     risk = _risk_settings()

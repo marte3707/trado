@@ -26,6 +26,7 @@ from app.engine.auto_tuner import AutoTuner
 from app.engine.btc_macro_protection import BtcMacroProtectionEngine
 from app.engine.calibration import AutoCalibrationEngine
 from app.engine.execution import OrderExecutionEngine
+from app.engine.macro_risk_monitor import MacroRiskMonitor
 from app.engine.signal_engine import SignalEngine
 from app.notifications.diagnostic_report import DiagnosticReporter
 from app.notifications.telegram import TelegramNotifier
@@ -1156,12 +1157,28 @@ async def _notify_btc_macro_reversals(
             )
 
 
+async def _notify_macro_risk_state_change(
+    notifier: TelegramNotifier,
+    result: dict[str, Any],
+) -> None:
+    if not result.get("changed"):
+        return
+    state = result.get("state")
+    if not isinstance(state, dict):
+        return
+    try:
+        await notifier.send_macro_risk_state_changed(state)
+    except Exception as exc:
+        logger.warning("telegram_macro_risk_notify_failed", error=str(exc))
+
+
 async def run_once(
     signal_engine: SignalEngine,
     candle_sync: CandleSyncService,
     calibration_engine: AutoCalibrationEngine,
     notifier: TelegramNotifier,
     executor: OrderExecutionEngine,
+    macro_risk_monitor: MacroRiskMonitor,
     btc_protection: BtcMacroProtectionEngine | None = None,
 ) -> tuple[int, int]:
     tick_start = datetime.now(UTC)
@@ -1200,6 +1217,8 @@ async def run_once(
     time_stop_result = await asyncio.to_thread(executor.apply_time_stops, db)
     closed += int(time_stop_result.get("paper_closed", 0))
     portfolio_breaker_result = executor.portfolio_guard.update_circuit_breaker(db)
+    macro_risk_result = macro_risk_monitor.run(db)
+    db.commit()
     calibrated = False
     calibration_attempted = False
     if should_run_calibration(db, closed):
@@ -1231,12 +1250,14 @@ async def run_once(
                     "time_stop_paper_closed": time_stop_result.get("paper_closed", 0),
                     "time_stop_live_alerted": time_stop_result.get("live_alerted", 0),
                     "portfolio_circuit_breaker": portfolio_breaker_result,
+                    "macro_risk": macro_risk_result,
                     "calibrated": calibrated,
                     "active_timeframes": [],
                     "paper_active_timeframes": [],
                 },
             ))
             db.commit()
+            await _notify_macro_risk_state_change(notifier, macro_risk_result)
             await _notify_live_position_closes(db, notifier, tick_start)
             await _notify_btc_macro_reversals(db, notifier, tick_start)
         finally:
@@ -1393,6 +1414,7 @@ async def run_once(
                     "time_stop_paper_closed": time_stop_result.get("paper_closed", 0),
                     "time_stop_live_alerted": time_stop_result.get("live_alerted", 0),
                     "portfolio_circuit_breaker": portfolio_breaker_result,
+                    "macro_risk": macro_risk_result,
                     "calibrated": calibrated,
                     # Aggregato dei motivi per cui i segnali non sono stati emessi —
                     # in produzione gli eventi debug per skip sono filtrati, qui
@@ -1402,6 +1424,7 @@ async def run_once(
             )
         )
         db.commit()
+        await _notify_macro_risk_state_change(notifier, macro_risk_result)
         await _notify_live_position_closes(db, notifier, tick_start)
         await _notify_btc_macro_reversals(db, notifier, tick_start)
         return generated, skipped
@@ -1436,6 +1459,7 @@ async def main() -> None:
     calibration_engine = AutoCalibrationEngine()
     notifier = TelegramNotifier(settings)
     executor = OrderExecutionEngine(settings)
+    macro_risk_monitor = MacroRiskMonitor(settings)
     btc_protection = BtcMacroProtectionEngine(settings)
     _record_heartbeat("starting")
 
@@ -1465,7 +1489,13 @@ async def main() -> None:
                 _record_heartbeat("tick")
                 try:
                     generated, candle_errors = await run_once(
-                        signal_engine, candle_sync, calibration_engine, notifier, executor, btc_protection
+                        signal_engine,
+                        candle_sync,
+                        calibration_engine,
+                        notifier,
+                        executor,
+                        macro_risk_monitor,
+                        btc_protection,
                     )
                     stats.cycles += 1
                     stats.signals_generated += generated

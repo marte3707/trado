@@ -3,6 +3,8 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.core.runtime_settings import (
     DEFAULT_MACRO_RISK_MODE_SETTINGS,
+    DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
+    DEFAULT_MACRO_RISK_STATE,
     DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
     DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE,
     DEFAULT_PORTFOLIO_GUARD_SETTINGS,
@@ -170,6 +172,7 @@ def seed_defaults(db: Session) -> None:
                     "portfolio_guard": DEFAULT_PORTFOLIO_GUARD_SETTINGS,
                     "circuit_breaker": DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
                     "macro_risk_mode": DEFAULT_MACRO_RISK_MODE_SETTINGS,
+                    "macro_risk_monitor": DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
                     **DEFAULT_EDGE_RISK_SETTINGS,
                     **DEFAULT_UAR_RISK_SETTINGS,
                 },
@@ -192,6 +195,7 @@ def seed_defaults(db: Session) -> None:
                 "portfolio_guard": DEFAULT_PORTFOLIO_GUARD_SETTINGS,
                 "circuit_breaker": DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
                 "macro_risk_mode": DEFAULT_MACRO_RISK_MODE_SETTINGS,
+                "macro_risk_monitor": DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
             }
             for key, default in portfolio_defaults.items():
                 if key not in value:
@@ -204,6 +208,13 @@ def seed_defaults(db: Session) -> None:
             AppSetting(
                 key="portfolio_circuit_breaker_state",
                 value=DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE,
+            )
+        )
+    if db.get(AppSetting, "macro_risk_state") is None:
+        db.add(
+            AppSetting(
+                key="macro_risk_state",
+                value=DEFAULT_MACRO_RISK_STATE,
             )
         )
     if db.get(AppSetting, "position_management") is None:

@@ -21,6 +21,7 @@ import { TopSignalsList } from "@/components/widgets/TopSignalsList";
 import { OpenPositionsLive } from "@/components/widgets/OpenPositionsLive";
 import { MarketIntelligenceStrip } from "@/components/widgets/MarketIntelligenceStrip";
 import { MacroCorrelationCard } from "@/components/widgets/MacroCorrelationCard";
+import { MacroRiskStateCard } from "@/components/widgets/MacroRiskStateCard";
 import { BitcoinNewsCard } from "@/components/widgets/BitcoinNewsCard";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
@@ -431,8 +432,9 @@ export function DashboardScreen({
         settings={settings}
         snapshot={marketDashboard}
       />
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
         <MacroCorrelationCard />
+        <MacroRiskStateCard settings={settings} />
         <div className="lg:col-span-2">
           <BitcoinNewsCard snapshot={marketDashboard} />
         </div>

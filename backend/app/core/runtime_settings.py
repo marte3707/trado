@@ -87,6 +87,70 @@ DEFAULT_MACRO_RISK_MODE_SETTINGS: dict[str, Any] = {
     "require_mtf_confluence": True,
 }
 
+DEFAULT_MACRO_RISK_MONITOR_SETTINGS: dict[str, Any] = {
+    "enabled": True,
+    "actions_enabled": True,
+    "news_enabled": True,
+    "market_stress_enabled": True,
+    "news_feed_urls": [
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://www.theguardian.com/world/rss",
+        "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    ],
+    "news_fetch_cooldown_minutes": 15,
+    "news_lookback_hours": 12,
+    "market_lookback_minutes": 120,
+    "watch_score": 40,
+    "high_score": 60,
+    "extreme_score": 80,
+    "ttl_minutes_by_level": {
+        "watch": 120,
+        "high": 360,
+        "extreme": 720,
+    },
+    "policies": {
+        "watch": {
+            "size_multiplier": 1.0,
+            "min_score_add": 4,
+            "disable_timeframes": [],
+            "require_mtf_confluence": True,
+        },
+        "high": {
+            "size_multiplier": 0.5,
+            "min_score_add": 8,
+            "disable_timeframes": ["5m"],
+            "require_mtf_confluence": True,
+        },
+        "extreme": {
+            "size_multiplier": 0.25,
+            "min_score_add": 12,
+            "disable_timeframes": ["5m", "15m"],
+            "require_mtf_confluence": True,
+        },
+    },
+}
+
+DEFAULT_MACRO_RISK_STATE: dict[str, Any] = {
+    "active": False,
+    "level": "off",
+    "reason": None,
+    "confidence": 0,
+    "combined_score": 0,
+    "news_score": 0,
+    "market_stress_score": 0,
+    "triggered_at": None,
+    "active_until": None,
+    "last_checked_at": None,
+    "summary": None,
+    "sources": [],
+    "policy": {},
+    "top_news": [],
+    "market_stress": {},
+    "last_news_fetch_at": None,
+    "cached_news_items": [],
+}
+
 DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE: dict[str, Any] = {
     "active_until": None,
     "triggered_at": None,
@@ -193,6 +257,12 @@ def effective_macro_risk_mode_settings(db: Session) -> dict[str, Any]:
     value = setting_value(db, "risk").get("macro_risk_mode")
     overrides = value if isinstance(value, dict) else {}
     return _deep_merge(DEFAULT_MACRO_RISK_MODE_SETTINGS, overrides)
+
+
+def effective_macro_risk_monitor_settings(db: Session) -> dict[str, Any]:
+    value = setting_value(db, "risk").get("macro_risk_monitor")
+    overrides = value if isinstance(value, dict) else {}
+    return _deep_merge(DEFAULT_MACRO_RISK_MONITOR_SETTINGS, overrides)
 
 
 def effective_alert_min_score(db: Session, settings: Settings) -> int:

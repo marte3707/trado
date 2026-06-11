@@ -36,10 +36,10 @@ class PortfolioGuard:
         self.settings = settings
 
     def position_size_multiplier(self, db: Session, signal: Signal) -> float:
-        macro = effective_macro_risk_mode_settings(db)
-        if not bool(macro.get("enabled", False)):
+        macro = _effective_macro_policy(db)
+        if not macro["active"]:
             return 1.0
-        multiplier = _float(macro.get("size_multiplier"), 1.0)
+        multiplier = _float(macro["policy"].get("size_multiplier"), 1.0)
         return max(0.0, min(1.0, multiplier))
 
     def evaluate_entry(
@@ -234,14 +234,18 @@ class PortfolioGuard:
         db: Session,
         signal: Signal,
     ) -> PortfolioGuardDecision:
-        config = effective_macro_risk_mode_settings(db)
-        if not bool(config.get("enabled", False)):
+        macro = _effective_macro_policy(db)
+        if not macro["active"]:
             return PortfolioGuardDecision(allowed=True)
-        disabled_timeframes = _string_set(config.get("disable_timeframes"))
+        policy = macro["policy"]
+        disabled_timeframes = _string_set(policy.get("disable_timeframes"))
         details = {
             "signal_id": signal.id,
             "timeframe": signal.timeframe,
             "score": signal.score,
+            "macro_level": macro.get("level"),
+            "macro_sources": macro.get("sources"),
+            "macro_reason": macro.get("reason"),
         }
         if signal.timeframe in disabled_timeframes:
             return PortfolioGuardDecision(
@@ -252,7 +256,7 @@ class PortfolioGuard:
 
         risk_value = setting_value(db, "risk")
         min_score = int(_float(risk_value.get("min_signal_score"), self.settings.min_signal_score))
-        min_score_add = int(_float(config.get("min_score_add"), 0))
+        min_score_add = int(_float(policy.get("min_score_add"), 0))
         required_score = min_score + min_score_add
         if min_score_add > 0 and signal.score < required_score:
             return PortfolioGuardDecision(
@@ -261,7 +265,7 @@ class PortfolioGuard:
                 details={**details, "required_score": required_score},
             )
 
-        if bool(config.get("require_mtf_confluence", False)):
+        if bool(policy.get("require_mtf_confluence", False)):
             breakdown = signal.strategy_breakdown if isinstance(signal.strategy_breakdown, dict) else {}
             if signal.timeframe in {"5m", "15m", "30m", "1h"} and "_mtf_confluence" not in breakdown:
                 return PortfolioGuardDecision(
@@ -276,6 +280,61 @@ class PortfolioGuard:
 def _mode_key(mode: str) -> str:
     raw = getattr(mode, "value", mode)
     return str(raw).lower()
+
+
+def _effective_macro_policy(db: Session) -> dict[str, Any]:
+    manual = effective_macro_risk_mode_settings(db)
+    state = setting_value(db, "macro_risk_state")
+    policies: list[dict[str, Any]] = []
+    sources: list[str] = []
+    level = "off"
+    reason = None
+
+    if bool(manual.get("enabled", False)):
+        policies.append(manual)
+        sources.append("manual")
+        level = "manual"
+        reason = "manual_macro_risk_mode"
+
+    if _macro_state_active(state):
+        policy = state.get("policy") if isinstance(state.get("policy"), dict) else {}
+        if policy:
+            policies.append(policy)
+            sources.extend(str(item) for item in state.get("sources", []) if item)
+            level = str(state.get("level") or level)
+            reason = state.get("reason") or reason
+
+    if not policies:
+        return {"active": False, "policy": {}, "level": "off", "sources": [], "reason": None}
+
+    merged = {
+        "size_multiplier": min((_float(policy.get("size_multiplier"), 1.0) for policy in policies), default=1.0),
+        "min_score_add": max((int(_float(policy.get("min_score_add"), 0)) for policy in policies), default=0),
+        "disable_timeframes": sorted(
+            {
+                timeframe
+                for policy in policies
+                for timeframe in _string_set(policy.get("disable_timeframes"))
+            }
+        ),
+        "require_mtf_confluence": any(
+            bool(policy.get("require_mtf_confluence", False)) for policy in policies
+        ),
+    }
+    return {
+        "active": True,
+        "policy": merged,
+        "level": level,
+        "sources": sorted(set(sources)),
+        "reason": reason,
+    }
+
+
+def _macro_state_active(state: dict[str, Any]) -> bool:
+    if not bool(state.get("active", False)):
+        return False
+    active_until = _parse_dt(state.get("active_until"))
+    return not (active_until is not None and active_until <= datetime.now(UTC))
 
 
 def _open_positions(db: Session, mode: str) -> list[Position]:
