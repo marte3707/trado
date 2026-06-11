@@ -15,6 +15,7 @@ from app.core.runtime_settings import (
     effective_alert_min_score,
     effective_enabled_timeframes,
     effective_live_execution_settings,
+    effective_live_trading_enabled,
     effective_operation_mode,
 )
 from app.db.init_db import create_schema, seed_defaults
@@ -44,7 +45,14 @@ from app.services.unified_account_ratio import (
     decimal_or_none,
     free_spot_usdc_from_balances,
 )
-from app.worker.scheduler import PeriodicScheduler, next_daily_recap_timestamp
+from app.worker.scheduler import (
+    DATA_RETENTION_INTERVAL_SECONDS,
+    DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
+    LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
+    UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
+    PeriodicScheduler,
+    next_daily_recap_timestamp,
+)
 
 # Re-export per retro-compatibilità: alcuni test referenziano
 # `app.worker.main.next_daily_recap_timestamp`.
@@ -53,6 +61,8 @@ __all__ = ["next_daily_recap_timestamp"]
 logger = structlog.get_logger()
 _LAST_TIMEFRAME_RUN_MS: dict[str, int] = {}
 _TICK_LOCK = asyncio.Lock()
+_FAST_RISK_LOCK = asyncio.Lock()
+SYSTEM_CYCLE_STATUS_SETTING_KEY = "system_cycle_status"
 
 
 @dataclasses.dataclass
@@ -62,6 +72,73 @@ class _WorkerStats:
     candle_errors: int = 0
     cycle_failures: int = 0
     period_start: float = dataclasses.field(default_factory=time.time)
+
+
+@dataclasses.dataclass
+class _FastRiskState:
+    last_liquidation_at: float = 0.0
+    last_reconcile_at: float = 0.0
+    last_uar_at: float = 0.0
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _record_system_cycle_status(
+    db,
+    cycle_id: str,
+    label: str,
+    status: str,
+    *,
+    message: str,
+    data: dict[str, Any] | None = None,
+    expected_interval_seconds: int | None = None,
+) -> None:
+    now = datetime.now(UTC).isoformat()
+    setting = db.get(AppSetting, SYSTEM_CYCLE_STATUS_SETTING_KEY)
+    value = dict(setting.value) if setting is not None and isinstance(setting.value, dict) else {}
+    cycles = dict(value.get("cycles", {})) if isinstance(value.get("cycles"), dict) else {}
+    previous = dict(cycles.get(cycle_id, {})) if isinstance(cycles.get(cycle_id), dict) else {}
+    previous_failures = previous.get("consecutive_failures", 0)
+    try:
+        consecutive_failures = int(previous_failures)
+    except (TypeError, ValueError):
+        consecutive_failures = 0
+    if status == "failed":
+        consecutive_failures += 1
+    elif status in {"ok", "skipped", "disabled"}:
+        consecutive_failures = 0
+
+    cycles[cycle_id] = {
+        "id": cycle_id,
+        "label": label,
+        "status": status,
+        "message": message,
+        "data": _json_safe(data or {}),
+        "last_seen_at": now,
+        "last_ok_at": now if status == "ok" else previous.get("last_ok_at"),
+        "last_failure_at": now if status == "failed" else previous.get("last_failure_at"),
+        "consecutive_failures": consecutive_failures,
+        "expected_interval_seconds": expected_interval_seconds,
+    }
+    value["updated_at"] = now
+    value["cycles"] = cycles
+    if setting is None:
+        setting = AppSetting(key=SYSTEM_CYCLE_STATUS_SETTING_KEY, value=value)
+    else:
+        setting.value = value
+    db.add(setting)
 
 
 def should_run_timeframe(timeframe: str, now_ms: int) -> bool:
@@ -267,6 +344,155 @@ def run_auto_tuner(db) -> dict:
         db.commit()
         logger.exception("auto_tuner_failed", error=str(exc))
         return {"status": "error", "error": str(exc)}
+
+
+async def run_fast_risk_once(
+    executor: OrderExecutionEngine,
+    state: _FastRiskState | None = None,
+    *,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Run a lightweight live-only risk pass outside the main signal cycle."""
+    settings = executor.settings
+    state = state or _FastRiskState()
+    started = time.monotonic()
+    current_time = time.time() if now is None else now
+    if _FAST_RISK_LOCK.locked():
+        return {"status": "skipped", "reason": "overlap"}
+
+    async with _FAST_RISK_LOCK:
+        db = SessionLocal()
+        try:
+            if not settings.fast_risk_loop_enabled:
+                disabled_result: dict[str, Any] = {"status": "skipped", "reason": "disabled"}
+                _record_system_cycle_status(
+                    db,
+                    "fast_risk_cycle",
+                    "Fast Risk Cycle",
+                    "skipped",
+                    message="Fast risk cycle skipped",
+                    data=disabled_result,
+                    expected_interval_seconds=settings.fast_risk_loop_interval_seconds,
+                )
+                db.commit()
+                return disabled_result
+            operation_mode = effective_operation_mode(db, settings)
+            live_enabled = effective_live_trading_enabled(db, settings)
+            if operation_mode != OperationMode.AUTO_TRADE or not live_enabled:
+                live_skipped_result: dict[str, Any] = {
+                    "status": "skipped",
+                    "reason": "live_not_enabled",
+                    "operation_mode": operation_mode.value,
+                    "live_enabled": live_enabled,
+                }
+                _record_system_cycle_status(
+                    db,
+                    "fast_risk_cycle",
+                    "Fast Risk Cycle",
+                    "skipped",
+                    message="Fast risk cycle skipped",
+                    data=live_skipped_result,
+                    expected_interval_seconds=settings.fast_risk_loop_interval_seconds,
+                )
+                db.commit()
+                return live_skipped_result
+
+            actions: dict[str, Any] = {}
+            liquidation_due = (
+                current_time - state.last_liquidation_at
+                >= settings.fast_risk_liquidation_interval_seconds
+            )
+            if liquidation_due:
+                liquidation = await asyncio.to_thread(
+                    executor.position_manager.audit_live_positions_against_liquidation,
+                    db,
+                )
+                actions["liquidation_guard"] = liquidation
+                state.last_liquidation_at = current_time
+
+            reconcile_due = (
+                current_time - state.last_reconcile_at
+                >= settings.fast_risk_reconcile_interval_seconds
+            )
+            if reconcile_due:
+                actions["live_reconciled"] = await asyncio.to_thread(
+                    reconcile_live_positions,
+                    db,
+                )
+                state.last_reconcile_at = current_time
+
+            uar_due = current_time - state.last_uar_at >= settings.fast_risk_uar_interval_seconds
+            if uar_due:
+                actions["unified_account_ratio"] = await asyncio.to_thread(
+                    audit_unified_account_ratio_guard,
+                    db,
+                    executor,
+                )
+                state.last_uar_at = current_time
+
+            duration_seconds = time.monotonic() - started
+            ok_result: dict[str, Any] = {
+                "status": "ok",
+                "duration_seconds": round(duration_seconds, 4),
+                "warn": duration_seconds > settings.fast_risk_warn_after_seconds,
+                "actions": actions,
+            }
+            _record_system_cycle_status(
+                db,
+                "fast_risk_cycle",
+                "Fast Risk Cycle",
+                "ok",
+                message="Fast risk cycle completed",
+                data=ok_result,
+                expected_interval_seconds=settings.fast_risk_loop_interval_seconds,
+            )
+            db.commit()
+            logger.info("fast_risk_cycle_completed", **ok_result)
+            return ok_result
+        except Exception as exc:
+            duration_seconds = time.monotonic() - started
+            db.rollback()
+            data = {
+                "status": "failed",
+                "error": str(exc),
+                "type": type(exc).__name__,
+                "duration_seconds": round(duration_seconds, 4),
+            }
+            try:
+                _record_system_cycle_status(
+                    db,
+                    "fast_risk_cycle",
+                    "Fast Risk Cycle",
+                    "failed",
+                    message="Fast risk cycle failed",
+                    data=data,
+                    expected_interval_seconds=settings.fast_risk_loop_interval_seconds,
+                )
+                db.add(
+                    DecisionLog(
+                        event_type="fast_risk_cycle_failed",
+                        message="Fast risk cycle failed",
+                        data=data,
+                    )
+                )
+                db.commit()
+            except Exception:
+                logger.exception("fast_risk_cycle_failure_log_failed")
+            logger.exception("fast_risk_cycle_failed", error=str(exc))
+            return data
+        finally:
+            db.close()
+
+
+async def run_fast_risk_loop(
+    executor: OrderExecutionEngine,
+    state: _FastRiskState | None = None,
+) -> None:
+    state = state or _FastRiskState()
+    settings = executor.settings
+    while True:
+        await run_fast_risk_once(executor, state)
+        await asyncio.sleep(max(1, int(settings.fast_risk_loop_interval_seconds)))
 
 
 def _risk_setting_value(db) -> dict[str, Any]:
@@ -1108,6 +1334,7 @@ async def main() -> None:
 
     scheduler = PeriodicScheduler(time.time())
     stats = _WorkerStats()
+    fast_risk_task = asyncio.create_task(run_fast_risk_loop(executor))
 
     startup_db = SessionLocal()
     try:
@@ -1118,6 +1345,12 @@ async def main() -> None:
         startup_db.close()
 
     while True:
+        if fast_risk_task.done():
+            try:
+                fast_risk_task.result()
+            except Exception as exc:
+                logger.exception("fast_risk_loop_stopped", error=str(exc))
+            fast_risk_task = asyncio.create_task(run_fast_risk_loop(executor))
         if _TICK_LOCK.locked():
             logger.warning("worker_tick_skipped_overlap")
         else:
@@ -1187,8 +1420,39 @@ async def main() -> None:
             diag_db = SessionLocal()
             try:
                 await DiagnosticReporter().send(diag_db, notifier)
-            except Exception:
+                _record_system_cycle_status(
+                    diag_db,
+                    "diagnostic_report_cycle",
+                    "Diagnostic Report Cycle",
+                    "ok",
+                    message="Diagnostic report sent",
+                    expected_interval_seconds=DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
+                )
+                diag_db.commit()
+            except Exception as exc:
                 logger.exception("telegram_diagnostic_report_failed")
+                diag_db.rollback()
+                try:
+                    data = {"error": str(exc), "type": type(exc).__name__}
+                    _record_system_cycle_status(
+                        diag_db,
+                        "diagnostic_report_cycle",
+                        "Diagnostic Report Cycle",
+                        "failed",
+                        message="Diagnostic report failed",
+                        data=data,
+                        expected_interval_seconds=DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
+                    )
+                    diag_db.add(
+                        DecisionLog(
+                            event_type="diagnostic_report_cycle_failed",
+                            message="Diagnostic report cycle failed",
+                            data=data,
+                        )
+                    )
+                    diag_db.commit()
+                except Exception:
+                    logger.exception("diagnostic_report_cycle_failure_log_failed")
             finally:
                 diag_db.close()
 
@@ -1196,10 +1460,41 @@ async def main() -> None:
             retention_db = SessionLocal()
             try:
                 result = await asyncio.to_thread(prune_old_data, retention_db)
+                _record_system_cycle_status(
+                    retention_db,
+                    "data_retention_cycle",
+                    "Data Retention Cycle",
+                    "ok",
+                    message="Data retention cycle completed",
+                    data=result,
+                    expected_interval_seconds=DATA_RETENTION_INTERVAL_SECONDS,
+                )
+                retention_db.commit()
                 logger.info("data_retention_cycle_completed", **result)
-            except Exception:
+            except Exception as exc:
                 logger.exception("data_retention_cycle_failed")
                 retention_db.rollback()
+                try:
+                    data = {"error": str(exc), "type": type(exc).__name__}
+                    _record_system_cycle_status(
+                        retention_db,
+                        "data_retention_cycle",
+                        "Data Retention Cycle",
+                        "failed",
+                        message="Data retention cycle failed",
+                        data=data,
+                        expected_interval_seconds=DATA_RETENTION_INTERVAL_SECONDS,
+                    )
+                    retention_db.add(
+                        DecisionLog(
+                            event_type="data_retention_cycle_failed",
+                            message="Data retention cycle failed",
+                            data=data,
+                        )
+                    )
+                    retention_db.commit()
+                except Exception:
+                    logger.exception("data_retention_cycle_failure_log_failed")
             finally:
                 retention_db.close()
 
@@ -1210,10 +1505,41 @@ async def main() -> None:
                     executor.position_manager.audit_live_positions_against_liquidation,
                     liq_db,
                 )
+                _record_system_cycle_status(
+                    liq_db,
+                    "live_liquidation_guard_cycle",
+                    "Live Liquidation Guard Cycle",
+                    "ok",
+                    message="Live liquidation guard cycle completed",
+                    data=result,
+                    expected_interval_seconds=LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
+                )
+                liq_db.commit()
                 logger.info("live_liquidation_guard_cycle_completed", **result)
             except Exception as exc:
                 logger.exception("live_liquidation_guard_cycle_failed", error=str(exc))
                 liq_db.rollback()
+                try:
+                    data = {"error": str(exc), "type": type(exc).__name__}
+                    _record_system_cycle_status(
+                        liq_db,
+                        "live_liquidation_guard_cycle",
+                        "Live Liquidation Guard Cycle",
+                        "failed",
+                        message="Live liquidation guard cycle failed",
+                        data=data,
+                        expected_interval_seconds=LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
+                    )
+                    liq_db.add(
+                        DecisionLog(
+                            event_type="live_liquidation_guard_cycle_failed",
+                            message="Live liquidation guard cycle failed",
+                            data=data,
+                        )
+                    )
+                    liq_db.commit()
+                except Exception:
+                    logger.exception("live_liquidation_guard_cycle_failure_log_failed")
             finally:
                 liq_db.close()
 
@@ -1225,10 +1551,42 @@ async def main() -> None:
                     uar_db,
                     executor,
                 )
+                cycle_status = "skipped" if result.get("status") == "skipped" else "ok"
+                _record_system_cycle_status(
+                    uar_db,
+                    "unified_account_ratio_guard_cycle",
+                    "Unified Account Ratio Guard Cycle",
+                    cycle_status,
+                    message="Unified Account Ratio guard cycle completed",
+                    data=result,
+                    expected_interval_seconds=UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
+                )
+                uar_db.commit()
                 logger.info("unified_account_ratio_guard_cycle_completed", **result)
             except Exception as exc:
                 logger.exception("unified_account_ratio_guard_cycle_failed", error=str(exc))
                 uar_db.rollback()
+                try:
+                    data = {"error": str(exc), "type": type(exc).__name__}
+                    _record_system_cycle_status(
+                        uar_db,
+                        "unified_account_ratio_guard_cycle",
+                        "Unified Account Ratio Guard Cycle",
+                        "failed",
+                        message="Unified Account Ratio guard cycle failed",
+                        data=data,
+                        expected_interval_seconds=UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
+                    )
+                    uar_db.add(
+                        DecisionLog(
+                            event_type="unified_account_ratio_guard_cycle_failed",
+                            message="Unified Account Ratio guard cycle failed",
+                            data=data,
+                        )
+                    )
+                    uar_db.commit()
+                except Exception:
+                    logger.exception("unified_account_ratio_guard_cycle_failure_log_failed")
             finally:
                 uar_db.close()
 

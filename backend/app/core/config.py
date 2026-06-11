@@ -94,6 +94,13 @@ class Settings(BaseSettings):
     ob_imbalance_weight: int = 8
     ob_imbalance_n_levels: int = 10  # top N livelli bid/ask da usare per l'OBI
 
+    fast_risk_loop_enabled: bool = True
+    fast_risk_loop_interval_seconds: int = 15
+    fast_risk_liquidation_interval_seconds: int = 600
+    fast_risk_reconcile_interval_seconds: int = 15
+    fast_risk_uar_interval_seconds: int = 30
+    fast_risk_warn_after_seconds: float = 4.0
+
     kill_switch_enabled: bool = False
     max_risk_per_trade_pct: float = 1.0
     max_daily_loss_pct: float = 3.0

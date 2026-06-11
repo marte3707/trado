@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
-import { Activity, TrendingDown } from "lucide-react";
+import { Activity, AlertTriangle, CheckCircle2, Clock3, MinusCircle, TrendingDown } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -10,7 +10,7 @@ import { SignalFunnelChart } from "@/components/calibration/SignalFunnelChart";
 import { RejectionReasonsList } from "@/components/calibration/RejectionReasonsList";
 import { fmt } from "@/components/atoms";
 import { cn } from "@/lib/utils";
-import { useOutcomeProfile, useEquitySlope, useExpectedRCalibration } from "@/lib/hooks/queries";
+import { useOutcomeProfile, useEquitySlope, useExpectedRCalibration, useSystemCycles } from "@/lib/hooks/queries";
 import type {
   Calibration,
   CalibrationHistoryEntry,
@@ -20,6 +20,7 @@ import type {
   OutcomeProfile,
   Signal,
   SignalRejections,
+  SystemCycleService,
   WorkerCycle,
 } from "@/lib/api";
 
@@ -95,6 +96,7 @@ export function DiagnosticsTab({
 }: Props) {
   const { data: outcomeProfile } = useOutcomeProfile(500);
   const { data: expectedRCalibration } = useExpectedRCalibration();
+  const { data: systemCycles } = useSystemCycles();
   const overall = calibration.overall;
   const winRate = overall?.win_rate ?? null;
   const profitFactor = overall?.profit_factor ?? null;
@@ -151,6 +153,8 @@ export function DiagnosticsTab({
       <OutcomeProfilePanel profile={outcomeProfile} edgeChanges={edgeChanges} />
 
       <ExpectedRCalibrationPanel data={expectedRCalibration} />
+
+      <SystemCyclesPanel diagnostics={systemCycles} />
 
       <SkipReasonsPanel workerCycles={workerCycles} />
 
@@ -520,6 +524,120 @@ function TpProfileGroup({ rows }: { rows: [string, CalibrationStats][] }) {
         </>
       )}
     </div>
+  );
+}
+
+function compactDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "—";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+  return `${Math.round(seconds / 86400)}d`;
+}
+
+const SYSTEM_STATUS_TONE: Record<SystemCycleService["status"], string> = {
+  ok: "border-success/40 bg-success/10 text-success",
+  warn: "border-warn/40 bg-warn/10 text-warn",
+  failed: "border-danger/40 bg-danger/10 text-danger",
+  stale: "border-warn/40 bg-warn/10 text-warn",
+  skipped: "border-border bg-surface-1 text-fg-3",
+  unknown: "border-border bg-surface-1 text-fg-3",
+};
+
+function SystemStatusIcon({ status }: { status: SystemCycleService["status"] }) {
+  if (status === "ok") return <CheckCircle2 className="h-3.5 w-3.5 text-success" />;
+  if (status === "failed" || status === "warn") return <AlertTriangle className="h-3.5 w-3.5 text-danger" />;
+  if (status === "stale") return <Clock3 className="h-3.5 w-3.5 text-warn" />;
+  if (status === "skipped") return <MinusCircle className="h-3.5 w-3.5 text-fg-3" />;
+  return <Activity className="h-3.5 w-3.5 text-fg-3" />;
+}
+
+function SystemCycleRow({ service }: { service: SystemCycleService }) {
+  const failureText = `${service.failure_count}/${service.failure_threshold} fail`;
+  return (
+    <div className="grid gap-2 rounded border border-border px-3 py-2.5 sm:grid-cols-[1fr_auto] sm:items-center">
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-2">
+          <SystemStatusIcon status={service.status} />
+          <span className="min-w-0 truncate text-xs font-semibold text-fg">{service.label}</span>
+          <Badge
+            variant="outline"
+            className={cn("shrink-0 font-mono text-[10px]", SYSTEM_STATUS_TONE[service.status])}
+          >
+            {service.status} ({service.state})
+          </Badge>
+        </div>
+        <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-fg-3">
+          <span>ultimo: {service.last_seen_at ? fmt.relTime(service.last_seen_at) : "—"}</span>
+          <span>atteso: {compactDuration(service.expected_interval_seconds)}</span>
+          <span>finestra: {compactDuration(service.failure_window_seconds)}</span>
+        </div>
+      </div>
+      <div className="flex items-center justify-between gap-2 sm:justify-end">
+        <span
+          className={cn(
+            "font-mono text-[11px] tabular-nums",
+            service.failure_count >= service.failure_threshold ? "text-danger" : "text-fg-3",
+          )}
+        >
+          {failureText}
+        </span>
+        {service.consecutive_failures > 0 && (
+          <Badge variant="outline" className="font-mono text-[10px] border-warn/40 bg-warn/10 text-warn">
+            streak {service.consecutive_failures}
+          </Badge>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SystemCyclesPanel({
+  diagnostics,
+}: {
+  diagnostics:
+    | {
+        status: "ok" | "degraded";
+        degraded_count: number;
+        services: SystemCycleService[];
+      }
+    | null
+    | undefined;
+}) {
+  return (
+    <Card className="p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">System cycles</div>
+          <div className="mt-0.5 text-xs text-fg-3">
+            Stato aggregato dei loop operativi, con soglia failure per finestra temporale.
+          </div>
+        </div>
+        <Badge
+          variant="outline"
+          className={cn(
+            "font-mono",
+            diagnostics?.status === "degraded"
+              ? "border-warn/40 bg-warn/10 text-warn"
+              : "border-success/40 bg-success/10 text-success",
+          )}
+        >
+          {diagnostics?.status ?? "loading"}
+          {diagnostics ? ` · ${diagnostics.degraded_count} degraded` : ""}
+        </Badge>
+      </div>
+      <div className="mt-4 grid grid-cols-1 gap-2 lg:grid-cols-2">
+        {diagnostics == null ? (
+          <div className="rounded border border-border px-3 py-2 text-xs text-fg-3">
+            Diagnostica cicli non disponibile.
+          </div>
+        ) : (
+          diagnostics.services.map((service) => (
+            <SystemCycleRow key={service.id} service={service} />
+          ))
+        )}
+      </div>
+    </Card>
   );
 }
 

@@ -25,6 +25,7 @@ export const qk = {
   tunerSourceTests: ["tuner", "source-tests"] as const,
   tunerStrategyTests: ["tuner", "strategy-tests"] as const,
   workerCycles: (limit: number) => ["worker", "cycles", limit] as const,
+  systemCycles: ["system", "cycles"] as const,
   signalRejections: (limit: number) => ["signal-rejections", limit] as const,
   marketIntelligence: ["market-intelligence"] as const,
   marketDashboard: ["market-intelligence", "dashboard"] as const,

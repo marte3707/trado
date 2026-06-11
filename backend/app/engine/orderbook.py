@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
+from math import sqrt
 
 from app.core.enums import Direction
 from app.services.hyperliquid import L2BookSnapshot
@@ -13,6 +15,9 @@ _OBI_NEUTRAL_THRESHOLD = 0.30
 _WALL_MULTIPLIER = 3.0
 # Ricerca muri entro questa distanza percentuale dal prezzo di entry
 _WALL_SEARCH_PCT = 0.05
+_DEFAULT_OBI_STATS_WINDOW = 120
+_MIN_OBI_STATS_SAMPLES = 5
+_OBI_HISTORY: dict[str, deque[float]] = {}
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,58 @@ class OrderBookAnalysis:
     ask_volume: float   # volume cumulato top-N livelli ask
     bid_walls: list[WallLevel]  # muri bid significativi sotto l'entry
     ask_walls: list[WallLevel]  # muri ask significativi sopra l'entry
+
+
+@dataclass(frozen=True)
+class OrderBookImbalanceStats:
+    obi_delta: float | None
+    obi_zscore: float | None
+    baseline_mean: float | None
+    baseline_std: float | None
+    baseline_samples: int
+
+
+def update_obi_stats(
+    key: str,
+    obi: float,
+    *,
+    window: int = _DEFAULT_OBI_STATS_WINDOW,
+    min_samples: int = _MIN_OBI_STATS_SAMPLES,
+) -> OrderBookImbalanceStats:
+    """Update rolling OBI history and return stats against the previous baseline."""
+    if window <= 1:
+        window = _DEFAULT_OBI_STATS_WINDOW
+    history = _OBI_HISTORY.get(key)
+    if history is None or history.maxlen != window:
+        history = deque(maxlen=window)
+        _OBI_HISTORY[key] = history
+
+    samples = len(history)
+    mean: float | None = None
+    std: float | None = None
+    delta: float | None = None
+    zscore: float | None = None
+    if samples >= min_samples:
+        mean = sum(history) / samples
+        variance = sum((value - mean) ** 2 for value in history) / samples
+        std = sqrt(variance)
+        delta = obi - mean
+        if std > 0:
+            zscore = delta / std
+
+    history.append(obi)
+    return OrderBookImbalanceStats(
+        obi_delta=delta,
+        obi_zscore=zscore,
+        baseline_mean=mean,
+        baseline_std=std,
+        baseline_samples=samples,
+    )
+
+
+def reset_obi_stats() -> None:
+    """Test helper: clear in-memory OBI baselines."""
+    _OBI_HISTORY.clear()
 
 
 def analyze_order_book(

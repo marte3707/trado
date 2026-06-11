@@ -35,6 +35,7 @@ import {
   type SignalRejections,
   type SignalSnapshot,
   type Strategy,
+  type SystemCycleDiagnostics,
   type WorkerCycle,
 } from "@/lib/api";
 import { qk } from "@/lib/hooks/queryKeys";
@@ -241,6 +242,15 @@ export function useWorkerCycles(limit = 20, opts?: QueryOpts<WorkerCycle[]>) {
     queryFn: () =>
       apiGet<WorkerCycle[]>(`/api/analytics/worker-cycles?limit=${limit}`).catch(() => []),
     refetchInterval: 30_000,
+    ...opts,
+  });
+}
+
+export function useSystemCycles(opts?: QueryOpts<SystemCycleDiagnostics | null>) {
+  return useQuery({
+    queryKey: qk.systemCycles,
+    queryFn: () => apiGet<SystemCycleDiagnostics>("/api/analytics/system-cycles").catch(() => null),
+    refetchInterval: 15_000,
     ...opts,
   });
 }

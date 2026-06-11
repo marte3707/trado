@@ -678,6 +678,31 @@ export type WorkerCycle = {
   };
 };
 
+export type SystemCycleService = {
+  id: string;
+  label: string;
+  status: "ok" | "warn" | "failed" | "stale" | "skipped" | "unknown";
+  state: "running" | "degraded" | "failing" | "stale" | "skipped" | "unknown";
+  message: string | null;
+  last_seen_at: string | null;
+  last_ok_at: string | null;
+  last_failure_at: string | null;
+  expected_interval_seconds: number;
+  stale_after_seconds: number;
+  failure_count: number;
+  failure_threshold: number;
+  failure_window_seconds: number;
+  consecutive_failures: number;
+  data: Record<string, unknown>;
+};
+
+export type SystemCycleDiagnostics = {
+  generated_at: string;
+  status: "ok" | "degraded";
+  degraded_count: number;
+  services: SystemCycleService[];
+};
+
 export type SignalRejections = {
   total: number;
   by_reason: Record<string, number>;

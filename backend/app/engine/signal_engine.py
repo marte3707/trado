@@ -15,7 +15,13 @@ from app.db.models import AppSetting, Candle, Indicator, Market, Signal, Strateg
 from app.engine.auto_tuner import active_ab_overlay
 from app.engine.edge_profile import signal_threshold_adjustment
 from app.engine.mtf import check_mtf_confluence, higher_timeframe
-from app.engine.orderbook import OrderBookAnalysis, analyze_order_book, ob_imbalance_result
+from app.engine.orderbook import (
+    OrderBookAnalysis,
+    OrderBookImbalanceStats,
+    analyze_order_book,
+    ob_imbalance_result,
+    update_obi_stats,
+)
 from app.engine.performance import SignalPerformanceAnalyzer
 from app.engine.regime import apply_regime_filter
 from app.engine.risk import RiskManager
@@ -965,6 +971,7 @@ class SignalEngine:
             results.append(funding_result)
             weights[funding_result.strategy_name] = max(0, settings.funding_rate_weight)
         ob_analysis: OrderBookAnalysis | None = None
+        ob_stats: OrderBookImbalanceStats | None = None
         ob_snapshot = None
         if "ob_imbalance" not in disabled_sources:
             # L2 book cachato per (coin, n_levels) per la durata del tick: lo stesso market
@@ -984,6 +991,7 @@ class SignalEngine:
                 entry=candles[-1].close,
                 n_levels=settings.ob_imbalance_n_levels,
             )
+            ob_stats = update_obi_stats(ob_cache_key, ob_analysis.obi)
             ob_result = ob_imbalance_result(context, ob_analysis)
             if ob_result is not None:
                 results.append(ob_result)
@@ -1051,6 +1059,19 @@ class SignalEngine:
                 "ask_wall_count": len(ob_analysis.ask_walls),
                 "bid_walls": [{"price": w.price, "size": w.size} for w in ob_analysis.bid_walls],
                 "ask_walls": [{"price": w.price, "size": w.size} for w in ob_analysis.ask_walls],
+                "obi_delta": round(ob_stats.obi_delta, 4)
+                if ob_stats is not None and ob_stats.obi_delta is not None
+                else None,
+                "obi_zscore": round(ob_stats.obi_zscore, 4)
+                if ob_stats is not None and ob_stats.obi_zscore is not None
+                else None,
+                "baseline_mean": round(ob_stats.baseline_mean, 4)
+                if ob_stats is not None and ob_stats.baseline_mean is not None
+                else None,
+                "baseline_std": round(ob_stats.baseline_std, 4)
+                if ob_stats is not None and ob_stats.baseline_std is not None
+                else None,
+                "baseline_samples": ob_stats.baseline_samples if ob_stats is not None else 0,
             }
         score.breakdown["_market_context"] = {
             "hyperliquid_average_quote_volume_usd": hyperliquid_average_quote_volume,

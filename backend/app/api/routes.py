@@ -91,6 +91,12 @@ from app.services.unified_account_ratio import (
 )
 from app.strategies.base import CandleInput, StrategyContext
 from app.strategies.registry import strategy_registry
+from app.worker.scheduler import (
+    DATA_RETENTION_INTERVAL_SECONDS,
+    DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
+    LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
+    UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
+)
 
 router = APIRouter(prefix="/api")
 _market_data_client: CoinMarketCapClient | None = None
@@ -117,6 +123,26 @@ HISTORY_ORDER_TYPES = (
     "time_stop",
     "btc_macro_protection_loss_exit",
     "liquidation_guard_failed",
+)
+SYSTEM_CYCLE_STATUS_SETTING_KEY = "system_cycle_status"
+WORKER_CYCLE_INTERVAL_SECONDS = 60
+SYSTEM_CYCLE_STALE_FACTOR = 3
+SYSTEM_CYCLE_MIN_STALE_GRACE_SECONDS = 120
+SYSTEM_CYCLE_EVENTS = frozenset(
+    {
+        "worker_cycle",
+        "worker_cycle_failed",
+        "fast_risk_cycle",
+        "fast_risk_cycle_failed",
+        "live_liquidation_guard_cycle",
+        "live_liquidation_guard_cycle_failed",
+        "unified_account_ratio_guard_cycle",
+        "unified_account_ratio_guard_cycle_failed",
+        "data_retention_cycle",
+        "data_retention_cycle_failed",
+        "diagnostic_report_cycle",
+        "diagnostic_report_cycle_failed",
+    }
 )
 
 _TRADE_MANAGEMENT_GUIDE_HTML = """<!doctype html>
@@ -833,6 +859,223 @@ def _serialize_decision_log(row: DecisionLog) -> dict[str, Any]:
         "message": row.message,
         "data": row.data,
     }
+
+
+def _coerce_utc_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    parsed: datetime | None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _iso_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _max_datetime(*values: datetime | None) -> datetime | None:
+    parsed = [value for value in values if value is not None]
+    return max(parsed) if parsed else None
+
+
+def _latest_decision_log(db: Session, event_types: Sequence[str]) -> DecisionLog | None:
+    if not event_types:
+        return None
+    return (
+        db.query(DecisionLog)
+        .filter(DecisionLog.event_type.in_(tuple(event_types)))
+        .order_by(DecisionLog.timestamp.desc())
+        .first()
+    )
+
+
+def _decision_log_count_since(db: Session, event_types: Sequence[str], since: datetime) -> int:
+    if not event_types:
+        return 0
+    return (
+        db.query(DecisionLog)
+        .filter(
+            DecisionLog.event_type.in_(tuple(event_types)),
+            DecisionLog.timestamp >= since,
+        )
+        .count()
+    )
+
+
+def _system_cycle_status_entry(db: Session, cycle_id: str) -> dict[str, Any]:
+    setting = db.get(AppSetting, SYSTEM_CYCLE_STATUS_SETTING_KEY)
+    value = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+    cycles = value.get("cycles") if isinstance(value, dict) else {}
+    if not isinstance(cycles, dict):
+        return {}
+    entry = cycles.get(cycle_id)
+    return dict(entry) if isinstance(entry, dict) else {}
+
+
+def _service_cycle_diagnostic(
+    db: Session,
+    *,
+    cycle_id: str,
+    label: str,
+    success_events: Sequence[str],
+    failure_events: Sequence[str],
+    expected_interval_seconds: int,
+    failure_window_seconds: int,
+    failure_threshold: int,
+    now: datetime,
+) -> dict[str, Any]:
+    status_entry = _system_cycle_status_entry(db, cycle_id)
+    latest_success = _latest_decision_log(db, success_events)
+    latest_failure = _latest_decision_log(db, failure_events)
+    stored_status = status_entry.get("status") if isinstance(status_entry.get("status"), str) else None
+
+    last_seen_at = _max_datetime(
+        _coerce_utc_datetime(status_entry.get("last_seen_at")),
+        _coerce_utc_datetime(latest_success.timestamp if latest_success is not None else None),
+        _coerce_utc_datetime(latest_failure.timestamp if latest_failure is not None else None),
+    )
+    last_ok_at = _max_datetime(
+        _coerce_utc_datetime(status_entry.get("last_ok_at")),
+        _coerce_utc_datetime(latest_success.timestamp if latest_success is not None else None),
+    )
+    last_failure_at = _max_datetime(
+        _coerce_utc_datetime(status_entry.get("last_failure_at")),
+        _coerce_utc_datetime(latest_failure.timestamp if latest_failure is not None else None),
+    )
+    failure_count = _decision_log_count_since(
+        db,
+        failure_events,
+        now - timedelta(seconds=failure_window_seconds),
+    )
+    stale_after = max(
+        expected_interval_seconds * SYSTEM_CYCLE_STALE_FACTOR,
+        expected_interval_seconds + SYSTEM_CYCLE_MIN_STALE_GRACE_SECONDS,
+    )
+    is_stale = (
+        last_seen_at is not None
+        and stored_status not in {"skipped", "disabled"}
+        and (now - last_seen_at).total_seconds() > stale_after
+    )
+    status = "unknown"
+    state = "unknown"
+    if failure_count >= failure_threshold:
+        status = "failed"
+        state = "failing"
+    elif is_stale:
+        status = "stale"
+        state = "stale"
+    elif stored_status in {"skipped", "disabled"}:
+        status = "skipped"
+        state = "skipped"
+    elif (
+        last_failure_at is not None
+        and (last_ok_at is None or last_failure_at > last_ok_at)
+    ):
+        status = "warn"
+        state = "degraded"
+    elif last_seen_at is not None:
+        status = "ok"
+        state = "running"
+
+    message = status_entry.get("message")
+    if not isinstance(message, str):
+        message = (
+            latest_failure.message
+            if latest_failure is not None and status in {"failed", "warn"}
+            else latest_success.message if latest_success is not None else None
+        )
+    data = status_entry.get("data") if isinstance(status_entry.get("data"), dict) else {}
+    if not data and latest_success is not None and isinstance(latest_success.data, dict):
+        data = latest_success.data
+    if status in {"failed", "warn"} and latest_failure is not None and isinstance(latest_failure.data, dict):
+        data = latest_failure.data
+
+    return {
+        "id": cycle_id,
+        "label": label,
+        "status": status,
+        "state": state,
+        "message": message,
+        "last_seen_at": _iso_or_none(last_seen_at),
+        "last_ok_at": _iso_or_none(last_ok_at),
+        "last_failure_at": _iso_or_none(last_failure_at),
+        "expected_interval_seconds": expected_interval_seconds,
+        "stale_after_seconds": stale_after,
+        "failure_count": failure_count,
+        "failure_threshold": failure_threshold,
+        "failure_window_seconds": failure_window_seconds,
+        "consecutive_failures": status_entry.get("consecutive_failures", 0),
+        "data": data,
+    }
+
+
+def _system_cycle_configs(settings: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "cycle_id": "fast_risk_cycle",
+            "label": "Fast Risk Cycle",
+            "success_events": ("fast_risk_cycle",),
+            "failure_events": ("fast_risk_cycle_failed",),
+            "expected_interval_seconds": int(settings.fast_risk_loop_interval_seconds),
+            "failure_window_seconds": 600,
+            "failure_threshold": 3,
+        },
+        {
+            "cycle_id": "worker_cycle",
+            "label": "Worker Cycle",
+            "success_events": ("worker_cycle",),
+            "failure_events": ("worker_cycle_failed",),
+            "expected_interval_seconds": WORKER_CYCLE_INTERVAL_SECONDS,
+            "failure_window_seconds": 900,
+            "failure_threshold": 3,
+        },
+        {
+            "cycle_id": "live_liquidation_guard_cycle",
+            "label": "Live Liquidation Guard Cycle",
+            "success_events": ("live_liquidation_guard_cycle",),
+            "failure_events": ("live_liquidation_guard_cycle_failed",),
+            "expected_interval_seconds": LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
+            "failure_window_seconds": 86400,
+            "failure_threshold": 2,
+        },
+        {
+            "cycle_id": "unified_account_ratio_guard_cycle",
+            "label": "Unified Account Ratio Guard Cycle",
+            "success_events": ("unified_account_ratio_guard_cycle",),
+            "failure_events": ("unified_account_ratio_guard_cycle_failed",),
+            "expected_interval_seconds": UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
+            "failure_window_seconds": 900,
+            "failure_threshold": 3,
+        },
+        {
+            "cycle_id": "data_retention_cycle",
+            "label": "Data Retention Cycle",
+            "success_events": ("data_retention_cycle",),
+            "failure_events": ("data_retention_cycle_failed",),
+            "expected_interval_seconds": DATA_RETENTION_INTERVAL_SECONDS,
+            "failure_window_seconds": 86400,
+            "failure_threshold": 1,
+        },
+        {
+            "cycle_id": "diagnostic_report_cycle",
+            "label": "Diagnostic Report Cycle",
+            "success_events": ("diagnostic_report_cycle",),
+            "failure_events": ("diagnostic_report_cycle_failed",),
+            "expected_interval_seconds": DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
+            "failure_window_seconds": 86400,
+            "failure_threshold": 1,
+        },
+    ]
 
 
 @router.get("/signals", response_model=list[SignalOut])
@@ -1868,6 +2111,23 @@ def worker_cycles(db: Session = Depends(get_db), limit: int = Query(20, ge=1, le
     ]
 
 
+@router.get("/analytics/system-cycles")
+def system_cycles(db: Session = Depends(get_db)) -> dict[str, Any]:
+    now = datetime.now(UTC)
+    settings = get_settings()
+    services = [
+        _service_cycle_diagnostic(db, now=now, **config)
+        for config in _system_cycle_configs(settings)
+    ]
+    degraded = [item for item in services if item["status"] in {"failed", "stale", "warn"}]
+    return {
+        "generated_at": now.isoformat(),
+        "status": "degraded" if degraded else "ok",
+        "degraded_count": len(degraded),
+        "services": services,
+    }
+
+
 @router.post("/system/services/{service}/{action}")
 def system_service_action(
     service: str = Path(..., pattern=r"^(backend|worker)$"),
@@ -2743,6 +3003,7 @@ def logs(
     position_id: int | None = Query(None),
     market_id: int | None = Query(None),
     event_type: str | None = Query(None),
+    include_system_cycles: bool = Query(False),
     limit: int = Query(250, ge=1, le=1000),
 ) -> list[dict]:
     q = db.query(DecisionLog)
@@ -2754,6 +3015,8 @@ def logs(
         q = q.filter(DecisionLog.market_id == market_id)
     if event_type is not None:
         q = q.filter(DecisionLog.event_type == event_type)
+    elif not include_system_cycles:
+        q = q.filter(~DecisionLog.event_type.in_(tuple(SYSTEM_CYCLE_EVENTS)))
     return [
         {
             "id": row.id,
