@@ -347,8 +347,6 @@ async def run_once(
                 closed += await asyncio.to_thread(
                     executor.close_paper_positions_for_timeframe, db, market, timeframe
                 )
-                if timeframe not in active_timeframes:
-                    continue
                 if operation_mode == OperationMode.AUTO_TRADE:
                     live_stop_updates += await asyncio.to_thread(
                         executor.position_manager.manage_live_positions_for_timeframe,
@@ -356,6 +354,8 @@ async def run_once(
                         market,
                         timeframe,
                     )
+                if timeframe not in active_timeframes:
+                    continue
                 signal = await asyncio.to_thread(signal_engine.generate, db, market, timeframe)
                 if signal is None:
                     continue

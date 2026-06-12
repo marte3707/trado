@@ -2138,6 +2138,7 @@ def reconcile_live_positions(
                 )
                 if last_filled is not None and last_filled.price is not None:
                     metadata["exit_price"] = str(last_filled.price)
+                    metadata["exit_reason"] = last_filled.order_type
 
             position.metadata_json = metadata
             db.add(position)

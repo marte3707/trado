@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.core.enums import Direction
 from app.core.runtime_settings import (
     DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE,
     effective_macro_risk_mode_settings,
@@ -15,7 +16,9 @@ from app.core.runtime_settings import (
     effective_portfolio_guard_settings,
     setting_value,
 )
-from app.db.models import AppSetting, DecisionLog, Position, Signal
+from app.db.models import AppSetting, Candle, DecisionLog, Position, Signal
+from app.engine.mtf import check_mtf_confluence, higher_timeframe
+from app.strategies.base import CandleInput
 
 
 @dataclass(frozen=True)
@@ -296,22 +299,19 @@ class PortfolioGuard:
             )
 
         if bool(policy.get("require_mtf_confluence", False)):
-            breakdown = signal.strategy_breakdown if isinstance(signal.strategy_breakdown, dict) else {}
-            if signal.timeframe in {"5m", "15m", "30m", "1h"} and "_mtf_confluence" not in breakdown:
+            mtf_passed, mtf_details = _evaluate_macro_mtf_confluence(db, signal)
+            if not mtf_passed:
                 return PortfolioGuardDecision(
                     allowed=False,
                     reason="macro risk mode requires MTF confluence",
-                    details=details,
+                    details={**details, **mtf_details},
                 )
 
         expected_r_floor = _optional_float(policy.get("min_expected_r"))
         if expected_r_floor is not None:
             breakdown = signal.strategy_breakdown if isinstance(signal.strategy_breakdown, dict) else {}
-            calibration = (
-                breakdown.get("_expected_r_calibration")
-                if isinstance(breakdown.get("_expected_r_calibration"), dict)
-                else {}
-            )
+            raw_calibration = breakdown.get("_expected_r_calibration")
+            calibration: dict[str, Any] = raw_calibration if isinstance(raw_calibration, dict) else {}
             confidence = str(calibration.get("confidence") or "").lower()
             expected_r = _optional_float(calibration.get("expected_r"))
             if confidence in {"medium", "high"} and expected_r is not None and expected_r < expected_r_floor:
@@ -369,8 +369,9 @@ def _effective_macro_policy(db: Session) -> dict[str, Any]:
                 for timeframe in _string_set(policy.get("disable_timeframes"))
             }
         ),
-        "require_mtf_confluence": any(
-            bool(policy.get("require_mtf_confluence", False)) for policy in policies
+        "require_mtf_confluence": _macro_mtf_required(
+            manual=manual,
+            state=state,
         ),
     }
     expected_r_floors = [
@@ -393,6 +394,74 @@ def _macro_state_active(state: dict[str, Any]) -> bool:
         return False
     active_until = _parse_dt(state.get("active_until"))
     return not (active_until is not None and active_until <= datetime.now(UTC))
+
+
+def _macro_mtf_required(*, manual: dict[str, Any], state: dict[str, Any]) -> bool:
+    manual_required = bool(
+        manual.get("enabled", False) and manual.get("require_mtf_confluence", False)
+    )
+    if manual_required:
+        return True
+    if not _macro_state_active(state):
+        return False
+    raw_policy = state.get("policy")
+    policy: dict[str, Any] = raw_policy if isinstance(raw_policy, dict) else {}
+    return bool(
+        str(state.get("level") or "").lower() == "extreme"
+        and policy.get("require_mtf_confluence", False)
+    )
+
+
+def _evaluate_macro_mtf_confluence(
+    db: Session,
+    signal: Signal,
+) -> tuple[bool, dict[str, Any]]:
+    if signal.timeframe not in {"5m", "15m", "30m", "1h"}:
+        return True, {}
+    higher_tf = higher_timeframe(signal.timeframe)
+    if higher_tf is None:
+        return True, {}
+    direction = _signal_direction(signal.direction)
+    risk_value = setting_value(db, "risk")
+    mtf_ema_period = int(risk_value.get("mtf_ema_period", 50))
+    higher_rows = (
+        db.query(Candle)
+        .filter(Candle.market_id == signal.market_id, Candle.timeframe == higher_tf)
+        .order_by(Candle.open_time.desc())
+        .limit(max(mtf_ema_period * 3, 100))
+        .all()
+    )
+    higher_candles = [
+        CandleInput(
+            open_time=row.open_time,
+            open=float(row.open),
+            high=float(row.high),
+            low=float(row.low),
+            close=float(row.close),
+            volume=float(row.volume),
+            open_interest=float(row.open_interest) if row.open_interest is not None else None,
+        )
+        for row in reversed(higher_rows)
+    ]
+    mtf_passed, mtf_info = check_mtf_confluence(
+        higher_candles,
+        direction,
+        enabled=True,
+        ema_period=mtf_ema_period,
+    )
+    if mtf_passed or mtf_info is None:
+        return True, {}
+    return False, {
+        "higher_timeframe": higher_tf,
+        "mtf": mtf_info,
+    }
+
+
+def _signal_direction(value: Any) -> Direction:
+    try:
+        return Direction(str(value))
+    except ValueError:
+        return Direction.NEUTRAL
 
 
 def _open_positions(db: Session, mode: str) -> list[Position]:

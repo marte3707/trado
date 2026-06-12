@@ -116,13 +116,13 @@ def _risk_settings(**monitor_overrides: Any) -> dict[str, Any]:
                     "size_multiplier": 1.0,
                     "min_score_add": 4,
                     "disable_timeframes": [],
-                    "require_mtf_confluence": True,
+                    "require_mtf_confluence": False,
                 },
                 "high": {
                     "size_multiplier": 0.5,
                     "min_score_add": 8,
                     "disable_timeframes": ["5m"],
-                    "require_mtf_confluence": True,
+                    "require_mtf_confluence": False,
                 },
                 "extreme": {
                     "size_multiplier": 0.25,
@@ -452,3 +452,42 @@ def test_monitor_reuses_cached_news_during_fetch_cooldown() -> None:
 
     assert client.calls == 0
     assert result["state"]["news_score"] > 0
+
+
+def test_market_stress_ema_smooths_spike_on_second_cycle() -> None:
+    now = datetime(2026, 6, 11, 8, 30, tzinfo=UTC)
+    news = [
+        MacroNewsItem(
+            title="Iran and Israel peace talks collapse after missile strike near Hormuz",
+            source="test",
+            url="https://example.com/a",
+            published_at=now - timedelta(minutes=5),
+        )
+    ]
+    # First cycle: high market stress → EMA initialized to raw score
+    db = FakeDb(
+        settings={"risk": _risk_settings()},
+        markets=[_market()],
+        candles=_candles(now),
+    )
+    monitor = MacroRiskMonitor(Settings(), news_client=StaticNewsClient(news))
+    result1 = monitor.run(db, now=now)  # type: ignore[arg-type]
+    raw_ema_after_first = result1["state"]["market_stress_ema"]
+    assert raw_ema_after_first is not None
+
+    # Second cycle: market stress drops to 0; EMA is smoothed (not a hard reset)
+    db2 = FakeDb(
+        settings={
+            "risk": _risk_settings(),
+            "macro_risk_state": result1["state"],
+        },
+        markets=[_market()],
+        candles=[],  # no candles → raw_market_score = 0
+    )
+    result2 = monitor.run(db2, now=now + timedelta(minutes=1))  # type: ignore[arg-type]
+    ema_after_drop = result2["state"]["market_stress_ema"]
+    assert ema_after_drop is not None
+    # EMA must be strictly between 0 and the previous value (smoothed, not zeroed)
+    assert 0 < ema_after_drop < raw_ema_after_first
+    # smoothed score stored in state must equal rounded EMA
+    assert result2["state"]["market_stress_score"] == round(ema_after_drop)

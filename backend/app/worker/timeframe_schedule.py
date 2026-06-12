@@ -36,7 +36,12 @@ def mark_timeframes_run(timeframes: list[str], started_ms: int) -> None:
 
 
 def paper_management_timeframes(db, enabled_timeframes: list[str]) -> list[str]:
-    """Keep paper positions manageable even after timeframe config changes."""
+    """Keep open positions manageable even after timeframe config changes.
+
+    Includes timeframes from both paper and live open positions so that candle
+    sync and trailing-stop management continue even when the source timeframe
+    is no longer in the enabled_timeframes list.
+    """
     managed: list[str] = []
     seen: set[str] = set()
 
@@ -48,7 +53,7 @@ def paper_management_timeframes(db, enabled_timeframes: list[str]) -> list[str]:
     positions = (
         db.query(Position)
         .filter(
-            Position.mode == OrderMode.PAPER.value,
+            Position.mode.in_([OrderMode.PAPER.value, OrderMode.LIVE.value]),
             Position.status == "open",
         )
         .all()

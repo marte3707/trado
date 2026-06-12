@@ -1,3 +1,5 @@
+from typing import Any
+
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -114,6 +116,29 @@ DEFAULT_EDGE_RISK_SETTINGS = {
 }
 
 
+def _normalize_macro_risk_monitor_policies(value: Any) -> tuple[Any, bool]:
+    if not isinstance(value, dict):
+        return value, False
+    raw_policies = value.get("policies")
+    if not isinstance(raw_policies, dict):
+        return value, False
+    policies = dict(raw_policies)
+    mutated = False
+    for level in ("watch", "high"):
+        raw_policy = raw_policies.get(level)
+        if not isinstance(raw_policy, dict):
+            continue
+        if raw_policy.get("require_mtf_confluence") is True:
+            policies[level] = {
+                **raw_policy,
+                "require_mtf_confluence": False,
+            }
+            mutated = True
+    if not mutated:
+        return value, False
+    return {**value, "policies": policies}, True
+
+
 # Market osservati solo a scopo macro: sincronizzano candele ma NON generano
 # segnali né posizioni (vedi guard `monitoring_only` nel worker). XYZ100 è il
 # perp HIP-3 di trade[XYZ] su Hyperliquid che traccia il Nasdaq-100 (coin API
@@ -216,6 +241,12 @@ def seed_defaults(db: Session) -> None:
                 if key not in value:
                     value[key] = default
                     mutated = True
+            normalized_monitor, normalized = _normalize_macro_risk_monitor_policies(
+                value.get("macro_risk_monitor")
+            )
+            if normalized:
+                value["macro_risk_monitor"] = normalized_monitor
+                mutated = True
             if mutated:
                 risk_setting.value = value
     if db.get(AppSetting, "portfolio_circuit_breaker_state") is None:

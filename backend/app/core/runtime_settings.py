@@ -199,14 +199,14 @@ DEFAULT_MACRO_RISK_MONITOR_SETTINGS: dict[str, Any] = {
             "min_score_add": 0,
             "min_expected_r": None,
             "disable_timeframes": [],
-            "require_mtf_confluence": True,
+            "require_mtf_confluence": False,
         },
         "high": {
             "size_multiplier": 0.5,
             "min_score_add": 0,
             "min_expected_r": 0.0,
             "disable_timeframes": ["5m"],
-            "require_mtf_confluence": True,
+            "require_mtf_confluence": False,
         },
         "extreme": {
             "size_multiplier": 0.25,
@@ -242,6 +242,7 @@ DEFAULT_MACRO_RISK_STATE: dict[str, Any] = {
     "cached_calendar_events": [],
     "last_telegram_risk_notification_at": None,
     "last_telegram_risk_notification_level": None,
+    "market_stress_ema": None,
 }
 
 DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE: dict[str, Any] = {

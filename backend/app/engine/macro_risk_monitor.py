@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from html import unescape
-import re
 from statistics import median
 from typing import Any
 from urllib.parse import urlparse
@@ -132,6 +132,11 @@ class MacroRiskMonitor:
         news_result = self._news_score(db, config, previous, now)
         calendar_result = self._calendar_score(db, config, previous, now)
         market_result = self._market_stress_score(db, config, now)
+        raw_market_score = int(market_result["score"])
+        prev_ema = previous.get("market_stress_ema")
+        alpha = max(0.1, min(1.0, _float(config.get("market_stress_ema_alpha"), 0.4)))
+        ema = alpha * raw_market_score + (1 - alpha) * (prev_ema if prev_ema is not None else raw_market_score)
+        market_result = {**market_result, "raw_score": raw_market_score, "score": int(round(ema)), "ema": ema}
         combined_score = _combined_score(
             news_result["score"],
             calendar_result["score"],
@@ -412,6 +417,7 @@ class MacroRiskMonitor:
                 "news_score": int(news_result["score"]),
                 "calendar_score": int(calendar_result["score"]),
                 "market_stress_score": int(market_result["score"]),
+                "market_stress_ema": market_result.get("ema"),
                 "triggered_at": triggered_at,
                 "active_until": active_until.isoformat() if active_until is not None else None,
                 "last_checked_at": now.isoformat(),

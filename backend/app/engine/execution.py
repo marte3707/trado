@@ -1369,6 +1369,8 @@ class OrderExecutionEngine:
                 raw_response=result.raw_response,
             )
         )
+        if exit_size >= position.size and reason == "liquidation_guard_failed":
+            self._close_companion_paper(db, position, exit_price, reason)
         db.commit()
 
     def _exit_position(
@@ -1517,6 +1519,31 @@ class OrderExecutionEngine:
         if reason in {"take_profit", "tp1", "tp2", "tp3"}:
             return "paper_position_auto_closed" if close_position else "paper_position_partial_closed"
         return "position_closed" if close_position else "position_partially_closed"
+
+    def _close_companion_paper(
+        self,
+        db: Session,
+        live_position: Position,
+        exit_price: Decimal,
+        reason: str,
+    ) -> None:
+        signal_id = _signal_id_from_position(live_position)
+        if signal_id is None:
+            return
+        paper = (
+            db.query(Position)
+            .filter(
+                Position.mode == OrderMode.PAPER.value,
+                Position.status == "open",
+            )
+            .filter(
+                Position.metadata_json["source_signal_id"].as_string() == str(signal_id)
+            )
+            .first()
+        )
+        if paper is None:
+            return
+        self.close_position(db, paper, exit_price=exit_price, reason=reason, commit=False)
 
     def close_paper_positions_for_candle(self, db: Session, market: Market, candle: Candle) -> int:
         positions = (

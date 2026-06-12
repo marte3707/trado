@@ -76,13 +76,16 @@ def initial_size(position: Position, orders: Iterable[Order] = ()) -> Decimal | 
 
 def initial_risk(position: Position, size: Decimal | None = None) -> Decimal | None:
     metadata = position.metadata_json or {}
-    stop_loss = _decimal(metadata.get("initial_stop_loss")) or position.stop_loss
-    if stop_loss is None:
-        return None
     initial = size if size is not None else initial_size(position)
     if initial is None:
         return None
-    risk = abs(position.entry_price - stop_loss) * initial
+    risk_per_unit = _decimal(metadata.get("initial_risk_per_unit"))
+    if risk_per_unit is None:
+        stop_loss = _decimal(metadata.get("initial_stop_loss")) or position.stop_loss
+        if stop_loss is None:
+            return None
+        risk_per_unit = abs(position.entry_price - stop_loss)
+    risk = risk_per_unit * initial
     return risk if risk > 0 else None
 
 

@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -335,7 +335,7 @@ async def test_send_signal_skips_public_channel_when_macro_risk_blocks_negative_
                 "active": True,
                 "level": "extreme",
                 "reason": "geopolitical_escalation, market_stress",
-                "active_until": "2026-06-12T12:00:00+00:00",
+                "active_until": (datetime.now(UTC) + timedelta(hours=1)).replace(microsecond=0).isoformat(),
                 "sources": ["news", "market_stress"],
                 "policy": {
                     "size_multiplier": 0.25,

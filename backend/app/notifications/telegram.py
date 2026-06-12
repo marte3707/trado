@@ -1149,7 +1149,8 @@ class TelegramNotifier:
         mtf = "required" if policy.get("require_mtf_confluence") else "not required"
         expected_r_floor = policy.get("min_expected_r")
         try:
-            expected_r_label = f">={float(expected_r_floor):.2f}R"
+            expected_r_value = float(expected_r_floor) if expected_r_floor is not None else None
+            expected_r_label = f">={expected_r_value:.2f}R"
         except (TypeError, ValueError):
             expected_r_label = "not enforced"
         lines = [

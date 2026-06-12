@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 from app.core.config import Settings
-from app.db.models import AppSetting, Position, Signal
+from app.db.models import AppSetting, Candle, Position, Signal
 from app.engine.portfolio_guard import PortfolioGuard
 
 
@@ -15,7 +15,31 @@ class FakeQuery:
     rows: list[Any]
 
     def filter(self, *_args: Any, **_kwargs: Any) -> FakeQuery:
-        return self
+        rows = list(self.rows)
+        for expr in _args:
+            key = getattr(getattr(expr, "left", None), "key", None)
+            operator = getattr(getattr(expr, "operator", None), "__name__", None)
+            value = getattr(getattr(expr, "right", None), "value", None)
+            if key is None or operator is None:
+                continue
+            if operator == "eq":
+                rows = [row for row in rows if getattr(row, key) == value]
+            elif operator == "ge":
+                rows = [row for row in rows if getattr(row, key) >= value]
+            elif operator == "is_not":
+                rows = [row for row in rows if getattr(row, key) is not value]
+        return FakeQuery(rows)
+
+    def order_by(self, *args: Any) -> FakeQuery:
+        rows = list(self.rows)
+        for expr in args:
+            key = getattr(getattr(expr, "element", None), "key", None)
+            modifier = getattr(getattr(expr, "modifier", None), "__name__", None)
+            if key is None:
+                continue
+            reverse = modifier == "desc_op"
+            rows = sorted(rows, key=lambda row: getattr(row, key), reverse=reverse)
+        return FakeQuery(rows)
 
     def limit(self, count: int) -> FakeQuery:
         return FakeQuery(self.rows[:count])
@@ -31,9 +55,11 @@ class FakeDb:
     def __init__(
         self,
         *,
+        candles: list[Candle] | None = None,
         positions: list[Position] | None = None,
         settings: dict[str, dict[str, Any]] | None = None,
     ) -> None:
+        self.candles = candles or []
         self.positions = positions or []
         self.settings = {
             key: AppSetting(key=key, value=value)
@@ -49,6 +75,8 @@ class FakeDb:
     def query(self, model: type[Any], *_args: Any, **_kwargs: Any) -> FakeQuery:
         if model is Position or model is Position.id:
             return FakeQuery(self.positions)
+        if model is Candle:
+            return FakeQuery(self.candles)
         return FakeQuery([])
 
     def add(self, row: Any) -> None:
@@ -162,6 +190,32 @@ def _risk_settings(**overrides: Any) -> dict[str, Any]:
     }
     value.update(overrides)
     return value
+
+
+def _candles(
+    prices: list[float],
+    *,
+    timeframe: str = "1h",
+    market_id: int = 1,
+    start: datetime | None = None,
+) -> list[Candle]:
+    base_time = start or datetime(2026, 6, 12, 0, 0, tzinfo=UTC)
+    rows: list[Candle] = []
+    for index, price in enumerate(prices):
+        value = Decimal(str(price))
+        rows.append(
+            Candle(
+                market_id=market_id,
+                timeframe=timeframe,
+                open_time=base_time + timedelta(hours=index),
+                open=value,
+                high=value + Decimal("0.3"),
+                low=value - Decimal("0.3"),
+                close=value,
+                volume=Decimal("1000"),
+            )
+        )
+    return rows
 
 
 def test_portfolio_guard_blocks_excessive_same_direction_positions() -> None:
@@ -350,6 +404,193 @@ def test_auto_macro_risk_state_blocks_disabled_timeframe() -> None:
     assert guard.position_size_multiplier(db, _signal(timeframe="1h")) == 0.25  # type: ignore[arg-type]
     assert not decision.allowed
     assert decision.reason == "macro risk mode disabled this timeframe"
+
+
+def test_auto_macro_risk_watch_allows_low_tf_signal_without_mtf_metadata() -> None:
+    db = FakeDb(
+        settings={
+            "risk": _risk_settings(),
+            "macro_risk_state": {
+                "active": True,
+                "level": "watch",
+                "reason": "geopolitical_escalation",
+                "active_until": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+                "sources": ["news"],
+                "policy": {
+                    "size_multiplier": 1.0,
+                    "min_score_add": 0,
+                    "disable_timeframes": [],
+                    "require_mtf_confluence": True,
+                },
+            },
+        },
+    )
+
+    decision = PortfolioGuard(Settings()).evaluate_entry(
+        db,  # type: ignore[arg-type]
+        _signal(timeframe="15m", direction="LONG"),
+        mode="paper",
+        side="long",
+    )
+
+    assert decision.allowed
+
+
+def test_auto_macro_risk_high_allows_low_tf_signal_without_mtf_metadata() -> None:
+    db = FakeDb(
+        settings={
+            "risk": _risk_settings(),
+            "macro_risk_state": {
+                "active": True,
+                "level": "high",
+                "reason": "geopolitical_escalation",
+                "active_until": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+                "sources": ["news"],
+                "policy": {
+                    "size_multiplier": 0.5,
+                    "min_score_add": 8,
+                    "disable_timeframes": ["5m"],
+                    "require_mtf_confluence": True,
+                },
+            },
+        },
+    )
+
+    decision = PortfolioGuard(Settings()).evaluate_entry(
+        db,  # type: ignore[arg-type]
+        _signal(timeframe="15m", direction="LONG"),
+        mode="paper",
+        side="long",
+    )
+
+    assert decision.allowed
+
+
+def test_auto_macro_risk_extreme_blocks_real_mtf_contra_trend() -> None:
+    signal = _signal(timeframe="15m", direction="LONG")
+    db = FakeDb(
+        candles=_candles([200.0 - index * 0.5 for index in range(80)]),
+        settings={
+            "risk": _risk_settings(),
+            "macro_risk_state": {
+                "active": True,
+                "level": "extreme",
+                "reason": "geopolitical_escalation",
+                "active_until": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+                "sources": ["news", "market_stress"],
+                "policy": {
+                    "size_multiplier": 0.25,
+                    "min_score_add": 12,
+                    "disable_timeframes": ["5m"],
+                    "require_mtf_confluence": True,
+                },
+            },
+        },
+    )
+
+    decision = PortfolioGuard(Settings()).evaluate_entry(
+        db,  # type: ignore[arg-type]
+        signal,
+        mode="paper",
+        side="long",
+    )
+
+    assert not decision.allowed
+    assert decision.reason == "macro risk mode requires MTF confluence"
+    assert decision.details["higher_timeframe"] == "1h"
+    assert decision.details["mtf"]["higher_trend"] == "down"
+    assert decision.details["mtf"]["distance_atr"] < 0
+
+
+def test_auto_macro_risk_extreme_allows_real_mtf_aligned_trend() -> None:
+    signal = _signal(timeframe="15m", direction="LONG")
+    db = FakeDb(
+        candles=_candles([100.0 + index * 0.5 for index in range(80)]),
+        settings={
+            "risk": _risk_settings(),
+            "macro_risk_state": {
+                "active": True,
+                "level": "extreme",
+                "reason": "geopolitical_escalation",
+                "active_until": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+                "sources": ["news", "market_stress"],
+                "policy": {
+                    "size_multiplier": 0.25,
+                    "min_score_add": 12,
+                    "disable_timeframes": ["5m"],
+                    "require_mtf_confluence": True,
+                },
+            },
+        },
+    )
+
+    decision = PortfolioGuard(Settings()).evaluate_entry(
+        db,  # type: ignore[arg-type]
+        signal,
+        mode="paper",
+        side="long",
+    )
+
+    assert decision.allowed
+
+
+def test_auto_macro_risk_extreme_fails_open_with_insufficient_higher_tf_candles() -> None:
+    signal = _signal(timeframe="15m", direction="LONG")
+    db = FakeDb(
+        candles=_candles([100.0] * 10),
+        settings={
+            "risk": _risk_settings(),
+            "macro_risk_state": {
+                "active": True,
+                "level": "extreme",
+                "reason": "geopolitical_escalation",
+                "active_until": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+                "sources": ["news", "market_stress"],
+                "policy": {
+                    "size_multiplier": 0.25,
+                    "min_score_add": 12,
+                    "disable_timeframes": ["5m"],
+                    "require_mtf_confluence": True,
+                },
+            },
+        },
+    )
+
+    decision = PortfolioGuard(Settings()).evaluate_entry(
+        db,  # type: ignore[arg-type]
+        signal,
+        mode="paper",
+        side="long",
+    )
+
+    assert decision.allowed
+
+
+def test_manual_macro_risk_mode_blocks_on_real_failed_mtf() -> None:
+    risk = _risk_settings()
+    risk["macro_risk_mode"] = {
+        "enabled": True,
+        "size_multiplier": 0.4,
+        "min_score_add": 8,
+        "disable_timeframes": [],
+        "require_mtf_confluence": True,
+    }
+    signal = _signal(timeframe="15m", direction="LONG")
+    db = FakeDb(
+        candles=_candles([200.0 - index * 0.5 for index in range(80)]),
+        settings={"risk": risk},
+    )
+
+    decision = PortfolioGuard(Settings()).evaluate_entry(
+        db,  # type: ignore[arg-type]
+        signal,
+        mode="paper",
+        side="long",
+    )
+
+    assert not decision.allowed
+    assert decision.reason == "macro risk mode requires MTF confluence"
+    assert decision.details["higher_timeframe"] == "1h"
 
 
 def test_circuit_breaker_activates_and_blocks_new_entries() -> None:
