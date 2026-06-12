@@ -62,8 +62,28 @@ function backendMeta(health: Health): ServiceMeta {
   };
 }
 
+function botMeta(health: Health): ServiceMeta {
+  const bot = health.bot;
+  let status: DotStatus = "muted";
+  let statusLabel = "n/d";
+  if (bot) {
+    status = bot.running ? "ok" : "danger";
+    statusLabel = bot.running ? "attivo" : "fermo";
+  }
+  return {
+    id: "bot",
+    label: "Bot Telegram",
+    description: "Bot per notifiche segnali, heartbeat e onboarding utenti",
+    status,
+    statusLabel,
+    detail: bot?.running
+      ? `PID: ${bot.pid ?? "—"} · ${bot.label}`
+      : `Servizio non in esecuzione${bot ? ` · ${bot.label}` : ""}`,
+  };
+}
+
 export function ServicesTab({ health }: Props) {
-  const services: ServiceMeta[] = [backendMeta(health), workerMeta(health)];
+  const services: ServiceMeta[] = [backendMeta(health), workerMeta(health), botMeta(health)];
   const { mutate: action, isPending } = useServiceAction();
 
   return (

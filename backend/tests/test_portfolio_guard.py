@@ -17,6 +17,12 @@ class FakeQuery:
     def filter(self, *_args: Any, **_kwargs: Any) -> FakeQuery:
         return self
 
+    def limit(self, count: int) -> FakeQuery:
+        return FakeQuery(self.rows[:count])
+
+    def count(self) -> int:
+        return len(self.rows)
+
     def all(self) -> list[Any]:
         return list(self.rows)
 
@@ -41,7 +47,7 @@ class FakeDb:
         return None
 
     def query(self, model: type[Any], *_args: Any, **_kwargs: Any) -> FakeQuery:
-        if model is Position:
+        if model is Position or model is Position.id:
             return FakeQuery(self.positions)
         return FakeQuery([])
 
@@ -248,6 +254,71 @@ def test_macro_risk_mode_blocks_disabled_timeframe_and_reduces_size() -> None:
     assert decision.reason == "macro risk mode disabled this timeframe"
 
 
+def test_macro_risk_mode_blocks_negative_expected_r_when_confident() -> None:
+    risk = _risk_settings()
+    risk["macro_risk_mode"] = {
+        "enabled": True,
+        "size_multiplier": 0.4,
+        "min_score_add": 8,
+        "min_expected_r": 0.0,
+        "disable_timeframes": [],
+        "require_mtf_confluence": False,
+    }
+    db = FakeDb(settings={"risk": risk})
+    guard = PortfolioGuard(Settings())
+    signal = _signal(timeframe="1h", score=68)
+    signal.strategy_breakdown = {
+        "_expected_r_calibration": {
+            "expected_r": -0.12,
+            "confidence": "medium",
+            "n_samples": 24,
+        }
+    }
+
+    decision = guard.evaluate_entry(
+        db,  # type: ignore[arg-type]
+        signal,
+        mode="paper",
+        side="short",
+    )
+
+    assert not decision.allowed
+    assert decision.reason == "macro risk mode expected R threshold not met"
+    assert decision.details["required_expected_r"] == 0.0
+    assert decision.details["calibrated_expected_r"] == -0.12
+
+
+def test_macro_risk_mode_ignores_low_confidence_expected_r() -> None:
+    risk = _risk_settings()
+    risk["macro_risk_mode"] = {
+        "enabled": True,
+        "size_multiplier": 0.4,
+        "min_score_add": 8,
+        "min_expected_r": 0.0,
+        "disable_timeframes": [],
+        "require_mtf_confluence": False,
+    }
+    db = FakeDb(settings={"risk": risk})
+    guard = PortfolioGuard(Settings())
+    signal = _signal(timeframe="1h", score=68)
+    signal.strategy_breakdown = {
+        "_expected_r_calibration": {
+            "expected_r": -0.25,
+            "confidence": "low",
+            "n_samples": 6,
+        }
+    }
+
+    decision = guard.evaluate_entry(
+        db,  # type: ignore[arg-type]
+        signal,
+        mode="paper",
+        side="short",
+    )
+
+    assert decision.allowed
+
+
 def test_auto_macro_risk_state_blocks_disabled_timeframe() -> None:
     db = FakeDb(
         settings={
@@ -261,7 +332,7 @@ def test_auto_macro_risk_state_blocks_disabled_timeframe() -> None:
                 "policy": {
                     "size_multiplier": 0.25,
                     "min_score_add": 12,
-                    "disable_timeframes": ["5m", "15m"],
+                    "disable_timeframes": ["5m"],
                     "require_mtf_confluence": True,
                 },
             },
@@ -308,3 +379,71 @@ def test_circuit_breaker_activates_and_blocks_new_entries() -> None:
     assert result["status"] == "activated"
     assert not decision.allowed
     assert decision.reason == "portfolio circuit breaker active"
+
+
+def test_new_market_probation_scales_size_for_market_without_history() -> None:
+    risk = _risk_settings()
+    risk["new_market_probation"] = {
+        "enabled": True,
+        "min_closed_trades": 3,
+        "size_multiplier": 0.5,
+    }
+    db = FakeDb(positions=[], settings={"risk": risk})
+    guard = PortfolioGuard(Settings())
+
+    assert guard.position_size_multiplier(db, _signal()) == 0.5  # type: ignore[arg-type]
+
+
+def test_new_market_probation_full_size_once_history_built() -> None:
+    risk = _risk_settings()
+    risk["new_market_probation"] = {
+        "enabled": True,
+        "min_closed_trades": 3,
+        "size_multiplier": 0.5,
+    }
+    now = datetime.now(UTC)
+    closed = [_closed_position(closed_at=now - timedelta(hours=hour)) for hour in range(3)]
+    db = FakeDb(positions=closed, settings={"risk": risk})
+    guard = PortfolioGuard(Settings())
+
+    assert guard.position_size_multiplier(db, _signal()) == 1.0  # type: ignore[arg-type]
+
+
+def test_new_market_probation_disabled_keeps_full_size() -> None:
+    risk = _risk_settings()
+    risk["new_market_probation"] = {
+        "enabled": False,
+        "min_closed_trades": 3,
+        "size_multiplier": 0.5,
+    }
+    db = FakeDb(positions=[], settings={"risk": risk})
+    guard = PortfolioGuard(Settings())
+
+    assert guard.position_size_multiplier(db, _signal()) == 1.0  # type: ignore[arg-type]
+
+
+def test_new_market_probation_missing_config_keeps_full_size() -> None:
+    db = FakeDb(positions=[], settings={"risk": _risk_settings()})
+    guard = PortfolioGuard(Settings())
+
+    assert guard.position_size_multiplier(db, _signal()) == 1.0  # type: ignore[arg-type]
+
+
+def test_new_market_probation_composes_with_macro_risk_multiplier() -> None:
+    risk = _risk_settings()
+    risk["macro_risk_mode"] = {
+        "enabled": True,
+        "size_multiplier": 0.4,
+        "min_score_add": 0,
+        "disable_timeframes": [],
+        "require_mtf_confluence": False,
+    }
+    risk["new_market_probation"] = {
+        "enabled": True,
+        "min_closed_trades": 3,
+        "size_multiplier": 0.5,
+    }
+    db = FakeDb(positions=[], settings={"risk": risk})
+    guard = PortfolioGuard(Settings())
+
+    assert guard.position_size_multiplier(db, _signal()) == 0.2  # type: ignore[arg-type]

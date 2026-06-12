@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { Activity, AlertTriangle, CheckCircle2, Clock3, MinusCircle, TrendingDown } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
@@ -94,7 +94,8 @@ export function DiagnosticsTab({
   rejections,
   workerCycles,
 }: Props) {
-  const { data: outcomeProfile } = useOutcomeProfile(500);
+  const [outcomeMode, setOutcomeMode] = useState<"paper" | "live" | null>("paper");
+  const { data: outcomeProfile } = useOutcomeProfile(500, outcomeMode);
   const { data: expectedRCalibration } = useExpectedRCalibration();
   const { data: systemCycles } = useSystemCycles();
   const overall = calibration.overall;
@@ -150,7 +151,12 @@ export function DiagnosticsTab({
         <RejectionReasonsList rejections={rejections} />
       </div>
 
-      <OutcomeProfilePanel profile={outcomeProfile} edgeChanges={edgeChanges} />
+      <OutcomeProfilePanel
+        profile={outcomeProfile}
+        edgeChanges={edgeChanges}
+        mode={outcomeMode}
+        onModeChange={setOutcomeMode}
+      />
 
       <ExpectedRCalibrationPanel data={expectedRCalibration} />
 
@@ -644,9 +650,13 @@ function SystemCyclesPanel({
 function OutcomeProfilePanel({
   profile,
   edgeChanges,
+  mode,
+  onModeChange,
 }: {
   profile: OutcomeProfile | null | undefined;
   edgeChanges: Calibration["changes"];
+  mode: "paper" | "live" | null;
+  onModeChange: (mode: "paper" | "live" | null) => void;
 }) {
   const directionRows = Object.entries(profile?.by_direction ?? {}).filter(([, s]) => s.trades > 0);
   const weakBuckets = weakestRows(profile?.by_score_bucket, 4);
@@ -670,12 +680,33 @@ function OutcomeProfilePanel({
             Profilo ultimi {profile?.filters.lookback ?? 500} trade chiusi per edge calibration
           </div>
         </div>
-        <Badge
-          variant="outline"
-          className={cn("font-mono", activePenaltyCount > 0 && "border-warn/40 bg-warn/10 text-warn")}
-        >
-          {activePenaltyCount} penalty preview
-        </Badge>
+        <div className="flex items-center gap-2">
+          <div className="flex overflow-hidden rounded-md border border-border text-[10px] font-medium uppercase tracking-wider">
+            {([
+              ["paper", "Paper"],
+              ["live", "Live"],
+              [null, "Tutti"],
+            ] as const).map(([value, label]) => (
+              <button
+                key={label}
+                type="button"
+                onClick={() => onModeChange(value)}
+                className={cn(
+                  "px-2 py-1 transition-colors",
+                  mode === value ? "bg-fg-3/20 text-fg-1" : "text-fg-3 hover:text-fg-2",
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <Badge
+            variant="outline"
+            className={cn("font-mono", activePenaltyCount > 0 && "border-warn/40 bg-warn/10 text-warn")}
+          >
+            {activePenaltyCount} penalty preview
+          </Badge>
+        </div>
       </div>
       <div className="mt-5 grid grid-cols-1 gap-6 lg:grid-cols-4">
         <DirectionGroup rows={directionRows} />

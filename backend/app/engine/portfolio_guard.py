@@ -36,11 +36,44 @@ class PortfolioGuard:
         self.settings = settings
 
     def position_size_multiplier(self, db: Session, signal: Signal) -> float:
+        multiplier = 1.0
         macro = _effective_macro_policy(db)
-        if not macro["active"]:
+        if macro["active"]:
+            macro_multiplier = _float(macro["policy"].get("size_multiplier"), 1.0)
+            multiplier *= max(0.0, min(1.0, macro_multiplier))
+        multiplier *= self._new_market_probation_multiplier(db, signal)
+        return multiplier
+
+    def _new_market_probation_multiplier(self, db: Session, signal: Signal) -> float:
+        """Rischio ridotto sui mercati senza storico di trade chiusi.
+
+        I mercati appena seedati tendono a bruciare stop pieni al primo segnale
+        (coda di one-shot losers): sotto `min_closed_trades` posizioni chiuse il
+        rischio per trade viene scalato di `size_multiplier`, finché il mercato
+        non costruisce abbastanza storico per le market_score_adjustments.
+        """
+        config = setting_value(db, "risk").get("new_market_probation")
+        if not isinstance(config, dict) or not bool(config.get("enabled", False)):
             return 1.0
-        multiplier = _float(macro["policy"].get("size_multiplier"), 1.0)
-        return max(0.0, min(1.0, multiplier))
+        try:
+            min_closed_trades = int(config.get("min_closed_trades", 3) or 0)
+        except (TypeError, ValueError):
+            min_closed_trades = 3
+        if min_closed_trades <= 0:
+            return 1.0
+        size_multiplier = max(0.0, min(1.0, _float(config.get("size_multiplier"), 0.5)))
+        if size_multiplier >= 1.0:
+            return 1.0
+        closed_count = (
+            db.query(Position.id)
+            .filter(
+                Position.market_id == signal.market_id,
+                Position.status == "closed",
+            )
+            .limit(min_closed_trades)
+            .count()
+        )
+        return 1.0 if closed_count >= min_closed_trades else size_multiplier
 
     def evaluate_entry(
         self,
@@ -205,6 +238,14 @@ class PortfolioGuard:
         _upsert_state(db, state_row, state)
         return {"status": "ok", "state": state}
 
+    def evaluate_macro_risk_gate(
+        self,
+        db: Session,
+        signal: Signal,
+    ) -> PortfolioGuardDecision:
+        """Macro-only gate shared by execution and public signal publishing."""
+        return self._macro_risk_mode_decision(db, signal)
+
     def _circuit_breaker_decision(
         self,
         db: Session,
@@ -254,17 +295,6 @@ class PortfolioGuard:
                 details={**details, "disabled_timeframes": sorted(disabled_timeframes)},
             )
 
-        risk_value = setting_value(db, "risk")
-        min_score = int(_float(risk_value.get("min_signal_score"), self.settings.min_signal_score))
-        min_score_add = int(_float(policy.get("min_score_add"), 0))
-        required_score = min_score + min_score_add
-        if min_score_add > 0 and signal.score < required_score:
-            return PortfolioGuardDecision(
-                allowed=False,
-                reason="macro risk mode score threshold not met",
-                details={**details, "required_score": required_score},
-            )
-
         if bool(policy.get("require_mtf_confluence", False)):
             breakdown = signal.strategy_breakdown if isinstance(signal.strategy_breakdown, dict) else {}
             if signal.timeframe in {"5m", "15m", "30m", "1h"} and "_mtf_confluence" not in breakdown:
@@ -272,6 +302,29 @@ class PortfolioGuard:
                     allowed=False,
                     reason="macro risk mode requires MTF confluence",
                     details=details,
+                )
+
+        expected_r_floor = _optional_float(policy.get("min_expected_r"))
+        if expected_r_floor is not None:
+            breakdown = signal.strategy_breakdown if isinstance(signal.strategy_breakdown, dict) else {}
+            calibration = (
+                breakdown.get("_expected_r_calibration")
+                if isinstance(breakdown.get("_expected_r_calibration"), dict)
+                else {}
+            )
+            confidence = str(calibration.get("confidence") or "").lower()
+            expected_r = _optional_float(calibration.get("expected_r"))
+            if confidence in {"medium", "high"} and expected_r is not None and expected_r < expected_r_floor:
+                return PortfolioGuardDecision(
+                    allowed=False,
+                    reason="macro risk mode expected R threshold not met",
+                    details={
+                        **details,
+                        "required_expected_r": expected_r_floor,
+                        "calibrated_expected_r": expected_r,
+                        "calibration_confidence": confidence,
+                        "calibration_samples": calibration.get("n_samples"),
+                    },
                 )
 
         return PortfolioGuardDecision(allowed=True, details=details)
@@ -309,7 +362,6 @@ def _effective_macro_policy(db: Session) -> dict[str, Any]:
 
     merged = {
         "size_multiplier": min((_float(policy.get("size_multiplier"), 1.0) for policy in policies), default=1.0),
-        "min_score_add": max((int(_float(policy.get("min_score_add"), 0)) for policy in policies), default=0),
         "disable_timeframes": sorted(
             {
                 timeframe
@@ -321,6 +373,12 @@ def _effective_macro_policy(db: Session) -> dict[str, Any]:
             bool(policy.get("require_mtf_confluence", False)) for policy in policies
         ),
     }
+    expected_r_floors = [
+        floor
+        for floor in (_optional_float(policy.get("min_expected_r")) for policy in policies)
+        if floor is not None
+    ]
+    merged["min_expected_r"] = max(expected_r_floors) if expected_r_floors else None
     return {
         "active": True,
         "policy": merged,
@@ -438,6 +496,13 @@ def _float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _decimal(value: Any) -> Decimal | None:

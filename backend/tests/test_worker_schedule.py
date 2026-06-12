@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from app.core.enums import OperationMode, SignalStatus
 from app.db.models import AppSetting, DecisionLog, Market, Position, Signal
+from app.worker import calibration_runner, live_close_notifications, timeframe_schedule
 from app.worker import main as worker
 
 
@@ -190,7 +191,7 @@ def _worker_cycle(
 
 
 def test_active_timeframes_use_boundary_window_without_history() -> None:
-    worker._LAST_TIMEFRAME_RUN_MS.clear()
+    timeframe_schedule._LAST_TIMEFRAME_RUN_MS.clear()
 
     assert worker.active_timeframes_for_tick(["5m", "15m"], 15 * 60 * 1000 + 30_000) == [
         "5m",
@@ -199,14 +200,14 @@ def test_active_timeframes_use_boundary_window_without_history() -> None:
 
 
 def test_active_timeframes_catch_up_after_long_cycle() -> None:
-    worker._LAST_TIMEFRAME_RUN_MS.clear()
+    timeframe_schedule._LAST_TIMEFRAME_RUN_MS.clear()
     worker.mark_timeframes_run(["5m"], 0)
 
     assert worker.active_timeframes_for_tick(["5m"], 6 * 60 * 1000) == ["5m"]
 
 
 def test_active_timeframes_do_not_run_unknown_timeframes() -> None:
-    worker._LAST_TIMEFRAME_RUN_MS.clear()
+    timeframe_schedule._LAST_TIMEFRAME_RUN_MS.clear()
 
     assert worker.active_timeframes_for_tick(["2m"], 0) == []
 
@@ -266,7 +267,7 @@ def test_display_live_close_reason_uses_trailing_stop_for_profitable_dynamic_sto
         },
     )
 
-    assert worker._display_live_close_reason(
+    assert live_close_notifications._display_live_close_reason(
         position,
         "stop_loss",
         exit_price=Decimal("108"),
@@ -284,7 +285,7 @@ def test_display_live_close_reason_keeps_stop_loss_without_profit() -> None:
         },
     )
 
-    assert worker._display_live_close_reason(
+    assert live_close_notifications._display_live_close_reason(
         position,
         "stop_loss",
         exit_price=Decimal("95"),
@@ -299,7 +300,7 @@ def test_display_live_close_reason_uses_trailing_stop_for_profitable_close_witho
         metadata_json={},
     )
 
-    assert worker._display_live_close_reason(
+    assert live_close_notifications._display_live_close_reason(
         position,
         "stop_loss",
         exit_price=Decimal("108"),
@@ -352,7 +353,7 @@ def test_calibration_legacy_lookback_count_runs_once_when_total_exceeds_cap() ->
 def test_record_calibration_total_closed_trade_count_persists_unbounded_total() -> None:
     db = CalibrationFakeDb(total_closed=819, state={"last_trade_count": 500})
 
-    worker._record_calibration_total_closed_trade_count(db, 819)
+    calibration_runner._record_calibration_total_closed_trade_count(db, 819)
 
     assert db.rows["auto_calibration_state"].value["last_total_closed_trade_count"] == 819
     assert db.committed == 1
@@ -457,7 +458,7 @@ def test_auto_trade_keeps_paper_when_live_is_rejected() -> None:
     assert db.committed == 0
 
 
-def test_auto_trade_marks_signal_ignored_when_paper_was_not_created_and_live_is_rejected() -> None:
+def test_auto_trade_skips_live_when_paper_was_not_created() -> None:
     signal = _signal()
     db = FakeDb()
     executor = FakeExecutor(live_error=PermissionError("rejected"), paper_position=None)
@@ -466,7 +467,10 @@ def test_auto_trade_marks_signal_ignored_when_paper_was_not_created_and_live_is_
         db, executor, signal, OperationMode.AUTO_TRADE, _market(), "5m"
     )
 
-    assert executor.calls == ["paper", "live"]
+    assert executor.calls == ["paper"]
     assert signal.status == SignalStatus.IGNORED.value
-    assert db.added == [signal]
+    assert db.added[0] is signal
+    assert isinstance(db.added[1], DecisionLog)
+    assert db.added[1].event_type == "live_order_skipped_after_paper_skip"
+    assert db.added[1].signal_id == signal.id
     assert db.committed == 1

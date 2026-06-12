@@ -33,6 +33,12 @@ export type Health = {
     last_error_at: string | null;
     last_error_message: string | null;
   };
+  bot?: {
+    running: boolean;
+    pid: number | null;
+    label: string;
+    source: string;
+  };
 };
 
 export type MarketIntelligence = {
@@ -138,7 +144,7 @@ export type CoinGeckoUsage = {
   source: string;
 };
 
-export type SystemService = "backend" | "worker";
+export type SystemService = "backend" | "worker" | "bot";
 export type SystemServiceAction = "start" | "stop" | "reboot";
 
 export type SystemServiceResult = {
@@ -474,7 +480,7 @@ export type Calibration = {
 };
 
 export type OutcomeProfile = {
-  filters: { lookback: number };
+  filters: { lookback: number; mode?: string | null };
   overall: CalibrationStats;
   by_mode: Record<string, CalibrationStats>;
   by_direction: Record<string, CalibrationStats>;

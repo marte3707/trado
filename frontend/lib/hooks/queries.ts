@@ -197,13 +197,18 @@ export function useCalibrationStability(opts?: QueryOpts<CalibrationStability | 
   });
 }
 
-export function useOutcomeProfile(lookback = 500, opts?: QueryOpts<OutcomeProfile | null>) {
+export function useOutcomeProfile(
+  lookback = 500,
+  mode: "paper" | "live" | null = null,
+  opts?: QueryOpts<OutcomeProfile | null>,
+) {
+  const modeParam = mode ? `&mode=${mode}` : "";
   return useQuery({
-    queryKey: qk.outcomeProfile(lookback),
+    queryKey: qk.outcomeProfile(lookback, mode),
     queryFn: () =>
-      apiGet<OutcomeProfile>(`/api/analytics/outcome-profile?lookback=${lookback}`).catch(
-        () => null,
-      ),
+      apiGet<OutcomeProfile>(
+        `/api/analytics/outcome-profile?lookback=${lookback}${modeParam}`,
+      ).catch(() => null),
     refetchInterval: 60_000,
     ...opts,
   });

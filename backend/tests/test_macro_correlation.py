@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api import routes
-from app.api.routes import _beta, _pearson
+from app.api.routers.analytics import _beta, _pearson
 from app.db.init_db import MONITORING_MARKETS, seed_monitoring_markets
 from app.db.models import Base, Candle, Market
 from app.db.session import get_db

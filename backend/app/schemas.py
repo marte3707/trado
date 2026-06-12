@@ -96,6 +96,7 @@ class MacroRiskModeSettings(BaseModel):
     enabled: bool | None = None
     size_multiplier: float | None = Field(default=None, ge=0, le=1)
     min_score_add: int | None = Field(default=None, ge=0, le=100)
+    min_expected_r: float | None = Field(default=None, ge=-0.5, le=1.0)
     disable_timeframes: list[str] | None = None
     require_mtf_confluence: bool | None = None
 
@@ -105,11 +106,19 @@ class MacroRiskMonitorSettings(BaseModel):
 
     enabled: bool | None = None
     actions_enabled: bool | None = None
+    telegram_notify_cooldown_minutes: int | None = Field(default=None, ge=0, le=1440)
+    telegram_notify_on_downgrade: bool | None = None
     news_enabled: bool | None = None
+    calendar_enabled: bool | None = None
     market_stress_enabled: bool | None = None
     news_feed_urls: list[str] | None = None
+    calendar_feed_urls: list[str] | None = None
     news_fetch_cooldown_minutes: int | None = Field(default=None, ge=1)
+    calendar_fetch_cooldown_hours: int | None = Field(default=None, ge=1, le=168)
     news_lookback_hours: int | None = Field(default=None, ge=1, le=168)
+    calendar_lookahead_hours: int | None = Field(default=None, ge=1, le=168)
+    calendar_pre_event_minutes: int | None = Field(default=None, ge=0, le=1440)
+    calendar_post_event_minutes: int | None = Field(default=None, ge=0, le=1440)
     market_lookback_minutes: int | None = Field(default=None, ge=30, le=1440)
     watch_score: int | None = Field(default=None, ge=0, le=100)
     high_score: int | None = Field(default=None, ge=0, le=100)

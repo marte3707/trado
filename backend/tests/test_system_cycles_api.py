@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api import routes
+from app.api.routers import system as system_router
 from app.db.models import AppSetting, Base, DecisionLog
 from app.db.session import get_db
 
@@ -79,7 +80,7 @@ def test_system_cycles_marks_service_failed_after_failure_threshold() -> None:
     now = datetime.now(UTC)
     db.add(
         AppSetting(
-            key=routes.SYSTEM_CYCLE_STATUS_SETTING_KEY,
+            key=system_router.SYSTEM_CYCLE_STATUS_SETTING_KEY,
             value={
                 "cycles": {
                     "fast_risk_cycle": {

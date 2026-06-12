@@ -14,6 +14,7 @@ from app.core.runtime_settings import effective_min_signal_expected_r
 from app.db.models import AppSetting, Candle, Indicator, Market, Signal, StrategyConfig
 from app.engine.auto_tuner import active_ab_overlay
 from app.engine.edge_profile import signal_threshold_adjustment
+from app.engine.macro_direction import btc_macro_direction, suspended_penalty_family
 from app.engine.mtf import check_mtf_confluence, higher_timeframe
 from app.engine.orderbook import (
     OrderBookAnalysis,
@@ -67,6 +68,28 @@ _TF_MINUTES: dict[str, int] = {
 }
 
 
+def apply_timeframe_min_score_override(
+    risk_value: dict[str, Any], timeframe: str, base_min_score: int
+) -> int:
+    """Soglia min score per-timeframe da `risk.timeframe_min_score_overrides`.
+
+    L'override può solo alzare la soglia rispetto al `min_signal_score` globale,
+    mai abbassarla: serve a stringere timeframe con edge negativo documentato
+    (es. 5m) senza penalizzare gli altri.
+    """
+    overrides = risk_value.get("timeframe_min_score_overrides")
+    if not isinstance(overrides, dict):
+        return base_min_score
+    raw = overrides.get(timeframe)
+    if raw is None:
+        return base_min_score
+    try:
+        override = int(raw)
+    except (TypeError, ValueError):
+        return base_min_score
+    return max(base_min_score, override)
+
+
 class SignalEngine:
     def __init__(self) -> None:
         self.registry = strategy_registry()
@@ -91,6 +114,7 @@ class SignalEngine:
         self._cycle_funding_breadth: dict[str, float] | None = None
         self._cycle_btc_volume_profile_loaded = False
         self._cycle_btc_volume_profile_context: dict[str, Any] | None = None
+        self._cycle_macro_direction: dict[str, Any] | None = None
 
     def begin_cycle(self) -> None:
         """Invalidate per-cycle caches at the start of each worker tick."""
@@ -100,6 +124,7 @@ class SignalEngine:
         self._cycle_funding_breadth = None
         self._cycle_btc_volume_profile_loaded = False
         self._cycle_btc_volume_profile_context = None
+        self._cycle_macro_direction = None
         # Abilita/invalida la cache per-cycle degli aggregati di performance
         # (global/timeframe stats + conteggi per market) usati da adjusted_weights.
         self.performance.begin_cycle()
@@ -143,6 +168,24 @@ class SignalEngine:
         if not isinstance(disabled, list):
             return set()
         return {str(item) for item in disabled if isinstance(item, str) and item}
+
+    def _get_cycle_macro_suspension(
+        self, db: Session, risk_value: dict[str, Any]
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Famiglia direzionale con penalità sospese nel regime macro corrente.
+
+        La direzione macro BTC è calcolata una volta per ciclo (query candele 4h)
+        e cachata; fail-safe a (None, {}) su qualsiasi errore — le penalità
+        restano attive, mai il contrario.
+        """
+        try:
+            if self._cycle_macro_direction is None:
+                self._cycle_macro_direction = btc_macro_direction(db, risk_value)
+            macro = self._cycle_macro_direction
+            return suspended_penalty_family(macro, risk_value), macro
+        except Exception:
+            logger.exception("macro_direction_failed")
+            return None, {}
 
     def _get_cycle_funding_breadth(self, threshold_pct: float) -> dict[str, float]:
         """Restituisce la frazione di mercati con funding estremo per direzione.
@@ -752,6 +795,14 @@ class SignalEngine:
         if ab_overlay:
             risk_value.update(ab_overlay)
         min_signal_score = int(risk_value.get("min_signal_score", min_signal_score))
+        min_signal_score = apply_timeframe_min_score_override(
+            risk_value, timeframe, min_signal_score
+        )
+        # Direzione macro BTC (cache per ciclo): determina se le penalità
+        # direzionali apprese nel regime opposto vanno sospese per questo segnale.
+        macro_suspended_family, macro_direction_info = self._get_cycle_macro_suspension(
+            db, risk_value
+        )
         min_risk_reward = float(risk_value.get("min_risk_reward", min_risk_reward))
         min_average_quote_volume_usd = float(
             risk_value.get("min_average_quote_volume_usd", min_average_quote_volume_usd)
@@ -928,6 +979,10 @@ class SignalEngine:
                 else None
             )
             override_key = f"{timeframe}:{direction_key}:{config.strategy_name}" if direction_key else None
+            # Gli override per la famiglia sospesa (appresi nel regime macro opposto)
+            # non vengono applicati finché il macro resta favorevole a quella direzione.
+            if direction_key is not None and direction_key == macro_suspended_family:
+                override_key = None
             if override_key and override_key in direction_strategy_overrides:
                 try:
                     weight = max(0, int(direction_strategy_overrides[override_key]))
@@ -1157,16 +1212,25 @@ class SignalEngine:
             timeframe=timeframe,
             direction=score.direction,
             score=score.score,
+            suspended_family=macro_suspended_family,
         )
         effective_min_signal_score = min_signal_score + int(edge_adjustment["total"])
         direction_family = edge_adjustment.get("direction")
         directional_key = f"{direction_family}:{timeframe}" if direction_family else None
+        if macro_suspended_family is not None and direction_family == macro_suspended_family:
+            score.breakdown["_macro_direction_suspension"] = {
+                "suspended_family": macro_suspended_family,
+                "macro": macro_direction_info,
+            }
         directional_blocklist = risk_value.get("directional_blocklist")
         if (
             bool(risk_value.get("directional_blocklist_enabled", True))
             and directional_key
             and isinstance(directional_blocklist, dict)
             and directional_key in directional_blocklist
+            # La blocklist LONG appresa in regime bearish è sospesa quando il
+            # macro BTC torna bullish (non cancellata: riprende se il regime gira).
+            and direction_family != macro_suspended_family
         ):
             score.breakdown["_directional_blocklist"] = {
                 "key": directional_key,
@@ -1185,7 +1249,11 @@ class SignalEngine:
             db.commit()
             return None
         extra_directional_min_score = 0
-        directional_min_score_adjustments = risk_value.get("directional_min_score_adjustments")
+        directional_min_score_adjustments = (
+            None
+            if direction_family == macro_suspended_family and macro_suspended_family is not None
+            else risk_value.get("directional_min_score_adjustments")
+        )
         if directional_key and isinstance(directional_min_score_adjustments, dict):
             raw_extra = directional_min_score_adjustments.get(directional_key)
             if isinstance(raw_extra, dict):
@@ -1206,8 +1274,12 @@ class SignalEngine:
             }
         # Penalità direzione applicata dopo il cap max_combined_score_adjustment.
         # Permette di alzare ulteriormente la soglia per LONG/STRONG_LONG senza
-        # interferire con la logica di calibrazione automatica.
-        if score.direction in {Direction.LONG, Direction.STRONG_LONG}:
+        # interferire con la logica di calibrazione automatica. Sospesa quando il
+        # macro BTC è bullish (penalità appresa in regime opposto).
+        if (
+            score.direction in {Direction.LONG, Direction.STRONG_LONG}
+            and macro_suspended_family != "LONG"
+        ):
             long_score_penalty = int(risk_value.get("long_score_penalty", 0))
             if long_score_penalty > 0:
                 effective_min_signal_score += long_score_penalty

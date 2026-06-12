@@ -1,6 +1,6 @@
 import uuid
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from typing import Any
 
 import structlog
@@ -290,12 +290,6 @@ class OrderExecutionEngine:
         trading = trading_client or HyperliquidTradingClient(self.settings)
         account_value, available_margin = trading.account_summary()
         plan = self._build_live_order_plan(db, signal, account_value, sizing_equity=available_margin)
-        if not self._validate_or_reject(db, signal, plan):
-            raise PermissionError(
-                "; ".join(
-                    self.validator.validate_live_execution(db, signal, self.settings, plan).reasons
-                )
-            )
         market = db.get(Market, signal.market_id)
         if market is None:
             raise PermissionError("market not found")
@@ -325,6 +319,12 @@ class OrderExecutionEngine:
             )
             db.commit()
             raise PermissionError(decision.reason or "portfolio guard rejected live entry")
+        if not self._validate_or_reject(db, signal, plan):
+            raise PermissionError(
+                "; ".join(
+                    self.validator.validate_live_execution(db, signal, self.settings, plan).reasons
+                )
+            )
         # Pre-flight: se esiste già una posizione HL su questo coin, set_leverage
         # non cambierà il leverage effettivo (HL lo mantiene per posizioni aperte).
         # Meglio saltare il trade ora piuttosto che aprire al leverage sbagliato e
@@ -1414,6 +1414,9 @@ class OrderExecutionEngine:
         )
         if close_position:
             metadata.update({"exit_price": str(exit_price), "exit_reason": reason})
+            metadata["exit_reason_detail"] = self._exit_reason_detail(
+                position, metadata, exit_price, reason
+            )
         self._mark_take_profit_filled(metadata, reason)
         position.metadata_json = metadata
         source_signal_id = metadata.get("source_signal_id")
@@ -1469,6 +1472,42 @@ class OrderExecutionEngine:
         )
         if commit:
             db.commit()
+
+    def _exit_reason_detail(
+        self,
+        position: Position,
+        metadata: dict[str, Any],
+        exit_price: Decimal,
+        reason: str,
+    ) -> str:
+        """Etichetta granulare per le chiusure da stop.
+
+        In `exit_reason` ogni stop finisce come "stop_loss", inclusi breakeven e
+        trailing in profitto: il breakdown by_exit_reason diventa illeggibile.
+        Qui distinguiamo stop iniziale pieno, breakeven, trailing in profitto e
+        stop stretto ma ancora in perdita. `exit_reason` resta invariato per
+        compatibilità (portfolio guard, decision log, dati storici).
+        """
+        if reason != "stop_loss":
+            return reason
+        entry = position.entry_price
+        if entry is None or entry <= 0:
+            return reason
+        side = str(position.side or "").lower()
+        if exit_price == entry:
+            return "breakeven_stop"
+        in_profit = exit_price > entry if side == "long" else exit_price < entry
+        if in_profit:
+            return "trailing_stop"
+        initial_sl_raw = metadata.get("initial_stop_loss")
+        if initial_sl_raw is not None:
+            try:
+                initial_sl = Decimal(str(initial_sl_raw))
+            except (InvalidOperation, TypeError, ValueError):
+                initial_sl = None
+            if initial_sl is not None and exit_price != initial_sl:
+                return "tightened_stop"
+        return "stop_loss"
 
     def _exit_event_type(self, reason: str, close_position: bool) -> str:
         if reason == "time_stop":

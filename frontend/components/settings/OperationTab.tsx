@@ -25,7 +25,7 @@ const TF_OPTIONS = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h
 export function OperationTab({ settings }: Props) {
   // Struttura backend:
   //   settings.operation_mode = { mode: "AUTO_TRADE", enable_live_trading: bool }
-  //   settings.timeframes     = { enabled: ["1m", "5m", ...] }
+  //   settings.timeframes     = { enabled: ["1m", "15m", ...], monitoring_only: ["5m"] }
   // Patch wrapping: { key: { value: <intero dict> } }
   const operationMode = (settings.operation_mode ?? {}) as Record<string, unknown>;
   const persistedMode = (operationMode.mode as string) ?? "SIGNAL_ONLY";
@@ -34,22 +34,43 @@ export function OperationTab({ settings }: Props) {
   const persistedTfs = Array.isArray(settings.timeframes?.enabled)
     ? (settings.timeframes.enabled as string[])
     : [];
+  const persistedMonitoringOnlyTfs = Array.isArray(settings.timeframes?.monitoring_only)
+    ? (settings.timeframes.monitoring_only as string[])
+    : [];
 
   const [mode, setMode] = useState(persistedMode);
   const [tfs, setTfs] = useState<string[]>(persistedTfs);
+  const [monitoringOnlyTfs, setMonitoringOnlyTfs] = useState<string[]>(persistedMonitoringOnlyTfs);
 
   const { mutate: updateSettings, isPending } = useUpdateSettings();
 
   useEffect(() => {
     setMode(persistedMode);
     setTfs(persistedTfs);
+    setMonitoringOnlyTfs(persistedMonitoringOnlyTfs);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [persistedMode, persistedTfs.join(",")]);
+  }, [persistedMode, persistedTfs.join(","), persistedMonitoringOnlyTfs.join(",")]);
 
-  const dirty = mode !== persistedMode || tfs.join(",") !== persistedTfs.join(",");
+  const dirty = (
+    mode !== persistedMode
+    || tfs.join(",") !== persistedTfs.join(",")
+    || monitoringOnlyTfs.join(",") !== persistedMonitoringOnlyTfs.join(",")
+  );
 
-  function toggleTf(tf: string) {
+  function toggleActiveTf(tf: string) {
+    if (!tfs.includes(tf)) {
+      setMonitoringOnlyTfs((curr) => curr.filter((value) => value !== tf));
+    }
     setTfs((curr) => (curr.includes(tf) ? curr.filter((t) => t !== tf) : [...curr, tf]));
+  }
+
+  function toggleMonitoringTf(tf: string) {
+    if (!monitoringOnlyTfs.includes(tf)) {
+      setTfs((curr) => curr.filter((value) => value !== tf));
+    }
+    setMonitoringOnlyTfs((curr) => (
+      curr.includes(tf) ? curr.filter((t) => t !== tf) : [...curr, tf]
+    ));
   }
 
   function handleSave() {
@@ -59,8 +80,17 @@ export function OperationTab({ settings }: Props) {
         value: { ...operationMode, mode, enable_live_trading: persistedEnableLive },
       };
     }
-    if (tfs.join(",") !== persistedTfs.join(",")) {
-      patch.timeframes = { value: { ...(settings.timeframes ?? {}), enabled: tfs } };
+    if (
+      tfs.join(",") !== persistedTfs.join(",")
+      || monitoringOnlyTfs.join(",") !== persistedMonitoringOnlyTfs.join(",")
+    ) {
+      patch.timeframes = {
+        value: {
+          ...(settings.timeframes ?? {}),
+          enabled: tfs,
+          monitoring_only: monitoringOnlyTfs,
+        },
+      };
     }
     if (Object.keys(patch).length === 0) return;
     updateSettings(patch as Partial<AppSettings>);
@@ -106,7 +136,7 @@ export function OperationTab({ settings }: Props) {
             return (
               <button
                 key={tf}
-                onClick={() => toggleTf(tf)}
+                onClick={() => toggleActiveTf(tf)}
                 className={cn(
                   "rounded-md border px-3 py-1.5 font-mono text-xs transition-colors",
                   active
@@ -121,6 +151,35 @@ export function OperationTab({ settings }: Props) {
         </div>
         <div className="mt-3 text-[11px] text-fg-3">
           {tfs.length} timeframe attivi
+        </div>
+      </Card>
+
+      <Card className="p-6">
+        <SectionTitle
+          title="Monitoring-only timeframes"
+          hint="Sincronizzati per macro risk e BTC macro protection, senza generare segnali"
+        />
+        <div className="mt-3 flex flex-wrap gap-2">
+          {TF_OPTIONS.map((tf) => {
+            const active = monitoringOnlyTfs.includes(tf);
+            return (
+              <button
+                key={tf}
+                onClick={() => toggleMonitoringTf(tf)}
+                className={cn(
+                  "rounded-md border px-3 py-1.5 font-mono text-xs transition-colors",
+                  active
+                    ? "border-info/40 bg-info/10 text-info"
+                    : "border-border bg-bg-1 text-fg-3 hover:bg-bg-2",
+                )}
+              >
+                {tf}
+              </button>
+            );
+          })}
+        </div>
+        <div className="mt-3 text-[11px] text-fg-3">
+          {monitoringOnlyTfs.length} timeframe solo monitoraggio
         </div>
       </Card>
 

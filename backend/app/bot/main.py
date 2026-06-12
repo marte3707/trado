@@ -24,8 +24,8 @@ from app.db.session import SessionLocal
 
 logger = structlog.get_logger()
 
-# Periodic heartbeat to the admin chat. 1 hour keeps the signal tight enough
-# to notice silent crashes early without spamming.
+# Periodic heartbeat to the admin chat. 12 hours keeps the signal useful to
+# notice silent crashes without spamming the admin DM.
 _HEARTBEAT_INTERVAL_SECONDS = 43200
 
 

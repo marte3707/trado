@@ -780,3 +780,141 @@ def test_factor_stability_freezes_change_when_history_oscillates() -> None:
         # Se non c'è weight change, vuol dire che il factor è rimasto a 1.0 → niente change.
         # Anche questo è una freeze valida.
         assert losing.weight == 9
+
+
+def test_strategy_factor_continuous_rewards_high_pf_beyond_old_cap() -> None:
+    strong = PerformanceStats(
+        trades=200, wins=126, losses=74, win_rate=0.63,
+        realized_pnl=10000.0, gross_profit=24000.0, gross_loss=14000.0, profit_factor=1.71,
+    )
+    factor, reason = AutoCalibrationEngine()._strategy_factor(strong)
+
+    # Col vecchio set discreto il massimo era 1.2: il factor continuo può premiare di più.
+    assert factor >= 1.25
+    assert factor <= 1.4
+
+
+def test_strategy_factor_continuous_stays_near_neutral_on_small_samples() -> None:
+    small = PerformanceStats(
+        trades=10, wins=4, losses=6, win_rate=0.4,
+        realized_pnl=-50.0, gross_profit=200.0, gross_loss=250.0, profit_factor=0.8,
+    )
+    factor, _ = AutoCalibrationEngine()._strategy_factor(small)
+
+    # Campione piccolo → la distanza dal neutro è scalata dalla confidenza.
+    assert 0.9 <= factor <= 1.0
+
+
+class CrossTfAnalyzer(FakeAnalyzer):
+    """Cella per-timeframe sotto campione ma aggregato cross-TF ampio e negativo."""
+
+    def __init__(self, name: str, cell: PerformanceStats, aggregate: PerformanceStats) -> None:
+        super().__init__({})
+        self.name = name
+        self.cell = cell
+        self.aggregate = aggregate
+
+    def strategy_positions(self, db, timeframe=None, market_id=None, limit=500):  # noqa: ANN001
+        target = self.aggregate if timeframe is None else self.cell
+        return {self.name: _positions_matching(target)}
+
+
+def test_cross_timeframe_floor_caps_cells_below_min_trades() -> None:
+    config = StrategyConfig(
+        strategy_name="volume_profile",
+        timeframe="15m",
+        enabled=True,
+        params={},
+        weight=10,
+    )
+    db = FakeStrategyDb([config])
+
+    cell = PerformanceStats(
+        trades=5, wins=2, losses=3, win_rate=0.4,
+        realized_pnl=-50.0, gross_profit=100.0, gross_loss=150.0, profit_factor=0.67,
+    )
+    aggregate = PerformanceStats(
+        trades=100, wins=30, losses=70, win_rate=0.30,
+        realized_pnl=-3000.0, gross_profit=2000.0, gross_loss=5000.0, profit_factor=0.4,
+    )
+    analyzer = CrossTfAnalyzer("volume_profile", cell, aggregate)
+
+    changes = AutoCalibrationEngine(analyzer=analyzer)._calibrate_strategy_weights(  # type: ignore[arg-type]
+        db,  # type: ignore[arg-type]
+        _weights_settings(),
+    )
+
+    # Senza il floor cross-TF la cella (n=5 < min_trades=8) sarebbe stata saltata
+    # e il peso sarebbe rimasto 10 — il buco che lasciava volume_profile intatta.
+    weight_changes = [c for c in changes if c.target == "strategy_weight"]
+    assert len(weight_changes) == 1
+    assert weight_changes[0].after < 10
+    assert "cross-TF" in weight_changes[0].reason
+    assert config.weight == weight_changes[0].after
+
+
+def test_baseline_drift_moves_anchor_after_persistent_factors() -> None:
+    config = StrategyConfig(
+        strategy_name="ema_crossover",
+        timeframe="15m",
+        enabled=True,
+        params={},
+        weight=6,
+    )
+    db = FakeStrategyDb([config])
+    db.rows["auto_calibration_baseline"].value["strategy_weights"] = {"15m:ema_crossover": 10}
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={"factor_history": {"15m:ema_crossover": [0.6, 0.6, 0.6, 0.6]}},
+    )
+
+    analyzer = FakeAnalyzer(
+        {"ema_crossover": stats(win_rate=0.23, pnl=-100, profit_factor=0.5)}
+    )
+    changes = AutoCalibrationEngine(analyzer=analyzer)._calibrate_strategy_weights(  # type: ignore[arg-type]
+        db,  # type: ignore[arg-type]
+        _weights_settings(),
+        total_closed=100,
+    )
+
+    baseline_changes = [c for c in changes if c.target == "strategy_baseline"]
+    assert len(baseline_changes) == 1
+    assert baseline_changes[0].before == 10
+    assert baseline_changes[0].after < 10
+    # L'ancora persistita si muove: al run successivo il range factor×baseline
+    # parte dal nuovo valore, permettendo al peso di continuare a scendere.
+    stored = db.rows["auto_calibration_baseline"].value["strategy_weights"]
+    assert stored["15m:ema_crossover"] == baseline_changes[0].after
+    state = db.rows["auto_calibration_state"].value
+    assert state["baseline_drift_at_trade_count"]["15m:ema_crossover"] == 100
+
+
+def test_baseline_drift_rate_limited_by_new_trades() -> None:
+    config = StrategyConfig(
+        strategy_name="ema_crossover",
+        timeframe="15m",
+        enabled=True,
+        params={},
+        weight=6,
+    )
+    db = FakeStrategyDb([config])
+    db.rows["auto_calibration_baseline"].value["strategy_weights"] = {"15m:ema_crossover": 10}
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={
+            "factor_history": {"15m:ema_crossover": [0.6, 0.6, 0.6, 0.6]},
+            # Drift già avvenuto a 90 trade chiusi: a 100 mancano nuovi trade.
+            "baseline_drift_at_trade_count": {"15m:ema_crossover": 90},
+        },
+    )
+
+    analyzer = FakeAnalyzer(
+        {"ema_crossover": stats(win_rate=0.23, pnl=-100, profit_factor=0.5)}
+    )
+    changes = AutoCalibrationEngine(analyzer=analyzer)._calibrate_strategy_weights(  # type: ignore[arg-type]
+        db,  # type: ignore[arg-type]
+        _weights_settings(),
+        total_closed=100,
+    )
+
+    assert all(c.target != "strategy_baseline" for c in changes)

@@ -8,9 +8,12 @@ from typing import Any
 from app.core.config import Settings
 from app.db.models import AppSetting, Candle, DecisionLog, Market
 from app.engine.macro_risk_monitor import (
+    MacroCalendarEvent,
     MacroNewsItem,
     MacroRiskMonitor,
+    _state_changed,
     parse_feed,
+    parse_ics_calendar,
     score_news_item,
 )
 
@@ -78,6 +81,19 @@ class StaticNewsClient:
         return list(self.items)
 
 
+class StaticCalendarClient:
+    def __init__(self, events: list[MacroCalendarEvent] | None = None, *, error: Exception | None = None) -> None:
+        self.events = events or []
+        self.error = error
+        self.calls = 0
+
+    def fetch(self, _urls: list[str]) -> list[MacroCalendarEvent]:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return list(self.events)
+
+
 def _risk_settings(**monitor_overrides: Any) -> dict[str, Any]:
     return {
         "min_signal_score": 65,
@@ -85,6 +101,7 @@ def _risk_settings(**monitor_overrides: Any) -> dict[str, Any]:
             "enabled": True,
             "actions_enabled": True,
             "news_enabled": True,
+            "calendar_enabled": False,
             "market_stress_enabled": True,
             "news_feed_urls": ["https://example.com/rss.xml"],
             "news_fetch_cooldown_minutes": 15,
@@ -110,7 +127,7 @@ def _risk_settings(**monitor_overrides: Any) -> dict[str, Any]:
                 "extreme": {
                     "size_multiplier": 0.25,
                     "min_score_add": 12,
-                    "disable_timeframes": ["5m", "15m"],
+                    "disable_timeframes": ["5m"],
                     "require_mtf_confluence": True,
                 },
             },
@@ -170,6 +187,31 @@ def test_parse_feed_extracts_rss_items() -> None:
     assert items[0].published_at.tzinfo is not None
 
 
+def test_parse_ics_calendar_extracts_high_impact_events() -> None:
+    raw = """
+BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:cpi-2026-07
+DTSTART:20260714T083000
+SUMMARY:Consumer Price Index
+URL:https://www.bls.gov/schedule/news_release/cpi.htm
+END:VEVENT
+BEGIN:VEVENT
+UID:low-impact
+DTSTART:20260715T083000
+SUMMARY:Regional statistics notice
+END:VEVENT
+END:VCALENDAR
+"""
+
+    events = parse_ics_calendar(raw, source_url="https://www.bls.gov/schedule/news_release/bls.ics")
+
+    assert len(events) == 1
+    assert events[0].title == "Consumer Price Index"
+    assert events[0].score == 72
+    assert events[0].starts_at.tzinfo is not None
+
+
 def test_news_scoring_identifies_geopolitical_escalation() -> None:
     now = datetime(2026, 6, 11, 8, 30, tzinfo=UTC)
     item = MacroNewsItem(
@@ -183,6 +225,60 @@ def test_news_scoring_identifies_geopolitical_escalation() -> None:
 
     assert scored["category"] == "geopolitical"
     assert scored["severity"] >= 80
+
+
+def test_news_scoring_identifies_crypto_systemic_risk() -> None:
+    now = datetime(2026, 6, 11, 8, 30, tzinfo=UTC)
+    item = MacroNewsItem(
+        title="Major stablecoin USDT depeg after exchange withdrawals halted",
+        source="test",
+        url="https://example.com/a",
+        published_at=now - timedelta(minutes=5),
+    )
+
+    scored = score_news_item(item, now)
+
+    assert scored["category"] == "crypto_systemic"
+    assert scored["severity"] >= 60
+
+
+def test_news_scoring_identifies_liquidity_risk() -> None:
+    now = datetime(2026, 6, 11, 8, 30, tzinfo=UTC)
+    item = MacroNewsItem(
+        title="Treasury weak auction tails as yields spike and liquidity worsens",
+        source="test",
+        url="https://example.com/a",
+        published_at=now - timedelta(minutes=5),
+    )
+
+    scored = score_news_item(item, now)
+
+    assert scored["category"] == "liquidity"
+    assert scored["severity"] >= 45
+
+
+def test_news_scoring_ignores_html_href_and_substring_false_positives() -> None:
+    now = datetime(2026, 6, 12, 7, 11, tzinfo=UTC)
+    item = MacroNewsItem(
+        title="UK economy shrank by 0.1% in April as Iran war held back growth",
+        source="test",
+        url="https://example.com/a",
+        published_at=now - timedelta(minutes=39),
+        summary=(
+            '<p>GDP hit by higher energy prices caused by Middle East conflict.</p>'
+            '<p>As energy prices have risen as a result of the conflict, after Iran '
+            'closed off the strait of Hormuz – a vital shipping route for global trade '
+            '– the UK’s strong expansion slid into reverse.</p>'
+            '<a href="https://example.com/us-israel-strikes-iran-oil-price">more</a>'
+        ),
+    )
+
+    scored = score_news_item(item, now)
+
+    assert scored["category"] == "geopolitical"
+    assert scored["severity"] < 100
+    assert "ppi" not in scored["entities"]
+    assert "israel" not in scored["entities"]
 
 
 def test_monitor_activates_extreme_with_news_and_market_confirmation() -> None:
@@ -209,8 +305,124 @@ def test_monitor_activates_extreme_with_news_and_market_confirmation() -> None:
     assert state["active"] is True
     assert state["level"] == "extreme"
     assert state["policy"]["size_multiplier"] == 0.25
-    assert state["policy"]["disable_timeframes"] == ["5m", "15m"]
+    assert state["policy"]["disable_timeframes"] == ["5m"]
     assert any(isinstance(row, DecisionLog) for row in db.added)
+
+
+def test_monitor_activates_high_for_macro_calendar_window() -> None:
+    now = datetime(2026, 6, 11, 12, 0, tzinfo=UTC)
+    calendar_event = MacroCalendarEvent(
+        title="FOMC rate decision",
+        source="Federal Reserve",
+        url="https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+        starts_at=now + timedelta(minutes=45),
+        category="macro_calendar",
+        score=72,
+    )
+    db = FakeDb(
+        settings={
+            "risk": _risk_settings(
+                calendar_enabled=True,
+                calendar_feed_urls=["https://example.com/calendar.ics"],
+                calendar_pre_event_minutes=90,
+                calendar_post_event_minutes=45,
+            )
+        },
+        markets=[],
+        candles=[],
+    )
+    monitor = MacroRiskMonitor(
+        Settings(),
+        news_client=StaticNewsClient([]),
+        calendar_client=StaticCalendarClient([calendar_event]),
+    )
+
+    result = monitor.run(db, now=now)  # type: ignore[arg-type]
+
+    state = result["state"]
+    assert state["active"] is True
+    assert state["level"] == "high"
+    assert state["calendar_score"] == 72
+    assert "macro_calendar" in state["sources"]
+    assert state["reason"] == "macro_calendar_risk"
+    assert state["policy"]["size_multiplier"] == 0.5
+
+
+def test_monitor_suppresses_optional_calendar_feed_error_when_static_events_exist() -> None:
+    now = datetime(2026, 6, 11, 12, 0, tzinfo=UTC)
+    db = FakeDb(
+        settings={
+            "risk": _risk_settings(
+                calendar_enabled=True,
+                calendar_feed_urls=["https://www.bls.gov/schedule/news_release/bls.ics"],
+                calendar_static_events=[
+                    {
+                        "key": "fomc_test",
+                        "title": "FOMC rate decision",
+                        "category": "macro_calendar",
+                        "source": "Federal Reserve",
+                        "starts_at": (now + timedelta(minutes=30)).isoformat(),
+                        "score": 72,
+                        "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+                    }
+                ],
+                calendar_pre_event_minutes=90,
+                calendar_post_event_minutes=45,
+            )
+        },
+        markets=[],
+        candles=[],
+    )
+    monitor = MacroRiskMonitor(
+        Settings(),
+        news_client=StaticNewsClient([]),
+        calendar_client=StaticCalendarClient(error=RuntimeError("403 Forbidden")),
+    )
+
+    result = monitor.run(db, now=now)  # type: ignore[arg-type]
+
+    state = result["state"]
+    assert state["level"] == "high"
+    assert state["calendar_score"] == 72
+    assert state["calendar_fetch_errors"] == []
+    assert state["last_calendar_fetch_at"] == now.isoformat()
+    assert not any(
+        isinstance(row, DecisionLog) and row.event_type == "macro_risk_calendar_fetch_failed"
+        for row in db.added
+    )
+
+
+def test_monitor_keeps_previous_extreme_inside_hysteresis_without_extending_ttl() -> None:
+    now = datetime(2026, 6, 11, 12, 0, tzinfo=UTC)
+    active_until = now + timedelta(hours=1)
+    monitor = MacroRiskMonitor(Settings(), news_client=StaticNewsClient([]))
+    config = _risk_settings(level_hysteresis_points=5)["macro_risk_monitor"]
+
+    state = monitor._next_state(  # type: ignore[attr-defined]
+        config=config,
+        previous={
+            "active": True,
+            "level": "extreme",
+            "active_until": active_until.isoformat(),
+            "triggered_at": (now - timedelta(minutes=30)).isoformat(),
+        },
+        now=now,
+        raw_level="high",
+        combined_score=79,
+        news_result={"score": 71, "items": [], "errors": []},
+        calendar_result={"score": 0, "active_events": [], "next_events": []},
+        market_result={"score": 71, "markets": []},
+    )
+
+    assert state["level"] == "extreme"
+    assert state["active_until"] == active_until.isoformat()
+
+
+def test_macro_risk_reason_only_change_is_not_state_change() -> None:
+    previous = {"active": True, "level": "high", "reason": "geopolitical_escalation"}
+    current = {"active": True, "level": "high", "reason": "geopolitical_escalation, market_stress"}
+
+    assert _state_changed(previous, current) is False
 
 
 def test_monitor_reuses_cached_news_during_fetch_cooldown() -> None:

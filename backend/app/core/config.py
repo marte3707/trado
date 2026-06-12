@@ -97,8 +97,8 @@ class Settings(BaseSettings):
     fast_risk_loop_enabled: bool = True
     fast_risk_loop_interval_seconds: int = 15
     fast_risk_liquidation_interval_seconds: int = 600
-    fast_risk_reconcile_interval_seconds: int = 15
-    fast_risk_uar_interval_seconds: int = 30
+    fast_risk_reconcile_interval_seconds: int = 60
+    fast_risk_uar_interval_seconds: int = 120
     fast_risk_warn_after_seconds: float = 4.0
 
     kill_switch_enabled: bool = False

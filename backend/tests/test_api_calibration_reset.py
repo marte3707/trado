@@ -1,4 +1,4 @@
-from app.api.routes import reset_calibration_baseline
+from app.api.routers.calibration import reset_calibration_baseline
 from app.db.models import AppSetting, DecisionLog
 
 

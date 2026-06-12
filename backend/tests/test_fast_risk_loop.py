@@ -5,7 +5,7 @@ import pytest
 from app.core.config import Settings
 from app.core.enums import OperationMode
 from app.db.models import AppSetting, DecisionLog
-from app.worker import main as worker
+from app.worker import fast_risk as worker
 
 
 class FastRiskDb:

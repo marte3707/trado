@@ -82,7 +82,8 @@ DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS: dict[str, Any] = {
 DEFAULT_MACRO_RISK_MODE_SETTINGS: dict[str, Any] = {
     "enabled": False,
     "size_multiplier": 0.5,
-    "min_score_add": 8,
+    "min_score_add": 0,
+    "min_expected_r": 0.0,
     "disable_timeframes": ["5m"],
     "require_mtf_confluence": True,
 }
@@ -90,7 +91,10 @@ DEFAULT_MACRO_RISK_MODE_SETTINGS: dict[str, Any] = {
 DEFAULT_MACRO_RISK_MONITOR_SETTINGS: dict[str, Any] = {
     "enabled": True,
     "actions_enabled": True,
+    "telegram_notify_cooldown_minutes": 180,
+    "telegram_notify_on_downgrade": False,
     "news_enabled": True,
+    "calendar_enabled": True,
     "market_stress_enabled": True,
     "news_feed_urls": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -98,12 +102,92 @@ DEFAULT_MACRO_RISK_MONITOR_SETTINGS: dict[str, Any] = {
         "https://www.aljazeera.com/xml/rss/all.xml",
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
     ],
+    "calendar_feed_urls": [],
     "news_fetch_cooldown_minutes": 15,
+    "calendar_fetch_cooldown_hours": 6,
     "news_lookback_hours": 12,
+    "calendar_lookahead_hours": 48,
+    "calendar_pre_event_minutes": 90,
+    "calendar_post_event_minutes": 45,
     "market_lookback_minutes": 120,
     "watch_score": 40,
     "high_score": 60,
     "extreme_score": 80,
+    "level_hysteresis_points": 5,
+    "calendar_static_events": [
+        {
+            "key": "fomc_2026_06",
+            "title": "FOMC rate decision and projections",
+            "category": "macro_calendar",
+            "source": "Federal Reserve",
+            "starts_at": "2026-06-17T14:00:00-04:00",
+            "score": 72,
+            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+        },
+        {
+            "key": "fomc_2026_07",
+            "title": "FOMC rate decision",
+            "category": "macro_calendar",
+            "source": "Federal Reserve",
+            "starts_at": "2026-07-29T14:00:00-04:00",
+            "score": 70,
+            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+        },
+        {
+            "key": "fomc_2026_09",
+            "title": "FOMC rate decision and projections",
+            "category": "macro_calendar",
+            "source": "Federal Reserve",
+            "starts_at": "2026-09-16T14:00:00-04:00",
+            "score": 72,
+            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+        },
+        {
+            "key": "fomc_2026_10",
+            "title": "FOMC rate decision",
+            "category": "macro_calendar",
+            "source": "Federal Reserve",
+            "starts_at": "2026-10-28T14:00:00-04:00",
+            "score": 70,
+            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+        },
+        {
+            "key": "fomc_2026_12",
+            "title": "FOMC rate decision and projections",
+            "category": "macro_calendar",
+            "source": "Federal Reserve",
+            "starts_at": "2026-12-09T14:00:00-05:00",
+            "score": 72,
+            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+        },
+        {
+            "key": "bea_pce_2026_06",
+            "title": "Personal Income and Outlays / PCE inflation",
+            "category": "macro_calendar",
+            "source": "BEA",
+            "starts_at": "2026-06-25T08:30:00-04:00",
+            "score": 66,
+            "url": "https://www.bea.gov/news/schedule",
+        },
+        {
+            "key": "bea_gdp_2026_q2_advance",
+            "title": "GDP advance estimate",
+            "category": "macro_calendar",
+            "source": "BEA",
+            "starts_at": "2026-07-30T08:30:00-04:00",
+            "score": 62,
+            "url": "https://www.bea.gov/news/schedule",
+        },
+        {
+            "key": "treasury_quarterly_refunding",
+            "title": "Treasury quarterly refunding window",
+            "category": "liquidity",
+            "source": "U.S. Treasury",
+            "starts_at": "2026-07-29T08:30:00-04:00",
+            "score": 55,
+            "url": "https://home.treasury.gov/policy-issues/financing-the-government/quarterly-refunding",
+        },
+    ],
     "ttl_minutes_by_level": {
         "watch": 120,
         "high": 360,
@@ -112,20 +196,23 @@ DEFAULT_MACRO_RISK_MONITOR_SETTINGS: dict[str, Any] = {
     "policies": {
         "watch": {
             "size_multiplier": 1.0,
-            "min_score_add": 4,
+            "min_score_add": 0,
+            "min_expected_r": None,
             "disable_timeframes": [],
             "require_mtf_confluence": True,
         },
         "high": {
             "size_multiplier": 0.5,
-            "min_score_add": 8,
+            "min_score_add": 0,
+            "min_expected_r": 0.0,
             "disable_timeframes": ["5m"],
             "require_mtf_confluence": True,
         },
         "extreme": {
             "size_multiplier": 0.25,
-            "min_score_add": 12,
-            "disable_timeframes": ["5m", "15m"],
+            "min_score_add": 0,
+            "min_expected_r": 0.0,
+            "disable_timeframes": ["5m"],
             "require_mtf_confluence": True,
         },
     },
@@ -138,6 +225,7 @@ DEFAULT_MACRO_RISK_STATE: dict[str, Any] = {
     "confidence": 0,
     "combined_score": 0,
     "news_score": 0,
+    "calendar_score": 0,
     "market_stress_score": 0,
     "triggered_at": None,
     "active_until": None,
@@ -146,9 +234,14 @@ DEFAULT_MACRO_RISK_STATE: dict[str, Any] = {
     "sources": [],
     "policy": {},
     "top_news": [],
+    "calendar": {},
     "market_stress": {},
     "last_news_fetch_at": None,
+    "last_calendar_fetch_at": None,
     "cached_news_items": [],
+    "cached_calendar_events": [],
+    "last_telegram_risk_notification_at": None,
+    "last_telegram_risk_notification_level": None,
 }
 
 DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE: dict[str, Any] = {
@@ -184,12 +277,17 @@ def effective_live_trading_enabled(db: Session, settings: Settings) -> bool:
 
 
 def effective_enabled_timeframes(db: Session, settings: Settings) -> list[str]:
-    raw = setting_value(db, "timeframes").get("enabled")
-    if isinstance(raw, list):
-        values = [item.strip() for item in raw if isinstance(item, str) and item.strip()]
-        if values:
-            return values
-    return settings.enabled_timeframes
+    values = _normalized_timeframe_list(setting_value(db, "timeframes").get("enabled"))
+    if values:
+        return values
+    return _normalized_timeframe_list(settings.enabled_timeframes)
+
+
+def effective_monitoring_only_timeframes(db: Session) -> list[str]:
+    timeframes = setting_value(db, "timeframes")
+    enabled = set(_normalized_timeframe_list(timeframes.get("enabled")))
+    monitoring_only = _normalized_timeframe_list(timeframes.get("monitoring_only"))
+    return [timeframe for timeframe in monitoring_only if timeframe not in enabled]
 
 
 def effective_paper_equity(db: Session, settings: Settings) -> float:
@@ -320,3 +418,19 @@ def _float(value: object | None, default: float) -> float:
         return float(cast(Any, value))
     except (TypeError, ValueError):
         return default
+
+
+def _normalized_timeframe_list(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        value = item.strip()
+        if not value or value in seen:
+            continue
+        values.append(value)
+        seen.add(value)
+    return values

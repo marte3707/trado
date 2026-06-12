@@ -1,10 +1,11 @@
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
 from app.core.config import Settings
-from app.db.models import AppSetting, Market, Order, Position, Signal
+from app.db.models import Alert, AppSetting, Market, Order, Position, Signal
 from app.notifications import telegram as telegram_module
 from app.notifications.telegram import (
     _DAILY_RECAP_STATE_KEY,
@@ -179,6 +180,27 @@ class FakeDailyRecapDb:
         raise AssertionError(f"unexpected query model: {model!r}")
 
 
+class FakeSignalDb:
+    def __init__(self, *, settings: dict[str, dict[str, Any]] | None = None) -> None:
+        self.settings = {
+            key: AppSetting(key=key, value=value)
+            for key, value in (settings or {}).items()
+        }
+        self.added: list[object] = []
+        self.commits = 0
+
+    def get(self, model, key):  # noqa: ANN001
+        if model is AppSetting:
+            return self.settings.get(str(key))
+        return None
+
+    def add(self, row: object) -> None:
+        self.added.append(row)
+
+    def commit(self) -> None:
+        self.commits += 1
+
+
 def _closed_position(
     *,
     position_id: int,
@@ -291,6 +313,80 @@ def test_build_signal_message_shows_tp1_tp2_and_runner_note(monkeypatch: pytest.
     assert "href=" not in message
 
 
+@pytest.mark.asyncio
+async def test_send_signal_skips_public_channel_when_macro_risk_blocks_negative_expected_r(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notifier = _build_notifier()
+    db = FakeSignalDb(
+        settings={
+            "risk": {
+                "min_signal_score": 65,
+                "macro_risk_mode": {
+                    "enabled": False,
+                    "size_multiplier": 0.5,
+                    "min_score_add": 8,
+                    "min_expected_r": 0.0,
+                    "disable_timeframes": ["5m"],
+                    "require_mtf_confluence": True,
+                },
+            },
+            "macro_risk_state": {
+                "active": True,
+                "level": "extreme",
+                "reason": "geopolitical_escalation, market_stress",
+                "active_until": "2026-06-12T12:00:00+00:00",
+                "sources": ["news", "market_stress"],
+                "policy": {
+                    "size_multiplier": 0.25,
+                    "min_score_add": 0,
+                    "min_expected_r": 0.0,
+                    "disable_timeframes": [],
+                    "require_mtf_confluence": False,
+                },
+            },
+        }
+    )
+    signal = Signal(
+        id=42,
+        market=Market(symbol="BTC"),
+        market_id=1,
+        timeframe="1h",
+        direction="LONG",
+        score=68,
+        entry_price=Decimal("100"),
+        stop_loss=Decimal("95"),
+        take_profit_1=Decimal("105"),
+        take_profit_2=Decimal("110"),
+        take_profit_3=Decimal("115"),
+        risk_reward=Decimal("2.4"),
+        strategy_breakdown={
+            "_expected_r_calibration": {
+                "expected_r": -0.11,
+                "confidence": "high",
+                "n_samples": 42,
+            }
+        },
+    )
+
+    class FailAsyncClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("telegram network call should be skipped")
+
+    monkeypatch.setattr(telegram_module.httpx, "AsyncClient", FailAsyncClient)
+
+    await notifier.send_signal(db, signal)  # type: ignore[arg-type]
+
+    assert db.commits == 1
+    assert len(db.added) == 1
+    alert = db.added[0]
+    assert isinstance(alert, Alert)
+    assert alert.status == "skipped"
+    assert alert.payload["skip_reason"] == "macro risk mode expected R threshold not met"
+    assert alert.payload["skip_details"]["required_expected_r"] == 0.0
+    assert alert.payload["skip_details"]["calibrated_expected_r"] == -0.11
+
+
 def test_daily_recap_summary_and_message() -> None:
     positions = [
         _closed_position(
@@ -395,6 +491,62 @@ async def test_losing_final_close_keeps_text_only_on_signal_channel(monkeypatch:
     assert len(notifier.text_calls) == 1
     assert notifier.text_calls[0]["chat_id"] == "signal-chat"
     assert "Stop Loss" in str(notifier.text_calls[0]["text"])
+
+
+@pytest.mark.asyncio
+async def test_macro_risk_alert_formats_active_until_in_italian_time() -> None:
+    notifier = _build_notifier()
+
+    await notifier.send_macro_risk_state_changed(
+        {
+            "level": "extreme",
+            "active": True,
+            "summary": "Macro risk EXTREME",
+            "reason": "geopolitical_escalation",
+            "sources": ["news", "market_stress"],
+            "combined_score": 100,
+            "news_score": 100,
+            "calendar_score": 72,
+            "market_stress_score": 100,
+            "active_until": "2026-06-12T00:41:26.653315+00:00",
+            "policy": {
+                "size_multiplier": 0.25,
+                "min_score_add": 0,
+                "min_expected_r": 0.0,
+                "disable_timeframes": ["5m"],
+                "require_mtf_confluence": True,
+            },
+            "top_news": [
+                {
+                    "title": "Iran talks collapse as markets sell off",
+                    "source": "Reuters",
+                    "url": "https://example.com/news?id=1&ref=trado",
+                }
+            ],
+            "calendar": {
+                "active_events": [
+                    {
+                        "title": "FOMC rate decision",
+                        "source": "Federal Reserve",
+                        "url": "https://example.com/fomc",
+                    }
+                ]
+            },
+        }
+    )
+
+    assert len(notifier.text_calls) == 1
+    text = str(notifier.text_calls[0]["text"])
+    assert "🚨 <b>Macro risk: EXTREME</b>" in text
+    assert "🛡️ <b>Trading impact</b>" in text
+    assert "geopolitical escalation" in text
+    assert "calendar <code>72</code>" in text
+    assert "Calibrated expected R: <code>>=0.00R</code>" in text
+    assert "Paused timeframes: <code>5m</code>" in text
+    assert "12/06/2026 alle 02:41" in text
+    assert "2026-06-12T00:41" not in text
+    assert '<a href="https://example.com/news?id=1&amp;ref=trado">' in text
+    assert '<a href="https://example.com/fomc">' in text
 
 
 @pytest.mark.asyncio

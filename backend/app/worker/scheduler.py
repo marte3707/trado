@@ -22,6 +22,25 @@ DATA_RETENTION_INTERVAL_SECONDS = 86400  # ogni 24h
 ERROR_NOTIFY_COOLDOWN_SECONDS = 1800  # max 1 notifica errore ogni 30 min
 DAILY_RECAP_HOUR_ROME = 10
 ROME_TZ = ZoneInfo("Europe/Rome")
+# Ritardo prima di eseguire un job giornaliero scaduto o mai eseguito dopo un riavvio
+DAILY_JOB_STARTUP_DELAY_SECONDS = 120
+
+
+def _next_daily_job_timestamp(
+    now: float,
+    last_run_at: float | None,
+    interval: int,
+) -> float:
+    """Calcola il prossimo timestamp per un job giornaliero tenendo conto dell'ultima esecuzione.
+
+    Se il job non è mai girato (last_run_at=None) o è scaduto, lo schedula dopo
+    DAILY_JOB_STARTUP_DELAY_SECONDS per evitare esecuzioni immediate al riavvio.
+    """
+    if last_run_at is not None:
+        next_due = last_run_at + interval
+        if next_due > now:
+            return next_due
+    return now + DAILY_JOB_STARTUP_DELAY_SECONDS
 
 
 def next_daily_recap_timestamp(now: datetime | None = None) -> float:
@@ -44,13 +63,19 @@ class PeriodicScheduler:
     `0.0` per essere dovuti già al primo tick (comportamento storico preservato).
     """
 
-    def __init__(self, now: float) -> None:
+    def __init__(
+        self,
+        now: float,
+        *,
+        last_diagnostic_at: float | None = None,
+        last_data_retention_at: float | None = None,
+    ) -> None:
         self.next_recap = now + RECAP_INTERVAL_SECONDS
         self.next_daily_recap = next_daily_recap_timestamp()
-        self.next_diagnostic = now + DIAGNOSTIC_REPORT_INTERVAL_SECONDS
+        self.next_diagnostic = _next_daily_job_timestamp(now, last_diagnostic_at, DIAGNOSTIC_REPORT_INTERVAL_SECONDS)
         self.next_live_liquidation_guard = 0.0
         self.next_unified_account_ratio_guard = 0.0
-        self.next_data_retention = now + DATA_RETENTION_INTERVAL_SECONDS
+        self.next_data_retention = _next_daily_job_timestamp(now, last_data_retention_at, DATA_RETENTION_INTERVAL_SECONDS)
         self.last_error_notify = 0.0
 
     def _due_interval(self, now: float, attr: str, interval: int) -> bool:

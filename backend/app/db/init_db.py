@@ -79,6 +79,21 @@ DEFAULT_EDGE_RISK_SETTINGS = {
     "score_bucket_adjustments": {},
     "market_score_adjustments": {},
     "timeframe_score_adjustments": {},
+    # Soglie min score per-timeframe (solo al rialzo rispetto a min_signal_score):
+    # stringe i timeframe con edge negativo documentato senza toccare gli altri.
+    "timeframe_min_score_overrides": {},
+    # Probation per mercati senza storico: sotto min_closed_trades posizioni
+    # chiuse il rischio per trade è scalato di size_multiplier. Taglia la coda
+    # dei mercati one-shot che bruciano stop pieni al primo segnale.
+    "new_market_probation": {
+        "enabled": True,
+        "min_closed_trades": 3,
+        "size_multiplier": 0.5,
+    },
+    # Sospende (non cancella) le penalità direzionali apprese in regime macro
+    # opposto: con macro BTC bullish, blocklist/penalità/override LONG non si
+    # applicano finché il regime resta favorevole. Vedi engine/macro_direction.py.
+    "regime_aware_directional_penalties": True,
     "allow_ob_imbalance_only_signals": False,
     "entry_quality_filter_enabled": True,
     "entry_quality_ema_period": 21,
@@ -232,7 +247,19 @@ def seed_defaults(db: Session) -> None:
                 value["timeStop"] = DEFAULT_POSITION_MANAGEMENT_SETTINGS["timeStop"]
                 existing_pm.value = value
     if db.get(AppSetting, "timeframes") is None:
-        db.add(AppSetting(key="timeframes", value={"enabled": settings.enabled_timeframes}))
+        db.add(
+            AppSetting(
+                key="timeframes",
+                value={"enabled": settings.enabled_timeframes, "monitoring_only": []},
+            )
+        )
+    else:
+        existing_timeframes = db.get(AppSetting, "timeframes")
+        if existing_timeframes is not None and isinstance(existing_timeframes.value, dict):
+            value = dict(existing_timeframes.value)
+            if "monitoring_only" not in value:
+                value["monitoring_only"] = []
+                existing_timeframes.value = value
     if db.get(AppSetting, "alerts") is None:
         db.add(
             AppSetting(

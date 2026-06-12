@@ -143,3 +143,38 @@ def test_strategy_config_filter_leaves_other_internal_strategies_untouched() -> 
 
     assert filtered_5m == ["volume_profile", "ema_crossover"]
     assert filtered_15m == ["cvd_divergence"]
+
+
+def test_timeframe_min_score_override_raises_threshold() -> None:
+    from app.engine.signal_engine import apply_timeframe_min_score_override
+
+    risk_value = {"timeframe_min_score_overrides": {"5m": 70}}
+
+    assert apply_timeframe_min_score_override(risk_value, "5m", 65) == 70
+    assert apply_timeframe_min_score_override(risk_value, "15m", 65) == 65
+
+
+def test_timeframe_min_score_override_never_lowers_threshold() -> None:
+    from app.engine.signal_engine import apply_timeframe_min_score_override
+
+    risk_value = {"timeframe_min_score_overrides": {"5m": 50}}
+
+    assert apply_timeframe_min_score_override(risk_value, "5m", 65) == 65
+
+
+def test_timeframe_min_score_override_ignores_invalid_values() -> None:
+    from app.engine.signal_engine import apply_timeframe_min_score_override
+
+    assert apply_timeframe_min_score_override({}, "5m", 65) == 65
+    assert (
+        apply_timeframe_min_score_override(
+            {"timeframe_min_score_overrides": "not-a-dict"}, "5m", 65
+        )
+        == 65
+    )
+    assert (
+        apply_timeframe_min_score_override(
+            {"timeframe_min_score_overrides": {"5m": "abc"}}, "5m", 65
+        )
+        == 65
+    )

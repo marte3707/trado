@@ -46,6 +46,7 @@ class FakeDb:
     enable_live_setting: dict[str, Any] = field(default_factory=lambda: {"value": True})
     kill_switch: dict[str, Any] | None = None
     portfolio_circuit_state: dict[str, Any] | None = None
+    macro_risk_state: dict[str, Any] | None = None
     added: list[Any] = field(default_factory=list)
     committed: int = 0
     rolled_back: int = 0
@@ -72,6 +73,12 @@ class FakeDb:
                 return (
                     AppSetting(key="portfolio_circuit_breaker_state", value=self.portfolio_circuit_state)
                     if self.portfolio_circuit_state
+                    else None
+                )
+            if pk == "macro_risk_state":
+                return (
+                    AppSetting(key="macro_risk_state", value=self.macro_risk_state)
+                    if self.macro_risk_state
                     else None
                 )
         return None
@@ -520,6 +527,49 @@ def test_execute_live_blocks_before_submit_when_portfolio_breaker_active(
     assert db.added_of(Position) == []
     events = [row.event_type for row in db.added_of(DecisionLog)]
     assert "live_order_rejected_portfolio_guard" in events
+
+
+def test_execute_live_checks_portfolio_guard_before_live_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.engine.order_validation import OrderValidator
+
+    def fail_if_called(self, db, signal, settings, plan=None):  # noqa: ARG001
+        raise AssertionError("live validation should run after portfolio guard")
+
+    monkeypatch.setattr(OrderValidator, "validate_live_execution", fail_if_called)
+
+    settings = _build_settings()
+    signal = _build_signal()
+    signal.timeframe = "5m"
+    active_until = datetime.now(UTC) + timedelta(hours=1)
+    db = FakeDb(
+        signal=signal,
+        market=_build_market(),
+        macro_risk_state={
+            "active": True,
+            "level": "extreme",
+            "reason": "geopolitical_escalation, market_stress",
+            "sources": ["news", "market_stress"],
+            "active_until": active_until.isoformat(),
+            "policy": {
+                "size_multiplier": 0.25,
+                "min_score_add": 12,
+                "disable_timeframes": ["5m"],
+                "require_mtf_confluence": True,
+            },
+        },
+    )
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="macro risk mode disabled this timeframe"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.market_orders == []
+    assert trading.leverage_calls == []
+    assert db.added_of(Position) == []
+    events = [row.event_type for row in db.added_of(DecisionLog)]
+    assert events == ["live_order_rejected_portfolio_guard"]
 
 
 def test_execute_live_sets_leverage_before_submitting_order(monkeypatch: pytest.MonkeyPatch) -> None:

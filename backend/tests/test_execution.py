@@ -1,10 +1,10 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from app.api.routes import _calculate_unrealized_pnl
 from app.core.config import Settings
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, Signal
 from app.engine.execution import OrderExecutionEngine
+from app.services.position_pnl import calculate_unrealized_pnl as _calculate_unrealized_pnl
 
 
 class FakeQuery:
@@ -974,3 +974,72 @@ def test_time_stop_does_not_duplicate_recent_live_alert() -> None:
         isinstance(row, DecisionLog) and row.event_type == "live_position_time_stop_alert"
         for row in db.added
     )
+
+
+def _detail_position(*, side: str = "long", entry: str = "100") -> Position:
+    return Position(
+        id=99,
+        market_id=1,
+        mode="paper",
+        side=side,
+        entry_price=Decimal(entry),
+        size=Decimal("1"),
+        status="open",
+        metadata_json={},
+    )
+
+
+def test_exit_reason_detail_keeps_initial_stop_label() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = _detail_position(side="long")
+    metadata = {"initial_stop_loss": "95"}
+
+    detail = engine._exit_reason_detail(position, metadata, Decimal("95"), "stop_loss")
+
+    assert detail == "stop_loss"
+
+
+def test_exit_reason_detail_labels_breakeven_stop() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = _detail_position(side="long")
+    metadata = {"initial_stop_loss": "95"}
+
+    detail = engine._exit_reason_detail(position, metadata, Decimal("100"), "stop_loss")
+
+    assert detail == "breakeven_stop"
+
+
+def test_exit_reason_detail_labels_trailing_stop_in_profit() -> None:
+    engine = OrderExecutionEngine(Settings())
+    long_position = _detail_position(side="long")
+    short_position = _detail_position(side="short")
+    metadata = {"initial_stop_loss": "95"}
+
+    assert (
+        engine._exit_reason_detail(long_position, metadata, Decimal("103"), "stop_loss")
+        == "trailing_stop"
+    )
+    assert (
+        engine._exit_reason_detail(
+            short_position, {"initial_stop_loss": "105"}, Decimal("97"), "stop_loss"
+        )
+        == "trailing_stop"
+    )
+
+
+def test_exit_reason_detail_labels_tightened_stop_still_losing() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = _detail_position(side="long")
+    metadata = {"initial_stop_loss": "95"}
+
+    detail = engine._exit_reason_detail(position, metadata, Decimal("98"), "stop_loss")
+
+    assert detail == "tightened_stop"
+
+
+def test_exit_reason_detail_passes_through_non_stop_reasons() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = _detail_position(side="long")
+
+    assert engine._exit_reason_detail(position, {}, Decimal("110"), "tp1") == "tp1"
+    assert engine._exit_reason_detail(position, {}, Decimal("90"), "time_stop") == "time_stop"

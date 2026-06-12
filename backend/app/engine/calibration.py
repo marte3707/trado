@@ -305,10 +305,56 @@ class AutoCalibrationEngine:
         wf_enabled = bool(settings.get("walk_forward_enabled", True))
         wf_train_ratio = float(settings.get("walk_forward_train_ratio", 0.7))
         wf_min_per_side = int(settings.get("walk_forward_min_per_side", 5))
+        # Floor cross-timeframe: una strategia globalmente negativa su un campione
+        # aggregato ampio va tagliata su TUTTE le celle, incluse quelle che da sole
+        # non raggiungono min_strategy_trades (è il buco che lasciava volume_profile
+        # a peso pieno su 1h/4h/1d: ogni cella era sotto soglia, l'aggregato no).
+        cross_tf_caps: dict[str, tuple[float, str]] = {}
+        if bool(settings.get("cross_timeframe_floor_enabled", True)):
+            cross_min_trades = int(settings.get("cross_timeframe_min_trades", 80))
+            cross_weak_pf = float(settings.get("cross_timeframe_weak_pf", 0.8))
+            cross_severe_pf = float(settings.get("cross_timeframe_severe_pf", 0.6))
+            cross_weak_cap = float(settings.get("cross_timeframe_weak_cap", 0.7))
+            cross_severe_cap = float(settings.get("cross_timeframe_severe_cap", 0.55))
+            all_by_strategy = self.analyzer.strategy_positions(
+                db, timeframe=None, limit=int(settings["lookback_trades"])
+            )
+            for strategy_name, aggregated_positions in all_by_strategy.items():
+                aggregate = self.analyzer.summarize_positions(aggregated_positions)
+                if (
+                    aggregate.trades < cross_min_trades
+                    or aggregate.realized_pnl >= 0
+                    or aggregate.profit_factor is None
+                ):
+                    continue
+                if aggregate.profit_factor < cross_severe_pf:
+                    cross_tf_caps[strategy_name] = (
+                        cross_severe_cap,
+                        f"cross-TF severe underperformance: PF={aggregate.profit_factor:.2f} "
+                        f"su {aggregate.trades} trade aggregati",
+                    )
+                elif aggregate.profit_factor < cross_weak_pf:
+                    cross_tf_caps[strategy_name] = (
+                        cross_weak_cap,
+                        f"cross-TF weak performance: PF={aggregate.profit_factor:.2f} "
+                        f"su {aggregate.trades} trade aggregati",
+                    )
         factor_history_window = int(settings.get("factor_history_window", 5))
         factor_history_threshold = float(settings.get("factor_history_std_threshold", 0.25))
         # Storico dei factor decisi per strategia (serve per detectare instabilità)
         factor_history: dict[str, list[float]] = dict(state_value.get("factor_history") or {})
+        # Baseline mobile: quando i factor recenti spingono stabilmente nella stessa
+        # direzione, il baseline si sposta del 25% verso il peso calibrato — così i
+        # pesi possono "camminare" oltre il range factor×baseline invece di restare
+        # ancorati per sempre alla fotografia iniziale. Rate-limited sui trade chiusi
+        # per evitare che la cadenza dei run (minuti) faccia collassare l'ancora.
+        baseline_drift_enabled = bool(settings.get("baseline_drift_enabled", True))
+        baseline_drift_runs = int(settings.get("baseline_drift_runs", 5))
+        baseline_drift_min_new_trades = int(settings.get("baseline_drift_min_new_trades", 25))
+        baseline_drift_at: dict[str, int] = dict(
+            state_value.get("baseline_drift_at_trade_count") or {}
+        )
+        baseline_updates: dict[str, int] = {}
         # Fix 4: rileva regime corrente una volta per tutta la calibrazione
         current_regime = self.analyzer.recent_regime(db)
         regime_pos_cache: dict[str, dict[str, list[Position]]] = {}
@@ -332,7 +378,8 @@ class AutoCalibrationEngine:
                 )
             contrib_perf = contrib_cache[strategy.timeframe].get(strategy.strategy_name)
             stats = self.analyzer.summarize_positions(strategy_positions)
-            if stats.trades < min_trades:
+            cross_cap = cross_tf_caps.get(strategy.strategy_name)
+            if stats.trades < min_trades and cross_cap is None:
                 continue
             key = f"{strategy.timeframe}:{strategy.strategy_name}"
             # Auto-disable usa Wilson upper bound: disabilita solo se *anche* nel migliore
@@ -363,40 +410,47 @@ class AutoCalibrationEngine:
                 )
                 continue
             baseline_weight = int(baseline_weights.get(key, strategy.weight))
-            factor, reason = self._strategy_factor_holdout_validated(
-                strategy_positions,
-                enabled=wf_enabled,
-                train_ratio=wf_train_ratio,
-                min_per_side=wf_min_per_side,
-            )
-            # Fix 3: nudge del factor in base al contribution-weighted win rate.
-            # Se la strategia vince di più quando è il contribuente principale, merita
-            # un factor più alto di quanto suggerisca il semplice conteggio vittorie.
-            if contrib_perf and contrib_perf.trades >= max(3, min_trades // 2):
-                wr_delta = contrib_perf.win_rate - (stats.win_rate if stats.trades > 0 else 0.5)
-                contrib_nudge = max(-0.15, min(0.15, wr_delta * 1.5))
-                if abs(contrib_nudge) >= 0.05:
-                    factor += contrib_nudge
-                    reason += f" | contrib_adj={contrib_nudge:+.2f}"
-            # Fix 4: blending con factor regime-specifico (60% regime / 40% globale).
-            # Il regime corrente è più predittivo degli ultimi N trade aggregati su tutti i regimi.
-            if current_regime and current_regime != "unknown":
-                if strategy.timeframe not in regime_pos_cache:
-                    regime_pos_cache[strategy.timeframe] = self.analyzer.regime_strategy_positions(
-                        db, current_regime,
-                        timeframe=strategy.timeframe,
-                        limit=int(settings["lookback_trades"]),
-                    )
-                regime_pos = regime_pos_cache[strategy.timeframe].get(strategy.strategy_name, [])
-                if len(regime_pos) >= min_trades:
-                    regime_factor, regime_reason = self._strategy_factor_holdout_validated(
-                        regime_pos,
-                        enabled=wf_enabled,
-                        train_ratio=wf_train_ratio,
-                        min_per_side=wf_min_per_side,
-                    )
-                    factor = 0.4 * factor + 0.6 * regime_factor
-                    reason = f"regime={current_regime}: {regime_reason} | global: {reason}"
+            if stats.trades < min_trades and cross_cap is not None:
+                # Cella sotto campione minimo ma strategia globalmente negativa:
+                # l'evidenza aggregata cross-TF giustifica il taglio anche qui,
+                # senza pipeline per-cella (holdout/regime non avrebbero dati).
+                factor = cross_cap[0]
+                reason = f"{cross_cap[1]} (cella n={stats.trades} sotto min_trades)"
+            else:
+                factor, reason = self._strategy_factor_holdout_validated(
+                    strategy_positions,
+                    enabled=wf_enabled,
+                    train_ratio=wf_train_ratio,
+                    min_per_side=wf_min_per_side,
+                )
+                # Fix 3: nudge del factor in base al contribution-weighted win rate.
+                # Se la strategia vince di più quando è il contribuente principale, merita
+                # un factor più alto di quanto suggerisca il semplice conteggio vittorie.
+                if contrib_perf and contrib_perf.trades >= max(3, min_trades // 2):
+                    wr_delta = contrib_perf.win_rate - (stats.win_rate if stats.trades > 0 else 0.5)
+                    contrib_nudge = max(-0.15, min(0.15, wr_delta * 1.5))
+                    if abs(contrib_nudge) >= 0.05:
+                        factor += contrib_nudge
+                        reason += f" | contrib_adj={contrib_nudge:+.2f}"
+                # Fix 4: blending con factor regime-specifico (60% regime / 40% globale).
+                # Il regime corrente è più predittivo degli ultimi N trade aggregati su tutti i regimi.
+                if current_regime and current_regime != "unknown":
+                    if strategy.timeframe not in regime_pos_cache:
+                        regime_pos_cache[strategy.timeframe] = self.analyzer.regime_strategy_positions(
+                            db, current_regime,
+                            timeframe=strategy.timeframe,
+                            limit=int(settings["lookback_trades"]),
+                        )
+                    regime_pos = regime_pos_cache[strategy.timeframe].get(strategy.strategy_name, [])
+                    if len(regime_pos) >= min_trades:
+                        regime_factor, regime_reason = self._strategy_factor_holdout_validated(
+                            regime_pos,
+                            enabled=wf_enabled,
+                            train_ratio=wf_train_ratio,
+                            min_per_side=wf_min_per_side,
+                        )
+                        factor = 0.4 * factor + 0.6 * regime_factor
+                        reason = f"regime={current_regime}: {regime_reason} | global: {reason}"
             # Stability tracking: registra il factor calcolato e congela il cambio se
             # i factor recenti per questa strategia variano troppo. La instabilità
             # è un segnale di overfitting al rumore — meglio non muovere i pesi.
@@ -414,7 +468,48 @@ class AutoCalibrationEngine:
                         f"stability freeze: factor std={std_dev:.2f} over last "
                         f"{len(history)} runs above threshold {factor_history_threshold}"
                     )
+            # Il cap cross-TF vince anche sullo stability freeze: l'evidenza è
+            # aggregata su un campione ampio, non rumore per-cella.
+            if cross_cap is not None and factor > cross_cap[0]:
+                factor = cross_cap[0]
+                reason = f"{cross_cap[1]} | {reason}"
             calibrated = max(min_weight, min(max_weight, round(baseline_weight * factor)))
+            # Baseline mobile: se i factor recenti spingono in modo persistente e
+            # unidirezionale, sposta l'ancora del 25% verso il peso calibrato.
+            if (
+                baseline_drift_enabled
+                and len(history) >= baseline_drift_runs
+                and calibrated != baseline_weight
+            ):
+                recent_factors = history[-baseline_drift_runs:]
+                persistent_down = all(value <= 0.85 for value in recent_factors)
+                persistent_up = all(value >= 1.15 for value in recent_factors)
+                last_drift_count = baseline_drift_at.get(key)
+                drift_allowed = (
+                    last_drift_count is None
+                    or total_closed - int(last_drift_count) >= baseline_drift_min_new_trades
+                )
+                if (persistent_down or persistent_up) and drift_allowed:
+                    drifted = max(
+                        min_weight,
+                        min(max_weight, round(0.75 * baseline_weight + 0.25 * calibrated)),
+                    )
+                    if drifted != baseline_weight:
+                        baseline_updates[key] = drifted
+                        baseline_drift_at[key] = int(total_closed)
+                        changes.append(
+                            CalibrationChange(
+                                target="strategy_baseline",
+                                key=key,
+                                before=baseline_weight,
+                                after=drifted,
+                                reason=(
+                                    f"baseline drift: factor persistente "
+                                    f"{'<=0.85' if persistent_down else '>=1.15'} negli ultimi "
+                                    f"{baseline_drift_runs} run"
+                                ),
+                            )
+                        )
             if calibrated == strategy.weight:
                 continue
             changes.append(
@@ -433,9 +528,21 @@ class AutoCalibrationEngine:
         # lo stesso oggetto) o in _record_run.
         state_value["auto_disabled_at_trade_count"] = disabled_at
         state_value["factor_history"] = factor_history
+        state_value["baseline_drift_at_trade_count"] = baseline_drift_at
         persisted = state_setting or AppSetting(key="auto_calibration_state", value={})
         persisted.value = state_value
         db.add(persisted)
+        # Persisti i drift del baseline (solo se l'ancora esiste già: senza un
+        # baseline salvato il drift non avrebbe alcun effetto al run successivo).
+        if baseline_updates:
+            baseline_setting = db.get(AppSetting, "auto_calibration_baseline")
+            if baseline_setting is not None and isinstance(baseline_setting.value, dict):
+                baseline_value = dict(baseline_setting.value)
+                stored_weights = dict(baseline_value.get("strategy_weights") or {})
+                stored_weights.update(baseline_updates)
+                baseline_value["strategy_weights"] = stored_weights
+                baseline_setting.value = baseline_value
+                db.add(baseline_setting)
         return changes
 
     def _calibrate_strategy_params(
@@ -894,32 +1001,56 @@ class AutoCalibrationEngine:
             db.add(risk_setting)
         return changes
 
+    # Range del factor continuo: più ampio dei vecchi 5 valori discreti
+    # {0.6, 0.8, 1.0, 1.1, 1.2} che impedivano al calibratore di esprimere
+    # giudizi forti ("questa strategia vale la metà / il 40% in più").
+    _FACTOR_MIN = 0.5
+    _FACTOR_MAX = 1.4
+    # Confidenza campionaria piena a partire da questo numero di trade: sotto,
+    # la distanza del factor da 1.0 viene scalata linearmente verso il neutro.
+    _FACTOR_FULL_CONFIDENCE_TRADES = 60
+
     def _strategy_factor(self, stats: PerformanceStats) -> tuple[float, str]:
+        """Factor continuo PF-informed in [0.5, 1.4].
+
+        Il profit factor è il segnale primario (cattura il payoff, non solo la
+        frequenza di vittoria); la distanza da 1.0 è scalata per confidenza
+        campionaria, e i Wilson bounds sul WR restano come guardie conservative
+        per ancorare i casi estremi al comportamento storico del calibratore.
+        """
         profit_factor = stats.profit_factor
-        # Why: il win rate puntuale su poche decine di trade è rumoroso (binomial CI ampio).
-        # Usiamo Wilson lower bound al 95% CI come stima conservativa: solo se il LB
-        # supera la soglia consideriamo la strategia confermata sopra (o sotto) di essa.
         wr_lb = _wilson_lower_bound(stats.wins, stats.trades)
         wr_ub = _wilson_upper_bound(stats.wins, stats.trades)
+        confidence = min(1.0, stats.trades / self._FACTOR_FULL_CONFIDENCE_TRADES)
+        if profit_factor is None:
+            # Nessuna perdita registrata: boost prudente solo se c'è PnL positivo.
+            raw = 1.2 if stats.realized_pnl > 0 else 1.0
+        elif profit_factor >= 1.0:
+            raw = 1.0 + min(self._FACTOR_MAX - 1.0, (profit_factor - 1.0) * 0.4)
+        else:
+            raw = 1.0 - min(1.0 - self._FACTOR_MIN, (1.0 - profit_factor) * 0.6)
+        factor = 1.0 + (raw - 1.0) * confidence
+        reason = (
+            f"PF-informed factor {factor:.2f} "
+            f"(PF={profit_factor if profit_factor is None else round(profit_factor, 2)}, "
+            f"WR LB={wr_lb:.2f}, UB={wr_ub:.2f}, n={stats.trades})"
+        )
+        # Guardie conservative compatibili con le vecchie soglie discrete.
         if stats.realized_pnl < 0 and (
             wr_ub < 0.40 or (profit_factor is not None and profit_factor < 0.8)
         ):
-            return 0.6, (
+            factor = min(factor, 0.6)
+            reason = (
                 f"strategy underperformed historically "
                 f"(WR LB={wr_lb:.2f}, UB={wr_ub:.2f}, n={stats.trades})"
             )
-        if wr_ub < 0.50 or (profit_factor is not None and profit_factor < 1.0):
-            return 0.8, (
-                f"strategy below-target historical performance "
-                f"(WR LB={wr_lb:.2f}, UB={wr_ub:.2f}, n={stats.trades})"
-            )
-        if wr_lb >= 0.55 and stats.realized_pnl > 0 and (
+        elif wr_lb >= 0.55 and stats.realized_pnl > 0 and (
             profit_factor is None or profit_factor >= 1.25
         ):
-            return 1.2, f"strategy outperformed historically (WR LB={wr_lb:.2f}, n={stats.trades})"
-        if wr_lb >= 0.50 and stats.realized_pnl > 0:
-            return 1.1, f"strategy positive historical edge (WR LB={wr_lb:.2f}, n={stats.trades})"
-        return 1.0, "strategy performance near baseline"
+            factor = max(factor, 1.2)
+            reason = f"strategy outperformed historically (WR LB={wr_lb:.2f}, n={stats.trades})"
+        factor = max(self._FACTOR_MIN, min(self._FACTOR_MAX, factor))
+        return round(factor, 4), reason
 
     def _strategy_factor_holdout_validated(
         self,
@@ -951,11 +1082,13 @@ class AutoCalibrationEngine:
         train_stats, test_stats = split
         train_factor, _ = self._strategy_factor(train_stats)
         test_factor, _ = self._strategy_factor(test_stats)
-        # "Concordi" = factor sullo stesso lato di 1.0 (entrambi <= 1.0 o entrambi >= 1.0).
-        # Train che dice 0.6 e test che dice 1.1 = regime cambiato → no cambio peso.
-        concordant = (train_factor <= 1.0 and test_factor <= 1.0) or (
-            train_factor >= 1.0 and test_factor >= 1.0
-        )
+        # "Concordi" = factor sullo stesso lato di 1.0 (entrambi <= 1.0 o entrambi >= 1.0),
+        # con banda neutra ±0.05: coi factor continui un 0.98 vs 1.02 è rumore, non
+        # divergenza di regime. Train 0.6 e test 1.15 = regime cambiato → no cambio peso.
+        neutral_band = 0.05
+        concordant = (
+            train_factor <= 1.0 + neutral_band and test_factor <= 1.0 + neutral_band
+        ) or (train_factor >= 1.0 - neutral_band and test_factor >= 1.0 - neutral_band)
         if not concordant:
             return 1.0, (
                 f"holdout instability: train_factor={train_factor:.2f} vs "

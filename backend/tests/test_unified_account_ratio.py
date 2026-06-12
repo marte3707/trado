@@ -4,12 +4,13 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api import routes
+from app.api.routers import account as account_router
 from app.core.config import Settings
 from app.db.models import AccountSnapshot, AppSetting, DecisionLog, Market, Position
 from app.db.session import get_db
 from app.services.hyperliquid import HyperliquidOrderResult
 from app.services.unified_account_ratio import calculate_unified_account_ratio
-from app.worker import main as worker
+from app.worker import uar_guard as worker
 
 
 def _state(ratio_pct: str, positions: list[dict] | None = None) -> dict:
@@ -112,10 +113,10 @@ def test_account_snapshot_exposes_unified_account_ratio_fields(monkeypatch) -> N
     async def predicted(_client):
         return [], None
 
-    monkeypatch.setattr(routes, "get_settings", lambda: Settings(hyperliquid_account_address="0xabc"))
-    monkeypatch.setattr(routes, "_fetch_market_meta", market_meta)
-    monkeypatch.setattr(routes, "_fetch_account_state", account_state)
-    monkeypatch.setattr(routes, "_fetch_predicted_fundings", predicted)
+    monkeypatch.setattr(account_router, "get_settings", lambda: Settings(hyperliquid_account_address="0xabc"))
+    monkeypatch.setattr(account_router, "_fetch_market_meta", market_meta)
+    monkeypatch.setattr(account_router, "_fetch_account_state", account_state)
+    monkeypatch.setattr(account_router, "_fetch_predicted_fundings", predicted)
 
     db = SnapshotDb()
     app = FastAPI()

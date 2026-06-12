@@ -59,11 +59,16 @@ export function MacroRiskStateCard({ settings }: { settings: AppSettings }) {
   const tone = levelTone(level, active);
   const score = asNumber(state.combined_score) ?? 0;
   const newsScore = asNumber(state.news_score) ?? 0;
+  const calendarScore = asNumber(state.calendar_score) ?? 0;
   const marketScore = asNumber(state.market_stress_score) ?? 0;
   const reason = asText(state.reason);
   const sources = asTextList(state.sources);
   const policy = asRecord(state.policy);
   const disabledTfs = asTextList(policy.disable_timeframes);
+  const calendar = asRecord(state.calendar);
+  const activeCalendarEvents = Array.isArray(calendar.active_events)
+    ? calendar.active_events.map(asRecord).slice(0, 1)
+    : [];
   const topNews = Array.isArray(state.top_news)
     ? state.top_news.map(asRecord).slice(0, 2)
     : [];
@@ -97,7 +102,7 @@ export function MacroRiskStateCard({ settings }: { settings: AppSettings }) {
           {score}
         </span>
         <span className="truncate text-xs text-fg-3">
-          news {newsScore} · market {marketScore}
+          news {newsScore} · calendar {calendarScore} · market {marketScore}
         </span>
       </div>
 
@@ -111,12 +116,30 @@ export function MacroRiskStateCard({ settings }: { settings: AppSettings }) {
         </div>
       </div>
 
+      {activeCalendarEvents.length > 0 && (
+        <div className="rounded-md border border-warn/25 bg-warn/10 px-2 py-1.5">
+          <div className="text-[9px] font-medium uppercase tracking-wider text-warn">
+            Macro calendar
+          </div>
+          <div className="mt-0.5 truncate text-[11px] text-fg-2">
+            {String(activeCalendarEvents[0].title ?? "Scheduled macro event")}
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 gap-1.5">
         <MiniMetric
           label="Size"
           value={`x${asNumber(policy.size_multiplier)?.toFixed(2) ?? "1.00"}`}
         />
-        <MiniMetric label="Score add" value={`+${asNumber(policy.min_score_add) ?? 0}`} />
+        <MiniMetric
+          label="Exp. R floor"
+          value={
+            asNumber(policy.min_expected_r) !== null
+              ? `${asNumber(policy.min_expected_r)?.toFixed(2)}R`
+              : "n/a"
+          }
+        />
         <MiniMetric
           label="Disabled TF"
           value={disabledTfs.length ? disabledTfs.join(", ") : "none"}

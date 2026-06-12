@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings, get_settings
 from app.core.runtime_settings import DEFAULT_POSITION_MANAGEMENT_SETTINGS
 from app.db.models import Alert, AppSetting, Order, Position, Signal
+from app.engine.portfolio_guard import PortfolioGuard
 from app.notifications.card_renderer import render_close_card
 from app.services.trade_metrics import build_trade_metrics
 
@@ -96,6 +97,103 @@ def _score_bar(score: int) -> str:
 
 def _fmt_reason(reason: str) -> str:
     return _REASON_LABELS.get(reason.lower(), reason.upper())
+
+
+def _macro_risk_icon(level: str, active: bool) -> str:
+    if not active:
+        return "✅"
+    return {
+        "extreme": "🚨",
+        "high": "⚠️",
+        "watch": "🟡",
+        "manual": "🛡️",
+    }.get(level.lower(), "⚠️")
+
+
+def _humanize_macro_tokens(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "n/a"
+    parts = [part.strip().replace("_", " ") for part in text.split(",") if part.strip()]
+    return ", ".join(parts) or "n/a"
+
+
+def _format_macro_sources(value: object) -> str:
+    if not isinstance(value, list):
+        return "n/a"
+    labels = [str(item).replace("_", " ").strip() for item in value if str(item).strip()]
+    return ", ".join(labels) or "n/a"
+
+
+def _short_text(value: str, max_len: int = 120) -> str:
+    text = " ".join(value.split())
+    if len(text) <= max_len:
+        return text
+    return f"{text[: max_len - 1].rstrip()}…"
+
+
+def _macro_risk_news_lines(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    lines: list[str] = []
+    for item in value[:2]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        source = str(item.get("source") or "").strip()
+        url = str(item.get("url") or "").strip()
+        label = escape(_short_text(title))
+        source_suffix = f" <i>{escape(source)}</i>" if source else ""
+        if url.startswith(("https://", "http://")):
+            safe_url = escape(url, quote=True)
+            lines.append(f"• <a href=\"{safe_url}\">{label}</a>{source_suffix}")
+        else:
+            lines.append(f"• {label}{source_suffix}")
+    return lines
+
+
+def _macro_risk_calendar_lines(value: object) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    active_events = value.get("active_events")
+    if not isinstance(active_events, list):
+        return []
+    lines: list[str] = []
+    for item in active_events[:2]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if not title:
+            continue
+        source = str(item.get("source") or "").strip()
+        url = str(item.get("url") or "").strip()
+        label = escape(_short_text(title))
+        source_suffix = f" <i>{escape(source)}</i>" if source else ""
+        if url.startswith(("https://", "http://")):
+            lines.append(f"• <a href=\"{escape(url, quote=True)}\">{label}</a>{source_suffix}")
+        else:
+            lines.append(f"• {label}{source_suffix}")
+    return lines
+
+
+def _format_italian_datetime(value: object) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+    else:
+        return str(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    local = parsed.astimezone(ZoneInfo("Europe/Rome"))
+    return local.strftime("%d/%m/%Y alle %H:%M")
 
 
 def _terms_guide_url(anchor: str | None = None) -> str:
@@ -1036,26 +1134,49 @@ class TelegramNotifier:
     async def send_macro_risk_state_changed(self, state: dict[str, Any]) -> None:
         if not self.settings.telegram_signal_chat_id:
             return
-        level = str(state.get("level") or "off").upper()
-        active = "ACTIVE" if state.get("active") else "OFF"
+        level_raw = str(state.get("level") or "off")
+        level = level_raw.upper()
+        is_active = bool(state.get("active"))
+        active = "ACTIVE · defensive rules enabled" if is_active else "OFF · normal rules restored"
+        icon = _macro_risk_icon(level_raw, is_active)
         summary = escape(str(state.get("summary") or "Macro risk state changed"))
-        reason = escape(str(state.get("reason") or "n/a"))
-        active_until = escape(str(state.get("active_until") or "n/a"))
+        reason = escape(_humanize_macro_tokens(state.get("reason")))
+        sources = escape(_format_macro_sources(state.get("sources")))
+        active_until = escape(_format_italian_datetime(state.get("active_until")))
         raw_policy = state.get("policy")
         policy: dict[str, Any] = raw_policy if isinstance(raw_policy, dict) else {}
         disabled_tfs = ", ".join(str(item) for item in policy.get("disable_timeframes", []) or []) or "none"
+        mtf = "required" if policy.get("require_mtf_confluence") else "not required"
+        expected_r_floor = policy.get("min_expected_r")
+        try:
+            expected_r_label = f">={float(expected_r_floor):.2f}R"
+        except (TypeError, ValueError):
+            expected_r_label = "not enforced"
         lines = [
-            f"<b>Macro Risk {level}</b> · {active}",
+            f"{icon} <b>Macro risk: {level}</b>",
+            f"Status: <b>{active}</b>",
             summary,
             "",
-            f"<b>Reason:</b> {reason}",
-            f"<b>Score:</b> {state.get('combined_score', 0)}/100 "
-            f"(news {state.get('news_score', 0)}, market {state.get('market_stress_score', 0)})",
-            f"<b>Policy:</b> size x{policy.get('size_multiplier', 1)}, "
-            f"score +{policy.get('min_score_add', 0)}, disabled TF {escape(disabled_tfs)}, "
-            f"MTF {'required' if policy.get('require_mtf_confluence') else 'not required'}",
-            f"<b>Active until:</b> {active_until}",
+            f"🧭 <b>Why:</b> {reason}",
+            f"📰 <b>Sources:</b> {sources}",
+            f"📊 <b>Risk score:</b> <code>{state.get('combined_score', 0)}/100</code> "
+            f"· news <code>{state.get('news_score', 0)}</code> "
+            f"· calendar <code>{state.get('calendar_score', 0)}</code> "
+            f"· market <code>{state.get('market_stress_score', 0)}</code>",
+            "",
+            "🛡️ <b>Trading impact</b>",
+            f"• Position size: <code>{policy.get('size_multiplier', 1)}x</code>",
+            f"• Calibrated expected R: <code>{expected_r_label}</code>",
+            f"• Paused timeframes: <code>{escape(disabled_tfs)}</code>",
+            f"• MTF confluence: <code>{mtf}</code>",
+            f"⏱️ <b>Active until:</b> {active_until}",
         ]
+        news_lines = _macro_risk_news_lines(state.get("top_news"))
+        if news_lines:
+            lines.extend(["", "📰 <b>Top news</b>", *news_lines])
+        calendar_lines = _macro_risk_calendar_lines(state.get("calendar"))
+        if calendar_lines:
+            lines.extend(["", "📅 <b>Macro calendar</b>", *calendar_lines])
         try:
             await self._send_text(
                 "\n".join(lines),
@@ -1085,6 +1206,22 @@ class TelegramNotifier:
             "take_profit_3": str(signal.take_profit_3) if signal.take_profit_3 is not None else None,
             "risk_reward": str(signal.risk_reward),
         }
+        macro_gate = PortfolioGuard(self.settings).evaluate_macro_risk_gate(db, signal)
+        if not macro_gate.allowed:
+            db.add(
+                Alert(
+                    signal_id=signal.id,
+                    channel="telegram",
+                    status="skipped",
+                    payload={
+                        **payload,
+                        "skip_reason": macro_gate.reason,
+                        "skip_details": macro_gate.details,
+                    },
+                )
+            )
+            db.commit()
+            return
         alert = Alert(signal_id=signal.id, channel="telegram", status="pending", payload=payload)
         db.add(alert)
         db.commit()

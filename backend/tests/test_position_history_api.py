@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.api import routes
+from app.api.routers import positions as positions_router
 from app.db.models import Base, Market, Order, Position
 from app.db.session import get_db
 
@@ -75,7 +76,7 @@ def test_position_history_returns_full_history_without_realtime_limit() -> None:
     base_closed = datetime(2026, 2, 1, tzinfo=UTC)
     positions = [
         _position(market, idx, closed_at=base_closed + timedelta(minutes=idx))
-        for idx in range(routes.POSITION_HISTORY_LIMIT + 10)
+        for idx in range(positions_router.POSITION_HISTORY_LIMIT + 10)
     ]
     db.add_all(positions)
     db.flush()
@@ -97,13 +98,13 @@ def test_position_history_returns_full_history_without_realtime_limit() -> None:
     client = _client(db)
     realtime = client.get("/api/positions")
     assert realtime.status_code == 200
-    assert len(realtime.json()) == routes.POSITION_HISTORY_LIMIT
+    assert len(realtime.json()) == positions_router.POSITION_HISTORY_LIMIT
 
     history = client.get("/api/positions/history?period=all&mode=paper&limit=5000")
     assert history.status_code == 200
     payload = history.json()
-    assert payload["total"] == routes.POSITION_HISTORY_LIMIT + 10
-    assert len(payload["positions"]) == routes.POSITION_HISTORY_LIMIT + 10
+    assert payload["total"] == positions_router.POSITION_HISTORY_LIMIT + 10
+    assert len(payload["positions"]) == positions_router.POSITION_HISTORY_LIMIT + 10
     assert len(payload["orders"]) == 1
     assert payload["orders"][0]["order_type"] == "stop_loss"
 

@@ -331,23 +331,34 @@ def signal_threshold_adjustment(
     timeframe: str,
     direction: Direction,
     score: int,
+    suspended_family: str | None = None,
 ) -> dict[str, Any]:
     family = direction_family(direction)
     if family is None:
         return {"total": 0, "components": {}, "max_adjustment": 0}
     max_adjustment = int(risk.get("max_combined_score_adjustment", DEFAULT_MAX_COMBINED_SCORE_ADJUSTMENT))
+    # Sospensione regime-aware: le penalità direzionali per `suspended_family`
+    # sono state apprese nel regime macro opposto — vengono azzerate (non
+    # cancellate dal DB) finché il regime resta favorevole a quella direzione.
+    directional_suspended = suspended_family is not None and family == suspended_family
     components = {
-        "directional": _adjustment_value(
+        "directional": 0
+        if directional_suspended
+        else _adjustment_value(
             risk.get("directional_score_adjustments"),
             f"{family}:{timeframe}",
         ),
-        "score_bucket": _adjustment_value(
+        "score_bucket": 0
+        if directional_suspended
+        else _adjustment_value(
             risk.get("score_bucket_adjustments"),
             f"{family}:{score_bucket(score)}",
         ),
         "market": _adjustment_value(risk.get("market_score_adjustments"), str(market_id)),
         "timeframe": _adjustment_value(risk.get("timeframe_score_adjustments"), timeframe),
-        "directional_min_score": _adjustment_value(
+        "directional_min_score": 0
+        if directional_suspended
+        else _adjustment_value(
             risk.get("directional_min_score_adjustments"),
             f"{family}:{timeframe}",
         ),
@@ -360,6 +371,7 @@ def signal_threshold_adjustment(
         "max_adjustment": max_adjustment,
         "direction": family,
         "score_bucket": score_bucket(score),
+        "suspended_family": suspended_family if directional_suspended else None,
     }
 
 
@@ -372,16 +384,20 @@ def _adjustment_value(raw: object, key: str) -> int:
     return max(0, _safe_int(value))
 
 
-def build_outcome_profile(db: Session, *, lookback: int = 500) -> dict[str, Any]:
+def build_outcome_profile(
+    db: Session, *, lookback: int = 500, mode: str | None = None
+) -> dict[str, Any]:
     analyzer = SignalPerformanceAnalyzer()
-    positions = (
+    query = (
         db.query(Position)
         .options(joinedload(Position.market))
         .filter(Position.status == "closed", Position.realized_pnl.is_not(None))
-        .order_by(Position.closed_at.desc())
-        .limit(lookback)
-        .all()
     )
+    # Senza filtro mode i trade live (notional minuscoli) diluiscono win rate e
+    # PF degli aggregati paper: i breakdown vanno letti per singola modalità.
+    if mode is not None:
+        query = query.filter(Position.mode == mode)
+    positions = query.order_by(Position.closed_at.desc()).limit(lookback).all()
     rows = linked_position_signals(db, positions)
     by_direction_summary = _summarize_groups(
         analyzer,
@@ -400,7 +416,7 @@ def build_outcome_profile(db: Session, *, lookback: int = 500) -> dict[str, Any]
         return f"{market.id}:{market.symbol}"
 
     return {
-        "filters": {"lookback": lookback},
+        "filters": {"lookback": lookback, "mode": mode},
         "overall": serialize_stats(analyzer.summarize_positions(positions)),
         "by_mode": _summarize_groups(analyzer, rows, lambda row: row.position.mode),
         "by_direction": by_direction_summary,
@@ -423,7 +439,10 @@ def build_outcome_profile(db: Session, *, lookback: int = 500) -> dict[str, Any]
             analyzer,
             rows,
             lambda row: (
-                row.position.metadata_json.get("exit_reason", "unknown")
+                (
+                    row.position.metadata_json.get("exit_reason_detail")
+                    or row.position.metadata_json.get("exit_reason", "unknown")
+                )
                 if isinstance(row.position.metadata_json, dict)
                 else "unknown"
             ),
