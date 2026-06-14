@@ -1,4 +1,5 @@
 """Stato dei cicli di sistema (system_cycle_status) e heartbeat del worker."""
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -7,9 +8,6 @@ import structlog
 
 from app.db.models import AppSetting, DecisionLog
 from app.db.session import SessionLocal
-
-# Re-export per retro-compatibilità: alcuni test referenziano
-# `app.worker.main.next_daily_recap_timestamp`.
 
 logger = structlog.get_logger()
 SYSTEM_CYCLE_STATUS_SETTING_KEY = "system_cycle_status"
@@ -73,6 +71,67 @@ def _record_system_cycle_status(
     else:
         setting.value = value
     db.add(setting)
+
+
+async def run_periodic_cycle(
+    *,
+    cycle_id: str,
+    label: str,
+    expected_interval_seconds: int,
+    work: Callable[[Any], Awaitable[dict[str, Any] | None]],
+    ok_message: str,
+    failed_message: str,
+    ok_status: Callable[[dict[str, Any] | None], str] | None = None,
+) -> None:
+    """Esegue un job periodico del worker con sessione, stato ciclo e logging standard.
+
+    Incapsula il boilerplate ripetuto (sessione dedicata, registrazione dello stato
+    del ciclo, rollback + DecisionLog su errore) che prima era copiato per ogni
+    guardrail nel loop principale di `worker/main.py`. `work` riceve la sessione e
+    ritorna un dict di risultato (loggato e salvato come `data`) oppure `None`.
+    """
+    db = SessionLocal()
+    try:
+        result = await work(db)
+        status = ok_status(result) if ok_status is not None else "ok"
+        _record_system_cycle_status(
+            db,
+            cycle_id,
+            label,
+            status,
+            message=ok_message,
+            data=result if isinstance(result, dict) else None,
+            expected_interval_seconds=expected_interval_seconds,
+        )
+        db.commit()
+        if isinstance(result, dict):
+            logger.info(f"{cycle_id}_completed", **result)
+    except Exception as exc:
+        logger.exception(f"{cycle_id}_failed", error=str(exc))
+        db.rollback()
+        try:
+            data = {"error": str(exc), "type": type(exc).__name__}
+            _record_system_cycle_status(
+                db,
+                cycle_id,
+                label,
+                "failed",
+                message=failed_message,
+                data=data,
+                expected_interval_seconds=expected_interval_seconds,
+            )
+            db.add(
+                DecisionLog(
+                    event_type=f"{cycle_id}_failed",
+                    message=failed_message,
+                    data=data,
+                )
+            )
+            db.commit()
+        except Exception:
+            logger.exception(f"{cycle_id}_failure_log_failed")
+    finally:
+        db.close()
 
 
 def _record_heartbeat(phase: str) -> None:

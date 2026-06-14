@@ -6,9 +6,9 @@ import { RiskTab } from "@/components/settings/RiskTab";
 import { PaperTab } from "@/components/settings/PaperTab";
 import { PositionTab } from "@/components/settings/PositionTab";
 import { LiveTab } from "@/components/settings/LiveTab";
-import { CalibrationTab } from "@/components/settings/CalibrationTab";
 import { ServicesTab } from "@/components/settings/ServicesTab";
 import { IntegrationsTab } from "@/components/settings/IntegrationsTab";
+import { Separator } from "@/components/ui/separator";
 import type { AppSettings, Health } from "@/lib/api";
 
 interface Props {
@@ -24,7 +24,7 @@ export function SettingsScreen({ settings, health }: Props) {
         <div>
           <h1 className="text-xl font-semibold tracking-tight text-fg">Settings</h1>
           <p className="mt-1 text-xs text-fg-3">
-            Operation · Risk · Paper · Position mgmt · Live · Calibration · Services · Integrations
+            Operation · Risk · Paper · Position mgmt · Live · Services &amp; Integrations
           </p>
         </div>
       </div>
@@ -36,9 +36,7 @@ export function SettingsScreen({ settings, health }: Props) {
           <TabsTrigger value="paper">Paper</TabsTrigger>
           <TabsTrigger value="position">Position</TabsTrigger>
           <TabsTrigger value="live">Live</TabsTrigger>
-          <TabsTrigger value="calibration">Calibration</TabsTrigger>
           <TabsTrigger value="services">Services</TabsTrigger>
-          <TabsTrigger value="integrations">Integrations</TabsTrigger>
         </TabsList>
 
         <TabsContent value="operation" className="mt-5">
@@ -56,13 +54,9 @@ export function SettingsScreen({ settings, health }: Props) {
         <TabsContent value="live" className="mt-5">
           <LiveTab health={health} settings={settings} />
         </TabsContent>
-        <TabsContent value="calibration" className="mt-5">
-          <CalibrationTab settings={settings} />
-        </TabsContent>
-        <TabsContent value="services" className="mt-5">
+        <TabsContent value="services" className="mt-5 space-y-6">
           <ServicesTab health={health} />
-        </TabsContent>
-        <TabsContent value="integrations" className="mt-5">
+          <Separator />
           <IntegrationsTab />
         </TabsContent>
       </Tabs>

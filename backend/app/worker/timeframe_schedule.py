@@ -6,9 +6,6 @@ from app.core.enums import OrderMode
 from app.db.models import Position, Signal
 from app.services.candle_sync import TIMEFRAME_MS
 
-# Re-export per retro-compatibilità: alcuni test referenziano
-# `app.worker.main.next_daily_recap_timestamp`.
-
 logger = structlog.get_logger()
 _LAST_TIMEFRAME_RUN_MS: dict[str, int] = {}
 

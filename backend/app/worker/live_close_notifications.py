@@ -10,9 +10,6 @@ from app.core.runtime_settings import effective_macro_risk_monitor_settings
 from app.db.models import AppSetting, DecisionLog, Position
 from app.notifications.telegram import TelegramNotifier
 
-# Re-export per retro-compatibilità: alcuni test referenziano
-# `app.worker.main.next_daily_recap_timestamp`.
-
 logger = structlog.get_logger()
 _FILL_EVENT_TYPES = frozenset(
     {
@@ -298,11 +295,39 @@ async def _notify_macro_risk_state_change(
     notify, transition = _should_notify_macro_risk_state(previous_state, state, config)
     if not notify:
         return
+    if not getattr(notifier.settings, "telegram_signal_chat_id", None):
+        return
     try:
-        await notifier.send_macro_risk_state_changed(state)
+        sent = await notifier.send_macro_risk_state_changed(state)
+        if not sent:
+            _record_macro_risk_notification(
+                db,
+                previous=previous_state,
+                state=state,
+                transition=transition,
+                status="failed",
+            )
+            db.commit()
+            return
         _persist_macro_risk_notification_state(db, state, transition)
+        _record_macro_risk_notification(
+            db,
+            previous=previous_state,
+            state=state,
+            transition=transition,
+            status="sent",
+        )
+        db.commit()
     except Exception as exc:
         logger.warning("telegram_macro_risk_notify_failed", error=str(exc))
+        _record_macro_risk_notification(
+            db,
+            previous=previous_state,
+            state=state,
+            transition=transition,
+            status="failed",
+        )
+        db.commit()
 
 
 def _macro_risk_transition(previous: dict[str, Any], state: dict[str, Any]) -> str:
@@ -380,7 +405,30 @@ def _persist_macro_risk_notification_state(
             "last_telegram_risk_notification_level": next_state["last_telegram_risk_notification_level"],
         }
     )
-    db.commit()
+
+
+def _record_macro_risk_notification(
+    db: Session,
+    *,
+    previous: dict[str, Any],
+    state: dict[str, Any],
+    transition: str,
+    status: str,
+) -> None:
+    db.add(
+        DecisionLog(
+            event_type="macro_risk_telegram_notification",
+            message=f"Macro risk Telegram notification {status}",
+            data={
+                "status": status,
+                "transition": transition,
+                "previous_level": previous.get("level", "off"),
+                "level": state.get("level"),
+                "active": state.get("active"),
+                "last_checked_at": state.get("last_checked_at"),
+            },
+        )
+    )
 
 
 def _parse_dt(value: object) -> datetime | None:

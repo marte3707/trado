@@ -78,9 +78,7 @@ export const NAV_HOTKEY_TO_ROUTE: Record<string, Route> = {
   s: "signals",
   m: "coin",
   a: "account",
-  l: "strategy-lab",
   c: "calibration",
-  h: "history",
   t: "strategies",
   n: "alerts", // n di "notifications"
   ",": "settings",

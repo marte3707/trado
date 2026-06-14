@@ -42,8 +42,8 @@ from app.worker.calibration_runner import (
 )
 from app.worker.cycle_status import (
     _record_heartbeat,
-    _record_system_cycle_status,
     _record_worker_failure,
+    run_periodic_cycle,
 )
 from app.worker.fast_risk import _FastRiskState, _last_cycle_ok_at, run_fast_risk_loop
 from app.worker.live_close_notifications import (
@@ -72,6 +72,10 @@ __all__ = ["next_daily_recap_timestamp"]
 
 logger = structlog.get_logger()
 _TICK_LOCK = asyncio.Lock()
+
+
+async def _send_diagnostic_report(db, notifier: TelegramNotifier) -> None:
+    await DiagnosticReporter().send(db, notifier)
 
 
 @dataclasses.dataclass
@@ -164,6 +168,8 @@ def execute_signal_for_mode(
     return None
 
 
+def should_publish_public_signal(signal, alert_min_score: int) -> bool:
+    return signal.score >= alert_min_score and signal.status != SignalStatus.IGNORED.value
 
 
 async def run_once(
@@ -369,9 +375,9 @@ async def run_once(
                     entry=str(signal.entry_price),
                 )
                 alert_min_score = effective_alert_min_score(db, settings)
-                if signal.score >= alert_min_score:
-                    await notifier.send_signal(db, signal)
                 live_position = execute_signal_for_mode(db, executor, signal, operation_mode, market, timeframe)
+                if should_publish_public_signal(signal, alert_min_score):
+                    await notifier.send_signal(db, signal)
                 if live_position is not None:
                     try:
                         await notifier.send_live_position_opened(live_position)
@@ -566,178 +572,52 @@ async def main() -> None:
                 recap_db.close()
 
         if scheduler.due_diagnostic(now):
-            diag_db = SessionLocal()
-            try:
-                await DiagnosticReporter().send(diag_db, notifier)
-                _record_system_cycle_status(
-                    diag_db,
-                    "diagnostic_report_cycle",
-                    "Diagnostic Report Cycle",
-                    "ok",
-                    message="Diagnostic report sent",
-                    expected_interval_seconds=DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
-                )
-                diag_db.commit()
-            except Exception as exc:
-                logger.exception("telegram_diagnostic_report_failed")
-                diag_db.rollback()
-                try:
-                    data = {"error": str(exc), "type": type(exc).__name__}
-                    _record_system_cycle_status(
-                        diag_db,
-                        "diagnostic_report_cycle",
-                        "Diagnostic Report Cycle",
-                        "failed",
-                        message="Diagnostic report failed",
-                        data=data,
-                        expected_interval_seconds=DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
-                    )
-                    diag_db.add(
-                        DecisionLog(
-                            event_type="diagnostic_report_cycle_failed",
-                            message="Diagnostic report cycle failed",
-                            data=data,
-                        )
-                    )
-                    diag_db.commit()
-                except Exception:
-                    logger.exception("diagnostic_report_cycle_failure_log_failed")
-            finally:
-                diag_db.close()
+            await run_periodic_cycle(
+                cycle_id="diagnostic_report_cycle",
+                label="Diagnostic Report Cycle",
+                expected_interval_seconds=DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
+                work=lambda db: _send_diagnostic_report(db, notifier),
+                ok_message="Diagnostic report sent",
+                failed_message="Diagnostic report failed",
+            )
 
         if scheduler.due_data_retention(now):
-            retention_db = SessionLocal()
-            try:
-                result = await asyncio.to_thread(prune_old_data, retention_db)
-                _record_system_cycle_status(
-                    retention_db,
-                    "data_retention_cycle",
-                    "Data Retention Cycle",
-                    "ok",
-                    message="Data retention cycle completed",
-                    data=result,
-                    expected_interval_seconds=DATA_RETENTION_INTERVAL_SECONDS,
-                )
-                retention_db.commit()
-                logger.info("data_retention_cycle_completed", **result)
-            except Exception as exc:
-                logger.exception("data_retention_cycle_failed")
-                retention_db.rollback()
-                try:
-                    data = {"error": str(exc), "type": type(exc).__name__}
-                    _record_system_cycle_status(
-                        retention_db,
-                        "data_retention_cycle",
-                        "Data Retention Cycle",
-                        "failed",
-                        message="Data retention cycle failed",
-                        data=data,
-                        expected_interval_seconds=DATA_RETENTION_INTERVAL_SECONDS,
-                    )
-                    retention_db.add(
-                        DecisionLog(
-                            event_type="data_retention_cycle_failed",
-                            message="Data retention cycle failed",
-                            data=data,
-                        )
-                    )
-                    retention_db.commit()
-                except Exception:
-                    logger.exception("data_retention_cycle_failure_log_failed")
-            finally:
-                retention_db.close()
+            await run_periodic_cycle(
+                cycle_id="data_retention_cycle",
+                label="Data Retention Cycle",
+                expected_interval_seconds=DATA_RETENTION_INTERVAL_SECONDS,
+                work=lambda db: asyncio.to_thread(prune_old_data, db),
+                ok_message="Data retention cycle completed",
+                failed_message="Data retention cycle failed",
+            )
 
         if scheduler.due_live_liquidation_guard(now):
-            liq_db = SessionLocal()
-            try:
-                result = await asyncio.to_thread(
+            await run_periodic_cycle(
+                cycle_id="live_liquidation_guard_cycle",
+                label="Live Liquidation Guard Cycle",
+                expected_interval_seconds=LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
+                work=lambda db: asyncio.to_thread(
                     executor.position_manager.audit_live_positions_against_liquidation,
-                    liq_db,
-                )
-                _record_system_cycle_status(
-                    liq_db,
-                    "live_liquidation_guard_cycle",
-                    "Live Liquidation Guard Cycle",
-                    "ok",
-                    message="Live liquidation guard cycle completed",
-                    data=result,
-                    expected_interval_seconds=LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
-                )
-                liq_db.commit()
-                logger.info("live_liquidation_guard_cycle_completed", **result)
-            except Exception as exc:
-                logger.exception("live_liquidation_guard_cycle_failed", error=str(exc))
-                liq_db.rollback()
-                try:
-                    data = {"error": str(exc), "type": type(exc).__name__}
-                    _record_system_cycle_status(
-                        liq_db,
-                        "live_liquidation_guard_cycle",
-                        "Live Liquidation Guard Cycle",
-                        "failed",
-                        message="Live liquidation guard cycle failed",
-                        data=data,
-                        expected_interval_seconds=LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
-                    )
-                    liq_db.add(
-                        DecisionLog(
-                            event_type="live_liquidation_guard_cycle_failed",
-                            message="Live liquidation guard cycle failed",
-                            data=data,
-                        )
-                    )
-                    liq_db.commit()
-                except Exception:
-                    logger.exception("live_liquidation_guard_cycle_failure_log_failed")
-            finally:
-                liq_db.close()
+                    db,
+                ),
+                ok_message="Live liquidation guard cycle completed",
+                failed_message="Live liquidation guard cycle failed",
+            )
 
         if scheduler.due_unified_account_ratio_guard(now):
-            uar_db = SessionLocal()
-            try:
-                result = await asyncio.to_thread(
-                    audit_unified_account_ratio_guard,
-                    uar_db,
-                    executor,
-                )
-                cycle_status = "skipped" if result.get("status") == "skipped" else "ok"
-                _record_system_cycle_status(
-                    uar_db,
-                    "unified_account_ratio_guard_cycle",
-                    "Unified Account Ratio Guard Cycle",
-                    cycle_status,
-                    message="Unified Account Ratio guard cycle completed",
-                    data=result,
-                    expected_interval_seconds=UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
-                )
-                uar_db.commit()
-                logger.info("unified_account_ratio_guard_cycle_completed", **result)
-            except Exception as exc:
-                logger.exception("unified_account_ratio_guard_cycle_failed", error=str(exc))
-                uar_db.rollback()
-                try:
-                    data = {"error": str(exc), "type": type(exc).__name__}
-                    _record_system_cycle_status(
-                        uar_db,
-                        "unified_account_ratio_guard_cycle",
-                        "Unified Account Ratio Guard Cycle",
-                        "failed",
-                        message="Unified Account Ratio guard cycle failed",
-                        data=data,
-                        expected_interval_seconds=UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
-                    )
-                    uar_db.add(
-                        DecisionLog(
-                            event_type="unified_account_ratio_guard_cycle_failed",
-                            message="Unified Account Ratio guard cycle failed",
-                            data=data,
-                        )
-                    )
-                    uar_db.commit()
-                except Exception:
-                    logger.exception("unified_account_ratio_guard_cycle_failure_log_failed")
-            finally:
-                uar_db.close()
+            await run_periodic_cycle(
+                cycle_id="unified_account_ratio_guard_cycle",
+                label="Unified Account Ratio Guard Cycle",
+                expected_interval_seconds=UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
+                work=lambda db: asyncio.to_thread(
+                    audit_unified_account_ratio_guard, db, executor
+                ),
+                ok_message="Unified Account Ratio guard cycle completed",
+                failed_message="Unified Account Ratio guard cycle failed",
+                ok_status=lambda result: (
+                    "skipped" if (result or {}).get("status") == "skipped" else "ok"
+                ),
+            )
 
         _record_heartbeat("idle")
         await asyncio.sleep(60)

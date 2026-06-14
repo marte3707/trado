@@ -21,9 +21,6 @@ from app.services.unified_account_ratio import (
     free_spot_usdc_from_balances,
 )
 
-# Re-export per retro-compatibilità: alcuni test referenziano
-# `app.worker.main.next_daily_recap_timestamp`.
-
 logger = structlog.get_logger()
 
 

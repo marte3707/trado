@@ -15,9 +15,6 @@ from app.db.models import AppSetting, DecisionLog
 from app.db.session import SessionLocal
 from app.engine.execution import OrderExecutionEngine
 from app.services.live_reconciliation import reconcile_live_positions
-
-# Re-export per retro-compatibilità: alcuni test referenziano
-# `app.worker.main.next_daily_recap_timestamp`.
 from app.worker.cycle_status import (
     SYSTEM_CYCLE_STATUS_SETTING_KEY,
     _record_system_cycle_status,

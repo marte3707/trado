@@ -1,8 +1,6 @@
 import {
   Activity,
   Bell,
-  Beaker,
-  History,
   LayoutDashboard,
   LineChart,
   RefreshCcw,
@@ -20,10 +18,8 @@ export type Route =
   | "coin"
   | "account"
   | "strategies"
-  | "strategy-lab"
   | "calibration"
   | "performance"
-  | "history"
   | "funnel"
   | "alerts"
   | "settings";
@@ -43,15 +39,13 @@ export const ROUTES: RouteMeta[] = [
   { id: "dash",        label: "Dashboard",  group: "workspace", icon: LayoutDashboard,   description: "Panoramica operativa" },
   { id: "signals",     label: "Segnali",    group: "workspace", icon: Activity,          description: "Feed segnali live" },
   { id: "coin",        label: "Dettaglio",    group: "workspace", icon: LineChart,         description: "Chart e indicatori per mercato" },
-  { id: "account",     label: "Account",    group: "workspace", icon: Wallet,            description: "Posizioni e ordini Hyperliquid" },
+  { id: "account",     label: "Account",    group: "workspace", icon: Wallet,            description: "Posizioni live e storico, ordini Hyperliquid" },
 
-  { id: "strategy-lab",label: "Analisi",    group: "analytics", icon: Beaker,            description: "Strategy lab: ranking e combinazioni" },
   { id: "calibration", label: "Calibration",group: "analytics", icon: RefreshCcw,        description: "Auto-tuner e stability" },
   { id: "performance", label: "Performance",group: "analytics", icon: TrendingUp,        description: "Equity, drawdown e distribuzione P&L" },
-  { id: "history",     label: "Storico",    group: "analytics", icon: History,           description: "Posizioni chiuse e exit orders" },
   { id: "funnel",      label: "Funnel",     group: "analytics", icon: Users,             description: "Bot Telegram: iscritti, conversione, source" },
 
-  { id: "strategies",  label: "Strategie",  group: "config",    icon: SlidersHorizontal, description: "Pesi e parametri per timeframe" },
+  { id: "strategies",  label: "Strategie",  group: "config",    icon: SlidersHorizontal, description: "Pesi, parametri e analisi (strategy lab)" },
   { id: "alerts",      label: "Alert",      group: "config",    icon: Bell,              description: "Feed alert, push, telegram" },
   { id: "settings",    label: "Settings",   group: "config",    icon: Settings,          description: "Operation, risk, services" },
 ];

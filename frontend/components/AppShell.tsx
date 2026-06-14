@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
-import { DashboardData } from "@/components/Dashboard";
+import type { DashboardData } from "@/components/dashboard/helpers";
 import { DashboardScreen } from "@/components/screens/DashboardScreen";
 import { SignalsScreen } from "@/components/screens/SignalsScreen";
 import { CoinScreen } from "@/components/screens/CoinScreen";
@@ -18,6 +18,7 @@ import { AlertsScreen } from "@/components/screens/AlertsScreen";
 import { SettingsScreen } from "@/components/screens/SettingsScreen";
 import { StrategyAnalysisScreen } from "@/components/screens/StrategyAnalysisScreen";
 
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Sidebar } from "@/components/shell/Sidebar";
 import { Topbar } from "@/components/shell/Topbar";
 import { CommandMenu } from "@/components/shell/CommandMenu";
@@ -539,18 +540,47 @@ export function AppShell({ initialData }: AppShellProps) {
           />
         )}
 
-        {route === "account" && <AccountMonitorScreen health={health} />}
+        {route === "account" && (
+          <Tabs defaultValue="live" className="w-full">
+            <TabsList className="mx-7 mt-7">
+              <TabsTrigger value="live">Live</TabsTrigger>
+              <TabsTrigger value="history">Storico</TabsTrigger>
+            </TabsList>
+            <TabsContent value="live">
+              <AccountMonitorScreen health={health} />
+            </TabsContent>
+            <TabsContent value="history">
+              <HistoryScreen fallbackPositions={positions} fallbackOrders={orders} />
+            </TabsContent>
+          </Tabs>
+        )}
 
         {route === "strategies" && (
-          <StrategiesScreen
-            strategies={strategies}
-            settings={settingsObj}
-            threshold={threshold}
-            onThresholdChange={() => {
-              /* threshold ora gestito via ThresholdMenu nella topbar */
-            }}
-            onRefresh={refresh}
-          />
+          <Tabs defaultValue="config" className="w-full">
+            <TabsList className="mx-7 mt-7">
+              <TabsTrigger value="config">Configurazione</TabsTrigger>
+              <TabsTrigger value="analysis">Analisi</TabsTrigger>
+            </TabsList>
+            <TabsContent value="config">
+              <StrategiesScreen
+                strategies={strategies}
+                settings={settingsObj}
+                threshold={threshold}
+                onThresholdChange={() => {
+                  /* threshold ora gestito via ThresholdMenu nella topbar */
+                }}
+                onRefresh={refresh}
+              />
+            </TabsContent>
+            <TabsContent value="analysis">
+              <StrategyAnalysisScreen
+                signals={hydratedSignals}
+                positions={positions}
+                orders={orders}
+                strategies={strategies}
+              />
+            </TabsContent>
+          </Tabs>
         )}
 
         {route === "calibration" && (
@@ -567,18 +597,7 @@ export function AppShell({ initialData }: AppShellProps) {
 
         {route === "performance" && <PerformanceScreen health={health} />}
 
-        {route === "history" && <HistoryScreen fallbackPositions={positions} fallbackOrders={orders} />}
-
         {route === "funnel" && <FunnelScreen />}
-
-        {route === "strategy-lab" && (
-          <StrategyAnalysisScreen
-            signals={hydratedSignals}
-            positions={positions}
-            orders={orders}
-            strategies={strategies}
-          />
-        )}
 
         {route === "alerts" && (
           <AlertsScreen
