@@ -1593,6 +1593,12 @@ class OrderExecutionEngine:
         for position in positions:
             if not self._position_matches_timeframe(db, position, timeframe):
                 continue
+            # Il trailing viene applicato qui solo se questo timeframe e' anche
+            # quello di riferimento del trailing (source == reference). Per le
+            # posizioni con un timeframe di riferimento piu' fine il trailing e'
+            # gestito da manage_paper_trailing_for_timeframe, per evitare doppi
+            # aggiornamenti dello stesso stop.
+            trail_here = self.position_manager.trailing_timeframe(db, position) == timeframe
             self._ensure_take_profit_plan(db, position)
             earliest_open = position.opened_at - timedelta(milliseconds=interval_ms)
             candles = (
@@ -1613,7 +1619,7 @@ class OrderExecutionEngine:
                 candle_key = candle.open_time.isoformat()
                 last_checked = (position.metadata_json or {}).get("last_trigger_checked_candle_open_time")
                 if last_checked is not None and candle_key <= last_checked:
-                    if position.status == "open":
+                    if position.status == "open" and trail_here:
                         self.position_manager.manage_paper_position_for_candle(
                             db, market, position, candles, candle
                         )
@@ -1629,10 +1635,11 @@ class OrderExecutionEngine:
                         db, position
                     )
                     exits += 1 if protected else 0
-                    updated = self.position_manager.manage_paper_position_for_candle(
-                        db, market, position, candles, candle
-                    )
-                    exits += 1 if updated else 0
+                    if trail_here:
+                        updated = self.position_manager.manage_paper_position_for_candle(
+                            db, market, position, candles, candle
+                        )
+                        exits += 1 if updated else 0
         if exits:
             db.commit()
         return closed

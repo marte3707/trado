@@ -38,6 +38,19 @@ DEFAULT_POSITION_MANAGEMENT_SETTINGS: dict[str, Any] = {
         "emaBufferAtr": 0.5,
         "minStopUpdateDistancePct": 0.15,
         "updateOnlyOnCandleClose": True,
+        # Timeframe di riferimento usato per la cadenza di ri-valutazione del
+        # trailing (e come fonte prezzo intraday). Per i timeframe lenti lo stop
+        # viene controllato sulla chiusura di una candela piu' fine, mantenendo
+        # pero' ATR/EMA (la larghezza del trail) sul timeframe della posizione.
+        "checkIntervalByTimeframe": {
+            "1d": "1h",
+            "4h": "1h",
+            "1h": "15m",
+            "30m": "15m",
+            "15m": "5m",
+            "5m": "5m",
+            "1m": "1m",
+        },
         "moveToBreakevenAtR": 1.0,
         "lockProfitAtR": 2.0,
         "lockProfitStopR": 1.0,
@@ -55,18 +68,27 @@ DEFAULT_POSITION_MANAGEMENT_SETTINGS: dict[str, Any] = {
 
 DEFAULT_PORTFOLIO_GUARD_SETTINGS: dict[str, Any] = {
     "enabled": True,
+    "max_new_positions_per_cycle_by_side": {
+        "live": 3,
+    },
     "max_directional_open_positions": {
-        "paper": 20,
-        "live": 12,
+        "paper": 25,
+        "live": 13,
+    },
+    "max_directional_markets": {
+        "live": 10,
     },
     "max_directional_risk_r": {
-        "paper": 12,
-        "live": 6,
+        "paper": 25,
+        "live": 8,
     },
     "max_low_tf_directional_positions": {
         "timeframes": ["5m", "15m"],
-        "paper": 12,
-        "live": 6,
+        "paper": 25,
+    },
+    "max_low_tf_directional_open_positions": {
+        "apply_timeframes": ["5m", "15m"],
+        "live": 8,
     },
 }
 
@@ -77,6 +99,18 @@ DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS: dict[str, Any] = {
     "max_stop_losses": 8,
     "pause_minutes": 180,
     "scope": "new_entries_only",
+}
+
+DEFAULT_DIRECTIONAL_REVERSAL_BREAKER_SETTINGS: dict[str, Any] = {
+    "enabled": True,
+    "modes": {
+        "paper": False,
+        "live": True,
+    },
+    "apply_timeframes": ["5m", "15m"],
+    "window_minutes": 120,
+    "stop_loss_count": 4,
+    "cooldown_minutes": 180,
 }
 
 DEFAULT_MACRO_RISK_MODE_SETTINGS: dict[str, Any] = {
@@ -110,10 +144,16 @@ DEFAULT_MACRO_RISK_MONITOR_SETTINGS: dict[str, Any] = {
     "calendar_pre_event_minutes": 90,
     "calendar_post_event_minutes": 45,
     "market_lookback_minutes": 120,
-    "watch_score": 40,
-    "high_score": 60,
-    "extreme_score": 80,
-    "level_hysteresis_points": 5,
+    # Thresholds raised after the monitor sat in high/extreme ~73% of its first
+    # days live: the band was too low for the real BTC/ETH market-stress scale.
+    "watch_score": 45,
+    "high_score": 70,
+    "extreme_score": 88,
+    # Anti-flapping: wider downgrade hysteresis, level-aware minimum hold and a
+    # smoother market-stress EMA so the state stops oscillating every ~20 minutes.
+    "level_hysteresis_points": 10,
+    "min_level_hold_minutes": {"watch": 30, "high": 60, "extreme": 90, "default": 30},
+    "market_stress_ema_alpha": 0.3,
     "calendar_static_events": [
         {
             "key": "fomc_2026_06",
@@ -251,6 +291,7 @@ DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE: dict[str, Any] = {
     "reason": None,
     "last_window_loss_r": 0,
     "last_window_stop_losses": 0,
+    "directional_reversal": {},
 }
 
 
@@ -350,6 +391,12 @@ def effective_portfolio_circuit_breaker_settings(db: Session) -> dict[str, Any]:
     value = setting_value(db, "risk").get("circuit_breaker")
     overrides = value if isinstance(value, dict) else {}
     return _deep_merge(DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS, overrides)
+
+
+def effective_directional_reversal_breaker_settings(db: Session) -> dict[str, Any]:
+    value = setting_value(db, "risk").get("directional_reversal_breaker")
+    overrides = value if isinstance(value, dict) else {}
+    return _deep_merge(DEFAULT_DIRECTIONAL_REVERSAL_BREAKER_SETTINGS, overrides)
 
 
 def effective_macro_risk_mode_settings(db: Session) -> dict[str, Any]:

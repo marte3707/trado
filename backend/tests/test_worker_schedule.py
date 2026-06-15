@@ -28,6 +28,9 @@ class FakeDb:
     def get(self, model: object, key: int) -> Signal | None:
         if model is Signal:
             return self.signals.get(key)
+        if model is AppSetting:
+            # Nessun override runtime: usa i default del position management.
+            return None
         raise AssertionError(f"unexpected get model: {model}")
 
 
@@ -251,10 +254,11 @@ def test_paper_management_timeframes_fall_back_to_signal_timeframe() -> None:
     ]
     signals = {42: Signal(timeframe="4h")}
 
+    # Una posizione 4h aggiunge anche il timeframe di riferimento del trailing (1h).
     assert worker.paper_management_timeframes(
         FakeDb(positions=positions, signals=signals),
         ["5m"],
-    ) == ["5m", "4h"]
+    ) == ["5m", "1h", "4h"]
 
 
 def test_display_live_close_reason_uses_trailing_stop_for_profitable_dynamic_stop() -> None:
@@ -474,3 +478,17 @@ def test_auto_trade_skips_live_when_paper_was_not_created() -> None:
     assert db.added[1].event_type == "live_order_skipped_after_paper_skip"
     assert db.added[1].signal_id == signal.id
     assert db.committed == 1
+
+
+def test_should_publish_public_signal_skips_ignored_signal() -> None:
+    signal = _signal()
+    signal.status = SignalStatus.IGNORED.value
+
+    assert worker.should_publish_public_signal(signal, 70) is False
+
+
+def test_should_publish_public_signal_keeps_executed_signal_above_threshold() -> None:
+    signal = _signal()
+    signal.status = SignalStatus.EXECUTED.value
+
+    assert worker.should_publish_public_signal(signal, 70) is True

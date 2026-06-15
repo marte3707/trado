@@ -281,6 +281,24 @@ def test_news_scoring_ignores_html_href_and_substring_false_positives() -> None:
     assert "israel" not in scored["entities"]
 
 
+def test_news_scoring_ignores_generic_event_words_without_macro_anchor() -> None:
+    now = datetime(2026, 6, 14, 9, 0, tzinfo=UTC)
+    item = MacroNewsItem(
+        title="NSW lifts drone ban over Sydney beach after shark attack",
+        source="test",
+        url="https://example.com/a",
+        published_at=now - timedelta(minutes=5),
+    )
+
+    scored = score_news_item(item, now)
+
+    # "ban" and "attack" match generic event keywords but there is no relevant
+    # entity, so the item must stay "general" and well below the 20-pt relevance
+    # threshold instead of activating crypto/geopolitical risk.
+    assert scored["category"] == "general"
+    assert scored["severity"] < 20
+
+
 def test_monitor_activates_extreme_with_news_and_market_confirmation() -> None:
     now = datetime(2026, 6, 11, 8, 30, tzinfo=UTC)
     news = [
@@ -416,6 +434,60 @@ def test_monitor_keeps_previous_extreme_inside_hysteresis_without_extending_ttl(
 
     assert state["level"] == "extreme"
     assert state["active_until"] == active_until.isoformat()
+
+
+def test_monitor_keeps_previous_level_until_min_hold_elapses() -> None:
+    now = datetime(2026, 6, 11, 12, 0, tzinfo=UTC)
+    active_until = now + timedelta(hours=1)
+    monitor = MacroRiskMonitor(Settings(), news_client=StaticNewsClient([]))
+    config = _risk_settings(level_hysteresis_points=5, min_level_hold_minutes=15)["macro_risk_monitor"]
+
+    state = monitor._next_state(  # type: ignore[attr-defined]
+        config=config,
+        previous={
+            "active": True,
+            "level": "extreme",
+            "active_until": active_until.isoformat(),
+            "triggered_at": (now - timedelta(minutes=5)).isoformat(),
+        },
+        now=now,
+        raw_level="high",
+        combined_score=61,
+        news_result={"score": 61, "items": [], "errors": []},
+        calendar_result={"score": 0, "active_events": [], "next_events": []},
+        market_result={"score": 61, "markets": []},
+    )
+
+    assert state["level"] == "extreme"
+    assert state["active_until"] == active_until.isoformat()
+
+
+def test_monitor_preserves_macro_risk_telegram_cooldown_fields() -> None:
+    now = datetime(2026, 6, 11, 12, 0, tzinfo=UTC)
+    active_until = now + timedelta(hours=1)
+    monitor = MacroRiskMonitor(Settings(), news_client=StaticNewsClient([]))
+    config = _risk_settings()["macro_risk_monitor"]
+
+    state = monitor._next_state(  # type: ignore[attr-defined]
+        config=config,
+        previous={
+            "active": True,
+            "level": "high",
+            "active_until": active_until.isoformat(),
+            "triggered_at": (now - timedelta(minutes=20)).isoformat(),
+            "last_telegram_risk_notification_at": (now - timedelta(minutes=3)).isoformat(),
+            "last_telegram_risk_notification_level": "high",
+        },
+        now=now,
+        raw_level="high",
+        combined_score=70,
+        news_result={"score": 70, "items": [], "errors": []},
+        calendar_result={"score": 0, "active_events": [], "next_events": []},
+        market_result={"score": 70, "markets": []},
+    )
+
+    assert state["last_telegram_risk_notification_at"] == (now - timedelta(minutes=3)).isoformat()
+    assert state["last_telegram_risk_notification_level"] == "high"
 
 
 def test_macro_risk_reason_only_change_is_not_state_change() -> None:

@@ -3,9 +3,14 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.core.config import Settings
-from app.db.models import Alert, AppSetting, Market, Order, Position, Signal
+from app.db.models import Alert, AppSetting, Base, Market, Order, Position, Signal
 from app.notifications import telegram as telegram_module
 from app.notifications.telegram import (
     _DAILY_RECAP_STATE_KEY,
@@ -18,6 +23,11 @@ from app.notifications.telegram import (
 )
 
 
+@compiles(JSONB, "sqlite")
+def _compile_jsonb_sqlite(_type, _compiler, **_kw):  # noqa: ANN001
+    return "JSON"
+
+
 class RecordingNotifier(TelegramNotifier):
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings)
@@ -26,6 +36,7 @@ class RecordingNotifier(TelegramNotifier):
         self.text_result_calls: list[dict[str, object]] = []
         self.pin_calls: list[dict[str, object]] = []
         self.unpin_calls: list[dict[str, object]] = []
+        self.delete_calls: list[dict[str, object]] = []
 
     async def _send_photo(
         self,
@@ -106,6 +117,20 @@ class RecordingNotifier(TelegramNotifier):
         )
         return True
 
+    async def _delete_message(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+    ) -> dict[str, object]:
+        self.delete_calls.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }
+        )
+        return {"ok": True}
+
     def _signal_channel_reply_id(self, db, signal_id: int | None) -> int | None:  # noqa: ANN001
         return 321 if signal_id is not None else None
 
@@ -119,6 +144,28 @@ def _build_notifier() -> RecordingNotifier:
             landing_bot_token="public-token",
             public_api_base_url="https://signals.trado.test",
         )
+    )
+
+
+def _session() -> Session:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)()
+
+
+def _market() -> Market:
+    return Market(
+        exchange="hyperliquid",
+        symbol="BTC",
+        base="BTC",
+        quote="USDC",
+        market_type="perp",
+        active=True,
+        metadata_json={"hl_coin": "BTC"},
     )
 
 
@@ -385,6 +432,192 @@ async def test_send_signal_skips_public_channel_when_macro_risk_blocks_negative_
     assert alert.payload["skip_reason"] == "macro risk mode expected R threshold not met"
     assert alert.payload["skip_details"]["required_expected_r"] == 0.0
     assert alert.payload["skip_details"]["calibrated_expected_r"] == -0.11
+
+
+@pytest.mark.asyncio
+async def test_delete_signal_message_marks_alert_deleted() -> None:
+    db = _session()
+    market = _market()
+    db.add(market)
+    db.flush()
+    signal = Signal(
+        market_id=market.id,
+        timeframe="1h",
+        direction="LONG",
+        score=82,
+        confidence_label="high",
+        entry_price=Decimal("100"),
+        stop_loss=Decimal("95"),
+        take_profit_1=Decimal("105"),
+        take_profit_2=Decimal("110"),
+        risk_reward=Decimal("2.4"),
+        reason="test",
+        strategy_breakdown={},
+        status="ignored",
+    )
+    db.add(signal)
+    db.flush()
+    db.add(
+        Alert(
+            signal_id=signal.id,
+            channel="telegram",
+            status="sent",
+            payload={"telegram_message_id": 321},
+        )
+    )
+    db.commit()
+
+    notifier = _build_notifier()
+    result = await notifier.delete_signal_message(db, signal.id)
+
+    alert = db.query(Alert).filter(Alert.signal_id == signal.id).one()
+    assert result["status"] == "deleted"
+    assert notifier.delete_calls == [{"chat_id": "signal-chat", "message_id": 321}]
+    assert alert.status == "deleted"
+    assert alert.payload["telegram_deleted_at"]
+
+
+@pytest.mark.asyncio
+async def test_delete_signal_message_treats_message_not_found_as_deleted() -> None:
+    class NotFoundNotifier(RecordingNotifier):
+        async def _delete_message(
+            self,
+            *,
+            chat_id: str,
+            message_id: int,
+        ) -> dict[str, object]:
+            self.delete_calls.append({"chat_id": chat_id, "message_id": message_id})
+            return {
+                "ok": False,
+                "status_code": 400,
+                "description": "Bad Request: message to delete not found",
+            }
+
+    db = _session()
+    market = _market()
+    db.add(market)
+    db.flush()
+    signal = Signal(
+        market_id=market.id,
+        timeframe="1h",
+        direction="LONG",
+        score=82,
+        confidence_label="high",
+        entry_price=Decimal("100"),
+        stop_loss=Decimal("95"),
+        take_profit_1=Decimal("105"),
+        take_profit_2=Decimal("110"),
+        risk_reward=Decimal("2.4"),
+        reason="test",
+        strategy_breakdown={},
+        status="ignored",
+    )
+    db.add(signal)
+    db.flush()
+    db.add(
+        Alert(
+            signal_id=signal.id,
+            channel="telegram",
+            status="sent",
+            payload={"telegram_message_id": 654},
+        )
+    )
+    db.commit()
+
+    notifier = NotFoundNotifier(
+        Settings(
+            telegram_bot_token="admin-token",
+            telegram_chat_id="admin-chat",
+            telegram_signal_chat_id="signal-chat",
+            landing_bot_token="public-token",
+            public_api_base_url="https://signals.trado.test",
+        )
+    )
+    result = await notifier.delete_signal_message(db, signal.id)
+
+    alert = db.query(Alert).filter(Alert.signal_id == signal.id).one()
+    assert result["status"] == "deleted"
+    assert result["reason"] == "message_not_found"
+    assert alert.status == "deleted"
+    assert alert.payload["telegram_delete_error"] == "Bad Request: message to delete not found"
+    assert alert.payload["telegram_deleted_at"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_ignored_signal_messages_deletes_only_ignored_candidates() -> None:
+    db = _session()
+    market = _market()
+    db.add(market)
+    db.flush()
+
+    ignored_signal = Signal(
+        market_id=market.id,
+        timeframe="1h",
+        direction="LONG",
+        score=80,
+        confidence_label="high",
+        entry_price=Decimal("100"),
+        stop_loss=Decimal("95"),
+        take_profit_1=Decimal("105"),
+        take_profit_2=Decimal("110"),
+        risk_reward=Decimal("2.1"),
+        reason="ignored",
+        strategy_breakdown={},
+        status="ignored",
+    )
+    active_signal = Signal(
+        market_id=market.id,
+        timeframe="1h",
+        direction="SHORT",
+        score=79,
+        confidence_label="high",
+        entry_price=Decimal("100"),
+        stop_loss=Decimal("103"),
+        take_profit_1=Decimal("97"),
+        take_profit_2=Decimal("94"),
+        risk_reward=Decimal("2.0"),
+        reason="active",
+        strategy_breakdown={},
+        status="new",
+    )
+    db.add_all([ignored_signal, active_signal])
+    db.flush()
+    db.add_all(
+        [
+            Alert(
+                signal_id=ignored_signal.id,
+                channel="telegram",
+                status="sent",
+                payload={"telegram_message_id": 111},
+            ),
+            Alert(
+                signal_id=active_signal.id,
+                channel="telegram",
+                status="sent",
+                payload={"telegram_message_id": 222},
+            ),
+        ]
+    )
+    db.commit()
+
+    notifier = _build_notifier()
+    result = await notifier.cleanup_ignored_signal_messages(db)
+
+    ignored_alert = db.query(Alert).filter(Alert.signal_id == ignored_signal.id).one()
+    active_alert = db.query(Alert).filter(Alert.signal_id == active_signal.id).one()
+    assert result == {
+        "status": "completed",
+        "candidates": 1,
+        "deleted": 1,
+        "failed": 0,
+        "skipped": 0,
+        "deleted_signal_ids": [ignored_signal.id],
+        "failed_signal_ids": [],
+        "skipped_signal_ids": [],
+    }
+    assert notifier.delete_calls == [{"chat_id": "signal-chat", "message_id": 111}]
+    assert ignored_alert.status == "deleted"
+    assert active_alert.status == "sent"
 
 
 def test_daily_recap_summary_and_message() -> None:

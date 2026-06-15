@@ -11,6 +11,7 @@ from app.api.routers.common import (
     _serialize_position,
 )
 from app.core.config import get_settings
+from app.core.enums import SignalStatus
 from app.db.models import (
     Alert,
     AppSetting,
@@ -173,14 +174,17 @@ def signal_snapshot(signal_id: int, db: Session = Depends(get_db)) -> SignalSnap
 
 
 @router.post("/signals/{signal_id}/ignore")
-def ignore_signal(signal_id: int, db: Session = Depends(get_db)) -> dict:
+async def ignore_signal(signal_id: int, db: Session = Depends(get_db)) -> dict:
     signal = db.get(Signal, signal_id)
     if signal is None:
         raise HTTPException(status_code=404, detail="Signal not found")
-    if signal.status == "executed":
+    if signal.status == SignalStatus.EXECUTED.value:
         raise HTTPException(status_code=409, detail="Executed signals cannot be ignored")
-    signal.status = "ignored"
+    signal.status = SignalStatus.IGNORED.value
     db.commit()
+    from app.notifications.telegram import TelegramNotifier
+
+    await TelegramNotifier(get_settings()).delete_signal_message(db, signal.id)
     return {"status": "ignored"}
 
 
@@ -189,9 +193,9 @@ def reopen_signal(signal_id: int, db: Session = Depends(get_db)) -> dict:
     signal = db.get(Signal, signal_id)
     if signal is None:
         raise HTTPException(status_code=404, detail="Signal not found")
-    if signal.status != "ignored":
+    if signal.status != SignalStatus.IGNORED.value:
         raise HTTPException(status_code=409, detail=f"Signal is {signal.status}, not ignored")
-    signal.status = "new"
+    signal.status = SignalStatus.NEW.value
     db.add(
         DecisionLog(
             event_type="signal_reopened",
@@ -259,5 +263,3 @@ def execute_live(signal_id: int, db: Session = Depends(get_db)) -> dict:
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return {"position_id": position.id, "status": "submitted"}
-
-

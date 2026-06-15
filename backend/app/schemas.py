@@ -127,6 +127,55 @@ class MacroRiskMonitorSettings(BaseModel):
     policies: dict[str, dict[str, Any]] | None = None
 
 
+class ModeLimitSettings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    paper: float | None = Field(default=None, ge=0)
+    live: float | None = Field(default=None, ge=0)
+
+
+class LowTimeframeDirectionalSettings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    timeframes: list[str] | None = None
+    apply_timeframes: list[str] | None = None
+    paper: float | None = Field(default=None, ge=0)
+    live: float | None = Field(default=None, ge=0)
+
+
+class PortfolioGuardSettings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    enabled: bool | None = None
+    max_new_positions_per_cycle_by_side: ModeLimitSettings | None = None
+    max_directional_open_positions: ModeLimitSettings | None = None
+    max_directional_markets: ModeLimitSettings | None = None
+    max_directional_risk_r: ModeLimitSettings | None = None
+    max_low_tf_directional_positions: LowTimeframeDirectionalSettings | None = None
+    max_low_tf_directional_open_positions: LowTimeframeDirectionalSettings | None = None
+
+
+class CircuitBreakerSettings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    enabled: bool | None = None
+    window_minutes: int | None = Field(default=None, ge=1, le=1440)
+    max_loss_r: float | None = Field(default=None, ge=0)
+    max_stop_losses: int | None = Field(default=None, ge=0)
+    pause_minutes: int | None = Field(default=None, ge=1, le=1440)
+
+
+class DirectionalReversalBreakerSettings(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    enabled: bool | None = None
+    modes: dict[str, bool] | None = None
+    apply_timeframes: list[str] | None = None
+    window_minutes: int | None = Field(default=None, ge=1, le=1440)
+    stop_loss_count: int | None = Field(default=None, ge=1, le=100)
+    cooldown_minutes: int | None = Field(default=None, ge=1, le=1440)
+
+
 class RiskControlsSettings(BaseModel):
     """Validazione non distruttiva dei campi di sicurezza di AppSetting "risk".
 
@@ -142,6 +191,9 @@ class RiskControlsSettings(BaseModel):
     max_daily_loss_pct: float | None = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: float | None = Field(default=None, ge=0, le=100)
     max_leverage: float | None = Field(default=None, gt=0, le=100)
+    portfolio_guard: PortfolioGuardSettings | None = None
+    circuit_breaker: CircuitBreakerSettings | None = None
+    directional_reversal_breaker: DirectionalReversalBreakerSettings | None = None
     macro_risk_mode: MacroRiskModeSettings | None = None
     macro_risk_monitor: MacroRiskMonitorSettings | None = None
 

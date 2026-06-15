@@ -3,6 +3,7 @@
 import structlog
 
 from app.core.enums import OrderMode
+from app.core.runtime_settings import effective_position_management_settings
 from app.db.models import Position, Signal
 from app.services.candle_sync import TIMEFRAME_MS
 
@@ -55,6 +56,11 @@ def paper_management_timeframes(db, enabled_timeframes: list[str]) -> list[str]:
         )
         .all()
     )
+    check_intervals = (
+        effective_position_management_settings(db)
+        .get("trailingStop", {})
+        .get("checkIntervalByTimeframe", {})
+    )
     discovered: set[str] = set()
     for position in positions:
         metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
@@ -70,7 +76,17 @@ def paper_management_timeframes(db, enabled_timeframes: list[str]) -> list[str]:
                 if signal is not None and isinstance(signal.timeframe, str):
                     source_timeframe = signal.timeframe
         if isinstance(source_timeframe, str) and source_timeframe in TIMEFRAME_MS:
+            # Sia il timeframe sorgente (necessario per ATR/EMA) sia quello di
+            # riferimento del trailing (cadenza di controllo + prezzo intraday)
+            # devono essere sincronizzati e gestiti.
             discovered.add(source_timeframe)
+            reference = check_intervals.get(source_timeframe)
+            if (
+                isinstance(reference, str)
+                and reference in TIMEFRAME_MS
+                and TIMEFRAME_MS[reference] <= TIMEFRAME_MS[source_timeframe]
+            ):
+                discovered.add(reference)
 
     for timeframe in sorted(discovered, key=lambda item: TIMEFRAME_MS[item]):
         if timeframe not in seen:

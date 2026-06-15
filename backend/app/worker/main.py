@@ -353,6 +353,14 @@ async def run_once(
                 closed += await asyncio.to_thread(
                     executor.close_paper_positions_for_timeframe, db, market, timeframe
                 )
+                # Trailing reattivo per posizioni paper il cui timeframe di
+                # riferimento e' piu' fine del timeframe sorgente (es. 1d -> 1h).
+                await asyncio.to_thread(
+                    executor.position_manager.manage_paper_trailing_for_timeframe,
+                    db,
+                    market,
+                    timeframe,
+                )
                 if operation_mode == OperationMode.AUTO_TRADE:
                     live_stop_updates += await asyncio.to_thread(
                         executor.position_manager.manage_live_positions_for_timeframe,

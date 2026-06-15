@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.runtime_settings import (
+    DEFAULT_DIRECTIONAL_REVERSAL_BREAKER_SETTINGS,
     DEFAULT_MACRO_RISK_MODE_SETTINGS,
     DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
     DEFAULT_MACRO_RISK_STATE,
@@ -211,6 +212,7 @@ def seed_defaults(db: Session) -> None:
                     "max_leverage": settings.max_leverage,
                     "portfolio_guard": DEFAULT_PORTFOLIO_GUARD_SETTINGS,
                     "circuit_breaker": DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
+                    "directional_reversal_breaker": DEFAULT_DIRECTIONAL_REVERSAL_BREAKER_SETTINGS,
                     "macro_risk_mode": DEFAULT_MACRO_RISK_MODE_SETTINGS,
                     "macro_risk_monitor": DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
                     **DEFAULT_EDGE_RISK_SETTINGS,
@@ -234,6 +236,7 @@ def seed_defaults(db: Session) -> None:
             portfolio_defaults = {
                 "portfolio_guard": DEFAULT_PORTFOLIO_GUARD_SETTINGS,
                 "circuit_breaker": DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
+                "directional_reversal_breaker": DEFAULT_DIRECTIONAL_REVERSAL_BREAKER_SETTINGS,
                 "macro_risk_mode": DEFAULT_MACRO_RISK_MODE_SETTINGS,
                 "macro_risk_monitor": DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
             }
@@ -327,6 +330,7 @@ def seed_defaults(db: Session) -> None:
                     "min_risk_reward_ceiling": 3.0,
                     "min_risk_per_trade_pct": 0.25,
                     "deep_defensive_slope_threshold": -0.1,
+                    "directional_penalty_lookback_trades": 200,
                     "auto_disable_retest_after_trades": 200,
                 },
             )
@@ -347,6 +351,9 @@ def seed_defaults(db: Session) -> None:
                 mutated = True
             if "auto_disable_retest_after_trades" not in updated:
                 updated["auto_disable_retest_after_trades"] = 200
+                mutated = True
+            if "directional_penalty_lookback_trades" not in updated:
+                updated["directional_penalty_lookback_trades"] = 200
                 mutated = True
             if "deep_defensive_cooldown_runs" not in updated:
                 updated["deep_defensive_cooldown_runs"] = 6

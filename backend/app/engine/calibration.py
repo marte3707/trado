@@ -172,6 +172,7 @@ class AutoCalibrationEngine:
             "starvation_exit_cycles": 3,
             "min_trades_for_slope": 10,
             "recent_window": 50,
+            "directional_penalty_lookback_trades": 200,
             "recent_slope_exit_cycles": 3,
             "deep_defensive_cooldown_runs": 6,
             "deep_defensive_cooldown_min_new_trades": 3,
@@ -945,9 +946,17 @@ class AutoCalibrationEngine:
         risk_setting = db.get(AppSetting, "risk") or AppSetting(key="risk", value={})
         risk = dict(risk_setting.value if isinstance(risk_setting.value, dict) else {})
         lookback = int(settings.get("lookback_trades", 500))
+        directional_lookback = max(
+            1,
+            min(
+                lookback,
+                int(settings.get("directional_penalty_lookback_trades", 200)),
+            ),
+        )
         edge_adjustments = compute_edge_adjustments(
             db,
             lookback=lookback,
+            directional_lookback=directional_lookback,
             analyzer=self.analyzer,
         )
 

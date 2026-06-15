@@ -338,3 +338,12 @@ async def telegram_channel_strategy_message(pin: bool = True) -> dict:
 
     notifier = TelegramNotifier(get_settings())
     return await notifier.send_channel_strategy_message(pin=pin)
+
+
+@router.post("/telegram/cleanup-ignored-signals")
+async def telegram_cleanup_ignored_signals(db: Session = Depends(get_db)) -> dict:
+    """Rimuove dal canale pubblico i segnali marcati `ignored` ma rimasti pubblicati."""
+    from app.notifications.telegram import TelegramNotifier
+
+    notifier = TelegramNotifier(get_settings())
+    return await notifier.cleanup_ignored_signal_messages(db)

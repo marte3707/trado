@@ -286,6 +286,58 @@ def test_trailing_short_moves_stop_down() -> None:
     assert position.stop_loss <= Decimal("100")
 
 
+def test_trailing_uses_reference_timeframe_for_slow_positions() -> None:
+    engine = PositionManagementEngine(Settings())
+    db = _db()
+    # Posizione short su timeframe 1d: il trailing deve essere valutato su 1h.
+    position = _position("short", "110")
+    position.metadata_json["source_timeframe"] = "1d"
+
+    assert engine.trailing_timeframe(db, position) == "1h"
+
+    # Serie giornaliera in discesa (short in profitto): usata per ATR/EMA.
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    daily: list[Candle] = []
+    for idx in range(30):
+        base = Decimal("100") - Decimal(idx) * Decimal("0.3")
+        close = base - Decimal("0.5")
+        daily.append(
+            Candle(
+                market_id=1,
+                timeframe="1d",
+                open_time=start + timedelta(days=idx),
+                open=base,
+                high=base + Decimal("1.5"),
+                low=close - Decimal("1"),
+                close=close,
+                volume=Decimal("1"),
+            )
+        )
+    db.candles = daily
+
+    # Candela 1h di riferimento con un nuovo minimo intraday.
+    reference = Candle(
+        market_id=1,
+        timeframe="1h",
+        open_time=start + timedelta(days=30),
+        open=Decimal("88"),
+        high=Decimal("88.5"),
+        low=Decimal("86"),
+        close=Decimal("87"),
+        volume=Decimal("1"),
+    )
+
+    candidate = engine.evaluate_stop_candidate(db, _market(), position, [reference], reference)
+
+    assert candidate is not None
+    # Lo stop dello short si stringe verso il basso, sotto lo stop attuale (110).
+    assert candidate.price < Decimal("110")
+    # ATR/EMA calcolati sulle candele 1d (larghezza ampia), non sulla candela 1h.
+    assert Decimal(candidate.indicators["atr"]) > Decimal("0")
+    # Il gate del trailing usa la candela di riferimento (1h).
+    assert position.metadata_json["last_trailing_candle_open_time"] == reference.open_time.isoformat()
+
+
 def test_stop_never_moves_against_position() -> None:
     engine = PositionManagementEngine(Settings())
     db = _db()

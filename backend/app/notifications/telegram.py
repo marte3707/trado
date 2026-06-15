@@ -656,6 +656,27 @@ class TelegramNotifier:
             return False
         return True
 
+    async def _delete_message(
+        self,
+        *,
+        chat_id: str,
+        message_id: int,
+    ) -> dict[str, Any]:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }
+        result = await self._telegram_json_post(
+            method="deleteMessage",
+            payload=payload,
+            chat_id=chat_id,
+            timeout=10,
+        )
+        error = result.get("description")
+        if not result.get("ok") and error != "Bad Request: message to delete not found":
+            logger.warning("telegram_delete_failed", error=error)
+        return result
+
     async def _send_photo(
         self,
         png_bytes: bytes,
@@ -688,22 +709,36 @@ class TelegramNotifier:
             logger.warning("telegram_send_photo_failed", error=str(exc))
             return False
 
-    def _signal_channel_reply_id(self, db: Session, signal_id: int | None) -> int | None:
-        """Look up the Telegram message_id of the original signal opening
-        message in the public signals channel, so close notifications can be
-        sent as a reply to it. Returns None if not available."""
+    def _latest_signal_channel_alert(
+        self,
+        db: Session,
+        signal_id: int | None,
+        *,
+        statuses: tuple[str, ...] = ("sent",),
+    ) -> Alert | None:
         if signal_id is None:
             return None
-        alert = (
+        alerts = (
             db.query(Alert)
             .filter(
                 Alert.signal_id == signal_id,
                 Alert.channel == "telegram",
-                Alert.status == "sent",
+                Alert.status.in_(statuses),
             )
             .order_by(Alert.id.desc())
-            .first()
+            .all()
         )
+        for alert in alerts:
+            payload: dict[str, Any] = getattr(alert, "payload", None) or {}
+            if payload.get("telegram_message_id") is not None:
+                return alert
+        return None
+
+    def _signal_channel_reply_id(self, db: Session, signal_id: int | None) -> int | None:
+        """Look up the Telegram message_id of the original signal opening
+        message in the public signals channel, so close notifications can be
+        sent as a reply to it. Returns None if not available."""
+        alert = self._latest_signal_channel_alert(db, signal_id, statuses=("sent",))
         if alert is None:
             return None
         payload: dict[str, Any] = getattr(alert, "payload", None) or {}
@@ -714,6 +749,113 @@ class TelegramNotifier:
             return int(raw)
         except (TypeError, ValueError):
             return None
+
+    async def delete_signal_message(self, db: Session, signal_id: int) -> dict[str, Any]:
+        if not self.settings.telegram_signal_chat_id:
+            return {"status": "skipped", "reason": "telegram_signal_chat_id_not_configured"}
+
+        alert = self._latest_signal_channel_alert(
+            db,
+            signal_id,
+            statuses=("sent", "delete_failed", "deleted"),
+        )
+        if alert is None:
+            return {"status": "skipped", "reason": "signal_channel_message_not_found"}
+
+        payload: dict[str, Any] = getattr(alert, "payload", None) or {}
+        if alert.status == "deleted" or payload.get("telegram_deleted_at"):
+            return {"status": "skipped", "reason": "already_deleted"}
+
+        raw_message_id = payload.get("telegram_message_id")
+        try:
+            message_id = int(raw_message_id) if raw_message_id is not None else None
+        except (TypeError, ValueError):
+            message_id = None
+        if message_id is None:
+            return {"status": "skipped", "reason": "invalid_message_id"}
+
+        result = await self._delete_message(
+            chat_id=self.settings.telegram_signal_chat_id,
+            message_id=message_id,
+        )
+        delete_error = result.get("description")
+        if delete_error == "Bad Request: message to delete not found":
+            alert.status = "deleted"
+            alert.payload = {
+                **payload,
+                "telegram_delete_status_code": result.get("status_code"),
+                "telegram_delete_error": delete_error,
+                "telegram_deleted_at": datetime.now(UTC).isoformat(),
+            }
+            db.commit()
+            return {
+                "status": "deleted",
+                "signal_id": signal_id,
+                "message_id": message_id,
+                "reason": "message_not_found",
+            }
+        if result.get("ok"):
+            alert.status = "deleted"
+            alert.payload = {
+                **payload,
+                "telegram_delete_status_code": None,
+                "telegram_delete_error": None,
+                "telegram_deleted_at": datetime.now(UTC).isoformat(),
+            }
+            db.commit()
+            return {"status": "deleted", "signal_id": signal_id, "message_id": message_id}
+
+        alert.status = "delete_failed"
+        alert.payload = {
+            **payload,
+            "telegram_delete_status_code": result.get("status_code"),
+            "telegram_delete_error": result.get("description"),
+        }
+        db.commit()
+        return {
+            "status": "failed",
+            "signal_id": signal_id,
+            "message_id": message_id,
+            "reason": delete_error or "telegram_delete_failed",
+        }
+
+    async def cleanup_ignored_signal_messages(self, db: Session) -> dict[str, Any]:
+        rows = (
+            db.query(Signal.id)
+            .join(Alert, Alert.signal_id == Signal.id)
+            .filter(
+                Signal.status == "ignored",
+                Alert.channel == "telegram",
+                Alert.status.in_(("sent", "delete_failed")),
+            )
+            .distinct()
+            .order_by(Signal.id.asc())
+            .all()
+        )
+
+        deleted_signal_ids: list[int] = []
+        failed_signal_ids: list[int] = []
+        skipped_signal_ids: list[int] = []
+        for (signal_id,) in rows:
+            result = await self.delete_signal_message(db, signal_id)
+            status = result.get("status")
+            if status == "deleted":
+                deleted_signal_ids.append(signal_id)
+            elif status == "failed":
+                failed_signal_ids.append(signal_id)
+            else:
+                skipped_signal_ids.append(signal_id)
+
+        return {
+            "status": "completed",
+            "candidates": len(rows),
+            "deleted": len(deleted_signal_ids),
+            "failed": len(failed_signal_ids),
+            "skipped": len(skipped_signal_ids),
+            "deleted_signal_ids": deleted_signal_ids,
+            "failed_signal_ids": failed_signal_ids,
+            "skipped_signal_ids": skipped_signal_ids,
+        }
 
     async def send_channel_strategy_message(self, *, pin: bool = True) -> dict[str, Any]:
         if not self.settings.telegram_signal_chat_id:
@@ -1131,9 +1273,9 @@ class TelegramNotifier:
         except Exception as exc:
             logger.warning("telegram_btc_macro_send_failed", error=str(exc))
 
-    async def send_macro_risk_state_changed(self, state: dict[str, Any]) -> None:
+    async def send_macro_risk_state_changed(self, state: dict[str, Any]) -> bool:
         if not self.settings.telegram_signal_chat_id:
-            return
+            return False
         level_raw = str(state.get("level") or "off")
         level = level_raw.upper()
         is_active = bool(state.get("active"))
@@ -1179,12 +1321,13 @@ class TelegramNotifier:
         if calendar_lines:
             lines.extend(["", "📅 <b>Macro calendar</b>", *calendar_lines])
         try:
-            await self._send_text(
+            return await self._send_text(
                 "\n".join(lines),
                 chat_id=self.settings.telegram_signal_chat_id,
             )
         except Exception as exc:
             logger.warning("telegram_macro_risk_send_failed", error=str(exc))
+            return False
 
     async def send_signal(self, db: Session, signal: Signal) -> None:
         """Publish a new signal to the public channel only.

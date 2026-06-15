@@ -11,6 +11,7 @@ from app.core.config import Settings
 from app.core.enums import Direction
 from app.core.runtime_settings import (
     DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE,
+    effective_directional_reversal_breaker_settings,
     effective_macro_risk_mode_settings,
     effective_portfolio_circuit_breaker_settings,
     effective_portfolio_guard_settings,
@@ -93,6 +94,10 @@ class PortfolioGuard:
         if not circuit_decision.allowed:
             return circuit_decision
 
+        reversal_decision = self._directional_reversal_decision(db, signal, mode, side, now)
+        if not reversal_decision.allowed:
+            return reversal_decision
+
         macro_decision = self._macro_risk_mode_decision(db, signal)
         if not macro_decision.allowed:
             return macro_decision
@@ -109,10 +114,7 @@ class PortfolioGuard:
             for position in open_positions
             if str(position.side or "").lower() == side_key
         ]
-        low_tf_config = config.get("max_low_tf_directional_positions")
-        low_timeframes = _string_set(
-            low_tf_config.get("timeframes") if isinstance(low_tf_config, dict) else []
-        )
+        low_timeframes = _low_tf_timeframes(config)
         same_low_tf = [
             position
             for position in same_direction
@@ -120,16 +122,46 @@ class PortfolioGuard:
         ]
         open_r = sum((_open_r_units(position) for position in same_direction), Decimal("0"))
         new_r = Decimal("1")
+        same_direction_markets = {
+            int(position.market_id)
+            for position in same_direction
+            if position.market_id is not None
+        }
+        new_market_count = len(same_direction_markets | {int(signal.market_id)})
+        new_this_cycle = _new_positions_this_cycle_by_side(
+            db,
+            open_positions,
+            mode=mode_key,
+            side=side_key,
+            now=now,
+        )
         details = {
             "mode": mode_key,
             "side": side_key,
             "signal_id": signal.id,
             "timeframe": signal.timeframe,
             "same_direction_open_positions": len(same_direction),
+            "same_direction_open_markets": len(same_direction_markets),
             "same_direction_open_r": str(open_r),
             "same_direction_low_tf_open_positions": len(same_low_tf),
+            "new_positions_this_cycle_by_side": new_this_cycle,
             "low_timeframes": sorted(low_timeframes),
         }
+
+        max_new_per_cycle = _mode_number(
+            config.get("max_new_positions_per_cycle_by_side"),
+            mode_key,
+        )
+        if (
+            max_new_per_cycle is not None
+            and new_this_cycle is not None
+            and new_this_cycle + 1 > int(max_new_per_cycle)
+        ):
+            return PortfolioGuardDecision(
+                allowed=False,
+                reason="max new directional positions per cycle reached",
+                details={**details, "limit": int(max_new_per_cycle)},
+            )
 
         max_positions = _mode_number(config.get("max_directional_open_positions"), mode_key)
         if max_positions is not None and len(same_direction) + 1 > int(max_positions):
@@ -137,6 +169,14 @@ class PortfolioGuard:
                 allowed=False,
                 reason="max directional open positions reached",
                 details={**details, "limit": int(max_positions)},
+            )
+
+        max_markets = _mode_number(config.get("max_directional_markets"), mode_key)
+        if max_markets is not None and new_market_count > int(max_markets):
+            return PortfolioGuardDecision(
+                allowed=False,
+                reason="max directional markets reached",
+                details={**details, "limit": int(max_markets), "new_market_count": new_market_count},
             )
 
         max_r = _mode_decimal(config.get("max_directional_risk_r"), mode_key)
@@ -148,7 +188,7 @@ class PortfolioGuard:
             )
 
         if signal.timeframe in low_timeframes:
-            max_low_tf = _mode_number(low_tf_config, mode_key)
+            max_low_tf = _mode_number(_low_tf_limit_config(config, mode_key), mode_key)
             if max_low_tf is not None and len(same_low_tf) + 1 > int(max_low_tf):
                 return PortfolioGuardDecision(
                     allowed=False,
@@ -165,19 +205,21 @@ class PortfolioGuard:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         now = now or datetime.now(UTC)
+        directional_result = self.update_directional_reversal_breaker(db, now=now)
         config = effective_portfolio_circuit_breaker_settings(db)
         state_row = db.get(AppSetting, "portfolio_circuit_breaker_state")
         state = _merged_state(state_row.value if state_row is not None else {})
 
         if not bool(config.get("enabled", True)):
             if state.get("active_until") is not None:
-                state = _merged_state({"active_until": None, "reason": None})
+                state["active_until"] = None
+                state["reason"] = None
                 _upsert_state(db, state_row, state)
-            return {"status": "disabled", "state": state}
+            return {"status": "disabled", "state": state, "directional_reversal": directional_result}
 
         active_until = _parse_dt(state.get("active_until"))
         if active_until is not None and active_until > now:
-            return {"status": "active", "state": state}
+            return {"status": "active", "state": state, "directional_reversal": directional_result}
 
         if active_until is not None and active_until <= now:
             state["active_until"] = None
@@ -236,10 +278,112 @@ class PortfolioGuard:
                     },
                 )
             )
-            return {"status": "activated", "state": state}
+            return {"status": "activated", "state": state, "directional_reversal": directional_result}
 
         _upsert_state(db, state_row, state)
-        return {"status": "ok", "state": state}
+        return {"status": "ok", "state": state, "directional_reversal": directional_result}
+
+    def update_directional_reversal_breaker(
+        self,
+        db: Session,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        now = now or datetime.now(UTC)
+        config = effective_directional_reversal_breaker_settings(db)
+        state_row = db.get(AppSetting, "portfolio_circuit_breaker_state")
+        state = _merged_state(state_row.value if state_row is not None else {})
+        directional_state = _directional_reversal_state(state)
+
+        if not bool(config.get("enabled", True)):
+            if directional_state:
+                state["directional_reversal"] = {}
+                _upsert_state(db, state_row, state)
+            return {"status": "disabled", "active": {}}
+
+        active_modes = _active_breaker_modes(config)
+        if not active_modes:
+            return {"status": "disabled", "active": directional_state}
+
+        window_minutes = max(1, int(_float(config.get("window_minutes"), 120)))
+        stop_loss_count = max(1, int(_float(config.get("stop_loss_count"), 4)))
+        cooldown_minutes = max(1, int(_float(config.get("cooldown_minutes"), 180)))
+        apply_timeframes = _string_set(config.get("apply_timeframes"))
+        window_start = now - timedelta(minutes=window_minutes)
+        positions = _closed_positions_since(db, window_start, now)
+        triggered: list[str] = []
+
+        counts: dict[str, int] = {}
+        for position in positions:
+            mode = str(position.mode or "").lower()
+            side = str(position.side or "").lower()
+            if mode not in active_modes or side not in {"long", "short"}:
+                continue
+            if apply_timeframes and _position_timeframe(position) not in apply_timeframes:
+                continue
+            if not _negative_stop_loss(position):
+                continue
+            key = _directional_reversal_key(mode, side)
+            counts[key] = counts.get(key, 0) + 1
+
+        for key, count in counts.items():
+            entry = _state_entry(directional_state.get(key))
+            active_until = _parse_dt(entry.get("active_until"))
+            if count < stop_loss_count or (active_until is not None and active_until > now):
+                entry.update(
+                    {
+                        "last_window_stop_losses": count,
+                        "last_checked_at": now.isoformat(),
+                        "last_window_start": window_start.isoformat(),
+                    }
+                )
+                directional_state[key] = entry
+                continue
+            mode, side = key.split(":", 1)
+            until = now + timedelta(minutes=cooldown_minutes)
+            entry = {
+                "active_until": until.isoformat(),
+                "triggered_at": now.isoformat(),
+                "mode": mode,
+                "side": side,
+                "reason": "same_side_stop_loss_cluster",
+                "last_window_stop_losses": count,
+                "last_window_start": window_start.isoformat(),
+                "last_checked_at": now.isoformat(),
+                "window_minutes": window_minutes,
+                "stop_loss_count": stop_loss_count,
+                "cooldown_minutes": cooldown_minutes,
+                "apply_timeframes": sorted(apply_timeframes),
+            }
+            directional_state[key] = entry
+            triggered.append(key)
+            db.add(
+                DecisionLog(
+                    event_type="directional_reversal_breaker_activated",
+                    message="Directional reversal breaker activated; blocking same-side low-TF entries",
+                    data=entry,
+                )
+            )
+
+        for key, raw_entry in list(directional_state.items()):
+            entry = _state_entry(raw_entry)
+            active_until = _parse_dt(entry.get("active_until"))
+            if active_until is not None and active_until <= now:
+                entry["expired_at"] = now.isoformat()
+                directional_state[key] = entry
+
+        state["directional_reversal"] = directional_state
+        _upsert_state(db, state_row, state)
+        return {
+            "status": "activated" if triggered else "ok",
+            "triggered": triggered,
+            "active": {
+                key: entry
+                for key, entry in directional_state.items()
+                if _parse_dt(_state_entry(entry).get("active_until")) is not None
+                and _parse_dt(_state_entry(entry).get("active_until")) > now
+            },
+        }
 
     def evaluate_macro_risk_gate(
         self,
@@ -270,6 +414,47 @@ class PortfolioGuard:
                 "reason": state.get("reason"),
                 "last_window_loss_r": state.get("last_window_loss_r"),
                 "last_window_stop_losses": state.get("last_window_stop_losses"),
+            },
+        )
+
+    def _directional_reversal_decision(
+        self,
+        db: Session,
+        signal: Signal,
+        mode: str,
+        side: str,
+        now: datetime,
+    ) -> PortfolioGuardDecision:
+        config = effective_directional_reversal_breaker_settings(db)
+        if not bool(config.get("enabled", True)):
+            return PortfolioGuardDecision(allowed=True)
+        mode_key = _mode_key(mode)
+        side_key = str(side).lower()
+        if mode_key not in _active_breaker_modes(config):
+            return PortfolioGuardDecision(allowed=True)
+        apply_timeframes = _string_set(config.get("apply_timeframes"))
+        if apply_timeframes and signal.timeframe not in apply_timeframes:
+            return PortfolioGuardDecision(allowed=True)
+        state = _merged_state(setting_value(db, "portfolio_circuit_breaker_state"))
+        directional_state = _directional_reversal_state(state)
+        entry = _state_entry(directional_state.get(_directional_reversal_key(mode_key, side_key)))
+        active_until = _parse_dt(entry.get("active_until"))
+        if active_until is None or active_until <= now:
+            return PortfolioGuardDecision(allowed=True)
+        return PortfolioGuardDecision(
+            allowed=False,
+            reason="directional reversal breaker active",
+            details={
+                "mode": mode_key,
+                "side": side_key,
+                "signal_id": signal.id,
+                "timeframe": signal.timeframe,
+                "active_until": active_until.isoformat(),
+                "triggered_at": entry.get("triggered_at"),
+                "window_minutes": entry.get("window_minutes"),
+                "stop_loss_count": entry.get("stop_loss_count"),
+                "last_window_stop_losses": entry.get("last_window_stop_losses"),
+                "apply_timeframes": entry.get("apply_timeframes"),
             },
         )
 
@@ -535,6 +720,93 @@ def _negative_stop_loss(position: Position) -> bool:
         return Decimal(str(position.realized_pnl)) <= 0
     except (InvalidOperation, TypeError, ValueError):
         return False
+
+
+def _low_tf_timeframes(config: dict[str, Any]) -> set[str]:
+    new_config = config.get("max_low_tf_directional_open_positions")
+    if isinstance(new_config, dict):
+        values = _string_set(new_config.get("apply_timeframes"))
+        if values:
+            return values
+    legacy_config = config.get("max_low_tf_directional_positions")
+    return _string_set(legacy_config.get("timeframes") if isinstance(legacy_config, dict) else [])
+
+
+def _low_tf_limit_config(config: dict[str, Any], mode: str) -> Any:
+    new_config = config.get("max_low_tf_directional_open_positions")
+    if _mode_number(new_config, mode) is not None:
+        return new_config
+    return config.get("max_low_tf_directional_positions")
+
+
+def _new_positions_this_cycle_by_side(
+    db: Session,
+    open_positions: list[Position],
+    *,
+    mode: str,
+    side: str,
+    now: datetime,
+) -> int | None:
+    cycle_started_at = _last_worker_cycle_at(db)
+    if cycle_started_at is None:
+        return None
+    return sum(
+        1
+        for position in open_positions
+        if str(position.side or "").lower() == side
+        and str(position.mode or "").lower() == mode
+        and _position_opened_between(position, cycle_started_at, now)
+    )
+
+
+def _last_worker_cycle_at(db: Session) -> datetime | None:
+    try:
+        row = (
+            db.query(DecisionLog)
+            .filter(DecisionLog.event_type == "worker_cycle")
+            .order_by(DecisionLog.timestamp.desc())
+            .first()
+        )
+    except Exception:
+        return None
+    if row is None:
+        return None
+    return _parse_dt(getattr(row, "timestamp", None))
+
+
+def _position_opened_between(position: Position, start: datetime, end: datetime) -> bool:
+    opened_at = _parse_dt(getattr(position, "opened_at", None))
+    return opened_at is not None and start <= opened_at <= end
+
+
+def _active_breaker_modes(config: dict[str, Any]) -> set[str]:
+    modes = config.get("modes")
+    if not isinstance(modes, dict):
+        return {"live"}
+    return {
+        str(mode).lower()
+        for mode, enabled in modes.items()
+        if bool(enabled) and str(mode).lower() in {"paper", "live"}
+    }
+
+
+def _directional_reversal_state(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    raw = state.get("directional_reversal")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(key): _state_entry(value)
+        for key, value in raw.items()
+        if isinstance(key, str)
+    }
+
+
+def _state_entry(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _directional_reversal_key(mode: str, side: str) -> str:
+    return f"{mode}:{side}"
 
 
 def _mode_number(value: Any, mode: str) -> float | None:

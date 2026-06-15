@@ -43,10 +43,15 @@ function fromCsv(v: string) {
 export function RiskTab({ settings }: Props) {
   const risk = (settings.risk ?? {}) as Record<string, unknown>;
   const portfolioGuard = toRecord(risk.portfolio_guard);
+  const maxNewBySide = toRecord(portfolioGuard.max_new_positions_per_cycle_by_side);
   const maxDirectionalOpen = toRecord(portfolioGuard.max_directional_open_positions);
+  const maxDirectionalMarkets = toRecord(portfolioGuard.max_directional_markets);
   const maxDirectionalRisk = toRecord(portfolioGuard.max_directional_risk_r);
   const lowTfDirectional = toRecord(portfolioGuard.max_low_tf_directional_positions);
+  const lowTfDirectionalOpen = toRecord(portfolioGuard.max_low_tf_directional_open_positions);
   const circuitBreaker = toRecord(risk.circuit_breaker);
+  const directionalReversalBreaker = toRecord(risk.directional_reversal_breaker);
+  const directionalReversalModes = toRecord(directionalReversalBreaker.modes);
   const macroRiskMode = toRecord(risk.macro_risk_mode);
   const macroRiskMonitor = toRecord(risk.macro_risk_monitor);
   const macroRiskState = toRecord(settings.macro_risk_state);
@@ -62,13 +67,17 @@ export function RiskTab({ settings }: Props) {
     maxLeverage: toNum(risk.max_leverage, 3),
     portfolioGuard: {
       enabled: toBool(portfolioGuard.enabled, true),
-      maxDirectionalOpenPaper: toNum(maxDirectionalOpen.paper, 20),
-      maxDirectionalOpenLive: toNum(maxDirectionalOpen.live, 12),
-      maxDirectionalRiskPaper: toNum(maxDirectionalRisk.paper, 12),
-      maxDirectionalRiskLive: toNum(maxDirectionalRisk.live, 6),
+      maxNewPerCycleLive: toNum(maxNewBySide.live, 3),
+      maxDirectionalOpenPaper: toNum(maxDirectionalOpen.paper, 25),
+      maxDirectionalOpenLive: toNum(maxDirectionalOpen.live, 13),
+      maxDirectionalMarketsLive: toNum(maxDirectionalMarkets.live, 10),
+      maxDirectionalRiskPaper: toNum(maxDirectionalRisk.paper, 25),
+      maxDirectionalRiskLive: toNum(maxDirectionalRisk.live, 8),
       lowTfTimeframes: toCsv(lowTfDirectional.timeframes, ["5m", "15m"]),
-      lowTfMaxPaper: toNum(lowTfDirectional.paper, 12),
-      lowTfMaxLive: toNum(lowTfDirectional.live, 6),
+      lowTfMaxPaper: toNum(lowTfDirectional.paper, 25),
+      lowTfMaxLive: toNum(lowTfDirectional.live, 13),
+      lowTfOpenTimeframes: toCsv(lowTfDirectionalOpen.apply_timeframes, ["5m", "15m"]),
+      lowTfMaxOpenLive: toNum(lowTfDirectionalOpen.live, 8),
     },
     circuitBreaker: {
       enabled: toBool(circuitBreaker.enabled, true),
@@ -76,6 +85,14 @@ export function RiskTab({ settings }: Props) {
       maxLossR: toNum(circuitBreaker.max_loss_r, 5),
       maxStopLosses: toNum(circuitBreaker.max_stop_losses, 8),
       pauseMinutes: toNum(circuitBreaker.pause_minutes, 180),
+    },
+    directionalReversalBreaker: {
+      enabled: toBool(directionalReversalBreaker.enabled, true),
+      liveEnabled: toBool(directionalReversalModes.live, true),
+      applyTimeframes: toCsv(directionalReversalBreaker.apply_timeframes, ["5m", "15m"]),
+      windowMinutes: toNum(directionalReversalBreaker.window_minutes, 120),
+      stopLossCount: toNum(directionalReversalBreaker.stop_loss_count, 4),
+      cooldownMinutes: toNum(directionalReversalBreaker.cooldown_minutes, 180),
     },
     macroRiskMode: {
       enabled: toBool(macroRiskMode.enabled, false),
@@ -140,18 +157,28 @@ export function RiskTab({ settings }: Props) {
     persisted.maxExposurePct,
     persisted.maxLeverage,
     persisted.portfolioGuard.enabled,
+    persisted.portfolioGuard.maxNewPerCycleLive,
     persisted.portfolioGuard.maxDirectionalOpenPaper,
     persisted.portfolioGuard.maxDirectionalOpenLive,
+    persisted.portfolioGuard.maxDirectionalMarketsLive,
     persisted.portfolioGuard.maxDirectionalRiskPaper,
     persisted.portfolioGuard.maxDirectionalRiskLive,
     persisted.portfolioGuard.lowTfTimeframes,
     persisted.portfolioGuard.lowTfMaxPaper,
     persisted.portfolioGuard.lowTfMaxLive,
+    persisted.portfolioGuard.lowTfOpenTimeframes,
+    persisted.portfolioGuard.lowTfMaxOpenLive,
     persisted.circuitBreaker.enabled,
     persisted.circuitBreaker.windowMinutes,
     persisted.circuitBreaker.maxLossR,
     persisted.circuitBreaker.maxStopLosses,
     persisted.circuitBreaker.pauseMinutes,
+    persisted.directionalReversalBreaker.enabled,
+    persisted.directionalReversalBreaker.liveEnabled,
+    persisted.directionalReversalBreaker.applyTimeframes,
+    persisted.directionalReversalBreaker.windowMinutes,
+    persisted.directionalReversalBreaker.stopLossCount,
+    persisted.directionalReversalBreaker.cooldownMinutes,
     persisted.macroRiskMode.enabled,
     persisted.macroRiskMode.sizeMultiplier,
     persisted.macroRiskMode.minExpectedR,
@@ -192,28 +219,59 @@ export function RiskTab({ settings }: Props) {
       max_total_exposure_pct: local.maxExposurePct,
       max_leverage: local.maxLeverage,
       portfolio_guard: {
+        ...portfolioGuard,
         enabled: local.portfolioGuard.enabled,
+        max_new_positions_per_cycle_by_side: {
+          ...maxNewBySide,
+          live: local.portfolioGuard.maxNewPerCycleLive,
+        },
         max_directional_open_positions: {
+          ...maxDirectionalOpen,
           paper: local.portfolioGuard.maxDirectionalOpenPaper,
           live: local.portfolioGuard.maxDirectionalOpenLive,
         },
+        max_directional_markets: {
+          ...maxDirectionalMarkets,
+          live: local.portfolioGuard.maxDirectionalMarketsLive,
+        },
         max_directional_risk_r: {
+          ...maxDirectionalRisk,
           paper: local.portfolioGuard.maxDirectionalRiskPaper,
           live: local.portfolioGuard.maxDirectionalRiskLive,
         },
         max_low_tf_directional_positions: {
+          ...lowTfDirectional,
           timeframes: fromCsv(local.portfolioGuard.lowTfTimeframes),
           paper: local.portfolioGuard.lowTfMaxPaper,
           live: local.portfolioGuard.lowTfMaxLive,
         },
+        max_low_tf_directional_open_positions: {
+          ...lowTfDirectionalOpen,
+          apply_timeframes: fromCsv(local.portfolioGuard.lowTfOpenTimeframes),
+          live: local.portfolioGuard.lowTfMaxOpenLive,
+        },
       },
       circuit_breaker: {
+        ...circuitBreaker,
         enabled: local.circuitBreaker.enabled,
         window_minutes: local.circuitBreaker.windowMinutes,
         max_loss_r: local.circuitBreaker.maxLossR,
         max_stop_losses: local.circuitBreaker.maxStopLosses,
         pause_minutes: local.circuitBreaker.pauseMinutes,
         scope: "new_entries_only",
+      },
+      directional_reversal_breaker: {
+        ...directionalReversalBreaker,
+        enabled: local.directionalReversalBreaker.enabled,
+        modes: {
+          ...directionalReversalModes,
+          paper: false,
+          live: local.directionalReversalBreaker.liveEnabled,
+        },
+        apply_timeframes: fromCsv(local.directionalReversalBreaker.applyTimeframes),
+        window_minutes: local.directionalReversalBreaker.windowMinutes,
+        stop_loss_count: local.directionalReversalBreaker.stopLossCount,
+        cooldown_minutes: local.directionalReversalBreaker.cooldownMinutes,
       },
       macro_risk_mode: {
         enabled: local.macroRiskMode.enabled,
@@ -255,6 +313,15 @@ export function RiskTab({ settings }: Props) {
 
   function setCircuitBreaker(patch: Partial<typeof persisted.circuitBreaker>) {
     setLocal((s) => ({ ...s, circuitBreaker: { ...s.circuitBreaker, ...patch } }));
+  }
+
+  function setDirectionalReversalBreaker(
+    patch: Partial<typeof persisted.directionalReversalBreaker>,
+  ) {
+    setLocal((s) => ({
+      ...s,
+      directionalReversalBreaker: { ...s.directionalReversalBreaker, ...patch },
+    }));
   }
 
   function setMacroRiskMode(patch: Partial<typeof persisted.macroRiskMode>) {
@@ -380,6 +447,13 @@ export function RiskTab({ settings }: Props) {
         </div>
         <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
           <Field
+            label="New live/cycle side"
+            hint="Max nuove live nella stessa direzione per ciclo worker"
+            value={local.portfolioGuard.maxNewPerCycleLive}
+            step={1}
+            onChange={(v) => setPortfolioGuard({ maxNewPerCycleLive: v })}
+          />
+          <Field
             label="Directional open paper"
             hint="Max posizioni paper nella stessa direzione"
             value={local.portfolioGuard.maxDirectionalOpenPaper}
@@ -392,6 +466,13 @@ export function RiskTab({ settings }: Props) {
             value={local.portfolioGuard.maxDirectionalOpenLive}
             step={1}
             onChange={(v) => setPortfolioGuard({ maxDirectionalOpenLive: v })}
+          />
+          <Field
+            label="Directional markets live"
+            hint="Max mercati live aperti nella stessa direzione"
+            value={local.portfolioGuard.maxDirectionalMarketsLive}
+            step={1}
+            onChange={(v) => setPortfolioGuard({ maxDirectionalMarketsLive: v })}
           />
           <Field
             label="Directional risk paper"
@@ -430,6 +511,21 @@ export function RiskTab({ settings }: Props) {
             value={local.portfolioGuard.lowTfMaxLive}
             step={1}
             onChange={(v) => setPortfolioGuard({ lowTfMaxLive: v })}
+          />
+        </div>
+        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-[minmax(0,1fr)_180px]">
+          <TextField
+            label="Low TF live list"
+            hint="Timeframe live a cui applicare il cap direzionale stretto"
+            value={local.portfolioGuard.lowTfOpenTimeframes}
+            onChange={(v) => setPortfolioGuard({ lowTfOpenTimeframes: v })}
+          />
+          <Field
+            label="Low TF live open"
+            hint="Max live low-TF nella stessa direzione"
+            value={local.portfolioGuard.lowTfMaxOpenLive}
+            step={1}
+            onChange={(v) => setPortfolioGuard({ lowTfMaxOpenLive: v })}
           />
         </div>
       </Card>
@@ -477,6 +573,57 @@ export function RiskTab({ settings }: Props) {
             step={15}
             suffix="min"
             onChange={(v) => setCircuitBreaker({ pauseMinutes: v })}
+          />
+        </div>
+      </Card>
+
+      <Card className="p-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <SectionTitle
+            title="Directional reversal breaker"
+            hint="Blocca nuove live low-TF same-side dopo cluster di stop loss"
+          />
+          <ToggleInline
+            label={local.directionalReversalBreaker.enabled ? "Enabled" : "Disabled"}
+            checked={local.directionalReversalBreaker.enabled}
+            onChange={(enabled) => setDirectionalReversalBreaker({ enabled })}
+          />
+        </div>
+        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-5">
+          <ToggleBlock
+            label="Live mode"
+            hint="Applica il breaker alle nuove entrate live"
+            checked={local.directionalReversalBreaker.liveEnabled}
+            onChange={(liveEnabled) => setDirectionalReversalBreaker({ liveEnabled })}
+          />
+          <TextField
+            label="Apply TF"
+            hint="Timeframe separati da virgola"
+            value={local.directionalReversalBreaker.applyTimeframes}
+            onChange={(applyTimeframes) => setDirectionalReversalBreaker({ applyTimeframes })}
+          />
+          <Field
+            label="Window"
+            hint="Finestra stop same-side"
+            value={local.directionalReversalBreaker.windowMinutes}
+            step={5}
+            suffix="min"
+            onChange={(windowMinutes) => setDirectionalReversalBreaker({ windowMinutes })}
+          />
+          <Field
+            label="Stop trigger"
+            hint="Stop loss necessari"
+            value={local.directionalReversalBreaker.stopLossCount}
+            step={1}
+            onChange={(stopLossCount) => setDirectionalReversalBreaker({ stopLossCount })}
+          />
+          <Field
+            label="Cooldown"
+            hint="Durata blocco same-side"
+            value={local.directionalReversalBreaker.cooldownMinutes}
+            step={15}
+            suffix="min"
+            onChange={(cooldownMinutes) => setDirectionalReversalBreaker({ cooldownMinutes })}
           />
         </div>
       </Card>

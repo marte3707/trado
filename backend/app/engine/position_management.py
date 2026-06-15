@@ -192,6 +192,48 @@ class PositionManagementEngine:
         self.apply_stop_update(db, position, candidate, mode=OrderMode.PAPER.value)
         return True
 
+    def manage_paper_trailing_for_timeframe(
+        self,
+        db: Session,
+        market: Market,
+        timeframe: str,
+    ) -> int:
+        """Ri-valuta il trailing delle posizioni paper il cui timeframe di
+        riferimento e' ``timeframe`` ma il cui timeframe sorgente e' piu' lento.
+
+        Il caso source == reference resta gestito da
+        ``close_paper_positions_for_timeframe`` insieme ai trigger SL/TP, quindi
+        qui lo escludiamo per non aggiornare due volte lo stesso stop.
+        """
+        positions = (
+            db.query(Position)
+            .filter(
+                Position.market_id == market.id,
+                Position.mode == OrderMode.PAPER.value,
+                Position.status == "open",
+            )
+            .all()
+        )
+        updated = 0
+        for position in positions:
+            if self.trailing_timeframe(db, position) != timeframe:
+                continue
+            if self.position_source_timeframe(db, position) == timeframe:
+                continue
+            candles = (
+                db.query(Candle)
+                .filter(Candle.market_id == market.id, Candle.timeframe == timeframe)
+                .order_by(Candle.open_time.asc())
+                .all()
+            )
+            if not candles:
+                continue
+            if self.manage_paper_position_for_candle(db, market, position, candles, candles[-1]):
+                updated += 1
+        if updated:
+            db.commit()
+        return updated
+
     def manage_live_positions_for_timeframe(
         self,
         db: Session,
@@ -214,7 +256,8 @@ class PositionManagementEngine:
             return 0
         updated = 0
         for position in positions:
-            if not self.position_matches_timeframe(db, position, timeframe):
+            trailing_tf = self.trailing_timeframe(db, position)
+            if trailing_tf is not None and trailing_tf != timeframe:
                 continue
             candles = (
                 db.query(Candle)
@@ -247,8 +290,27 @@ class PositionManagementEngine:
             return None
         if not self._position_update_allowed(db, market, position):
             return None
-        if not self.position_matches_timeframe(db, position, candle.timeframe):
+        trailing_tf = self.trailing_timeframe(db, position)
+        if trailing_tf is not None and trailing_tf != candle.timeframe:
             return None
+        # ATR/EMA (la larghezza del trail) restano sul timeframe sorgente anche
+        # quando il controllo avviene su una candela piu' fine: in quel caso
+        # ricarichiamo le candele del timeframe sorgente per gli indicatori,
+        # mentre prezzo/estremi/gate usano la candela di riferimento.
+        source_tf = self.position_source_timeframe(db, position) or candle.timeframe
+        if candle.timeframe != source_tf:
+            indicator_candles: Sequence[Candle] = (
+                db.query(Candle)
+                .filter(
+                    Candle.market_id == market.id,
+                    Candle.timeframe == source_tf,
+                    Candle.open_time <= candle.open_time,
+                )
+                .order_by(Candle.open_time.asc())
+                .all()
+            )
+        else:
+            indicator_candles = candles
         metadata = self.ensure_position_state(position)
         candle_key = candle.open_time.isoformat()
         if trailing.get("updateOnlyOnCandleClose", True):
@@ -270,7 +332,7 @@ class PositionManagementEngine:
         if risk_per_unit is None or risk_per_unit <= 0:
             return None
 
-        relevant = [row for row in candles if row.open_time <= candle.open_time]
+        relevant = [row for row in indicator_candles if row.open_time <= candle.open_time]
         if len(relevant) < max(int(trailing.get("atrPeriod", 14)) + 1, 2):
             return None
         highs = [float(row.high) for row in relevant]
@@ -918,19 +980,48 @@ class PositionManagementEngine:
         return result
 
     def position_matches_timeframe(self, db: Session, position: Position, timeframe: str) -> bool:
+        source_timeframe = self.position_source_timeframe(db, position)
+        return source_timeframe is None or source_timeframe == timeframe
+
+    def position_source_timeframe(self, db: Session, position: Position) -> str | None:
+        """Timeframe del segnale che ha originato la posizione, o None se ignoto."""
         metadata = position.metadata_json or {}
         source_timeframe = metadata.get("source_timeframe")
-        if isinstance(source_timeframe, str):
-            return source_timeframe == timeframe
+        if isinstance(source_timeframe, str) and source_timeframe:
+            return source_timeframe
         source_signal_id = metadata.get("source_signal_id")
         if source_signal_id is None:
-            return True
+            return None
         try:
             signal_id = int(source_signal_id)
         except (TypeError, ValueError):
-            return True
+            return None
         signal = db.get(Signal, signal_id)
-        return signal is None or signal.timeframe == timeframe
+        if signal is None or not isinstance(signal.timeframe, str):
+            return None
+        return signal.timeframe
+
+    def trailing_timeframe(self, db: Session, position: Position) -> str | None:
+        """Timeframe su cui ri-valutare il trailing stop.
+
+        Per i timeframe lenti viene usata una candela piu' fine (vedi
+        ``checkIntervalByTimeframe``) come cadenza di controllo e fonte prezzo
+        intraday, mantenendo ATR/EMA sul timeframe sorgente. Ritorna None se il
+        timeframe sorgente non e' ricavabile (gestione su qualsiasi timeframe).
+        """
+        source = self.position_source_timeframe(db, position)
+        if source is None:
+            return None
+        config = effective_position_management_settings(db)
+        trailing = config.get("trailingStop", {})
+        mapping = trailing.get("checkIntervalByTimeframe") or {}
+        reference = mapping.get(source)
+        if not isinstance(reference, str) or reference not in TIMEFRAME_MS:
+            return source
+        # Mai piu' lento del timeframe sorgente.
+        if TIMEFRAME_MS.get(reference, 0) > TIMEFRAME_MS.get(source, 0):
+            return source
+        return reference
 
     def _position_update_allowed(self, db: Session, market: Market, position: Position) -> bool:
         if position.status != "open" or position.size <= POSITION_DUST_THRESHOLD:

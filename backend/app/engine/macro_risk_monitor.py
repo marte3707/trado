@@ -24,6 +24,45 @@ from app.db.models import AppSetting, Candle, DecisionLog, Market
 
 LEVEL_ORDER = {"off": 0, "watch": 1, "high": 2, "extreme": 3}
 MARKET_TARGET_BASES = {"BTC", "ETH"}
+# Event phrases specific enough to anchor macro relevance on their own. Generic
+# single words ("attack", "ban", "strike", "war", "missile"...) are intentionally
+# excluded: without a relevant entity they fire on unrelated headlines, e.g. a
+# shark "attack" or a drone "ban" being scored as macro/crypto risk.
+SELF_ANCHORING_EVENT_PHRASES = {
+    "strait of hormuz",
+    "talks collapse",
+    "peace talks",
+    "sanctions",
+    "rate hike",
+    "rate cut",
+    "higher for longer",
+    "hot inflation",
+    "payrolls beat",
+    "payrolls miss",
+    "jobs data",
+    "rate decision",
+    "auction tails",
+    "weak auction",
+    "yield spike",
+    "liquidity crunch",
+    "funding stress",
+    "debt limit",
+    "debt ceiling",
+    "credit spread",
+    "bridge exploit",
+    "depeg",
+    "de-pegged",
+    "withdrawals halted",
+    "halt withdrawals",
+    "chain halt",
+    "network halt",
+    "mass liquidations",
+    "bank failure",
+    "bank run",
+    "emergency lending",
+    "oil spike",
+    "supply disruption",
+}
 NEWS_FETCH_TIMEOUT_SECONDS = 6
 CALENDAR_FETCH_TIMEOUT_SECONDS = 6
 CALENDAR_DEFAULT_TZ = ZoneInfo("America/New_York")
@@ -370,14 +409,23 @@ class MacroRiskMonitor:
         retained_previous_level = False
         previous_level = str(previous.get("level") or "off")
         previous_still_active = bool(previous.get("active")) and previous_until is not None and previous_until > now
+        is_downgrade = _is_lower_level(raw_level, previous_level)
         should_retain_previous = previous_still_active and (
             not active
             or (
-                _is_lower_level(raw_level, previous_level)
-                and not _downgrade_confirmed(
-                    combined_score,
-                    previous_level=previous_level,
-                    config=config,
+                is_downgrade
+                and (
+                    not _downgrade_confirmed(
+                        combined_score,
+                        previous_level=previous_level,
+                        config=config,
+                    )
+                    or not _downgrade_hold_elapsed(
+                        previous=previous,
+                        previous_level=previous_level,
+                        now=now,
+                        config=config,
+                    )
                 )
             )
         )
@@ -436,6 +484,12 @@ class MacroRiskMonitor:
                 ),
                 "news_fetch_errors": news_result.get("errors", []),
                 "calendar_fetch_errors": calendar_result.get("errors", []),
+                "last_telegram_risk_notification_at": previous.get(
+                    "last_telegram_risk_notification_at"
+                ),
+                "last_telegram_risk_notification_level": previous.get(
+                    "last_telegram_risk_notification_level"
+                ),
             }
         )
 
@@ -741,6 +795,16 @@ def score_news_item(item: MacroNewsItem, now: datetime) -> dict[str, Any]:
     ):
         category = "macro_calendar"
 
+    # Without a relevant named entity (country, institution, asset...) or a
+    # self-anchoring event phrase, generic event keywords are almost always noise
+    # from unrelated headlines. Demote such items to "general" so the dampener
+    # below keeps them well below the activation threshold.
+    has_macro_anchor = bool(entities) or bool(
+        matched_event_phrases & SELF_ANCHORING_EVENT_PHRASES
+    )
+    if not has_macro_anchor:
+        category = "general"
+
     if category == "general":
         severity = int(severity * 0.4)
 
@@ -854,6 +918,27 @@ def _downgrade_confirmed(score: int, *, previous_level: str, config: dict[str, A
     if previous_level == "watch":
         return score < int(_float(config.get("watch_score"), 40)) - hysteresis
     return True
+
+
+def _downgrade_hold_elapsed(
+    *,
+    previous: dict[str, Any],
+    previous_level: str,
+    now: datetime,
+    config: dict[str, Any],
+) -> bool:
+    hold_config = config.get("min_level_hold_minutes")
+    if isinstance(hold_config, dict):
+        raw_hold = hold_config.get(previous_level, hold_config.get("default", 15))
+    else:
+        raw_hold = hold_config
+    hold_minutes = max(0, int(_float(raw_hold, 15)))
+    if hold_minutes <= 0:
+        return True
+    triggered_at = _parse_dt(previous.get("triggered_at"))
+    if triggered_at is None:
+        return True
+    return now - triggered_at >= timedelta(minutes=hold_minutes)
 
 
 def _policy_for_level(config: dict[str, Any], level: str) -> dict[str, Any]:

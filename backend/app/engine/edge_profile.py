@@ -120,15 +120,27 @@ def compute_edge_adjustments(
     db: Session,
     *,
     lookback: int = 500,
+    directional_lookback: int | None = None,
     analyzer: SignalPerformanceAnalyzer | None = None,
 ) -> dict[str, dict[str, Any]]:
     analyzer = analyzer or SignalPerformanceAnalyzer()
     positions = analyzer.closed_paper_positions(db, limit=lookback)
     rows = [row for row in linked_position_signals(db, positions) if row.signal is not None]
+    directional_rows = rows
+    if directional_lookback is not None and directional_lookback < lookback:
+        directional_positions = analyzer.closed_paper_positions(
+            db,
+            limit=max(1, directional_lookback),
+        )
+        directional_rows = [
+            row
+            for row in linked_position_signals(db, directional_positions)
+            if row.signal is not None
+        ]
 
     by_direction_tf = _summarize_groups(
         analyzer,
-        rows,
+        directional_rows,
         lambda row: (
             f"{direction_family(row.signal.direction)}:{row.signal.timeframe}"
             if row.signal and direction_family(row.signal.direction)
@@ -155,7 +167,7 @@ def compute_edge_adjustments(
         lambda row: row.signal.timeframe if row.signal else None,
     )
     strategy_direction_groups: dict[str, list[Position]] = {}
-    for row in rows:
+    for row in directional_rows:
         if row.signal is None or not isinstance(row.signal.strategy_breakdown, dict):
             continue
         for strategy_name, payload in row.signal.strategy_breakdown.items():

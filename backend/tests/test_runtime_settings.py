@@ -1,6 +1,8 @@
 from app.core.config import Settings
 from app.core.runtime_settings import (
+    effective_directional_reversal_breaker_settings,
     DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
+    effective_portfolio_guard_settings,
     effective_enabled_timeframes,
     effective_macro_risk_monitor_settings,
     effective_monitoring_only_timeframes,
@@ -68,9 +70,34 @@ def test_effective_macro_risk_monitor_defaults_keep_watch_and_high_soft() -> Non
 
     result = effective_macro_risk_monitor_settings(db)
 
+    assert result["min_level_hold_minutes"] == {
+        "watch": 30,
+        "high": 60,
+        "extreme": 90,
+        "default": 30,
+    }
     assert result["policies"]["watch"]["require_mtf_confluence"] is False
     assert result["policies"]["high"]["require_mtf_confluence"] is False
     assert result["policies"]["extreme"]["require_mtf_confluence"] is True
+
+
+def test_directional_risk_guard_defaults_are_live_only_for_new_caps() -> None:
+    db = FakeDb({"risk": AppSetting(key="risk", value={})})
+
+    portfolio = effective_portfolio_guard_settings(db)
+    breaker = effective_directional_reversal_breaker_settings(db)
+
+    assert portfolio["max_new_positions_per_cycle_by_side"] == {"live": 3}
+    assert portfolio["max_directional_markets"] == {"live": 10}
+    assert portfolio["max_low_tf_directional_open_positions"] == {
+        "apply_timeframes": ["5m", "15m"],
+        "live": 8,
+    }
+    assert portfolio["max_directional_risk_r"]["live"] == 8
+    assert breaker["modes"] == {"paper": False, "live": True}
+    assert breaker["window_minutes"] == 120
+    assert breaker["stop_loss_count"] == 4
+    assert breaker["cooldown_minutes"] == 180
 
 
 def test_normalize_macro_risk_monitor_policies_backfills_only_watch_and_high() -> None:
