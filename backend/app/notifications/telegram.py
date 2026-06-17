@@ -924,6 +924,34 @@ class TelegramNotifier:
             f"<code>{error_type}: {error_msg}</code>"
         )
 
+    async def send_stop_update_failure(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        reason: str,
+        candidate_stop: str | None,
+        attempts: int,
+        error: str | None,
+        stuck: bool,
+    ) -> bool:
+        now = datetime.now(UTC).strftime("%H:%M UTC")
+        title = "🛑 <b>Stop bloccato</b>" if stuck else "⚠️ <b>Stop loss non aggiornato</b>"
+        detail = f"\n<code>{_short_text(error, 200)}</code>" if error else ""
+        stuck_line = (
+            f"\n‼️ Bloccato dopo <b>{attempts}</b> tentativi — intervento manuale consigliato"
+            if stuck
+            else ""
+        )
+        return await self._send_text(
+            f"{title}\n"
+            f"<code>{now}</code>\n\n"
+            f"<b>{symbol}</b> {side.upper()} — il vecchio stop resta attivo\n"
+            f"Nuovo stop richiesto: <b>{candidate_stop or '—'}</b> ({_fmt_reason(reason)})"
+            f"{stuck_line}"
+            f"{detail}"
+        )
+
     async def send_hourly_recap(self, db: Session, stats: dict) -> None:
         _rome = ZoneInfo("Europe/Rome")
         now_str = datetime.now(_rome).strftime("%d/%m/%Y %H:%M (Roma)")

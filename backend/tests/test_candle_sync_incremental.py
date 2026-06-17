@@ -44,23 +44,39 @@ class FakeDb:
 class _SpyClient:
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
         self.captured: dict[str, Any] = {}
+        self.calls: list[dict[str, Any]] = []
         self.rows = rows or []
 
-    async def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
-        self.captured = {"coin": coin, "interval": interval, "start_ms": start_ms, "end_ms": end_ms}
+    async def candles(
+        self,
+        coin: str,
+        interval: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        attempts: int = 2,
+    ) -> list[dict[str, Any]]:
+        self.captured = {
+            "coin": coin,
+            "interval": interval,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "attempts": attempts,
+        }
+        self.calls.append(self.captured)
         return self.rows
 
 
-def _market() -> Market:
+def _market(*, market_id: int = 1, market_type: str = "perp", symbol: str = "BTC") -> Market:
     return Market(
-        id=1,
+        id=market_id,
         exchange="hyperliquid",
-        symbol="BTC",
-        base="BTC",
+        symbol=symbol,
+        base=symbol.split("/")[0],
         quote="USDC",
-        market_type="perp",
+        market_type=market_type,
         active=True,
-        metadata_json={"hl_coin": "BTC"},
+        metadata_json={"hl_coin": symbol},
     )
 
 
@@ -95,3 +111,26 @@ async def test_sync_uses_incremental_window_when_db_has_data() -> None:
     # Way smaller than 300 bars (300*5min = 25h).
     assert requested_window_ms < interval_ms * 50
     assert spy.captured["start_ms"] == int(last.timestamp() * 1000) - interval_ms
+
+
+@pytest.mark.asyncio
+async def test_prefetch_skips_spot_markets_and_uses_configured_attempts() -> None:
+    db = FakeDb(latest_open=None)
+    service = CandleSyncService()
+    spy = _SpyClient()
+    service.client = spy  # type: ignore[assignment]
+    service._latest_open_map = lambda *_args, **_kwargs: {}  # type: ignore[method-assign]
+
+    result = await service.prefetch(
+        db,
+        [
+            (_market(market_id=1, market_type="perp", symbol="BTC"), "5m"),
+            (_market(market_id=2, market_type="spot", symbol="PURR/USDC"), "5m"),
+        ],
+        attempts=2,
+    )
+
+    assert set(result) == {(1, "5m")}
+    assert len(spy.calls) == 1
+    assert spy.calls[0]["coin"] == "BTC"
+    assert spy.calls[0]["attempts"] == 2

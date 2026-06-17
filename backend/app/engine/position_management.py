@@ -32,7 +32,7 @@ from app.db.models import (
 )
 from app.indicators.core import atr, ema
 from app.services.candle_sync import TIMEFRAME_MS
-from app.services.hyperliquid import HyperliquidTradingClient
+from app.services.hyperliquid import DEFAULT_GUARD_STATE_CACHE_SECONDS, HyperliquidTradingClient
 
 logger = structlog.get_logger()
 
@@ -541,6 +541,20 @@ class PositionManagementEngine:
 
     _STUCK_STOP_ALERT_THRESHOLD = 3
 
+    @staticmethod
+    def _is_safety_critical_stop(position: Position, candidate: StopCandidate) -> bool:
+        """Una mossa di stop e' safety-critical quando porta lo stop a breakeven o
+        oltre (in profitto): il fallimento lascia la posizione con piu' rischio del
+        previsto e merita un alert immediato, non solo dopo 3 fallimenti."""
+        if candidate.reason in {"breakeven", "lock_profit"}:
+            return True
+        side = position.side.lower()
+        if side == "long":
+            return candidate.price >= position.entry_price
+        if side == "short":
+            return candidate.price <= position.entry_price
+        return False
+
     def _record_stop_update_failure(
         self,
         db: Session,
@@ -548,6 +562,7 @@ class PositionManagementEngine:
         *,
         reason: str,
         payload: dict[str, Any],
+        safety_critical: bool = False,
     ) -> None:
         metadata = dict(position.metadata_json or {})
         attempts = int(metadata.get("stop_replacement_attempts", 0)) + 1
@@ -557,13 +572,14 @@ class PositionManagementEngine:
             "at": datetime.now(UTC).isoformat(),
         }
         position.metadata_json = metadata
+        data = {**payload, "attempts": attempts, "reason": reason, "safety_critical": safety_critical}
         db.add(
             DecisionLog(
                 event_type="live_stop_update_submit_failed",
                 market_id=position.market_id,
                 position_id=position.id,
                 message="Live stop update failed; old stop left unchanged",
-                data={**payload, "attempts": attempts, "reason": reason},
+                data=data,
             )
         )
         if attempts >= self._STUCK_STOP_ALERT_THRESHOLD:
@@ -576,7 +592,7 @@ class PositionManagementEngine:
                         f"Stop replacement stuck after {attempts} attempts "
                         f"({reason}); manual intervention needed"
                     ),
-                    data={**payload, "attempts": attempts, "reason": reason},
+                    data=data,
                 )
             )
 
@@ -590,6 +606,7 @@ class PositionManagementEngine:
     ) -> bool:
         if not self._live_updates_allowed(db) or position.mode != OrderMode.LIVE.value:
             return False
+        safety_critical = self._is_safety_critical_stop(position, candidate)
         old_order = self._active_stop_order(db, position)
         live_settings = effective_live_execution_settings(db, self.settings)
         close_is_buy = position.side.lower() == "short"
@@ -615,11 +632,15 @@ class PositionManagementEngine:
                     if guard.liquidation_price is not None
                     else None,
                 },
+                safety_critical=safety_critical,
             )
             return False
         order_size = _round_size(position.size, sz_decimals)
         expires = int(live_settings["order_expires_after_seconds"])
-        _RETRY_DELAYS = (0.5, 1.5)  # secondi tra tentativo 1→2 e 2→3
+        # Backoff piu' lungo (1s→3s→6s, 4 tentativi) per superare una raffica di
+        # 429 di Hyperliquid: i ~2s precedenti (0.5/1.5) rientravano nella stessa
+        # finestra di rate-limit e fallivano tutti.
+        _RETRY_DELAYS = (1.0, 3.0, 6.0)
         last_exc: Exception | None = None
         last_response: dict | None = None
         result = None
@@ -661,6 +682,7 @@ class PositionManagementEngine:
                     position,
                     reason="submit_exception",
                     payload={"error": str(last_exc), "candidate_stop": str(candidate.price), "attempts": len(_RETRY_DELAYS) + 1},
+                    safety_critical=safety_critical,
                 )
             else:
                 self._record_stop_update_failure(
@@ -668,6 +690,7 @@ class PositionManagementEngine:
                     position,
                     reason="submit_rejected",
                     payload={"response": last_response, "candidate_stop": str(candidate.price), "attempts": len(_RETRY_DELAYS) + 1},
+                    safety_critical=safety_critical,
                 )
             return False
         # Successo: azzeriamo il contatore degli attempt falliti
@@ -776,7 +799,10 @@ class PositionManagementEngine:
 
         trading = trading_client or HyperliquidTradingClient(self.settings)
         remote_positions = _remote_position_map(
-            trading.user_state(self.settings.hyperliquid_account_address)
+            trading.user_state(
+                self.settings.hyperliquid_account_address,
+                max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS,
+            )
         )
         checked = 0
         failed = 0

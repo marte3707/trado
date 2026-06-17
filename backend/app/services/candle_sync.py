@@ -6,6 +6,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.enums import MarketType
 from app.db.models import Candle, Market
 from app.services.hyperliquid import HyperliquidClient, parse_hl_candle
 
@@ -32,6 +33,8 @@ DEFAULT_CANDLE_LOOKBACK = 300
 # e un circuit breaker condiviso, ma evitiamo comunque di saturare l'endpoint info
 # di Hyperliquid con centinaia di richieste simultanee.
 DEFAULT_PREFETCH_CONCURRENCY = 4
+DEFAULT_CANDLE_PREFETCH_BUDGET = 120
+DEFAULT_CANDLE_RETRY_ATTEMPTS = 2
 
 
 def _compute_start_ms(
@@ -57,6 +60,7 @@ class CandleSyncService:
         timeframe: str,
         lookback: int = DEFAULT_CANDLE_LOOKBACK,
         open_interest: float | None = None,
+        attempts: int = DEFAULT_CANDLE_RETRY_ATTEMPTS,
     ) -> int:
         """Sync sincrono di una singola coppia: query latest_open → fetch HTTP →
         persist. Mantenuto per i percorsi che sincronizzano una coppia per volta
@@ -78,6 +82,7 @@ class CandleSyncService:
             interval=timeframe,
             start_ms=start_ms,
             end_ms=end_ms,
+            attempts=attempts,
         )
         return self.persist_candles(db, market, timeframe, rows, open_interest=open_interest)
 
@@ -155,11 +160,20 @@ class CandleSyncService:
         pairs: list[tuple[Market, str]],
         lookback: int = DEFAULT_CANDLE_LOOKBACK,
         concurrency: int = DEFAULT_PREFETCH_CONCURRENCY,
+        budget: int | None = None,
+        attempts: int = DEFAULT_CANDLE_RETRY_ATTEMPTS,
     ) -> dict[tuple[int, str], list[dict] | Exception]:
         """Esegue in parallelo (con concorrenza limitata) i fetch HTTP delle candele
         per molte coppie (market, timeframe). Non scrive su DB: ritorna i rows grezzi
         (o l'eccezione catturata) per coppia, lasciando la persistenza serializzata al
         chiamante. La query per le ultime open_time è batchata in un'unica SELECT."""
+        pairs = [
+            (market, timeframe)
+            for market, timeframe in pairs
+            if market.market_type == MarketType.PERP.value
+        ]
+        if budget is not None:
+            pairs = pairs[: max(0, budget)]
         if not pairs:
             return {}
         end_ms = int(datetime.now(UTC).timestamp() * 1000)
@@ -183,6 +197,7 @@ class CandleSyncService:
                         interval=timeframe,
                         start_ms=start_ms,
                         end_ms=end_ms,
+                        attempts=attempts,
                     )
                     return key, rows
                 except Exception as exc:  # noqa: BLE001 — propagata al chiamante per coppia

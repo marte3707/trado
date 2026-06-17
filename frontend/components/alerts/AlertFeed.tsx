@@ -47,7 +47,7 @@ type ModeFilter = "all" | AlertMode;
 export function AlertFeed({ logs, selectedId, onSelect }: Props) {
   const [search, setSearch] = useState("");
   const [levelFilter, setLevelFilter] = useState<LevelFilter>("all");
-  const [modeFilter, setModeFilter] = useState<ModeFilter>("all");
+  const [modeFilter, setModeFilter] = useState<ModeFilter>("live");
 
   const alerts = useMemo(() => logs.map(logToAlert), [logs]);
 

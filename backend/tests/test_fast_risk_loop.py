@@ -165,13 +165,122 @@ async def test_fast_risk_failure_rolls_back_and_logs(monkeypatch) -> None:
         manager,
     )
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    state = worker._FastRiskState()
 
-    result = await worker.run_fast_risk_once(executor, worker._FastRiskState(), now=100)
+    result = await worker.run_fast_risk_once(executor, state, now=100)
+    retry = await worker.run_fast_risk_once(executor, state, now=110)
 
     assert result["status"] == "failed"
-    assert result["type"] == "RuntimeError"
+    assert "liquidation guard exploded" in result["errors"]["liquidation_guard"]
+    assert "liquidation_guard" not in result["actions"]
+    assert retry["status"] == "ok"
+    assert "liquidation_guard" not in retry["actions"]
+    assert manager.audit_calls == 1
+    assert state.last_liquidation_at == 100
     assert db.rolled_back == 1
     assert any(
         isinstance(row, DecisionLog) and row.event_type == "fast_risk_cycle_failed"
         for row in db.added
     )
+
+
+def _find_recorded_cycle(db: "FastRiskDb", cycle_id: str) -> dict | None:
+    for row in db.added:
+        if isinstance(row, AppSetting) and row.key == worker.SYSTEM_CYCLE_STATUS_SETTING_KEY:
+            cycles = row.value.get("cycles", {}) if isinstance(row.value, dict) else {}
+            if cycle_id in cycles:
+                return cycles[cycle_id]
+    return None
+
+
+@pytest.mark.asyncio
+async def test_fast_risk_records_guard_subcycles(monkeypatch) -> None:
+    db = FastRiskDb(mode=OperationMode.AUTO_TRADE, live_enabled=True)
+    manager = FakePositionManager()
+    executor = FakeExecutor(
+        Settings(
+            fast_risk_liquidation_interval_seconds=600,
+            fast_risk_reconcile_interval_seconds=15,
+            fast_risk_uar_interval_seconds=120,
+        ),
+        manager,
+    )
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "reconcile_live_positions", lambda _db: 0)
+    monkeypatch.setattr(
+        worker,
+        "audit_unified_account_ratio_guard",
+        lambda _db, _executor: {"status": "ok", "unified_account_ratio_pct": "0"},
+    )
+
+    result = await worker.run_fast_risk_once(executor, worker._FastRiskState(), now=1000)
+
+    assert result["status"] == "ok"
+    liquidation = _find_recorded_cycle(db, "live_liquidation_guard_cycle")
+    uar = _find_recorded_cycle(db, "unified_account_ratio_guard_cycle")
+    assert liquidation is not None
+    assert liquidation["status"] == "ok"
+    assert liquidation["expected_interval_seconds"] == 600
+    assert uar is not None
+    assert uar["status"] == "ok"
+    assert uar["expected_interval_seconds"] == 120
+
+
+@pytest.mark.asyncio
+async def test_fast_risk_transient_failure_does_not_record_guard_subcycle(monkeypatch) -> None:
+    db = FastRiskDb(mode=OperationMode.AUTO_TRADE, live_enabled=True)
+    manager = FakePositionManager(fail=True)
+    executor = FakeExecutor(
+        Settings(
+            fast_risk_liquidation_interval_seconds=600,
+            fast_risk_reconcile_interval_seconds=999,
+            fast_risk_uar_interval_seconds=999,
+        ),
+        manager,
+    )
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "reconcile_live_positions", lambda _db: 0)
+    monkeypatch.setattr(worker, "audit_unified_account_ratio_guard", lambda _db, _executor: {})
+
+    result = await worker.run_fast_risk_once(executor, worker._FastRiskState(), now=1000)
+
+    # Un 429/circuit-breaker transitorio resta aggregato in fast_risk_cycle e non
+    # deve scrivere uno stato 'failed' sul sotto-ciclo del singolo guard.
+    assert result["status"] == "failed"
+    assert _find_recorded_cycle(db, "live_liquidation_guard_cycle") is None
+
+
+@pytest.mark.asyncio
+async def test_fast_risk_one_action_failure_does_not_block_others(monkeypatch) -> None:
+    db = FastRiskDb(mode=OperationMode.AUTO_TRADE, live_enabled=True)
+    manager = FakePositionManager(fail=True)
+    executor = FakeExecutor(
+        Settings(
+            fast_risk_liquidation_interval_seconds=60,
+            fast_risk_reconcile_interval_seconds=15,
+            fast_risk_uar_interval_seconds=30,
+        ),
+        manager,
+    )
+    calls: dict[str, int] = {"reconcile": 0, "uar": 0}
+
+    def reconcile(_db):
+        calls["reconcile"] += 1
+        return 2
+
+    def uar(_db, _executor):
+        calls["uar"] += 1
+        return {"status": "ok"}
+
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "reconcile_live_positions", reconcile)
+    monkeypatch.setattr(worker, "audit_unified_account_ratio_guard", uar)
+
+    result = await worker.run_fast_risk_once(executor, worker._FastRiskState(), now=100)
+
+    assert result["status"] == "failed"
+    assert list(result["errors"].keys()) == ["liquidation_guard"]
+    assert result["actions"]["live_reconciled"] == 2
+    assert result["actions"]["unified_account_ratio"] == {"status": "ok"}
+    assert calls == {"reconcile": 1, "uar": 1}
+    assert db.rolled_back == 1

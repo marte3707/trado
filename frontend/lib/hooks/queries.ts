@@ -362,7 +362,8 @@ export function useAccountMonitor(opts?: QueryOpts<AccountMonitor>) {
   return useQuery({
     queryKey: qk.accountMonitor,
     queryFn: () => apiGet<AccountMonitor>("/api/account/snapshot"),
-    refetchInterval: 5_000,
+    refetchInterval: 30_000,
+    staleTime: 20_000,
     retry: 1,
     ...opts,
   });

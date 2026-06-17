@@ -101,21 +101,21 @@ class FakeTrading:
         self.resubmitted: list[dict[str, Any]] = []
         self.canceled: list[dict[str, Any]] = []
 
-    def user_state(self, _address: str) -> dict[str, Any]:
+    def user_state(self, _address: str, *, max_age_seconds: float | None = None) -> dict[str, Any]:
         return {"assetPositions": [{"position": p} for p in self._remote]}
 
-    def user_fills(self, _address: str) -> list[dict[str, Any]]:
+    def user_fills(self, _address: str, *, max_age_seconds: float | None = None) -> list[dict[str, Any]]:
         return list(self._fills)
 
-    def open_orders(self, _address: str) -> list[dict[str, Any]]:
+    def open_orders(self, _address: str, *, max_age_seconds: float | None = None) -> list[dict[str, Any]]:
         if self._open_order_oids is None:
             raise AttributeError("open_orders not configured")
         return [{"oid": oid} for oid in self._open_order_oids]
 
-    def frontend_open_orders(self, _address: str) -> list[dict[str, Any]]:
+    def frontend_open_orders(self, _address: str, *, max_age_seconds: float | None = None) -> list[dict[str, Any]]:
         return list(self._frontend_open_orders)
 
-    def all_mids(self) -> dict[str, str]:
+    def all_mids(self, *, max_age_seconds: float | None = None) -> dict[str, str]:
         return getattr(self, "_all_mids", {}) or {}
 
     def submit_trigger_order(

@@ -244,6 +244,67 @@ async def _notify_live_position_closes(
             )
 
 
+async def _notify_stop_update_failures(
+    db: Session,
+    notifier: TelegramNotifier,
+    since: datetime,
+) -> None:
+    """Alert immediato (admin) sui fallimenti di aggiornamento stop live: subito
+    per le mosse safety-critical (breakeven/profitto) e per gli stop 'stuck'
+    (>=3 tentativi). I trailing di routine restano fuori per non fare rumore."""
+    events = (
+        db.query(DecisionLog)
+        .filter(
+            DecisionLog.event_type.in_(
+                ["live_stop_update_submit_failed", "live_stop_update_stuck"]
+            ),
+            DecisionLog.timestamp >= since,
+            DecisionLog.position_id.isnot(None),
+        )
+        .order_by(DecisionLog.timestamp)
+        .all()
+    )
+    if not events:
+        return
+    stuck_positions: set[int] = {
+        e.position_id
+        for e in events
+        if e.event_type == "live_stop_update_stuck" and e.position_id is not None
+    }
+    notified: set[int] = set()
+    for event in events:
+        position_id = event.position_id
+        if position_id is None or position_id in notified:
+            continue
+        data = event.data or {}
+        is_stuck = event.event_type == "live_stop_update_stuck"
+        # Submit-failed non-stuck: notifica solo se safety-critical e non gia'
+        # coperto dall'evento 'stuck' della stessa posizione in questo tick.
+        if not is_stuck and (not data.get("safety_critical") or position_id in stuck_positions):
+            continue
+        position = db.get(Position, position_id)
+        if position is None or position.market is None:
+            continue
+        raw_detail = data.get("error") or data.get("response")
+        error_detail = None if raw_detail is None else str(raw_detail)
+        try:
+            await notifier.send_stop_update_failure(
+                symbol=position.market.symbol,
+                side=position.side,
+                reason=str(data.get("reason") or "—"),
+                candidate_stop=data.get("candidate_stop"),
+                attempts=int(data.get("attempts") or 1),
+                error=error_detail,
+                stuck=is_stuck,
+            )
+            notified.add(position_id)
+        except Exception:
+            logger.warning(
+                "telegram_stop_update_failure_notify_failed",
+                position_id=position_id,
+            )
+
+
 async def _notify_btc_macro_reversals(
     db: Session,
     notifier: TelegramNotifier,

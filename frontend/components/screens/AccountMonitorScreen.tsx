@@ -24,9 +24,11 @@ import {
   AccountSpotBalance,
   ApiError,
   Health,
+  Order,
+  Position,
   apiPost,
 } from "@/lib/api";
-import { useAccountMonitor } from "@/lib/hooks/queries";
+import { useAccountMonitor, usePositionHistory } from "@/lib/hooks/queries";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -146,6 +148,28 @@ function fmtTime(ms: number | null | undefined): string {
     month: "2-digit",
   }).format(new Date(ms));
 }
+
+function fmtDateTime(value: string | null | undefined): string {
+  if (!value) return "-";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "-";
+  return new Intl.DateTimeFormat("it-IT", {
+    dateStyle: "short",
+    timeStyle: "short",
+  }).format(parsed);
+}
+
+const EXIT_ORDER_TYPES = new Set([
+  "tp1",
+  "tp2",
+  "tp3",
+  "take_profit",
+  "stop_loss",
+  "manual",
+  "time_stop",
+  "btc_macro_protection_loss_exit",
+  "liquidation_guard_failed",
+]);
 
 function accountSnapshotErrorMessage(error: Error | null, hasStaleData: boolean): string {
   const prefix = hasStaleData
@@ -358,6 +382,16 @@ function statusToDot(status: string): DotStatus {
 
 export function AccountMonitorScreen({ health }: { health: Health }) {
   const { data: snapshot, error: snapshotError, isError: hasSnapshotError, isFetching, refetch } = useAccountMonitor();
+  const {
+    data: liveHistory,
+    isLoading: isLiveHistoryLoading,
+    isError: hasLiveHistoryError,
+  } = usePositionHistory({
+    period: "all",
+    mode: "live",
+    market_type: "perp",
+    limit: 50,
+  });
   const [ws, setWs] = useState<WsState>(WS_INITIAL);
   const [midPrices, setMidPrices] = useState<Record<string, number>>({});
   const [action, setAction] = useState<ActionState>(ACTION_INITIAL);
@@ -517,6 +551,26 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
     }
     return hasData ? total : null;
   }, [snapshot?.positions, fundingByCoin]);
+
+  const recentClosedLivePositions = useMemo(() => {
+    return (liveHistory?.positions ?? [])
+      .filter((position) => position.status === "closed" && position.closed_at)
+      .sort((a, b) => new Date(b.closed_at ?? 0).getTime() - new Date(a.closed_at ?? 0).getTime())
+      .slice(0, 10);
+  }, [liveHistory?.positions]);
+  const liveExitOrdersByPosition = useMemo(() => {
+    const map = new Map<number, Order[]>();
+    for (const order of liveHistory?.orders ?? []) {
+      if (order.position_id == null || order.status !== "filled" || !EXIT_ORDER_TYPES.has(order.order_type)) continue;
+      const existing = map.get(order.position_id) ?? [];
+      existing.push(order);
+      map.set(order.position_id, existing);
+    }
+    for (const orders of map.values()) {
+      orders.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    }
+    return map;
+  }, [liveHistory?.orders]);
 
   const isInitialLoading = snapshot === undefined && !hasSnapshotError;
   const hasDataError = hasSnapshotError;
@@ -704,6 +758,13 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
               }}
             />
           </div>
+
+          <RecentClosedLivePositionsTable
+            rows={recentClosedLivePositions}
+            exitOrdersByPosition={liveExitOrdersByPosition}
+            loading={isLiveHistoryLoading}
+            error={hasLiveHistoryError}
+          />
 
           {/* Debug collapsible */}
           <div>
@@ -988,6 +1049,109 @@ function SideBadge({ side }: { side: string | null | undefined }) {
   if (normalized === "long") return <span className="dir mono long">↑ LONG</span>;
   if (normalized === "short") return <span className="dir mono short">↓ SHORT</span>;
   return <span className="badge muted">-</span>;
+}
+
+function RecentClosedLivePositionsTable({
+  rows,
+  exitOrdersByPosition,
+  loading,
+  error,
+}: {
+  rows: Position[];
+  exitOrdersByPosition: Map<number, Order[]>;
+  loading: boolean;
+  error: boolean;
+}) {
+  return (
+    <Card className="overflow-hidden">
+      <div className="flex items-center justify-between border-b border-border px-6 py-4">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+          Ultime posizioni live chiuse
+        </span>
+        <span className="badge muted">{rows.length}/10</span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="tbl" style={{ minWidth: 920 }}>
+          <thead>
+            <tr>
+              <th>Chiusa</th>
+              <th>Coin</th>
+              <th>Dir</th>
+              <th style={{ textAlign: "right" }}>Size</th>
+              <th style={{ textAlign: "right" }}>Entry</th>
+              <th style={{ textAlign: "right" }}>Exit</th>
+              <th style={{ textAlign: "right" }}>Return</th>
+              <th style={{ textAlign: "right" }}>PnL</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && (
+              <tr>
+                <td colSpan={8} style={{ textAlign: "center", padding: "24px 0", color: "var(--fg-3)" }}>
+                  Caricamento storico live…
+                </td>
+              </tr>
+            )}
+            {!loading && error && (
+              <tr>
+                <td colSpan={8} style={{ textAlign: "center", padding: "24px 0", color: "var(--danger)" }}>
+                  Storico live non disponibile
+                </td>
+              </tr>
+            )}
+            {!loading && !error && rows.length === 0 && (
+              <tr>
+                <td colSpan={8} style={{ textAlign: "center", padding: "24px 0", color: "var(--fg-3)" }}>
+                  Nessuna posizione live chiusa disponibile
+                </td>
+              </tr>
+            )}
+            {!loading && !error && rows.map((row) => {
+              const pnl = asNumber(row.realized_pnl);
+              const realizedReturn = asNumber(row.realized_return_pct);
+              const metadataPrice = row.metadata_json?.exit_price ?? row.metadata_json?.last_exit_price;
+              const exitOrderPrice = exitOrdersByPosition.get(row.id)?.at(-1)?.price ?? null;
+              const exitPrice = asNumber(
+                (typeof metadataPrice === "string" || typeof metadataPrice === "number")
+                  ? metadataPrice
+                  : exitOrderPrice,
+              );
+              return (
+                <tr key={row.id}>
+                  <td className="mono" style={{ whiteSpace: "nowrap" }}>{fmtDateTime(row.closed_at)}</td>
+                  <td className="fg">
+                    <strong>{row.market?.symbol ?? "—"}</strong>
+                  </td>
+                  <td><SideBadge side={row.side} /></td>
+                  <td className="mono" style={{ textAlign: "right" }}>{fmtNum(row.initial_size ?? row.size)}</td>
+                  <td className="mono" style={{ textAlign: "right" }}>{fmt.price(row.entry_price)}</td>
+                  <td className="mono" style={{ textAlign: "right" }}>{exitPrice != null ? fmt.price(exitPrice) : "—"}</td>
+                  <td
+                    className="mono"
+                    style={{
+                      textAlign: "right",
+                      color: realizedReturn != null ? (realizedReturn >= 0 ? "var(--long)" : "var(--short)") : undefined,
+                    }}
+                  >
+                    {realizedReturn != null ? fmtPct(realizedReturn) : "—"}
+                  </td>
+                  <td
+                    className="mono"
+                    style={{
+                      textAlign: "right",
+                      color: pnl != null ? (pnl >= 0 ? "var(--long)" : "var(--short)") : undefined,
+                    }}
+                  >
+                    {pnl != null ? fmtUsdPrecise(pnl) : "—"}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </Card>
+  );
 }
 
 // ── UnifiedPositionsTable ─────────────────────────────────────────────────────

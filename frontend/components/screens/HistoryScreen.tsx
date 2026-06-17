@@ -277,7 +277,7 @@ function positionSearchText(position: Position, exitOrders: Order[]): string {
 
 /* ─────────────────────────────────────────────────────────────────────────── */
 export function HistoryScreen({ fallbackPositions = EMPTY_POSITIONS, fallbackOrders = EMPTY_ORDERS }: Props) {
-  const [modeFilter, setModeFilter] = useState<ModeFilter>("all");
+  const [modeFilter, setModeFilter] = useState<ModeFilter>("live");
   const [marketTypeFilter, setMarketTypeFilter] = useState<"all" | "perp" | "spot">("all");
   const [periodFilter, setPeriodFilter] = useState("7d");
   const [historyQuery, setHistoryQuery] = useState("");

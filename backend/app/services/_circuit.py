@@ -77,10 +77,31 @@ class CircuitBreaker:
             self._opened_at = 0.0
 
 
-# Single shared breaker for all Hyperliquid info endpoint calls. Worker and API
-# share the same process, so a single instance is enough.
-hyperliquid_info_breaker = CircuitBreaker(
-    name="hyperliquid_info",
+# Breakers are intentionally split by dependency class. Market-data endpoints
+# can hit rate limits during broad candle/L2 prefetches and must not block
+# account/live paths used by live preflight, reconciliation, or UAR.
+hyperliquid_market_data_breaker = CircuitBreaker(
+    name="hyperliquid_market_data",
     failure_threshold=5,
     reset_after_seconds=30.0,
 )
+
+hyperliquid_account_breaker = CircuitBreaker(
+    name="hyperliquid_account",
+    failure_threshold=5,
+    reset_after_seconds=30.0,
+)
+
+# Order submission (trigger/stop, market close, cancel) gets its own breaker so a
+# 429 storm on the read/account path cannot block a safety-critical stop move,
+# and order-side failures do not trip the read breaker. Kept slightly more
+# tolerant since order rejects are rarer and each retry is throttle-only (429).
+hyperliquid_order_breaker = CircuitBreaker(
+    name="hyperliquid_order",
+    failure_threshold=8,
+    reset_after_seconds=20.0,
+)
+
+# Backward-compatible alias for tests and older imports. New code should choose
+# the account or market-data breaker explicitly.
+hyperliquid_info_breaker = hyperliquid_market_data_breaker

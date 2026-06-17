@@ -139,7 +139,7 @@ class FakeTrading:
         self.canceled.append({"coin": coin, "oid": oid, "expires_after_seconds": expires_after_seconds})
         return {"status": "ok"}
 
-    def user_state(self, _address: str | None = None) -> dict[str, Any]:
+    def user_state(self, _address: str | None = None, *, max_age_seconds: float | None = None) -> dict[str, Any]:
         return {"assetPositions": [{"position": row} for row in self.user_state_positions]}
 
 
@@ -585,7 +585,7 @@ class _RetryTrading:
         self.canceled.append({"coin": coin, "oid": oid})
         return {"status": "ok"}
 
-    def user_state(self, _address=None):
+    def user_state(self, _address=None, *, max_age_seconds=None):
         return {"assetPositions": []}
 
 
@@ -660,12 +660,13 @@ def test_retry_all_attempts_fail_records_failure_once(monkeypatch) -> None:
     result = engine.replace_live_stop_order(db, _market(), position, candidate, trading)
 
     assert result is False
-    assert trading.call_count == 3  # 3 tentativi totali
+    assert trading.call_count == 4  # 4 tentativi totali (backoff 1s/3s/6s)
     failure_logs = [
         r for r in db.added
         if isinstance(r, DecisionLog) and r.event_type == "live_stop_update_submit_failed"
     ]
-    assert len(failure_logs) == 1  # un solo log, non tre
+    assert len(failure_logs) == 1  # un solo log, non quattro
+    assert failure_logs[0].data.get("safety_critical") is True  # candidate reason="breakeven"
 
 
 def test_retry_on_exception_succeeds_on_third_attempt(monkeypatch) -> None:

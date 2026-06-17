@@ -9,7 +9,11 @@ from app.core.config import Settings
 from app.db.models import AppSetting, DecisionLog, Market, Order, Position, Signal
 from app.engine.execution import OrderExecutionEngine, _target_leverage
 from app.engine.order_validation import ValidationResult
-from app.services.hyperliquid import HyperliquidError, HyperliquidOrderResult
+from app.services.hyperliquid import (
+    HyperliquidError,
+    HyperliquidOrderResult,
+    HyperliquidTransientError,
+)
 
 
 @dataclass
@@ -125,6 +129,7 @@ class FakeTradingClient:
         pre_existing_positions: list[dict[str, Any]] | None = None,
         fillable_notional: Decimal = Decimal("1000000"),
         depth_error: Exception | None = None,
+        account_summary_error: Exception | None = None,
     ) -> None:
         self._account_value = account_value
         self.market_status = market_status
@@ -139,11 +144,14 @@ class FakeTradingClient:
         self.leverage_calls: list[dict[str, Any]] = []
         self.fillable_notional = fillable_notional
         self.depth_error = depth_error
+        self.account_summary_error = account_summary_error
 
     def account_value(self) -> Decimal:
         return self._account_value
 
     def account_summary(self) -> tuple[Decimal, Decimal]:
+        if self.account_summary_error is not None:
+            raise self.account_summary_error
         return self._account_value, self._account_value
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> None:
@@ -395,6 +403,37 @@ def test_execute_live_raises_when_market_order_rejected(monkeypatch: pytest.Monk
     assert trading.trigger_orders == []
 
 
+def test_execute_live_logs_preflight_account_summary_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient(
+        account_summary_error=RuntimeError("Hyperliquid info circuit breaker is open")
+    )
+
+    with pytest.raises(RuntimeError, match="circuit breaker"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.market_orders == []
+    assert trading.leverage_calls == []
+    assert db.added_of(Position) == []
+    logs = db.added_of(DecisionLog)
+    assert len(logs) == 1
+    log = logs[0]
+    assert log.event_type == "live_order_preflight_failed"
+    assert log.signal_id == signal.id
+    assert log.market_id == signal.market_id
+    assert log.data == {
+        "stage": "account_summary",
+        "error_type": "RuntimeError",
+        "status_code": None,
+        "error": "Hyperliquid info circuit breaker is open",
+    }
+
+
 def test_execute_live_records_partial_failure_when_trigger_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     _force_validator_ok(monkeypatch)
     settings = _build_settings()
@@ -409,6 +448,31 @@ def test_execute_live_records_partial_failure_when_trigger_fails(monkeypatch: py
     assert any("stop_loss" in e for e in position.metadata_json["protection_order_errors"])
     events = [row.event_type for row in db.added_of(DecisionLog)]
     assert "live_protection_orders_partial_failure" in events
+
+
+def test_execute_live_does_not_submit_after_transient_set_leverage_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(signal=signal, market=_build_market())
+
+    class RateLimitedLeverageClient(FakeTradingClient):
+        def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> None:
+            self.leverage_calls.append({"coin": coin, "leverage": leverage, "is_cross": is_cross})
+            raise HyperliquidTransientError("Hyperliquid order request failed after retries: 429")
+
+    trading = RateLimitedLeverageClient()
+
+    with pytest.raises(HyperliquidTransientError):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert len(trading.leverage_calls) == 1
+    assert trading.market_orders == []
+    logs = [row for row in db.added_of(DecisionLog) if row.event_type == "live_set_leverage_failed"]
+    assert len(logs) == 1
+    assert logs[0].data["retry_fallback"] is False
 
 
 def test_execute_live_adjusts_sl_when_stop_is_beyond_liquidation(monkeypatch: pytest.MonkeyPatch) -> None:

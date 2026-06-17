@@ -17,7 +17,7 @@ from app.db.models import Candle, DecisionLog, Market, Order, Position, Signal
 from app.engine.execution import make_cloid
 from app.engine.position_management import PositionManagementEngine, StopCandidate
 from app.indicators.core import atr
-from app.services.hyperliquid import HyperliquidTradingClient
+from app.services.hyperliquid import DEFAULT_GUARD_STATE_CACHE_SECONDS, HyperliquidTradingClient
 
 logger = structlog.get_logger()
 
@@ -1982,13 +1982,17 @@ def reconcile_live_positions(
     if not settings.hyperliquid_account_address:
         return 0
     trading = trading_client or HyperliquidTradingClient(settings)
-    remote_positions = _position_map(trading.user_state(settings.hyperliquid_account_address))
+    remote_positions = _position_map(
+        trading.user_state(
+            settings.hyperliquid_account_address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS
+        )
+    )
     # HL non sempre include markPx nei payload di user_state. Quando manca usiamo
     # allMids come fallback: serve per il TP rescue (check "mark > target") che
     # altrimenti non scatterebbe mai e per `last_mark_price` nel metadata.
     if any(not item.get("markPx") for item in remote_positions.values()):
         try:
-            mids = trading.all_mids()
+            mids = trading.all_mids(max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS)
         except Exception as exc:
             logger.warning("live_reconciliation_all_mids_failed", error=str(exc))
             mids = {}
@@ -1996,7 +2000,9 @@ def reconcile_live_positions(
             if not item.get("markPx") and coin_key in mids:
                 item["markPx"] = mids[coin_key]
     try:
-        raw_fills = trading.user_fills(settings.hyperliquid_account_address)
+        raw_fills = trading.user_fills(
+            settings.hyperliquid_account_address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS
+        )
     except Exception as exc:
         # Fills are an enrichment — never fail the whole reconciliation if HL
         # returns an error on the userFills endpoint.
@@ -2007,14 +2013,18 @@ def reconcile_live_positions(
 
     open_orders_available = True
     try:
-        raw_open_orders = trading.open_orders(settings.hyperliquid_account_address)
+        raw_open_orders = trading.open_orders(
+            settings.hyperliquid_account_address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS
+        )
     except Exception as exc:
         logger.warning("live_reconciliation_open_orders_failed", error=str(exc))
         raw_open_orders = []
         open_orders_available = False
     hl_open_oids, hl_open_cloids = _index_open_orders(raw_open_orders)
     try:
-        raw_frontend_open_orders = trading.frontend_open_orders(settings.hyperliquid_account_address)
+        raw_frontend_open_orders = trading.frontend_open_orders(
+            settings.hyperliquid_account_address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS
+        )
     except Exception as exc:
         logger.warning("live_reconciliation_frontend_open_orders_failed", error=str(exc))
         raw_frontend_open_orders = []

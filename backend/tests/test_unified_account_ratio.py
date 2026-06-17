@@ -98,6 +98,8 @@ class SnapshotQuery:
 
 
 def test_account_snapshot_exposes_unified_account_ratio_fields(monkeypatch) -> None:
+    account_router._ACCOUNT_SNAPSHOT_CACHE.clear()
+
     async def market_meta(_client):
         return {"universe": [{}]}, {"BTC": "100"}, None
 
@@ -131,6 +133,47 @@ def test_account_snapshot_exposes_unified_account_ratio_fields(monkeypatch) -> N
     assert account["unified_account_ratio_threshold_pct"] == "95.000000"
     assert account["unified_account_ratio_numerator"] == "950.000000"
     assert account["unified_account_ratio_denominator"] == "1000.000000"
+
+
+def test_account_snapshot_uses_short_lived_cache(monkeypatch) -> None:
+    account_router._ACCOUNT_SNAPSHOT_CACHE.clear()
+    calls = {"account_state": 0}
+
+    async def market_meta(_client):
+        return {"universe": [{}]}, {"BTC": "100"}, None
+
+    async def account_state(_client, _address, _checked_at):
+        calls["account_state"] += 1
+        return (
+            _state("5"),
+            {"balances": [{"coin": "USDC", "total": "0", "hold": "0"}]},
+            [],
+            [],
+            None,
+        )
+
+    async def predicted(_client):
+        return [], None
+
+    monkeypatch.setattr(account_router, "get_settings", lambda: Settings(hyperliquid_account_address="0xabc"))
+    monkeypatch.setattr(account_router, "_fetch_market_meta", market_meta)
+    monkeypatch.setattr(account_router, "_fetch_account_state", account_state)
+    monkeypatch.setattr(account_router, "_fetch_predicted_fundings", predicted)
+
+    db = SnapshotDb()
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[get_db] = lambda: db
+    client = TestClient(app)
+
+    first = client.get("/api/account/snapshot")
+    second = client.get("/api/account/snapshot")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls["account_state"] == 1
+    assert db.committed == 1
+    account_router._ACCOUNT_SNAPSHOT_CACHE.clear()
 
 
 class GuardQuery:
@@ -196,13 +239,13 @@ class FakeTrading:
         self.closed: list[dict] = []
         self.cancelled: list[tuple[str, int]] = []
 
-    def user_state(self, _address=None):
+    def user_state(self, _address=None, *, max_age_seconds=None):
         return self.state
 
-    def spot_user_state(self, _address=None):
+    def spot_user_state(self, _address=None, *, max_age_seconds=None):
         return {"balances": []}
 
-    def frontend_open_orders(self, _address=None):
+    def frontend_open_orders(self, _address=None, *, max_age_seconds=None):
         return [{"coin": "ETH", "oid": 123}, {"coin": "BTC", "oid": 456}]
 
     def cancel_order(self, coin, oid, expires_after_seconds):

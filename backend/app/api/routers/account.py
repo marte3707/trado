@@ -1,4 +1,5 @@
 """Account Hyperliquid: equity history, snapshot, ordini e protezioni."""
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from time import perf_counter
@@ -39,6 +40,13 @@ from app.services.unified_account_ratio import (
 _logger = structlog.get_logger()
 
 router = APIRouter()
+
+_ACCOUNT_SNAPSHOT_CACHE_TTL_SECONDS = 25.0
+_ACCOUNT_SNAPSHOT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _account_snapshot_cache_key(settings: Any) -> str:
+    return f"{settings.hyperliquid_network}:{settings.hyperliquid_account_address or 'none'}"
 
 
 def _uar_setting_decimal(risk: dict, key: str) -> Decimal:
@@ -327,6 +335,13 @@ async def account_equity_history(
 @router.get("/account/snapshot")
 async def account_snapshot(db: Session = Depends(get_db)) -> dict:
     settings = get_settings()
+    cache_key = _account_snapshot_cache_key(settings)
+    cached = _ACCOUNT_SNAPSHOT_CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, cached_payload = cached
+        if perf_counter() - cached_at <= _ACCOUNT_SNAPSHOT_CACHE_TTL_SECONDS:
+            return deepcopy(cached_payload)
+
     client = HyperliquidClient(settings)
     checked_at = datetime.now(UTC)
     started = perf_counter()
@@ -434,7 +449,7 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
         )
         db.commit()
 
-    return {
+    payload = {
         "status": "ok" if api_error is None and account_error is None else "degraded",
         "network": settings.hyperliquid_network,
         "checked_at": checked_at,
@@ -481,6 +496,9 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
         },
         "last_snapshot": _latest_account_snapshot(db),
     }
+    if api_error is None and account_error is None:
+        _ACCOUNT_SNAPSHOT_CACHE[cache_key] = (perf_counter(), deepcopy(payload))
+    return payload
 
 
 @router.post("/account/orders/{oid}/cancel")
@@ -754,5 +772,3 @@ def repair_position_protection(
         "updated_positions": updated,
         "protection": aggregated,
     }
-
-

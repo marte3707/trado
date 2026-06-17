@@ -12,6 +12,7 @@ from app.core.runtime_settings import (
 from app.db.models import AppSetting, DecisionLog, Position
 from app.engine.execution import OrderExecutionEngine
 from app.services.hyperliquid import (
+    DEFAULT_GUARD_STATE_CACHE_SECONDS,
     HyperliquidTradingClient,
 )
 from app.services.unified_account_ratio import (
@@ -169,8 +170,8 @@ def audit_unified_account_ratio_guard(
     max_positions = _uar_int_setting(risk, "unified_account_ratio_derisk_max_positions_per_cycle")
 
     trading = trading_client or HyperliquidTradingClient(settings)
-    user_state = trading.user_state(address)
-    spot_state = trading.spot_user_state(address)
+    user_state = trading.user_state(address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS)
+    spot_state = trading.spot_user_state(address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS)
     balances = spot_state.get("balances", []) if isinstance(spot_state, dict) else []
     free_spot_usdc = free_spot_usdc_from_balances(balances) if isinstance(balances, list) else Decimal("0")
     ratio = calculate_unified_account_ratio(

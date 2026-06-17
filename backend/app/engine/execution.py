@@ -20,7 +20,11 @@ from app.engine.order_validation import LiveOrderPlan, OrderValidator
 from app.engine.portfolio_guard import PortfolioGuard, PortfolioGuardDecision
 from app.engine.position_management import LiquidationGuardResult, PositionManagementEngine
 from app.engine.risk import calculate_position_size
-from app.services.hyperliquid import HyperliquidError, HyperliquidTradingClient
+from app.services.hyperliquid import (
+    HyperliquidError,
+    HyperliquidTradingClient,
+    HyperliquidTransientError,
+)
 
 logger = structlog.get_logger()
 
@@ -57,6 +61,22 @@ def _live_guard_block_reason(db: Session, settings: Settings) -> str | None:
     if kill_switch and kill_switch.value.get("enabled"):
         return "kill switch enabled"
     return None
+
+
+def _exception_status_code(exc: Exception) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None) if response is not None else None
+    return response_status if isinstance(response_status, int) else None
+
+
+def _safe_error_message(exc: Exception, max_length: int = 500) -> str:
+    message = str(exc)
+    if len(message) <= max_length:
+        return message
+    return f"{message[:max_length]}..."
 
 
 TIMEFRAME_MS = {
@@ -288,7 +308,11 @@ class OrderExecutionEngine:
         trading_client: HyperliquidTradingClient | None = None,
     ) -> Position:
         trading = trading_client or HyperliquidTradingClient(self.settings)
-        account_value, available_margin = trading.account_summary()
+        try:
+            account_value, available_margin = trading.account_summary()
+        except Exception as exc:
+            self._record_live_preflight_failure(db, signal, stage="account_summary", exc=exc)
+            raise
         plan = self._build_live_order_plan(db, signal, account_value, sizing_equity=available_margin)
         market = db.get(Market, signal.market_id)
         if market is None:
@@ -441,22 +465,30 @@ class OrderExecutionEngine:
             # Il fallback non deve mai AUMENTARE il leverage oltre quello inteso:
             # se safe_leverage < _FALLBACK_LEVERAGE usiamo il valore più conservativo.
             fallback_leverage = min(safe_leverage, _FALLBACK_LEVERAGE)
+            retry_fallback = fallback_leverage < safe_leverage and not isinstance(exc, HyperliquidTransientError)
             db.add(
                 DecisionLog(
                     event_type="live_set_leverage_failed",
                     market_id=signal.market_id,
                     signal_id=signal.id,
-                    message=f"set_leverage({safe_leverage}) failed, retrying with fallback {fallback_leverage}x",
+                    message=(
+                        f"set_leverage({safe_leverage}) failed, retrying with fallback {fallback_leverage}x"
+                        if retry_fallback
+                        else f"set_leverage({safe_leverage}) failed before live submit"
+                    ),
                     data={
                         "coin": coin,
                         "leverage": safe_leverage,
                         "fallback_leverage": fallback_leverage,
                         "is_cross": False,
+                        "retry_fallback": retry_fallback,
                         "error": str(exc),
                     },
                 )
             )
             db.commit()
+            if not retry_fallback:
+                raise
             trading.set_leverage(coin, fallback_leverage, is_cross=False)
             safe_leverage = fallback_leverage
 
@@ -575,6 +607,30 @@ class OrderExecutionEngine:
         )
         db.commit()
         return False
+
+    def _record_live_preflight_failure(
+        self,
+        db: Session,
+        signal: Signal,
+        *,
+        stage: str,
+        exc: Exception,
+    ) -> None:
+        db.add(
+            DecisionLog(
+                event_type="live_order_preflight_failed",
+                market_id=signal.market_id,
+                signal_id=signal.id,
+                message=f"Live order pre-flight failed before submit: {stage}",
+                data={
+                    "stage": stage,
+                    "error_type": type(exc).__name__,
+                    "status_code": _exception_status_code(exc),
+                    "error": _safe_error_message(exc),
+                },
+            )
+        )
+        db.commit()
 
     def _find_idempotent_position(
         self, db: Session, signal: Signal, market_cloid: str

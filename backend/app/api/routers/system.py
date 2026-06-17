@@ -359,6 +359,21 @@ def _service_cycle_diagnostic(
 
 
 def _system_cycle_configs(settings: Any) -> list[dict[str, Any]]:
+    # Con fast_risk attivo, liquidation guard e UAR sono guidati dal fast_risk
+    # loop (vedi worker/fast_risk.py) alle sue cadenze, non da quelle legacy del
+    # loop principale: l'intervalo atteso (e quindi la soglia di staleness) deve
+    # rispecchiare la cadenza reale, altrimenti la card va 'stale' a torto.
+    fast_risk_on = bool(getattr(settings, "fast_risk_loop_enabled", False))
+    live_liquidation_interval = (
+        int(settings.fast_risk_liquidation_interval_seconds)
+        if fast_risk_on
+        else LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS
+    )
+    uar_interval = (
+        int(settings.fast_risk_uar_interval_seconds)
+        if fast_risk_on
+        else UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS
+    )
     return [
         {
             "cycle_id": "fast_risk_cycle",
@@ -383,7 +398,7 @@ def _system_cycle_configs(settings: Any) -> list[dict[str, Any]]:
             "label": "Live Liquidation Guard Cycle",
             "success_events": ("live_liquidation_guard_cycle",),
             "failure_events": ("live_liquidation_guard_cycle_failed",),
-            "expected_interval_seconds": LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
+            "expected_interval_seconds": live_liquidation_interval,
             "failure_window_seconds": 86400,
             "failure_threshold": 2,
         },
@@ -392,7 +407,7 @@ def _system_cycle_configs(settings: Any) -> list[dict[str, Any]]:
             "label": "Unified Account Ratio Guard Cycle",
             "success_events": ("unified_account_ratio_guard_cycle",),
             "failure_events": ("unified_account_ratio_guard_cycle_failed",),
-            "expected_interval_seconds": UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
+            "expected_interval_seconds": uar_interval,
             "failure_window_seconds": 900,
             "failure_threshold": 3,
         },

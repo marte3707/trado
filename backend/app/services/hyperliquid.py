@@ -7,13 +7,93 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from importlib import import_module
+from threading import Lock
 from typing import Any
 
 import httpx
 
 from app.core.config import Settings
 from app.core.enums import MarketType
-from app.services._circuit import hyperliquid_info_breaker
+from app.services._circuit import (
+    CircuitBreaker,
+    hyperliquid_account_breaker,
+    hyperliquid_market_data_breaker,
+    hyperliquid_order_breaker,
+)
+
+# Status HTTP che indicano un problema transitorio lato Hyperliquid/CloudFront
+# (rate limit o sovraccarico) piuttosto che un errore di richiesta del client.
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# TTL di default per la cache opt-in di user_state/spot_user_state/ecc. Usata
+# solo dai guard periodici (fast_risk_cycle + worker_cycle) che leggono lo
+# stesso account a cadenze indipendenti ravvicinate — non dai path di
+# pre-trade/pre-close, che richiedono sempre il dato piu' fresco possibile.
+DEFAULT_GUARD_STATE_CACHE_SECONDS = 15.0
+
+_state_cache_lock = Lock()
+_state_cache: dict[tuple[str, str], tuple[float, Any]] = {}
+
+
+def _status_code_of(exc: Exception) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return status
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None) if response is not None else None
+    return response_status if isinstance(response_status, int) else None
+
+
+def _cached_or_fetch(cache_key: tuple[str, str], max_age_seconds: float | None, fetch: Any) -> Any:
+    if not max_age_seconds:
+        return fetch()
+    now = time.monotonic()
+    with _state_cache_lock:
+        cached = _state_cache.get(cache_key)
+        if cached is not None and now - cached[0] < max_age_seconds:
+            return cached[1]
+    result = fetch()
+    with _state_cache_lock:
+        _state_cache[cache_key] = (now, result)
+    return result
+
+
+def _call_trading_with_retry(
+    fn: Any,
+    *,
+    attempts: int = 4,
+    breaker: CircuitBreaker = hyperliquid_account_breaker,
+    retryable_status: set[int] | None = None,
+) -> Any:
+    """Retry+circuit breaker sincrono per le chiamate nude dell'SDK Hyperliquid
+    (user_state, spot_user_state, ecc.). Di default usa il breaker account/live;
+    i call site market-data devono passare esplicitamente il proprio breaker.
+
+    Il submit di ordini passa ``retryable_status={429}``: un 429 e' un throttle
+    (ordine NON eseguito), quindi il retry e' idempotente; i 5xx vengono invece
+    propagati perche' l'ordine potrebbe essere comunque andato a buon fine."""
+    retry_on = retryable_status if retryable_status is not None else _RETRYABLE_STATUS
+    if not breaker.allow():
+        raise HyperliquidTransientError(f"Hyperliquid {breaker.name} circuit breaker is open")
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            result = fn()
+        except Exception as exc:
+            status = _status_code_of(exc)
+            if status not in retry_on:
+                raise
+            last_exc = exc
+            if attempt < attempts - 1:  # niente sleep dopo l'ultimo tentativo
+                time.sleep(0.5 * (2**attempt))
+            continue
+        else:
+            breaker.record_success()
+            return result
+    breaker.record_failure()
+    raise HyperliquidTransientError(
+        f"Hyperliquid trading request failed after retries: {last_exc}"
+    ) from last_exc
 
 
 @dataclass(frozen=True)
@@ -35,7 +115,13 @@ class L2BookSnapshot:
 
 
 def fetch_l2_book(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapshot | None:
-    """Ritorna snapshot L2 dell'order book per `coin`. None in caso di errore."""
+    """Ritorna snapshot L2 dell'order book per `coin`. None in caso di errore.
+
+    Consulta hyperliquid_market_data_breaker prima di chiamare: se e'
+    gia' noto che Hyperliquid sta limitando evitiamo di consumare il timeout
+    pieno per ogni coin (vedi diagnosi 16/06/2026 sui worker_cycle lenti)."""
+    if not hyperliquid_market_data_breaker.allow():
+        return None
     try:
         with httpx.Client(timeout=5) as client:
             response = client.post(
@@ -43,10 +129,13 @@ def fetch_l2_book(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapsho
                 json={"type": "l2Book", "coin": coin, "nLevels": n_levels},
             )
             if response.is_error:
+                if response.status_code in _RETRYABLE_STATUS:
+                    hyperliquid_market_data_breaker.record_failure()
                 return None
             data = response.json()
             raw_levels = data.get("levels", [])
             if len(raw_levels) < 2:
+                hyperliquid_market_data_breaker.record_success()
                 return None
             bids = [
                 OrderBookLevel(price=float(level["px"]), size=float(level["sz"]))
@@ -56,13 +145,19 @@ def fetch_l2_book(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapsho
                 OrderBookLevel(price=float(level["px"]), size=float(level["sz"]))
                 for level in raw_levels[1]
             ]
+            hyperliquid_market_data_breaker.record_success()
             return L2BookSnapshot(bids=bids, asks=asks)
     except Exception:
+        hyperliquid_market_data_breaker.record_failure()
         return None
 
 
 async def fetch_l2_book_async(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapshot | None:
-    """Versione async di fetch_l2_book. None in caso di errore o rate limit."""
+    """Versione async di fetch_l2_book. None in caso di errore o rate limit.
+
+    Stesso breaker condiviso di fetch_l2_book (vedi docstring)."""
+    if not hyperliquid_market_data_breaker.allow():
+        return None
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             response = await client.post(
@@ -70,10 +165,13 @@ async def fetch_l2_book_async(info_url: str, coin: str, n_levels: int = 20) -> L
                 json={"type": "l2Book", "coin": coin, "nLevels": n_levels},
             )
             if response.is_error:
+                if response.status_code in _RETRYABLE_STATUS:
+                    hyperliquid_market_data_breaker.record_failure()
                 return None
             data = response.json()
             raw_levels = data.get("levels", [])
             if len(raw_levels) < 2:
+                hyperliquid_market_data_breaker.record_success()
                 return None
             bids = [
                 OrderBookLevel(price=float(level["px"]), size=float(level["sz"]))
@@ -83,17 +181,23 @@ async def fetch_l2_book_async(info_url: str, coin: str, n_levels: int = 20) -> L
                 OrderBookLevel(price=float(level["px"]), size=float(level["sz"]))
                 for level in raw_levels[1]
             ]
+            hyperliquid_market_data_breaker.record_success()
             return L2BookSnapshot(bids=bids, asks=asks)
     except Exception:
+        hyperliquid_market_data_breaker.record_failure()
         return None
 
 
 def fetch_predicted_fundings(info_url: str) -> dict[str, float]:
     """Returns coin → predicted 8h funding rate (decimal fraction). Empty dict on failure."""
+    if not hyperliquid_market_data_breaker.allow():
+        return {}
     try:
         with httpx.Client(timeout=10) as client:
             response = client.post(info_url, json={"type": "predictedFundings"})
             if response.is_error:
+                if response.status_code in _RETRYABLE_STATUS:
+                    hyperliquid_market_data_breaker.record_failure()
                 return {}
             data = response.json()
             result: dict[str, float] = {}
@@ -109,20 +213,27 @@ def fetch_predicted_fundings(info_url: str) -> dict[str, float]:
                         with contextlib.suppress(ValueError, TypeError):
                             result[coin] = float(venue_entry[1])
                         break
+            hyperliquid_market_data_breaker.record_success()
             return result
     except Exception:
+        hyperliquid_market_data_breaker.record_failure()
         return {}
 
 
 def fetch_perp_open_interests(info_url: str) -> dict[str, float]:
     """Returns coin → open interest in USD notional. Empty dict on failure. Perpetuals only."""
+    if not hyperliquid_market_data_breaker.allow():
+        return {}
     try:
         with httpx.Client(timeout=10) as client:
             response = client.post(info_url, json={"type": "metaAndAssetCtxs"})
             if response.is_error:
+                if response.status_code in _RETRYABLE_STATUS:
+                    hyperliquid_market_data_breaker.record_failure()
                 return {}
             data = response.json()
             if not isinstance(data, list) or len(data) < 2:
+                hyperliquid_market_data_breaker.record_success()
                 return {}
             meta, asset_ctxs = data[0], data[1]
             universe = meta.get("universe", [])
@@ -133,8 +244,10 @@ def fetch_perp_open_interests(info_url: str) -> dict[str, float]:
                 if coin and oi_str is not None:
                     with contextlib.suppress(ValueError, TypeError):
                         result[coin] = float(oi_str)
+            hyperliquid_market_data_breaker.record_success()
             return result
     except Exception:
+        hyperliquid_market_data_breaker.record_failure()
         return {}
 
 
@@ -150,28 +263,34 @@ class HyperliquidClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    async def _post_info(self, payload: dict[str, Any]) -> Any:
-        if not hyperliquid_info_breaker.allow():
+    async def _post_info(
+        self,
+        payload: dict[str, Any],
+        *,
+        breaker: CircuitBreaker,
+        attempts: int = 4,
+    ) -> Any:
+        if not breaker.allow():
             raise HyperliquidTransientError(
-                "Hyperliquid info circuit breaker is open"
+                f"Hyperliquid {breaker.name} circuit breaker is open"
             )
         try:
-            result = await self._post_info_raw(payload)
+            result = await self._post_info_raw(payload, attempts=attempts)
         except HyperliquidTransientError:
-            hyperliquid_info_breaker.record_failure()
+            breaker.record_failure()
             raise
         except HyperliquidError:
             # non-transient (4xx other than rate-limit, etc.) should not trip the breaker
             raise
         else:
-            hyperliquid_info_breaker.record_success()
+            breaker.record_success()
             return result
 
-    async def _post_info_raw(self, payload: dict[str, Any]) -> Any:
+    async def _post_info_raw(self, payload: dict[str, Any], *, attempts: int = 4) -> Any:
         async with httpx.AsyncClient(timeout=20) as client:
             last_status: int | None = None
             last_text = ""
-            for attempt in range(4):
+            for attempt in range(max(1, attempts)):
                 response = await client.post(self.settings.info_url, json=payload)
                 if response.status_code in {429, 500, 502, 503, 504}:
                     last_status = response.status_code
@@ -186,49 +305,86 @@ class HyperliquidClient:
         )
 
     async def meta(self) -> dict[str, Any]:
-        return await self._post_info({"type": "meta"})
+        return await self._post_info(
+            {"type": "meta"},
+            breaker=hyperliquid_market_data_breaker,
+        )
 
     async def spot_meta(self) -> dict[str, Any]:
-        return await self._post_info({"type": "spotMeta"})
+        return await self._post_info(
+            {"type": "spotMeta"},
+            breaker=hyperliquid_market_data_breaker,
+        )
 
     async def mids(self) -> dict[str, str]:
-        return await self._post_info({"type": "allMids"})
+        return await self._post_info(
+            {"type": "allMids"},
+            breaker=hyperliquid_market_data_breaker,
+        )
 
-    async def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+    async def candles(
+        self,
+        coin: str,
+        interval: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        attempts: int = 2,
+    ) -> list[dict[str, Any]]:
         return await self._post_info(
             {
                 "type": "candleSnapshot",
                 "req": {"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms},
-            }
+            },
+            breaker=hyperliquid_market_data_breaker,
+            attempts=attempts,
         )
 
     async def user_state(self, address: str) -> dict[str, Any]:
-        return await self._post_info({"type": "clearinghouseState", "user": address})
+        return await self._post_info(
+            {"type": "clearinghouseState", "user": address},
+            breaker=hyperliquid_account_breaker,
+        )
 
     async def spot_user_state(self, address: str) -> dict[str, Any]:
-        return await self._post_info({"type": "spotClearinghouseState", "user": address})
+        return await self._post_info(
+            {"type": "spotClearinghouseState", "user": address},
+            breaker=hyperliquid_account_breaker,
+        )
 
     async def open_orders(self, address: str) -> list[dict[str, Any]]:
-        return await self._post_info({"type": "openOrders", "user": address})
+        return await self._post_info(
+            {"type": "openOrders", "user": address},
+            breaker=hyperliquid_account_breaker,
+        )
 
     async def frontend_open_orders(self, address: str) -> list[dict[str, Any]]:
-        return await self._post_info({"type": "frontendOpenOrders", "user": address})
+        return await self._post_info(
+            {"type": "frontendOpenOrders", "user": address},
+            breaker=hyperliquid_account_breaker,
+        )
 
     async def predicted_fundings(self) -> list[Any]:
-        return await self._post_info({"type": "predictedFundings"})
+        return await self._post_info(
+            {"type": "predictedFundings"},
+            breaker=hyperliquid_market_data_breaker,
+        )
 
     async def portfolio(self, address: str) -> list[Any]:
         """Returns portfolio history per period (day/week/month/allTime + perp variants).
 
         Each item is [period_name, {accountValueHistory: [[ts_ms, value], ...], pnlHistory: [...], vlm: ...}].
         """
-        return await self._post_info({"type": "portfolio", "user": address})
+        return await self._post_info(
+            {"type": "portfolio", "user": address},
+            breaker=hyperliquid_account_breaker,
+        )
 
     async def user_funding(self, address: str, start_ms: int, end_ms: int | None = None) -> list[dict[str, Any]]:
         payload: dict[str, Any] = {"type": "userFunding", "user": address, "startTime": start_ms}
         if end_ms is not None:
             payload["endTime"] = end_ms
-        return await self._post_info(payload)
+        return await self._post_info(payload, breaker=hyperliquid_account_breaker)
 
     @staticmethod
     def perp_markets(meta: dict[str, Any]) -> list[dict[str, Any]]:
@@ -326,50 +482,94 @@ class HyperliquidTradingClient:
         total, _ = self.account_summary()
         return total
 
-    def spot_user_state(self, address: str | None = None) -> dict[str, Any]:
-        info = self._info()
+    def spot_user_state(
+        self, address: str | None = None, *, max_age_seconds: float | None = None
+    ) -> dict[str, Any]:
         addr = address or self._account_address()
-        spot_method = getattr(info, "spot_user_state", None)
-        if callable(spot_method):
-            return spot_method(addr)
-        import httpx
-        response = httpx.post(
-            self.settings.info_url,
-            json={"type": "spotClearinghouseState", "user": addr},
-            timeout=20,
-        )
-        response.raise_for_status()
-        return response.json()
 
-    def user_state(self, address: str | None = None) -> dict[str, Any]:
-        info = self._info()
-        return info.user_state(address or self._account_address())
+        def _fetch() -> dict[str, Any]:
+            info = self._info()
+            spot_method = getattr(info, "spot_user_state", None)
+            if callable(spot_method):
+                return _call_trading_with_retry(lambda: spot_method(addr))
 
-    def user_fills(self, address: str | None = None) -> list[dict[str, Any]]:
-        info = self._info()
-        fills = info.user_fills(address or self._account_address())
-        return fills if isinstance(fills, list) else []
+            def _http_fetch() -> dict[str, Any]:
+                response = httpx.post(
+                    self.settings.info_url,
+                    json={"type": "spotClearinghouseState", "user": addr},
+                    timeout=20,
+                )
+                response.raise_for_status()
+                return response.json()
 
-    def open_orders(self, address: str | None = None) -> list[dict[str, Any]]:
-        info = self._info()
-        result = info.open_orders(address or self._account_address())
-        return result if isinstance(result, list) else []
+            return _call_trading_with_retry(_http_fetch)
 
-    def frontend_open_orders(self, address: str | None = None) -> list[dict[str, Any]]:
-        info = self._info()
-        result = info.frontend_open_orders(address or self._account_address())
-        return result if isinstance(result, list) else []
+        return _cached_or_fetch(("spot_user_state", addr), max_age_seconds, _fetch)
 
-    def all_mids(self) -> dict[str, str]:
+    def user_state(
+        self, address: str | None = None, *, max_age_seconds: float | None = None
+    ) -> dict[str, Any]:
+        addr = address or self._account_address()
+
+        def _fetch() -> dict[str, Any]:
+            info = self._info()
+            return _call_trading_with_retry(lambda: info.user_state(addr))
+
+        return _cached_or_fetch(("user_state", addr), max_age_seconds, _fetch)
+
+    def user_fills(
+        self, address: str | None = None, *, max_age_seconds: float | None = None
+    ) -> list[dict[str, Any]]:
+        addr = address or self._account_address()
+
+        def _fetch() -> list[dict[str, Any]]:
+            info = self._info()
+            fills = _call_trading_with_retry(lambda: info.user_fills(addr))
+            return fills if isinstance(fills, list) else []
+
+        return _cached_or_fetch(("user_fills", addr), max_age_seconds, _fetch)
+
+    def open_orders(
+        self, address: str | None = None, *, max_age_seconds: float | None = None
+    ) -> list[dict[str, Any]]:
+        addr = address or self._account_address()
+
+        def _fetch() -> list[dict[str, Any]]:
+            info = self._info()
+            result = _call_trading_with_retry(lambda: info.open_orders(addr))
+            return result if isinstance(result, list) else []
+
+        return _cached_or_fetch(("open_orders", addr), max_age_seconds, _fetch)
+
+    def frontend_open_orders(
+        self, address: str | None = None, *, max_age_seconds: float | None = None
+    ) -> list[dict[str, Any]]:
+        addr = address or self._account_address()
+
+        def _fetch() -> list[dict[str, Any]]:
+            info = self._info()
+            result = _call_trading_with_retry(lambda: info.frontend_open_orders(addr))
+            return result if isinstance(result, list) else []
+
+        return _cached_or_fetch(("frontend_open_orders", addr), max_age_seconds, _fetch)
+
+    def all_mids(self, *, max_age_seconds: float | None = None) -> dict[str, str]:
         """Restituisce {coin: mid_price_str} per tutti i mercati HL.
 
         Fallback usato dalla reconciliation per derivare il mark price quando
         `assetPositions` non lo include (HL non lo restituisce sempre nel payload
         di user_state).
         """
-        info = self._info()
-        result = info.all_mids()
-        return result if isinstance(result, dict) else {}
+
+        def _fetch() -> dict[str, str]:
+            info = self._info()
+            result = _call_trading_with_retry(
+                lambda: info.all_mids(),
+                breaker=hyperliquid_market_data_breaker,
+            )
+            return result if isinstance(result, dict) else {}
+
+        return _cached_or_fetch(("all_mids", "_"), max_age_seconds, _fetch)
 
     def available_fill_notional(
         self,
@@ -437,13 +637,18 @@ class HyperliquidTradingClient:
         expires_after_seconds: int,
     ) -> HyperliquidOrderResult:
         exchange = self._exchange(expires_after_seconds)
-        response = exchange.order(
-            coin,
-            is_buy,
-            _size_to_float(size),
-            exchange._slippage_price(coin, is_buy, max(0.0, max_slippage_pct) / 100),
-            order_type={"limit": {"tif": "Ioc"}},
-            reduce_only=True,
+        response = _call_trading_with_retry(
+            lambda: exchange.order(
+                coin,
+                is_buy,
+                _size_to_float(size),
+                exchange._slippage_price(coin, is_buy, max(0.0, max_slippage_pct) / 100),
+                order_type={"limit": {"tif": "Ioc"}},
+                reduce_only=True,
+            ),
+            attempts=1,
+            breaker=hyperliquid_order_breaker,
+            retryable_status={429},
         )
         return parse_order_result(response)
 
@@ -472,12 +677,22 @@ class HyperliquidTradingClient:
         cloid_obj = _build_cloid(cloid)
         if cloid_obj is not None:
             order_kwargs["cloid"] = cloid_obj
-        response = exchange.order(coin, is_buy, _size_to_float(size), rounded_price, **order_kwargs)
+        response = _call_trading_with_retry(
+            lambda: exchange.order(coin, is_buy, _size_to_float(size), rounded_price, **order_kwargs),
+            attempts=1,
+            breaker=hyperliquid_order_breaker,
+            retryable_status={429},
+        )
         return parse_order_result(response)
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> None:
         exchange = self._exchange(0)
-        response = exchange.update_leverage(leverage, coin, is_cross)
+        response = _call_trading_with_retry(
+            lambda: exchange.update_leverage(leverage, coin, is_cross),
+            attempts=3,
+            breaker=hyperliquid_order_breaker,
+            retryable_status={429},
+        )
         if isinstance(response, dict) and response.get("status") == "err":
             raise HyperliquidError(f"set_leverage failed: {response}")
 
@@ -491,7 +706,12 @@ class HyperliquidTradingClient:
         expires_after_seconds: int,
     ) -> dict[str, Any]:
         exchange = self._exchange(expires_after_seconds)
-        response = exchange.cancel(coin, oid)
+        response = _call_trading_with_retry(
+            lambda: exchange.cancel(coin, oid),
+            attempts=1,
+            breaker=hyperliquid_order_breaker,
+            retryable_status={429},
+        )
         if not isinstance(response, dict):
             raise HyperliquidError("Hyperliquid cancel returned an invalid response")
         if response.get("status") == "err":

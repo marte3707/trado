@@ -31,6 +31,53 @@ class _FastRiskState:
     last_uar_at: float = 0.0
     consecutive_failures: int = 0
 
+
+def _record_guard_subcycle(
+    db,
+    cycle_id: str,
+    label: str,
+    result: Any,
+    expected_interval_seconds: int,
+    *,
+    ok_message: str,
+) -> None:
+    """Aggiorna lo stato del sotto-ciclo guard guidato dal fast_risk loop.
+
+    Quando fast_risk possiede liquidation guard e UAR al posto del loop
+    principale, i rispettivi `cycle_id` (live_liquidation_guard_cycle /
+    unified_account_ratio_guard_cycle) altrimenti non verrebbero mai aggiornati
+    e le card del cruscotto finirebbero 'stale'. Registriamo qui solo
+    sull'esecuzione riuscita e committiamo subito (le azioni si auto-committano
+    internamente): un fallimento transitorio successivo nello stesso ciclo non
+    deve annullare questo record. I fallimenti 429/circuit-breaker restano
+    aggregati in `fast_risk_cycle` e non sporcano la salute del singolo guard.
+    """
+    status = (
+        result["status"]
+        if isinstance(result, dict) and isinstance(result.get("status"), str)
+        else "ok"
+    )
+    _record_system_cycle_status(
+        db,
+        cycle_id,
+        label,
+        status,
+        message=ok_message,
+        data=result if isinstance(result, dict) else None,
+        expected_interval_seconds=expected_interval_seconds,
+    )
+    db.commit()
+
+
+def _compact_error(exc: Exception, *, max_length: int = 240) -> str:
+    message = str(exc).replace("\n", " ").strip()
+    if not message:
+        message = type(exc).__name__
+    if len(message) > max_length:
+        return f"{message[:max_length]}..."
+    return message
+
+
 async def run_fast_risk_once(
     executor: OrderExecutionEngine,
     state: _FastRiskState | None = None,
@@ -83,63 +130,123 @@ async def run_fast_risk_once(
                 return live_skipped_result
 
             actions: dict[str, Any] = {}
+            errors: dict[str, str] = {}
+
+            # Ogni azione ha il proprio try/except: un 429 (o altro fallimento
+            # transitorio) su una singola azione non deve piu' far contare le
+            # altre due come fallite (vedi diagnosi 16/06/2026 sui falsi
+            # fast_risk_cycle_failed). Le 3 funzioni-azione si auto-committano
+            # internamente in caso di successo, quindi il rollback locale qui
+            # annulla solo il lavoro non committato della azione fallita.
             liquidation_due = (
                 current_time - state.last_liquidation_at
                 >= settings.fast_risk_liquidation_interval_seconds
             )
             if liquidation_due:
-                liquidation = await asyncio.to_thread(
-                    executor.position_manager.audit_live_positions_against_liquidation,
-                    db,
-                )
-                actions["liquidation_guard"] = liquidation
-                state.last_liquidation_at = current_time
+                try:
+                    liquidation = await asyncio.to_thread(
+                        executor.position_manager.audit_live_positions_against_liquidation,
+                        db,
+                    )
+                    actions["liquidation_guard"] = liquidation
+                    state.last_liquidation_at = current_time
+                    _record_guard_subcycle(
+                        db,
+                        "live_liquidation_guard_cycle",
+                        "Live Liquidation Guard Cycle",
+                        liquidation,
+                        settings.fast_risk_liquidation_interval_seconds,
+                        ok_message="Live liquidation guard cycle completed",
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    state.last_liquidation_at = current_time
+                    error = _compact_error(exc)
+                    errors["liquidation_guard"] = error
+                    logger.exception("fast_risk_liquidation_guard_failed", error=error)
 
             reconcile_due = (
                 current_time - state.last_reconcile_at
                 >= settings.fast_risk_reconcile_interval_seconds
             )
             if reconcile_due:
-                actions["live_reconciled"] = await asyncio.to_thread(
-                    reconcile_live_positions,
-                    db,
-                )
-                state.last_reconcile_at = current_time
+                try:
+                    actions["live_reconciled"] = await asyncio.to_thread(
+                        reconcile_live_positions,
+                        db,
+                    )
+                    state.last_reconcile_at = current_time
+                except Exception as exc:
+                    db.rollback()
+                    state.last_reconcile_at = current_time
+                    error = _compact_error(exc)
+                    errors["live_reconciled"] = error
+                    logger.exception("fast_risk_reconcile_failed", error=error)
 
             uar_due = current_time - state.last_uar_at >= settings.fast_risk_uar_interval_seconds
             if uar_due:
-                actions["unified_account_ratio"] = await asyncio.to_thread(
-                    audit_unified_account_ratio_guard,
-                    db,
-                    executor,
-                )
-                state.last_uar_at = current_time
+                try:
+                    uar_result = await asyncio.to_thread(
+                        audit_unified_account_ratio_guard,
+                        db,
+                        executor,
+                    )
+                    actions["unified_account_ratio"] = uar_result
+                    state.last_uar_at = current_time
+                    _record_guard_subcycle(
+                        db,
+                        "unified_account_ratio_guard_cycle",
+                        "Unified Account Ratio Guard Cycle",
+                        uar_result,
+                        settings.fast_risk_uar_interval_seconds,
+                        ok_message="Unified Account Ratio guard cycle completed",
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    state.last_uar_at = current_time
+                    error = _compact_error(exc)
+                    errors["unified_account_ratio"] = error
+                    logger.exception("fast_risk_uar_guard_failed", error=error)
 
             duration_seconds = time.monotonic() - started
-            ok_result: dict[str, Any] = {
-                "status": "ok",
+            status = "failed" if errors else "ok"
+            result: dict[str, Any] = {
+                "status": status,
                 "duration_seconds": round(duration_seconds, 4),
                 "warn": duration_seconds > settings.fast_risk_warn_after_seconds,
                 "actions": actions,
             }
+            if errors:
+                result["errors"] = errors
             _record_system_cycle_status(
                 db,
                 "fast_risk_cycle",
                 "Fast Risk Cycle",
-                "ok",
-                message="Fast risk cycle completed",
-                data=ok_result,
+                status,
+                message="Fast risk cycle completed" if not errors else "Fast risk cycle completed with errors",
+                data=result,
                 expected_interval_seconds=settings.fast_risk_loop_interval_seconds,
             )
+            if errors:
+                db.add(
+                    DecisionLog(
+                        event_type="fast_risk_cycle_failed",
+                        message="Fast risk cycle: one or more actions failed",
+                        data=result,
+                    )
+                )
             db.commit()
-            logger.info("fast_risk_cycle_completed", **ok_result)
-            return ok_result
+            if errors:
+                logger.warning("fast_risk_cycle_completed_with_errors", **result)
+            else:
+                logger.info("fast_risk_cycle_completed", **result)
+            return result
         except Exception as exc:
             duration_seconds = time.monotonic() - started
             db.rollback()
             data = {
                 "status": "failed",
-                "error": str(exc),
+                "error": _compact_error(exc),
                 "type": type(exc).__name__,
                 "duration_seconds": round(duration_seconds, 4),
             }
@@ -163,7 +270,7 @@ async def run_fast_risk_once(
                 db.commit()
             except Exception:
                 logger.exception("fast_risk_cycle_failure_log_failed")
-            logger.exception("fast_risk_cycle_failed", error=str(exc))
+            logger.exception("fast_risk_cycle_failed", error=data["error"])
             return data
         finally:
             db.close()
@@ -208,5 +315,4 @@ def _last_cycle_ok_at(db, cycle_id: str) -> float | None:
         return dt.timestamp()
     except (ValueError, TypeError):
         return None
-
 
