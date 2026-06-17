@@ -79,6 +79,34 @@ def _safe_error_message(exc: Exception, max_length: int = 500) -> str:
     return f"{message[:max_length]}..."
 
 
+_HYPERLIQUID_RATE_LIMIT_COOLDOWN_SECONDS = 600
+_HYPERLIQUID_RATE_LIMIT_EVENTS = {
+    "fast_risk_cycle_failed",
+    "live_order_preflight_failed",
+    "live_set_leverage_failed",
+    "live_stop_update_cancel_failed",
+    "live_stop_update_submit_failed",
+}
+
+
+def _recent_hyperliquid_rate_limit(db: Session) -> DecisionLog | None:
+    cutoff = datetime.now(UTC) - timedelta(seconds=_HYPERLIQUID_RATE_LIMIT_COOLDOWN_SECONDS)
+    rows = (
+        db.query(DecisionLog)
+        .filter(DecisionLog.timestamp >= cutoff)
+        .filter(DecisionLog.event_type.in_(_HYPERLIQUID_RATE_LIMIT_EVENTS))
+        .all()
+    )
+    recent: DecisionLog | None = None
+    for row in rows:
+        data = row.data if isinstance(row.data, dict) else {}
+        if "429" not in f"{row.message} {data}":
+            continue
+        if recent is None or row.timestamp > recent.timestamp:
+            recent = row
+    return recent
+
+
 TIMEFRAME_MS = {
     "5m": 5 * 60 * 1000,
     "15m": 15 * 60 * 1000,
@@ -307,6 +335,23 @@ class OrderExecutionEngine:
         signal: Signal,
         trading_client: HyperliquidTradingClient | None = None,
     ) -> Position:
+        recent_rate_limit = _recent_hyperliquid_rate_limit(db)
+        if recent_rate_limit is not None:
+            db.add(
+                DecisionLog(
+                    event_type="live_order_preflight_deferred_rate_limit",
+                    market_id=signal.market_id,
+                    signal_id=signal.id,
+                    message="Live order pre-flight deferred during Hyperliquid rate-limit cooldown",
+                    data={
+                        "cooldown_seconds": _HYPERLIQUID_RATE_LIMIT_COOLDOWN_SECONDS,
+                        "recent_event_type": recent_rate_limit.event_type,
+                        "recent_event_at": recent_rate_limit.timestamp.isoformat(),
+                    },
+                )
+            )
+            db.commit()
+            raise PermissionError("Hyperliquid rate-limit cooldown active; live preflight deferred")
         trading = trading_client or HyperliquidTradingClient(self.settings)
         try:
             account_value, available_margin = trading.account_summary()

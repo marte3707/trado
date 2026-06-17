@@ -184,6 +184,39 @@ async def test_fast_risk_failure_rolls_back_and_logs(monkeypatch) -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_fast_risk_enters_cooldown_after_hyperliquid_429(monkeypatch) -> None:
+    db = FastRiskDb(mode=OperationMode.AUTO_TRADE, live_enabled=True)
+    manager = FakePositionManager()
+    executor = FakeExecutor(
+        Settings(
+            fast_risk_liquidation_interval_seconds=60,
+            fast_risk_reconcile_interval_seconds=999,
+            fast_risk_uar_interval_seconds=999,
+            fast_risk_rate_limit_cooldown_seconds=600,
+        ),
+        manager,
+    )
+    state = worker._FastRiskState()
+
+    def fail_429(_db):
+        manager.audit_calls += 1
+        raise RuntimeError("429 too many requests")
+
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(manager, "audit_live_positions_against_liquidation", fail_429)
+
+    failed = await worker.run_fast_risk_once(executor, state, now=100)
+    skipped = await worker.run_fast_risk_once(executor, state, now=120)
+
+    assert failed["status"] == "failed"
+    assert failed["rate_limit_cooldown_seconds"] == 600
+    assert skipped["status"] == "skipped"
+    assert skipped["reason"] == "hyperliquid_rate_limit_cooldown"
+    assert manager.audit_calls == 1
+    assert state.hyperliquid_rate_limit_cooldown_until == 700
+
+
 def _find_recorded_cycle(db: "FastRiskDb", cycle_id: str) -> dict | None:
     for row in db.added:
         if isinstance(row, AppSetting) and row.key == worker.SYSTEM_CYCLE_STATUS_SETTING_KEY:

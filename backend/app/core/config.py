@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     fast_risk_reconcile_interval_seconds: int = 60
     fast_risk_uar_interval_seconds: int = 120
     fast_risk_warn_after_seconds: float = 4.0
+    fast_risk_rate_limit_cooldown_seconds: int = 600
 
     kill_switch_enabled: bool = False
     max_risk_per_trade_pct: float = 1.0

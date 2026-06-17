@@ -30,6 +30,8 @@ class _FastRiskState:
     last_reconcile_at: float = 0.0
     last_uar_at: float = 0.0
     consecutive_failures: int = 0
+    hyperliquid_rate_limit_cooldown_until: float = 0.0
+    last_rate_limit_log_at: float = 0.0
 
 
 def _record_guard_subcycle(
@@ -76,6 +78,11 @@ def _compact_error(exc: Exception, *, max_length: int = 240) -> str:
     if len(message) > max_length:
         return f"{message[:max_length]}..."
     return message
+
+
+def _is_hyperliquid_rate_limit_error(error: str) -> bool:
+    lower = error.lower()
+    return "429" in lower or "rate limit" in lower or "too many requests" in lower
 
 
 async def run_fast_risk_once(
@@ -131,6 +138,37 @@ async def run_fast_risk_once(
 
             actions: dict[str, Any] = {}
             errors: dict[str, str] = {}
+            if current_time < state.hyperliquid_rate_limit_cooldown_until:
+                remaining = int(state.hyperliquid_rate_limit_cooldown_until - current_time)
+                result: dict[str, Any] = {
+                    "status": "skipped",
+                    "reason": "hyperliquid_rate_limit_cooldown",
+                    "cooldown_remaining_seconds": remaining,
+                    "actions": actions,
+                    "duration_seconds": round(time.monotonic() - started, 4),
+                    "warn": False,
+                }
+                _record_system_cycle_status(
+                    db,
+                    "fast_risk_cycle",
+                    "Fast Risk Cycle",
+                    "skipped",
+                    message="Fast risk cycle skipped during Hyperliquid rate-limit cooldown",
+                    data=result,
+                    expected_interval_seconds=settings.fast_risk_loop_interval_seconds,
+                )
+                if current_time - state.last_rate_limit_log_at >= 300:
+                    db.add(
+                        DecisionLog(
+                            event_type="fast_risk_rate_limit_cooldown",
+                            message="Fast risk cycle skipped during Hyperliquid rate-limit cooldown",
+                            data=result,
+                        )
+                    )
+                    state.last_rate_limit_log_at = current_time
+                db.commit()
+                logger.warning("fast_risk_rate_limit_cooldown", **result)
+                return result
 
             # Ogni azione ha il proprio try/except: un 429 (o altro fallimento
             # transitorio) su una singola azione non deve piu' far contare le
@@ -218,6 +256,14 @@ async def run_fast_risk_once(
             }
             if errors:
                 result["errors"] = errors
+                if any(_is_hyperliquid_rate_limit_error(error) for error in errors.values()):
+                    state.hyperliquid_rate_limit_cooldown_until = current_time + max(
+                        60,
+                        int(settings.fast_risk_rate_limit_cooldown_seconds),
+                    )
+                    result["rate_limit_cooldown_seconds"] = int(
+                        state.hyperliquid_rate_limit_cooldown_until - current_time
+                    )
             _record_system_cycle_status(
                 db,
                 "fast_risk_cycle",
@@ -315,4 +361,3 @@ def _last_cycle_ok_at(db, cycle_id: str) -> float | None:
         return dt.timestamp()
     except (ValueError, TypeError):
         return None
-

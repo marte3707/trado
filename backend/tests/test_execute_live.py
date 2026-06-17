@@ -434,6 +434,38 @@ def test_execute_live_logs_preflight_account_summary_failure(
     }
 
 
+def test_execute_live_defers_preflight_during_recent_hyperliquid_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    recent = DecisionLog(
+        event_type="fast_risk_cycle_failed",
+        timestamp=datetime.now(UTC),
+        message="Fast risk cycle: one or more actions failed",
+        data={"errors": {"live_reconciled": "429 too many requests"}},
+    )
+
+    class RateLimitDb(FakeDb):
+        def query(self, model: type[Any], *args: Any, **kwargs: Any) -> _FakeQuery:  # type: ignore[override]
+            if model is DecisionLog:
+                return _FakeQuery(rows=[recent])
+            return super().query(model, *args, **kwargs)
+
+    db = RateLimitDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="rate-limit cooldown"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.market_orders == []
+    assert trading.leverage_calls == []
+    logs = [row for row in db.added_of(DecisionLog) if row.event_type == "live_order_preflight_deferred_rate_limit"]
+    assert len(logs) == 1
+    assert logs[0].signal_id == signal.id
+
+
 def test_execute_live_records_partial_failure_when_trigger_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     _force_validator_ok(monkeypatch)
     settings = _build_settings()

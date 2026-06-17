@@ -29,7 +29,7 @@ _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 # solo dai guard periodici (fast_risk_cycle + worker_cycle) che leggono lo
 # stesso account a cadenze indipendenti ravvicinate — non dai path di
 # pre-trade/pre-close, che richiedono sempre il dato piu' fresco possibile.
-DEFAULT_GUARD_STATE_CACHE_SECONDS = 15.0
+DEFAULT_GUARD_STATE_CACHE_SECONDS = 60.0
 
 _state_cache_lock = Lock()
 _state_cache: dict[tuple[str, str], tuple[float, Any]] = {}
