@@ -20,6 +20,11 @@ from app.services._circuit import (
     hyperliquid_market_data_breaker,
     hyperliquid_order_breaker,
 )
+from app.services.hyperliquid_rate_limit import (
+    check_hyperliquid_rate_limit,
+    record_hyperliquid_rate_limit,
+    record_hyperliquid_response_weight,
+)
 
 # Status HTTP che indicano un problema transitorio lato Hyperliquid/CloudFront
 # (rate limit o sovraccarico) piuttosto che un errore di richiesta del client.
@@ -64,6 +69,10 @@ def _call_trading_with_retry(
     attempts: int = 4,
     breaker: CircuitBreaker = hyperliquid_account_breaker,
     retryable_status: set[int] | None = None,
+    request_type: str = "unknown",
+    rate_limit_class: str = "info",
+    safety_critical: bool = False,
+    live_preflight: bool = False,
 ) -> Any:
     """Retry+circuit breaker sincrono per le chiamate nude dell'SDK Hyperliquid
     (user_state, spot_user_state, ecc.). Di default usa il breaker account/live;
@@ -73,6 +82,18 @@ def _call_trading_with_retry(
     (ordine NON eseguito), quindi il retry e' idempotente; i 5xx vengono invece
     propagati perche' l'ordine potrebbe essere comunque andato a buon fine."""
     retry_on = retryable_status if retryable_status is not None else _RETRYABLE_STATUS
+    decision = check_hyperliquid_rate_limit(
+        request_type=request_type,
+        rate_limit_class=rate_limit_class,
+        safety_critical=safety_critical,
+        live_preflight=live_preflight,
+    )
+    if not decision.allowed:
+        raise HyperliquidTransientError(
+            "Hyperliquid rate-limit governor skipped "
+            f"{rate_limit_class}:{request_type}; reason={decision.reason}; "
+            f"next_retry_after={decision.next_retry_after}"
+        )
     if not breaker.allow():
         raise HyperliquidTransientError(f"Hyperliquid {breaker.name} circuit breaker is open")
     last_exc: Exception | None = None
@@ -83,6 +104,12 @@ def _call_trading_with_retry(
             status = _status_code_of(exc)
             if status not in retry_on:
                 raise
+            record_hyperliquid_rate_limit(
+                request_type=request_type,
+                rate_limit_class=rate_limit_class,
+                status_code=status,
+                error=str(exc),
+            )
             last_exc = exc
             if attempt < attempts - 1:  # niente sleep dopo l'ultimo tentativo
                 time.sleep(0.5 * (2**attempt))
@@ -122,6 +149,13 @@ def fetch_l2_book(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapsho
     pieno per ogni coin (vedi diagnosi 16/06/2026 sui worker_cycle lenti)."""
     if not hyperliquid_market_data_breaker.allow():
         return None
+    decision = check_hyperliquid_rate_limit(
+        request_type="l2Book",
+        rate_limit_class="info",
+        safety_critical=False,
+    )
+    if not decision.allowed:
+        return None
     try:
         with httpx.Client(timeout=5) as client:
             response = client.post(
@@ -131,6 +165,12 @@ def fetch_l2_book(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapsho
             if response.is_error:
                 if response.status_code in _RETRYABLE_STATUS:
                     hyperliquid_market_data_breaker.record_failure()
+                    record_hyperliquid_rate_limit(
+                        request_type="l2Book",
+                        rate_limit_class="info",
+                        status_code=response.status_code,
+                        error=response.text[:200],
+                    )
                 return None
             data = response.json()
             raw_levels = data.get("levels", [])
@@ -158,6 +198,13 @@ async def fetch_l2_book_async(info_url: str, coin: str, n_levels: int = 20) -> L
     Stesso breaker condiviso di fetch_l2_book (vedi docstring)."""
     if not hyperliquid_market_data_breaker.allow():
         return None
+    decision = check_hyperliquid_rate_limit(
+        request_type="l2Book",
+        rate_limit_class="info",
+        safety_critical=False,
+    )
+    if not decision.allowed:
+        return None
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             response = await client.post(
@@ -167,6 +214,12 @@ async def fetch_l2_book_async(info_url: str, coin: str, n_levels: int = 20) -> L
             if response.is_error:
                 if response.status_code in _RETRYABLE_STATUS:
                     hyperliquid_market_data_breaker.record_failure()
+                    record_hyperliquid_rate_limit(
+                        request_type="l2Book",
+                        rate_limit_class="info",
+                        status_code=response.status_code,
+                        error=response.text[:200],
+                    )
                 return None
             data = response.json()
             raw_levels = data.get("levels", [])
@@ -192,12 +245,25 @@ def fetch_predicted_fundings(info_url: str) -> dict[str, float]:
     """Returns coin → predicted 8h funding rate (decimal fraction). Empty dict on failure."""
     if not hyperliquid_market_data_breaker.allow():
         return {}
+    decision = check_hyperliquid_rate_limit(
+        request_type="predictedFundings",
+        rate_limit_class="info",
+        safety_critical=False,
+    )
+    if not decision.allowed:
+        return {}
     try:
         with httpx.Client(timeout=10) as client:
             response = client.post(info_url, json={"type": "predictedFundings"})
             if response.is_error:
                 if response.status_code in _RETRYABLE_STATUS:
                     hyperliquid_market_data_breaker.record_failure()
+                    record_hyperliquid_rate_limit(
+                        request_type="predictedFundings",
+                        rate_limit_class="info",
+                        status_code=response.status_code,
+                        error=response.text[:200],
+                    )
                 return {}
             data = response.json()
             result: dict[str, float] = {}
@@ -224,12 +290,25 @@ def fetch_perp_open_interests(info_url: str) -> dict[str, float]:
     """Returns coin → open interest in USD notional. Empty dict on failure. Perpetuals only."""
     if not hyperliquid_market_data_breaker.allow():
         return {}
+    decision = check_hyperliquid_rate_limit(
+        request_type="metaAndAssetCtxs",
+        rate_limit_class="info",
+        safety_critical=False,
+    )
+    if not decision.allowed:
+        return {}
     try:
         with httpx.Client(timeout=10) as client:
             response = client.post(info_url, json={"type": "metaAndAssetCtxs"})
             if response.is_error:
                 if response.status_code in _RETRYABLE_STATUS:
                     hyperliquid_market_data_breaker.record_failure()
+                    record_hyperliquid_rate_limit(
+                        request_type="metaAndAssetCtxs",
+                        rate_limit_class="info",
+                        status_code=response.status_code,
+                        error=response.text[:200],
+                    )
                 return {}
             data = response.json()
             if not isinstance(data, list) or len(data) < 2:
@@ -270,13 +349,30 @@ class HyperliquidClient:
         breaker: CircuitBreaker,
         attempts: int = 4,
     ) -> Any:
+        request_type = str(payload.get("type") or "unknown")
+        decision = check_hyperliquid_rate_limit(
+            request_type=request_type,
+            rate_limit_class="info",
+            safety_critical=False,
+        )
+        if not decision.allowed:
+            raise HyperliquidTransientError(
+                "Hyperliquid rate-limit governor skipped "
+                f"info:{request_type}; reason={decision.reason}; "
+                f"next_retry_after={decision.next_retry_after}"
+            )
         if not breaker.allow():
             raise HyperliquidTransientError(
                 f"Hyperliquid {breaker.name} circuit breaker is open"
             )
         try:
             result = await self._post_info_raw(payload, attempts=attempts)
-        except HyperliquidTransientError:
+        except HyperliquidTransientError as exc:
+            record_hyperliquid_rate_limit(
+                request_type=request_type,
+                rate_limit_class="info",
+                error=str(exc),
+            )
             breaker.record_failure()
             raise
         except HyperliquidError:
@@ -284,6 +380,12 @@ class HyperliquidClient:
             raise
         else:
             breaker.record_success()
+            if isinstance(result, list):
+                record_hyperliquid_response_weight(
+                    request_type=request_type,
+                    rate_limit_class="info",
+                    item_count=len(result),
+                )
             return result
 
     async def _post_info_raw(self, payload: dict[str, Any], *, attempts: int = 4) -> Any:
@@ -491,7 +593,11 @@ class HyperliquidTradingClient:
             info = self._info()
             spot_method = getattr(info, "spot_user_state", None)
             if callable(spot_method):
-                return _call_trading_with_retry(lambda: spot_method(addr))
+                return _call_trading_with_retry(
+                    lambda: spot_method(addr),
+                    request_type="spotClearinghouseState",
+                    rate_limit_class="info",
+                )
 
             def _http_fetch() -> dict[str, Any]:
                 response = httpx.post(
@@ -502,7 +608,11 @@ class HyperliquidTradingClient:
                 response.raise_for_status()
                 return response.json()
 
-            return _call_trading_with_retry(_http_fetch)
+            return _call_trading_with_retry(
+                _http_fetch,
+                request_type="spotClearinghouseState",
+                rate_limit_class="info",
+            )
 
         return _cached_or_fetch(("spot_user_state", addr), max_age_seconds, _fetch)
 
@@ -513,7 +623,11 @@ class HyperliquidTradingClient:
 
         def _fetch() -> dict[str, Any]:
             info = self._info()
-            return _call_trading_with_retry(lambda: info.user_state(addr))
+            return _call_trading_with_retry(
+                lambda: info.user_state(addr),
+                request_type="clearinghouseState",
+                rate_limit_class="info",
+            )
 
         return _cached_or_fetch(("user_state", addr), max_age_seconds, _fetch)
 
@@ -524,10 +638,54 @@ class HyperliquidTradingClient:
 
         def _fetch() -> list[dict[str, Any]]:
             info = self._info()
-            fills = _call_trading_with_retry(lambda: info.user_fills(addr))
+            fills = _call_trading_with_retry(
+                lambda: info.user_fills(addr),
+                request_type="userFills",
+                rate_limit_class="info",
+            )
+            if isinstance(fills, list):
+                record_hyperliquid_response_weight(
+                    request_type="userFills",
+                    rate_limit_class="info",
+                    item_count=len(fills),
+                )
             return fills if isinstance(fills, list) else []
 
         return _cached_or_fetch(("user_fills", addr), max_age_seconds, _fetch)
+
+    def user_fills_by_time(
+        self,
+        address: str | None = None,
+        *,
+        start_time: int,
+        end_time: int | None = None,
+        aggregate_by_time: bool = False,
+        max_age_seconds: float | None = None,
+    ) -> list[dict[str, Any]]:
+        addr = address or self._account_address()
+        cache_key = ("user_fills_by_time", f"{addr}:{start_time}:{end_time}:{aggregate_by_time}")
+
+        def _fetch() -> list[dict[str, Any]]:
+            info = self._info()
+            fills = _call_trading_with_retry(
+                lambda: info.user_fills_by_time(
+                    addr,
+                    start_time,
+                    end_time,
+                    aggregate_by_time,
+                ),
+                request_type="userFillsByTime",
+                rate_limit_class="info",
+            )
+            if isinstance(fills, list):
+                record_hyperliquid_response_weight(
+                    request_type="userFillsByTime",
+                    rate_limit_class="info",
+                    item_count=len(fills),
+                )
+            return fills if isinstance(fills, list) else []
+
+        return _cached_or_fetch(cache_key, max_age_seconds, _fetch)
 
     def open_orders(
         self, address: str | None = None, *, max_age_seconds: float | None = None
@@ -536,7 +694,11 @@ class HyperliquidTradingClient:
 
         def _fetch() -> list[dict[str, Any]]:
             info = self._info()
-            result = _call_trading_with_retry(lambda: info.open_orders(addr))
+            result = _call_trading_with_retry(
+                lambda: info.open_orders(addr),
+                request_type="openOrders",
+                rate_limit_class="info",
+            )
             return result if isinstance(result, list) else []
 
         return _cached_or_fetch(("open_orders", addr), max_age_seconds, _fetch)
@@ -548,7 +710,11 @@ class HyperliquidTradingClient:
 
         def _fetch() -> list[dict[str, Any]]:
             info = self._info()
-            result = _call_trading_with_retry(lambda: info.frontend_open_orders(addr))
+            result = _call_trading_with_retry(
+                lambda: info.frontend_open_orders(addr),
+                request_type="frontendOpenOrders",
+                rate_limit_class="info",
+            )
             return result if isinstance(result, list) else []
 
         return _cached_or_fetch(("frontend_open_orders", addr), max_age_seconds, _fetch)
@@ -566,6 +732,8 @@ class HyperliquidTradingClient:
             result = _call_trading_with_retry(
                 lambda: info.all_mids(),
                 breaker=hyperliquid_market_data_breaker,
+                request_type="allMids",
+                rate_limit_class="info",
             )
             return result if isinstance(result, dict) else {}
 
@@ -588,7 +756,13 @@ class HyperliquidTradingClient:
         """
         try:
             info = self._info()
-            book = info.l2_snapshot(coin)
+            book = _call_trading_with_retry(
+                lambda: info.l2_snapshot(coin),
+                breaker=hyperliquid_market_data_breaker,
+                request_type="l2Book",
+                rate_limit_class="info",
+                live_preflight=True,
+            )
             levels = book.get("levels", [[], []])
             slippage_factor = slippage_pct / 100.0
             if is_buy:
@@ -625,7 +799,15 @@ class HyperliquidTradingClient:
         cloid_obj = _build_cloid(cloid)
         if cloid_obj is not None:
             kwargs["cloid"] = cloid_obj
-        response = exchange.market_open(coin, is_buy, _size_to_float(size), **kwargs)
+        response = _call_trading_with_retry(
+            lambda: exchange.market_open(coin, is_buy, _size_to_float(size), **kwargs),
+            attempts=1,
+            breaker=hyperliquid_order_breaker,
+            retryable_status={429},
+            request_type="order",
+            rate_limit_class="exchange",
+            safety_critical=True,
+        )
         return parse_order_result(response)
 
     def submit_market_close(
@@ -649,6 +831,9 @@ class HyperliquidTradingClient:
             attempts=1,
             breaker=hyperliquid_order_breaker,
             retryable_status={429},
+            request_type="close",
+            rate_limit_class="exchange",
+            safety_critical=True,
         )
         return parse_order_result(response)
 
@@ -682,6 +867,50 @@ class HyperliquidTradingClient:
             attempts=1,
             breaker=hyperliquid_order_breaker,
             retryable_status={429},
+            request_type="order",
+            rate_limit_class="exchange",
+            safety_critical=True,
+        )
+        return parse_order_result(response)
+
+    def modify_trigger_order(
+        self,
+        oid: int,
+        coin: str,
+        is_buy: bool,
+        size: Decimal,
+        trigger_price: Decimal,
+        tpsl: str,
+        expires_after_seconds: int,
+        cloid: str | None = None,
+    ) -> HyperliquidOrderResult:
+        exchange = self._exchange(expires_after_seconds)
+        rounded_price = _round_price_for_coin(trigger_price, coin, getattr(exchange, "info", None))
+        order_type = {
+            "trigger": {
+                "isMarket": True,
+                "triggerPx": rounded_price,
+                "tpsl": tpsl,
+            }
+        }
+        cloid_obj = _build_cloid(cloid)
+        response = _call_trading_with_retry(
+            lambda: exchange.modify_order(
+                oid,
+                coin,
+                is_buy,
+                _size_to_float(size),
+                rounded_price,
+                order_type=order_type,
+                reduce_only=True,
+                cloid=cloid_obj,
+            ),
+            attempts=1,
+            breaker=hyperliquid_order_breaker,
+            retryable_status={429},
+            request_type="modify",
+            rate_limit_class="exchange",
+            safety_critical=True,
         )
         return parse_order_result(response)
 
@@ -692,6 +921,9 @@ class HyperliquidTradingClient:
             attempts=3,
             breaker=hyperliquid_order_breaker,
             retryable_status={429},
+            request_type="setLeverage",
+            rate_limit_class="exchange",
+            safety_critical=True,
         )
         if isinstance(response, dict) and response.get("status") == "err":
             raise HyperliquidError(f"set_leverage failed: {response}")
@@ -711,6 +943,9 @@ class HyperliquidTradingClient:
             attempts=1,
             breaker=hyperliquid_order_breaker,
             retryable_status={429},
+            request_type="cancel",
+            rate_limit_class="exchange",
+            safety_critical=False,
         )
         if not isinstance(response, dict):
             raise HyperliquidError("Hyperliquid cancel returned an invalid response")

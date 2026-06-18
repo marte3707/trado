@@ -145,7 +145,7 @@ async def test_fast_risk_liquidation_guard_uses_own_interval(monkeypatch) -> Non
 
     await worker.run_fast_risk_once(executor, state, now=100)
     middle = await worker.run_fast_risk_once(executor, state, now=150)
-    due = await worker.run_fast_risk_once(executor, state, now=160)
+    due = await worker.run_fast_risk_once(executor, state, now=700)
 
     assert "liquidation_guard" not in middle["actions"]
     assert due["actions"]["liquidation_guard"]["checked"] == 1
@@ -165,6 +165,8 @@ async def test_fast_risk_failure_rolls_back_and_logs(monkeypatch) -> None:
         manager,
     )
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(worker, "reconcile_live_positions", lambda _db: 0)
+    monkeypatch.setattr(worker, "audit_unified_account_ratio_guard", lambda _db, _executor: {})
     state = worker._FastRiskState()
 
     result = await worker.run_fast_risk_once(executor, state, now=100)
@@ -205,6 +207,8 @@ async def test_fast_risk_enters_cooldown_after_hyperliquid_429(monkeypatch) -> N
 
     monkeypatch.setattr(worker, "SessionLocal", lambda: db)
     monkeypatch.setattr(manager, "audit_live_positions_against_liquidation", fail_429)
+    monkeypatch.setattr(worker, "reconcile_live_positions", lambda _db: 0)
+    monkeypatch.setattr(worker, "audit_unified_account_ratio_guard", lambda _db, _executor: {})
 
     failed = await worker.run_fast_risk_once(executor, state, now=100)
     skipped = await worker.run_fast_risk_once(executor, state, now=120)
@@ -256,7 +260,7 @@ async def test_fast_risk_records_guard_subcycles(monkeypatch) -> None:
     assert liquidation["expected_interval_seconds"] == 600
     assert uar is not None
     assert uar["status"] == "ok"
-    assert uar["expected_interval_seconds"] == 120
+    assert uar["expected_interval_seconds"] == 300
 
 
 @pytest.mark.asyncio

@@ -298,7 +298,11 @@ def test_worker_sync_pair_selection_uses_only_perps_and_prioritizes_open_or_rece
         _sync_market(3, "SOL"),
         _sync_market(4, "PURR/USDC", "spot"),
     ]
-    monkeypatch.setattr(worker, "_open_position_market_ids", lambda _db: {3})
+    monkeypatch.setattr(
+        worker,
+        "_open_position_market_ids",
+        lambda _db, **kwargs: {3} if kwargs.get("mode") is None else set(),
+    )
     monkeypatch.setattr(worker, "_recent_signal_market_ids", lambda _db, _now: {2})
 
     pairs, stats = worker.select_worker_sync_pairs(
@@ -310,8 +314,8 @@ def test_worker_sync_pair_selection_uses_only_perps_and_prioritizes_open_or_rece
     )
 
     assert [(market.id, timeframe) for market, timeframe in pairs] == [
-        (2, "5m"),
         (3, "5m"),
+        (2, "5m"),
         (1, "5m"),
     ]
     assert stats["total_pairs"] == 3
@@ -327,7 +331,7 @@ def test_worker_sync_pair_selection_staggers_remaining_perps(monkeypatch) -> Non
         _sync_market(2, "ETH"),
         _sync_market(3, "SOL"),
     ]
-    monkeypatch.setattr(worker, "_open_position_market_ids", lambda _db: set())
+    monkeypatch.setattr(worker, "_open_position_market_ids", lambda _db, **_kwargs: set())
     monkeypatch.setattr(worker, "_recent_signal_market_ids", lambda _db, _now: set())
 
     first, first_stats = worker.select_worker_sync_pairs(
@@ -350,6 +354,55 @@ def test_worker_sync_pair_selection_staggers_remaining_perps(monkeypatch) -> Non
     assert [(market.id, timeframe) for market, timeframe in second] == [(3, "5m"), (1, "5m")]
     assert second_stats["cursor_offset"] == 2
     assert second_stats["next_cursor_offset"] == 1
+
+
+def test_worker_sync_pair_selection_restricts_monitoring_only_market_scope(monkeypatch) -> None:
+    db = SyncCursorFakeDb()
+    markets = [
+        _sync_market(1, "BTC"),
+        _sync_market(2, "ETH"),
+        _sync_market(3, "SOL"),
+    ]
+    monkeypatch.setattr(worker, "_open_position_market_ids", lambda _db, **_kwargs: set())
+    monkeypatch.setattr(worker, "_recent_signal_market_ids", lambda _db, _now: set())
+
+    pairs, stats = worker.select_worker_sync_pairs(
+        db,
+        markets,
+        ["5m"],
+        budget=10,
+        now=datetime(2026, 6, 18, 12, 7, tzinfo=UTC),
+        restricted_market_ids_by_timeframe={"5m": {1, 2}},
+        priority_pair_keys={(2, "5m")},
+    )
+
+    assert [(market.id, timeframe) for market, timeframe in pairs] == [
+        (2, "5m"),
+        (1, "5m"),
+    ]
+    assert stats["total_pairs"] == 2
+
+
+def test_worker_sync_pair_selection_skips_current_closed_candles(monkeypatch) -> None:
+    db = SyncCursorFakeDb()
+    markets = [_sync_market(1, "BTC"), _sync_market(2, "ETH")]
+    monkeypatch.setattr(worker, "_open_position_market_ids", lambda _db, **_kwargs: set())
+    monkeypatch.setattr(worker, "_recent_signal_market_ids", lambda _db, _now: set())
+
+    pairs, stats = worker.select_worker_sync_pairs(
+        db,
+        markets,
+        ["5m"],
+        budget=10,
+        now=datetime(2026, 6, 18, 12, 7, tzinfo=UTC),
+        latest_open_by_pair={
+            (1, "5m"): datetime(2026, 6, 18, 12, 0, tzinfo=UTC),
+            (2, "5m"): datetime(2026, 6, 18, 11, 55, tzinfo=UTC),
+        },
+    )
+
+    assert [(market.id, timeframe) for market, timeframe in pairs] == [(2, "5m")]
+    assert stats["total_pairs"] == 1
 
 
 def test_display_live_close_reason_uses_trailing_stop_for_profitable_dynamic_stop() -> None:

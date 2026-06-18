@@ -14,6 +14,10 @@ from app.core.runtime_settings import (
 from app.db.models import AppSetting, DecisionLog
 from app.db.session import SessionLocal
 from app.engine.execution import OrderExecutionEngine
+from app.services.hyperliquid_rate_limit import (
+    effective_hyperliquid_rate_limit_settings,
+    hyperliquid_rate_limit_cooldown_until,
+)
 from app.services.live_reconciliation import reconcile_live_positions
 from app.worker.cycle_status import (
     SYSTEM_CYCLE_STATUS_SETTING_KEY,
@@ -136,11 +140,18 @@ async def run_fast_risk_once(
                 db.commit()
                 return live_skipped_result
 
+            rate_limit_settings = effective_hyperliquid_rate_limit_settings(db)
             actions: dict[str, Any] = {}
             errors: dict[str, str] = {}
+            persisted_cooldown_until = hyperliquid_rate_limit_cooldown_until(db)
+            if persisted_cooldown_until is not None:
+                state.hyperliquid_rate_limit_cooldown_until = max(
+                    state.hyperliquid_rate_limit_cooldown_until,
+                    persisted_cooldown_until.timestamp(),
+                )
             if current_time < state.hyperliquid_rate_limit_cooldown_until:
                 remaining = int(state.hyperliquid_rate_limit_cooldown_until - current_time)
-                result: dict[str, Any] = {
+                cooldown_result: dict[str, Any] = {
                     "status": "skipped",
                     "reason": "hyperliquid_rate_limit_cooldown",
                     "cooldown_remaining_seconds": remaining,
@@ -154,7 +165,7 @@ async def run_fast_risk_once(
                     "Fast Risk Cycle",
                     "skipped",
                     message="Fast risk cycle skipped during Hyperliquid rate-limit cooldown",
-                    data=result,
+                    data=cooldown_result,
                     expected_interval_seconds=settings.fast_risk_loop_interval_seconds,
                 )
                 if current_time - state.last_rate_limit_log_at >= 300:
@@ -162,13 +173,13 @@ async def run_fast_risk_once(
                         DecisionLog(
                             event_type="fast_risk_rate_limit_cooldown",
                             message="Fast risk cycle skipped during Hyperliquid rate-limit cooldown",
-                            data=result,
+                            data=cooldown_result,
                         )
                     )
                     state.last_rate_limit_log_at = current_time
                 db.commit()
-                logger.warning("fast_risk_rate_limit_cooldown", **result)
-                return result
+                logger.warning("fast_risk_rate_limit_cooldown", **cooldown_result)
+                return cooldown_result
 
             # Ogni azione ha il proprio try/except: un 429 (o altro fallimento
             # transitorio) su una singola azione non deve piu' far contare le
@@ -177,8 +188,9 @@ async def run_fast_risk_once(
             # internamente in caso di successo, quindi il rollback locale qui
             # annulla solo il lavoro non committato della azione fallita.
             liquidation_due = (
-                current_time - state.last_liquidation_at
-                >= settings.fast_risk_liquidation_interval_seconds
+                state.last_liquidation_at == 0.0
+                or current_time - state.last_liquidation_at
+                >= rate_limit_settings["liquidation_interval_seconds"]
             )
             if liquidation_due:
                 try:
@@ -193,7 +205,7 @@ async def run_fast_risk_once(
                         "live_liquidation_guard_cycle",
                         "Live Liquidation Guard Cycle",
                         liquidation,
-                        settings.fast_risk_liquidation_interval_seconds,
+                        rate_limit_settings["liquidation_interval_seconds"],
                         ok_message="Live liquidation guard cycle completed",
                     )
                 except Exception as exc:
@@ -204,8 +216,9 @@ async def run_fast_risk_once(
                     logger.exception("fast_risk_liquidation_guard_failed", error=error)
 
             reconcile_due = (
-                current_time - state.last_reconcile_at
-                >= settings.fast_risk_reconcile_interval_seconds
+                state.last_reconcile_at == 0.0
+                or current_time - state.last_reconcile_at
+                >= rate_limit_settings["reconcile_interval_seconds"]
             )
             if reconcile_due:
                 try:
@@ -221,7 +234,10 @@ async def run_fast_risk_once(
                     errors["live_reconciled"] = error
                     logger.exception("fast_risk_reconcile_failed", error=error)
 
-            uar_due = current_time - state.last_uar_at >= settings.fast_risk_uar_interval_seconds
+            uar_due = (
+                state.last_uar_at == 0.0
+                or current_time - state.last_uar_at >= rate_limit_settings["uar_interval_seconds"]
+            )
             if uar_due:
                 try:
                     uar_result = await asyncio.to_thread(
@@ -236,7 +252,7 @@ async def run_fast_risk_once(
                         "unified_account_ratio_guard_cycle",
                         "Unified Account Ratio Guard Cycle",
                         uar_result,
-                        settings.fast_risk_uar_interval_seconds,
+                        rate_limit_settings["uar_interval_seconds"],
                         ok_message="Unified Account Ratio guard cycle completed",
                     )
                 except Exception as exc:
@@ -259,7 +275,7 @@ async def run_fast_risk_once(
                 if any(_is_hyperliquid_rate_limit_error(error) for error in errors.values()):
                     state.hyperliquid_rate_limit_cooldown_until = current_time + max(
                         60,
-                        int(settings.fast_risk_rate_limit_cooldown_seconds),
+                        int(rate_limit_settings["noncritical_cooldown_seconds"]),
                     )
                     result["rate_limit_cooldown_seconds"] = int(
                         state.hyperliquid_rate_limit_cooldown_until - current_time

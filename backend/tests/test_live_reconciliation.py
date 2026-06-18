@@ -95,7 +95,12 @@ class FakeTrading:
         self._fills = fills or []
         # oids of orders currently open on HL (for protection-order detection tests)
         self._open_order_oids: list[int] | None = open_order_oids
-        self._frontend_open_orders = frontend_open_orders or []
+        if frontend_open_orders is not None:
+            self._frontend_open_orders = frontend_open_orders
+        elif open_order_oids is not None:
+            self._frontend_open_orders = [{"oid": oid} for oid in open_order_oids]
+        else:
+            self._frontend_open_orders = None
         self._resubmit_oid = resubmit_oid
         self._resubmit_immediately_filled = resubmit_immediately_filled
         self.resubmitted: list[dict[str, Any]] = []
@@ -113,6 +118,8 @@ class FakeTrading:
         return [{"oid": oid} for oid in self._open_order_oids]
 
     def frontend_open_orders(self, _address: str, *, max_age_seconds: float | None = None) -> list[dict[str, Any]]:
+        if self._frontend_open_orders is None:
+            raise AttributeError("frontend_open_orders not configured")
         return list(self._frontend_open_orders)
 
     def all_mids(self, *, max_age_seconds: float | None = None) -> dict[str, str]:
@@ -132,6 +139,18 @@ class FakeTrading:
         self.resubmitted.append(
             {"coin": coin, "is_buy": is_buy, "size": size, "tpsl": tpsl}
         )
+        if self._frontend_open_orders is not None:
+            self._frontend_open_orders.append(
+                {
+                    "oid": int(self._resubmit_oid),
+                    "coin": coin,
+                    "reduceOnly": True,
+                    "isTrigger": True,
+                    "orderType": "Stop Market" if tpsl == "sl" else "Take Profit Market",
+                    "triggerPx": str(trigger_price),
+                    "sz": str(size),
+                }
+            )
         if self._resubmit_immediately_filled:
             return _FakeOrderResult(
                 oid=self._resubmit_oid,
@@ -145,6 +164,10 @@ class FakeTrading:
         self.canceled.append(
             {"coin": coin, "oid": oid, "expires_after_seconds": expires_after_seconds}
         )
+        if self._frontend_open_orders is not None:
+            self._frontend_open_orders = [
+                order for order in self._frontend_open_orders if order.get("oid") != oid
+            ]
         return {"status": "ok"}
 
 
@@ -205,6 +228,74 @@ def test_reconciliation_closes_position_missing_remote() -> None:
     assert position.status == "closed"
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_position_reconciled_closed" in events
+
+
+def test_reconciliation_cancels_only_orphan_reduce_only_triggers() -> None:
+    position = _make_position()
+    orphan_order = Order(
+        id=30,
+        position_id=20,
+        mode="live",
+        order_type="tp1",
+        side="sell",
+        price=Decimal("46"),
+        size=Decimal("0.1"),
+        status="open",
+        reduce_only=True,
+        hyperliquid_order_id="222",
+        raw_response={},
+    )
+    db = FakeDb(positions=[position], orders=[orphan_order])
+    trading = FakeTrading(
+        remote_positions=[{"coin": "BTC", "szi": "1", "entryPx": "100"}],
+        frontend_open_orders=[
+            {"coin": "BTC", "oid": 111, "reduceOnly": True, "isTrigger": True},
+            {"coin": "LTC", "oid": 222, "reduceOnly": True, "isTrigger": True},
+            {"coin": "MNT", "oid": 333, "reduceOnly": False, "isTrigger": True},
+            {"coin": "ZORA", "oid": 444, "reduceOnly": True, "isTrigger": False},
+        ],
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    assert [item["oid"] for item in trading.canceled] == [222]
+    assert orphan_order.status == "canceled"
+    assert "orphan_cleanup" in orphan_order.raw_response
+    assert any(
+        isinstance(row, DecisionLog)
+        and row.event_type == "live_orphan_protection_order_canceled"
+        for row in db.added
+    )
+
+
+def test_reconciliation_cleans_orphans_without_local_open_positions() -> None:
+    orphan_order = Order(
+        id=31,
+        position_id=21,
+        mode="live",
+        order_type="tp2",
+        side="buy",
+        price=Decimal("1.2"),
+        size=Decimal("2"),
+        status="open",
+        reduce_only=True,
+        hyperliquid_order_id="555",
+        raw_response={},
+    )
+    db = FakeDb(positions=[], orders=[orphan_order])
+    trading = FakeTrading(
+        remote_positions=[],
+        frontend_open_orders=[
+            {"coin": "LIT", "oid": 555, "reduceOnly": True, "isTrigger": True}
+        ],
+    )
+
+    updated = reconcile_live_positions(db, trading_client=trading)
+
+    assert updated == 0
+    assert [item["oid"] for item in trading.canceled] == [555]
+    assert orphan_order.status == "canceled"
+    assert db.committed == 1
 
 
 def test_reconciliation_does_not_derive_mark_px_from_unrealized() -> None:

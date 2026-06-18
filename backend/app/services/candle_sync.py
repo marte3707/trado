@@ -136,7 +136,7 @@ class CandleSyncService:
         db.commit()
         return inserted
 
-    def _latest_open_map(
+    def latest_open_map(
         self,
         db: Session,
         market_ids: list[int],
@@ -153,6 +153,14 @@ class CandleSyncService:
             .all()
         )
         return {(market_id, timeframe): latest for market_id, timeframe, latest in rows}
+
+    def _latest_open_map(
+        self,
+        db: Session,
+        market_ids: list[int],
+        timeframes: list[str],
+    ) -> dict[tuple[int, str], datetime]:
+        return self.latest_open_map(db, market_ids, timeframes)
 
     async def prefetch(
         self,

@@ -143,6 +143,47 @@ class FakeTrading:
         return {"assetPositions": [{"position": row} for row in self.user_state_positions]}
 
 
+class FakeModifyTrading(FakeTrading):
+    def __init__(self, *, raise_modify: Exception | None = None) -> None:
+        super().__init__()
+        self.raise_modify = raise_modify
+        self.modified: list[dict[str, Any]] = []
+
+    def modify_trigger_order(
+        self,
+        *,
+        oid: int,
+        coin: str,
+        is_buy: bool,
+        size: Decimal,
+        trigger_price: Decimal,
+        tpsl: str,
+        expires_after_seconds: int,
+        cloid: str | None = None,
+    ) -> HyperliquidOrderResult:
+        self.modified.append(
+            {
+                "oid": oid,
+                "coin": coin,
+                "is_buy": is_buy,
+                "size": size,
+                "trigger_price": trigger_price,
+                "tpsl": tpsl,
+                "expires_after_seconds": expires_after_seconds,
+                "cloid": cloid,
+            }
+        )
+        if self.raise_modify is not None:
+            raise self.raise_modify
+        return HyperliquidOrderResult(
+            status="ok",
+            oid=str(oid),
+            avg_price=None,
+            filled_size=None,
+            raw_response={"status": "ok", "modified": True},
+        )
+
+
 def _market(active: bool = True) -> Market:
     return Market(
         id=1,
@@ -486,6 +527,93 @@ def test_live_replacement_submits_new_stop_before_canceling_old_stop() -> None:
     assert any(isinstance(row, Order) and row.raw_response.get("dynamic_stop_update") for row in db.added)
 
 
+def test_live_replacement_modifies_existing_stop_when_supported() -> None:
+    engine = PositionManagementEngine(Settings())
+    db = _db()
+    position = _position("long", "90", mode="live")
+    old_order = Order(
+        id=55,
+        position_id=10,
+        hyperliquid_order_id="111",
+        cloid="old",
+        mode="live",
+        order_type="stop_loss",
+        side="sell",
+        price=Decimal("90"),
+        size=Decimal("10"),
+        status="ok",
+        reduce_only=True,
+        raw_response={},
+    )
+    db.orders.append(old_order)
+    candidate = StopCandidate(
+        price=Decimal("95"),
+        reason="breakeven",
+        indicators={"current_price": "105"},
+        r_multiple=Decimal("1"),
+    )
+    trading = FakeModifyTrading()
+
+    assert engine.replace_live_stop_order(db, _market(), position, candidate, trading)
+
+    assert trading.modified[0]["oid"] == 111
+    assert trading.submitted == []
+    assert trading.canceled == []
+    assert old_order.price == Decimal("95")
+    assert position.stop_loss == Decimal("95")
+    assert any(
+        isinstance(row, DecisionLog) and row.event_type == "live_stop_update_modify_succeeded"
+        for row in db.added
+    )
+
+
+def test_live_stop_modify_429_records_pending_without_mutating_stop() -> None:
+    engine = PositionManagementEngine(Settings())
+    db = _db()
+    position = _position("long", "90", mode="live")
+    old_order = Order(
+        id=55,
+        position_id=10,
+        hyperliquid_order_id="111",
+        cloid="old",
+        mode="live",
+        order_type="stop_loss",
+        side="sell",
+        price=Decimal("90"),
+        size=Decimal("10"),
+        status="ok",
+        reduce_only=True,
+        raw_response={},
+    )
+    db.orders.append(old_order)
+    candidate = StopCandidate(
+        price=Decimal("95"),
+        reason="breakeven",
+        indicators={"current_price": "105"},
+        r_multiple=Decimal("1"),
+    )
+    trading = FakeModifyTrading(
+        raise_modify=RuntimeError(
+            "Hyperliquid rate-limit governor skipped exchange:modify; "
+            "reason=address_action_spacing; next_retry_after=2026-06-17T12:00:10+00:00"
+        )
+    )
+
+    assert not engine.replace_live_stop_order(db, _market(), position, candidate, trading)
+
+    assert position.stop_loss == Decimal("90")
+    assert old_order.price == Decimal("90")
+    assert trading.submitted == []
+    pending = [
+        row for row in db.added
+        if isinstance(row, DecisionLog) and row.event_type == "live_stop_update_pending_retry"
+    ]
+    assert pending
+    assert pending[-1].data["submit_attempts"] == 0
+    assert pending[-1].data["rate_limit_class"] == "exchange"
+    assert pending[-1].data["next_retry_after"] == "2026-06-17T12:00:10+00:00"
+
+
 def test_signal_only_mode_blocks_live_replacement() -> None:
     engine = PositionManagementEngine(Settings(operation_mode="SIGNAL_ONLY", enable_live_trading=False))
     db = _db()
@@ -600,8 +728,7 @@ def _live_position_with_metadata() -> Position:
     return p
 
 
-def test_retry_succeeds_on_second_attempt(monkeypatch) -> None:
-    monkeypatch.setattr("app.engine.position_management.time.sleep", lambda _: None)
+def test_submit_failure_records_pending_without_retry() -> None:
     engine = PositionManagementEngine(Settings())
     position = _live_position_with_metadata()
     db = _db()
@@ -615,15 +742,17 @@ def test_retry_succeeds_on_second_attempt(monkeypatch) -> None:
 
     result = engine.replace_live_stop_order(db, _market(), position, candidate, trading)
 
-    assert result is True
-    assert trading.call_count == 2
-    # ogni tentativo deve usare un cloid diverso
-    cloids = [s["cloid"] for s in trading.submitted]
-    assert len(set(cloids)) == 2
+    assert result is False
+    assert trading.call_count == 1
+    failure_logs = [
+        r for r in db.added
+        if isinstance(r, DecisionLog) and r.event_type == "live_stop_update_submit_failed"
+    ]
+    assert len(failure_logs) == 1
+    assert failure_logs[0].data["submit_attempts"] == 1
 
 
-def test_successful_stop_replacement_clears_previous_failure(monkeypatch) -> None:
-    monkeypatch.setattr("app.engine.position_management.time.sleep", lambda _: None)
+def test_successful_stop_replacement_clears_previous_failure() -> None:
     engine = PositionManagementEngine(Settings())
     position = _live_position_with_metadata()
     position.metadata_json["last_stop_replacement_failure"] = {"reason": "submit_rejected"}
@@ -644,8 +773,7 @@ def test_successful_stop_replacement_clears_previous_failure(monkeypatch) -> Non
     assert "last_stop_replacement_failure" not in position.metadata_json
 
 
-def test_retry_all_attempts_fail_records_failure_once(monkeypatch) -> None:
-    monkeypatch.setattr("app.engine.position_management.time.sleep", lambda _: None)
+def test_retry_all_attempts_fail_records_failure_once() -> None:
     engine = PositionManagementEngine(Settings())
     position = _live_position_with_metadata()
     db = _db()
@@ -660,7 +788,7 @@ def test_retry_all_attempts_fail_records_failure_once(monkeypatch) -> None:
     result = engine.replace_live_stop_order(db, _market(), position, candidate, trading)
 
     assert result is False
-    assert trading.call_count == 4  # 4 tentativi totali (backoff 1s/3s/6s)
+    assert trading.call_count == 1
     failure_logs = [
         r for r in db.added
         if isinstance(r, DecisionLog) and r.event_type == "live_stop_update_submit_failed"
@@ -669,8 +797,7 @@ def test_retry_all_attempts_fail_records_failure_once(monkeypatch) -> None:
     assert failure_logs[0].data.get("safety_critical") is True  # candidate reason="breakeven"
 
 
-def test_retry_on_exception_succeeds_on_third_attempt(monkeypatch) -> None:
-    monkeypatch.setattr("app.engine.position_management.time.sleep", lambda _: None)
+def test_submit_exception_records_failure_without_retry() -> None:
     engine = PositionManagementEngine(Settings())
     position = _live_position_with_metadata()
     db = _db()
@@ -684,5 +811,11 @@ def test_retry_on_exception_succeeds_on_third_attempt(monkeypatch) -> None:
 
     result = engine.replace_live_stop_order(db, _market(), position, candidate, trading)
 
-    assert result is True
-    assert trading.call_count == 3
+    assert result is False
+    assert trading.call_count == 1
+    failure_logs = [
+        r for r in db.added
+        if isinstance(r, DecisionLog) and r.event_type == "live_stop_update_submit_failed"
+    ]
+    assert len(failure_logs) == 1
+    assert failure_logs[0].data["submit_attempts"] == 1

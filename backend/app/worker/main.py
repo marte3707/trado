@@ -37,6 +37,7 @@ from app.services.hyperliquid import (
     HyperliquidTransientError,
     fetch_perp_open_interests,
 )
+from app.services.hyperliquid_rate_limit import available_hyperliquid_info_request_capacity
 from app.services.live_reconciliation import reconcile_live_positions
 from app.services.market_sync import MarketSyncService
 from app.services.position_pnl import refresh_open_position_pnls
@@ -101,6 +102,11 @@ DEFAULT_HYPERLIQUID_RATE_LIMIT_SETTINGS = {
     "candle_prefetch_budget_per_tick": DEFAULT_CANDLE_PREFETCH_BUDGET,
     "candle_retry_attempts": DEFAULT_CANDLE_RETRY_ATTEMPTS,
     "fast_risk_recent_reconcile_ttl_seconds": DEFAULT_FAST_RISK_RECENT_RECONCILE_TTL_SECONDS,
+    "noncritical_cooldown_seconds": 600,
+    "reconcile_interval_seconds": 180,
+    "uar_interval_seconds": 300,
+    "liquidation_interval_seconds": 600,
+    "fills_cursor_overlap_minutes": 10,
 }
 
 
@@ -134,19 +140,36 @@ def effective_hyperliquid_rate_limit_settings(db) -> dict[str, int]:
             raw.get("fast_risk_recent_reconcile_ttl_seconds"),
             DEFAULT_FAST_RISK_RECENT_RECONCILE_TTL_SECONDS,
         ),
+        "noncritical_cooldown_seconds": _int_setting(
+            raw.get("noncritical_cooldown_seconds"),
+            DEFAULT_HYPERLIQUID_RATE_LIMIT_SETTINGS["noncritical_cooldown_seconds"],
+        ),
+        "reconcile_interval_seconds": _int_setting(
+            raw.get("reconcile_interval_seconds"),
+            DEFAULT_HYPERLIQUID_RATE_LIMIT_SETTINGS["reconcile_interval_seconds"],
+        ),
+        "uar_interval_seconds": _int_setting(
+            raw.get("uar_interval_seconds"),
+            DEFAULT_HYPERLIQUID_RATE_LIMIT_SETTINGS["uar_interval_seconds"],
+        ),
+        "liquidation_interval_seconds": _int_setting(
+            raw.get("liquidation_interval_seconds"),
+            DEFAULT_HYPERLIQUID_RATE_LIMIT_SETTINGS["liquidation_interval_seconds"],
+        ),
+        "fills_cursor_overlap_minutes": _int_setting(
+            raw.get("fills_cursor_overlap_minutes"),
+            DEFAULT_HYPERLIQUID_RATE_LIMIT_SETTINGS["fills_cursor_overlap_minutes"],
+        ),
     }
 
 
-def _open_position_market_ids(db) -> set[int]:
-    rows = (
-        db.query(Position.market_id)
-        .filter(
-            Position.status == "open",
-            Position.mode.in_([OrderMode.LIVE.value, OrderMode.PAPER.value]),
-        )
-        .distinct()
-        .all()
-    )
+def _open_position_market_ids(db, *, mode: str | None = None) -> set[int]:
+    query = db.query(Position.market_id).filter(Position.status == "open")
+    if mode is None:
+        query = query.filter(Position.mode.in_([OrderMode.LIVE.value, OrderMode.PAPER.value]))
+    else:
+        query = query.filter(Position.mode == mode)
+    rows = query.distinct().all()
     return {int(row[0]) for row in rows if row[0] is not None}
 
 
@@ -188,6 +211,9 @@ def select_worker_sync_pairs(
     *,
     budget: int,
     now: datetime,
+    latest_open_by_pair: dict[tuple[int, str], datetime] | None = None,
+    restricted_market_ids_by_timeframe: dict[str, set[int]] | None = None,
+    priority_pair_keys: set[tuple[int, str]] | None = None,
 ) -> tuple[list[tuple[Market, str]], dict[str, int]]:
     valid_timeframes = [timeframe for timeframe in timeframes if timeframe in TIMEFRAME_MS]
     perp_markets = [
@@ -195,7 +221,26 @@ def select_worker_sync_pairs(
         for market in markets
         if market.active and market.market_type == MarketType.PERP.value
     ]
-    total_pairs = len(perp_markets) * len(valid_timeframes)
+    restrictions = restricted_market_ids_by_timeframe or {}
+
+    def eligible(market: Market, timeframe: str) -> bool:
+        allowed_market_ids = restrictions.get(timeframe)
+        if allowed_market_ids is not None and market.id not in allowed_market_ids:
+            return False
+        if latest_open_by_pair is None:
+            return True
+        interval_ms = TIMEFRAME_MS[timeframe]
+        latest_closed_ms = (int(now.timestamp() * 1000) // interval_ms - 1) * interval_ms
+        latest_closed = datetime.fromtimestamp(latest_closed_ms / 1000, tz=UTC)
+        latest_open = latest_open_by_pair.get((market.id, timeframe))
+        return latest_open is None or latest_open < latest_closed
+
+    total_pairs = sum(
+        1
+        for market in perp_markets
+        for timeframe in valid_timeframes
+        if eligible(market, timeframe)
+    )
     if not perp_markets or not valid_timeframes or budget <= 0:
         _store_cursor_offset(db, 0, universe_size=0)
         return [], {
@@ -206,18 +251,42 @@ def select_worker_sync_pairs(
             "next_cursor_offset": 0,
         }
 
-    priority_market_ids = _open_position_market_ids(db) | _recent_signal_market_ids(db, now)
-    priority_markets = [market for market in perp_markets if market.id in priority_market_ids]
+    live_market_ids = _open_position_market_ids(db, mode=OrderMode.LIVE.value)
+    open_market_ids = _open_position_market_ids(db)
+    recent_market_ids = _recent_signal_market_ids(db, now)
+    priority_market_ids = open_market_ids | recent_market_ids
+    live_markets = [market for market in perp_markets if market.id in live_market_ids]
+    other_open_markets = [
+        market
+        for market in perp_markets
+        if market.id in open_market_ids and market.id not in live_market_ids
+    ]
+    recent_markets = [
+        market
+        for market in perp_markets
+        if market.id in recent_market_ids and market.id not in open_market_ids
+    ]
+    priority_markets = [*live_markets, *other_open_markets, *recent_markets]
     remaining_markets = [market for market in perp_markets if market.id not in priority_market_ids]
-    priority_pairs = [
+    explicit_priority_keys = priority_pair_keys or set()
+    explicit_priority_pairs = [
+        (market, timeframe)
+        for market in perp_markets
+        for timeframe in valid_timeframes
+        if (market.id, timeframe) in explicit_priority_keys and eligible(market, timeframe)
+    ]
+    regular_priority_pairs = [
         (market, timeframe)
         for market in priority_markets
         for timeframe in valid_timeframes
+        if (market.id, timeframe) not in explicit_priority_keys and eligible(market, timeframe)
     ]
+    priority_pairs = [*explicit_priority_pairs, *regular_priority_pairs]
     remaining_pairs = [
         (market, timeframe)
         for market in remaining_markets
         for timeframe in valid_timeframes
+        if (market.id, timeframe) not in explicit_priority_keys and eligible(market, timeframe)
     ]
 
     selected = priority_pairs[:budget]
@@ -378,12 +447,16 @@ async def run_once(
     live_reconciled = 0
     live_reconcile_skipped_reason: str | None = None
     try:
-        if settings.fast_risk_loop_enabled and _fast_risk_reconcile_recent(
-            db,
-            now=time.time(),
-            ttl_seconds=rate_limit_settings["fast_risk_recent_reconcile_ttl_seconds"],
-        ):
-            live_reconcile_skipped_reason = "fast_risk_recent"
+        if settings.fast_risk_loop_enabled:
+            live_reconcile_skipped_reason = (
+                "fast_risk_recent"
+                if _fast_risk_reconcile_recent(
+                    db,
+                    now=time.time(),
+                    ttl_seconds=rate_limit_settings["fast_risk_recent_reconcile_ttl_seconds"],
+                )
+                else "fast_risk_owner"
+            )
         else:
             live_reconciled = await asyncio.to_thread(reconcile_live_positions, db)
         pnl_updated = await refresh_open_position_pnls(db)
@@ -474,12 +547,49 @@ async def run_once(
         # La latenza di rete è il costo dominante del ciclo: scaricare in parallelo (con
         # concorrenza limitata) invece che una coppia per volta riduce drasticamente la
         # durata del tick. La persistenza resta serializzata sulla sessione condivisa.
+        monitoring_market_ids = {
+            market.id
+            for market in markets
+            if market.base in {"BTC", "ETH"}
+            or bool((market.metadata_json or {}).get("monitoring_only"))
+        }
+        restricted_market_ids_by_timeframe = {
+            timeframe: monitoring_market_ids
+            for timeframe in sync_active_timeframes
+            if timeframe in monitoring_only_timeframes and timeframe not in active_timeframes
+        }
+        monitoring_priority_pair_keys = {
+            (market_id, timeframe)
+            for timeframe in sync_active_timeframes
+            if timeframe in monitoring_only_timeframes
+            for market_id in monitoring_market_ids
+        }
+        latest_open_by_pair = await asyncio.to_thread(
+            candle_sync.latest_open_map,
+            db,
+            [market.id for market in markets],
+            sync_active_timeframes,
+        )
+        available_candle_requests = available_hyperliquid_info_request_capacity(
+            db,
+            request_type="candleSnapshot",
+        )
+        if active_timeframes:
+            # Each signal market may also need one l2Book request this minute.
+            available_candle_requests //= 2
+        effective_candle_budget = min(
+            rate_limit_settings["candle_prefetch_budget_per_tick"],
+            available_candle_requests,
+        )
         sync_pairs, sync_pair_stats = select_worker_sync_pairs(
             db,
             markets,
             sync_active_timeframes,
-            budget=rate_limit_settings["candle_prefetch_budget_per_tick"],
+            budget=effective_candle_budget,
             now=tick_start,
+            latest_open_by_pair=latest_open_by_pair,
+            restricted_market_ids_by_timeframe=restricted_market_ids_by_timeframe,
+            priority_pair_keys=monitoring_priority_pair_keys,
         )
         prefetched_candles = await candle_sync.prefetch(
             db,
@@ -492,7 +602,11 @@ async def run_once(
             if isinstance(result, Exception) and _is_market_data_breaker_error(result)
         )
         market_data_breaker_skip_logged = False
-        selected_markets_by_id = {market.id: market for market, _ in sync_pairs}
+        selected_markets_by_id = {
+            market.id: market
+            for market, timeframe in sync_pairs
+            if timeframe in active_timeframes
+        }
         selected_markets = list(selected_markets_by_id.values())
         # Prefetch L2 books per i market selezionati prima del loop segnali: evita
         # le ~N fetch sequenziali (una per coin) dentro generate(), sostituendole con
@@ -618,7 +732,12 @@ async def run_once(
             except Exception as exc:
                 logger.exception("btc_macro_protection_failed", error=str(exc))
                 db.rollback()
-        mark_timeframes_run(sync_active_timeframes, now_ms)
+        completed_sync_backlog = (
+            skipped == 0
+            and sync_pair_stats["selected_pairs"] >= sync_pair_stats["total_pairs"]
+        )
+        if completed_sync_backlog:
+            mark_timeframes_run(sync_active_timeframes, now_ms)
         db.add(
             DecisionLog(
                 event_type="worker_cycle",
@@ -649,6 +768,8 @@ async def run_once(
                     "rate_limit_settings": rate_limit_settings,
                     "sync_pairs_total": sync_pair_stats["total_pairs"],
                     "sync_pairs_selected": sync_pair_stats["selected_pairs"],
+                    "sync_candle_budget": effective_candle_budget,
+                    "sync_backlog_completed": completed_sync_backlog,
                     "sync_priority_pairs": sync_pair_stats["priority_pairs"],
                     "sync_cursor_offset": sync_pair_stats["cursor_offset"],
                     "sync_next_cursor_offset": sync_pair_stats["next_cursor_offset"],

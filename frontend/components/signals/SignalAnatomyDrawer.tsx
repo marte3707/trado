@@ -56,6 +56,11 @@ export function SignalAnatomyDrawer({ signal, positions, onClose, onOpenChart }:
     const src = asNumber(p.metadata_json?.source_signal_id);
     return src === signal.id;
   });
+  const sameMarketOpenPositions = positions.filter((p) => {
+    const src = asNumber(p.metadata_json?.source_signal_id);
+    return p.status === "open" && p.market_id === signal.market_id && src !== signal.id;
+  });
+  const hasDuplicateMarketSkip = signalLogs.some((log) => log.event_type === "paper_order_skipped_duplicate_market");
 
   const entry = asNumber(signal.entry_price);
   const sl = asNumber(signal.stop_loss);
@@ -211,6 +216,53 @@ export function SignalAnatomyDrawer({ signal, positions, onClose, onOpenChart }:
                       </span>
                     </span>
                   </div>
+                </div>
+              </Section>
+            )}
+
+            {!linkedPosition && sameMarketOpenPositions.length > 0 && (
+              <Section title="Posizione aperta sul mercato">
+                {hasDuplicateMarketSkip && (
+                  <div className="mb-2 rounded-md border border-warn/30 bg-warn/10 px-3 py-2 text-xs leading-relaxed text-warn">
+                    Paper non aperta per questo segnale: esiste gia una posizione aperta sullo stesso mercato.
+                  </div>
+                )}
+                <div className="space-y-2">
+                  {sameMarketOpenPositions.map((position) => {
+                    const sourceSignalId = asNumber(position.metadata_json?.source_signal_id);
+                    return (
+                      <div key={position.id} className="rounded-md border border-border bg-bg-2 p-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span
+                              className={cn(
+                                "inline-flex h-5 items-center rounded-md border px-1.5 font-mono text-[10px]",
+                                position.side === "long"
+                                  ? "border-success/30 bg-success/10 text-success"
+                                  : "border-danger/30 bg-danger/10 text-danger",
+                              )}
+                            >
+                              {position.side.toUpperCase()}
+                            </span>
+                            <span className="font-mono text-sm font-medium text-fg">
+                              {position.market?.symbol}
+                            </span>
+                            <span className="text-[10px] uppercase tracking-wider text-fg-3">
+                              {position.mode}
+                            </span>
+                          </div>
+                          <span className="font-mono text-sm text-success">
+                            {position.status.toUpperCase()}
+                          </span>
+                        </div>
+                        <div className="mt-2 grid grid-cols-3 gap-2 font-mono text-xs text-fg-3">
+                          <span>Entry {fmt.price(position.entry_price)}</span>
+                          <span>Size {fmt.price(position.size)}</span>
+                          <span>Signal #{sourceSignalId ?? "—"}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </Section>
             )}

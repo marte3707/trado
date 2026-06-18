@@ -1,6 +1,7 @@
 "use client";
 
-import { ArrowRight, ChevronLeft, ChevronRight } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { ArrowRight, ChevronLeft, ChevronRight, Search, X } from "lucide-react";
 
 import { Card } from "@/components/ui/card";
 import { fmt } from "@/components/atoms";
@@ -64,19 +65,43 @@ export function OpenPositionsLive({
   onPageChange,
   onPageSizeChange,
 }: OpenPositionsLiveProps) {
-  const open = positions
-    .filter((p) => p.status.toLowerCase() === "open")
-    .sort((a, b) => new Date(b.opened_at).getTime() - new Date(a.opened_at).getTime());
-  const totalPages = Math.max(1, Math.ceil(open.length / pageSize));
+  const [query, setQuery] = useState("");
+  const normalizedQuery = query.trim().toLowerCase();
+  const open = useMemo(
+    () =>
+      positions
+        .filter((p) => p.status.toLowerCase() === "open")
+        .sort((a, b) => new Date(b.opened_at).getTime() - new Date(a.opened_at).getTime()),
+    [positions],
+  );
+  const filteredOpen = useMemo(() => {
+    if (!normalizedQuery) return open;
+    return open.filter((p) => {
+      const symbol = p.market?.symbol ?? "";
+      return [
+        symbol,
+        p.mode,
+        p.side,
+        String(p.id),
+        String(p.metadata_json?.source_signal_id ?? ""),
+      ].some((value) => value.toLowerCase().includes(normalizedQuery));
+    });
+  }, [normalizedQuery, open]);
+
+  useEffect(() => {
+    onPageChange?.(1);
+  }, [normalizedQuery, onPageChange]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredOpen.length / pageSize));
   const safePage = Math.min(page, totalPages);
   const pageStart = (safePage - 1) * pageSize;
-  const pageItems = open.slice(pageStart, pageStart + pageSize);
-  const rangeStart = open.length === 0 ? 0 : pageStart + 1;
-  const rangeEnd = Math.min(open.length, pageStart + pageSize);
+  const pageItems = filteredOpen.slice(pageStart, pageStart + pageSize);
+  const rangeStart = filteredOpen.length === 0 ? 0 : pageStart + 1;
+  const rangeEnd = Math.min(filteredOpen.length, pageStart + pageSize);
 
   return (
     <Card className={cn("flex flex-col", className)}>
-      <div className="flex items-center justify-between border-b border-border px-6 py-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-6 py-4">
         <div className="flex items-center gap-2">
           <span className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
             Posizioni aperte
@@ -87,12 +112,38 @@ export function OpenPositionsLive({
             </span>
           )}
         </div>
-        <span className="font-mono text-[10px] text-fg-3">{open.length}</span>
+        <div className="flex items-center gap-2">
+          <label className="relative">
+            <Search className="pointer-events-none absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-fg-4" />
+            <input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Cerca"
+              className="h-8 w-32 rounded-md border border-border bg-bg-1 pl-7 pr-7 font-mono text-[10px] text-fg outline-none transition-colors placeholder:text-fg-4 hover:bg-bg-2 focus:border-fg-3 sm:w-40"
+              aria-label="Cerca posizioni aperte"
+            />
+            {query && (
+              <button
+                type="button"
+                onClick={() => setQuery("")}
+                className="absolute right-1 top-1/2 grid h-6 w-6 -translate-y-1/2 place-items-center rounded text-fg-4 transition-colors hover:bg-bg-2 hover:text-fg"
+                aria-label="Cancella ricerca"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </label>
+          <span className="font-mono text-[10px] text-fg-3">
+            {filteredOpen.length === open.length ? open.length : `${filteredOpen.length}/${open.length}`}
+          </span>
+        </div>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {open.length === 0 ? (
+        {filteredOpen.length === 0 ? (
           <div className="grid h-full min-h-32 place-items-center text-xs text-fg-3">
-            Nessuna posizione aperta {label ? `in ${label}` : ""}.
+            {open.length === 0
+              ? `Nessuna posizione aperta ${label ? `in ${label}` : ""}.`
+              : "Nessuna posizione corrisponde alla ricerca."}
           </div>
         ) : (
           <ul className="divide-y divide-border">
@@ -178,7 +229,7 @@ export function OpenPositionsLive({
       </div>
       <div className="flex items-center justify-between gap-3 border-t border-border px-4 py-3 max-sm:flex-col max-sm:items-start">
         <span className="font-mono text-[10px] text-fg-3">
-          {rangeStart}-{rangeEnd} di {open.length}
+          {rangeStart}-{rangeEnd} di {filteredOpen.length}
         </span>
         <div className="flex items-center gap-2">
           <select

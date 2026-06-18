@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -13,11 +13,12 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.core.config import get_settings
 from app.core.enums import OrderMode, SignalStatus
 from app.core.runtime_settings import effective_live_execution_settings
-from app.db.models import Candle, DecisionLog, Market, Order, Position, Signal
+from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, Signal
 from app.engine.execution import make_cloid
 from app.engine.position_management import PositionManagementEngine, StopCandidate
 from app.indicators.core import atr
 from app.services.hyperliquid import DEFAULT_GUARD_STATE_CACHE_SECONDS, HyperliquidTradingClient
+from app.services.hyperliquid_rate_limit import effective_hyperliquid_rate_limit_settings
 
 logger = structlog.get_logger()
 
@@ -62,6 +63,7 @@ _TP_RESCUE_ATR_MULTIPLIER = Decimal("0.6")
 _TP_RESCUE_PCT_FALLBACK = Decimal("0.003")  # 0.3%
 _TP_RESCUE_MIN_BUFFER_PCT = Decimal("0.0005")  # 0.05% — pavimento contro tick troppo piccoli
 _MAX_TP_RESCUE_PER_LEVEL = 3
+HYPERLIQUID_LIVE_RECONCILIATION_CURSOR_KEY = "hyperliquid_live_reconciliation_cursor"
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,58 @@ def _parse_iso(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed
+
+
+def _fills_time_window(
+    db: Session,
+    positions: list[Position],
+    *,
+    overlap_minutes: int,
+) -> tuple[int, int]:
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    setting = db.get(AppSetting, HYPERLIQUID_LIVE_RECONCILIATION_CURSOR_KEY)
+    raw = setting.value if setting is not None and isinstance(setting.value, dict) else {}
+    overlap_ms = max(1, int(overlap_minutes)) * 60 * 1000
+    last_fill_time_ms = raw.get("last_fill_time_ms")
+    if isinstance(last_fill_time_ms, int) and last_fill_time_ms > 0:
+        return max(0, last_fill_time_ms - overlap_ms), now_ms
+
+    opened_ats = [p.opened_at for p in positions if p.opened_at is not None]
+    earliest = min(opened_ats) if opened_ats else datetime.now(UTC)
+    if earliest.tzinfo is None:
+        earliest = earliest.replace(tzinfo=UTC)
+    start_ms = int((earliest - timedelta(hours=1)).timestamp() * 1000)
+    return max(0, start_ms), now_ms
+
+
+def _record_fills_cursor(
+    db: Session,
+    *,
+    start_ms: int,
+    end_ms: int,
+    fills: list[dict[str, Any]],
+) -> None:
+    setting = db.get(AppSetting, HYPERLIQUID_LIVE_RECONCILIATION_CURSOR_KEY)
+    value = dict(setting.value) if setting is not None and isinstance(setting.value, dict) else {}
+    fill_times = [int(fill["time"]) for fill in fills if isinstance(fill.get("time"), int)]
+    previous_last = value.get("last_fill_time_ms")
+    last_fill = max(fill_times) if fill_times else previous_last
+    if isinstance(previous_last, int) and isinstance(last_fill, int):
+        last_fill = max(previous_last, last_fill)
+    value.update(
+        {
+            "last_requested_start_ms": start_ms,
+            "last_requested_end_ms": end_ms,
+            "last_success_at": datetime.now(UTC).isoformat(),
+            "last_fill_time_ms": last_fill,
+            "last_fill_count": len(fills),
+        }
+    )
+    if setting is None:
+        db.add(AppSetting(key=HYPERLIQUID_LIVE_RECONCILIATION_CURSOR_KEY, value=value))
+    else:
+        setting.value = value
+        db.add(setting)
 
 
 def _coin_for_market(market: Market) -> str:
@@ -520,6 +574,89 @@ def _index_frontend_open_orders(frontend_open_orders: list[dict]) -> dict[str, l
         if isinstance(coin, str) and coin:
             grouped.setdefault(coin, []).append(order)
     return grouped
+
+
+def _cancel_orphan_protection_orders(
+    db: Session,
+    remote_positions: dict[str, dict],
+    frontend_open_orders: list[dict],
+    trading: HyperliquidTradingClient,
+    expires_after_seconds: int,
+) -> int:
+    """Cancel reduce-only triggers for coins with no remote HL position."""
+    local_pending = (
+        db.query(Order)
+        .filter(
+            Order.mode == OrderMode.LIVE.value,
+            Order.order_type.in_(_RECONCILED_EXIT_TYPES),
+            Order.status.notin_(_TERMINAL_ORDER_STATUSES),
+        )
+        .all()
+    )
+    local_by_oid = {
+        str(order.hyperliquid_order_id): order
+        for order in local_pending
+        if order.hyperliquid_order_id
+    }
+    canceled = 0
+    for item in frontend_open_orders:
+        if not isinstance(item, dict):
+            continue
+        coin = item.get("coin")
+        oid = item.get("oid")
+        if (
+            not isinstance(coin, str)
+            or not coin
+            or not isinstance(oid, int)
+            or coin in remote_positions
+            or item.get("reduceOnly") is not True
+            or item.get("isTrigger") is not True
+        ):
+            continue
+
+        local_order = local_by_oid.get(str(oid))
+        try:
+            response = trading.cancel_order(
+                coin=coin,
+                oid=oid,
+                expires_after_seconds=expires_after_seconds,
+            )
+        except Exception as exc:
+            logger.warning(
+                "live_orphan_protection_order_cancel_failed",
+                coin=coin,
+                oid=oid,
+                error=str(exc),
+            )
+            db.add(
+                DecisionLog(
+                    event_type="live_orphan_protection_order_cancel_failed",
+                    position_id=local_order.position_id if local_order is not None else None,
+                    message="Failed to cancel orphan reduce-only trigger order",
+                    data={"coin": coin, "oid": oid, "error": str(exc)},
+                )
+            )
+            continue
+
+        if local_order is not None:
+            local_order.status = "canceled"
+            raw = dict(local_order.raw_response or {})
+            raw["orphan_cleanup"] = {
+                "canceled_at": datetime.now(UTC).isoformat(),
+                "response": response,
+            }
+            _set_order_raw_response(local_order, raw)
+            db.add(local_order)
+        db.add(
+            DecisionLog(
+                event_type="live_orphan_protection_order_canceled",
+                position_id=local_order.position_id if local_order is not None else None,
+                message="Canceled orphan reduce-only trigger order for coin without an HL position",
+                data={"coin": coin, "oid": oid},
+            )
+        )
+        canceled += 1
+    return canceled
 
 
 def _frontend_order_tpsl(order: dict, position: Position) -> str | None:
@@ -1975,8 +2112,6 @@ def reconcile_live_positions(
         .filter(Position.mode == OrderMode.LIVE.value, Position.status == "open")
         .all()
     )
-    if not positions:
-        return 0
 
     settings = get_settings()
     if not settings.hyperliquid_account_address:
@@ -2000,9 +2135,35 @@ def reconcile_live_positions(
             if not item.get("markPx") and coin_key in mids:
                 item["markPx"] = mids[coin_key]
     try:
-        raw_fills = trading.user_fills(
-            settings.hyperliquid_account_address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS
-        )
+        rate_limit_settings = effective_hyperliquid_rate_limit_settings(db)
+        if positions:
+            fills_start_ms, fills_end_ms = _fills_time_window(
+                db,
+                positions,
+                overlap_minutes=rate_limit_settings["fills_cursor_overlap_minutes"],
+            )
+            user_fills_by_time = getattr(trading, "user_fills_by_time", None)
+            if callable(user_fills_by_time):
+                raw_fills = user_fills_by_time(
+                    settings.hyperliquid_account_address,
+                    start_time=fills_start_ms,
+                    end_time=fills_end_ms,
+                    aggregate_by_time=False,
+                    max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS,
+                )
+            else:
+                raw_fills = trading.user_fills(
+                    settings.hyperliquid_account_address,
+                    max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS,
+                )
+            _record_fills_cursor(
+                db,
+                start_ms=fills_start_ms,
+                end_ms=fills_end_ms,
+                fills=raw_fills if isinstance(raw_fills, list) else [],
+            )
+        else:
+            raw_fills = []
     except Exception as exc:
         # Fills are an enrichment — never fail the whole reconciliation if HL
         # returns an error on the userFills endpoint.
@@ -2013,25 +2174,40 @@ def reconcile_live_positions(
 
     open_orders_available = True
     try:
-        raw_open_orders = trading.open_orders(
-            settings.hyperliquid_account_address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS
-        )
-    except Exception as exc:
-        logger.warning("live_reconciliation_open_orders_failed", error=str(exc))
-        raw_open_orders = []
-        open_orders_available = False
-    hl_open_oids, hl_open_cloids = _index_open_orders(raw_open_orders)
-    try:
         raw_frontend_open_orders = trading.frontend_open_orders(
             settings.hyperliquid_account_address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS
         )
     except Exception as exc:
         logger.warning("live_reconciliation_frontend_open_orders_failed", error=str(exc))
         raw_frontend_open_orders = []
+        try:
+            raw_open_orders = trading.open_orders(
+                settings.hyperliquid_account_address,
+                max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS,
+            )
+        except Exception as open_exc:
+            logger.warning("live_reconciliation_open_orders_failed", error=str(open_exc))
+            raw_open_orders = []
+            open_orders_available = False
+        hl_open_oids, hl_open_cloids = _index_open_orders(raw_open_orders)
+    else:
+        hl_open_oids, hl_open_cloids = _index_open_orders(raw_frontend_open_orders)
     frontend_open_orders_by_coin = _index_frontend_open_orders(raw_frontend_open_orders)
 
     live_settings = effective_live_execution_settings(db, settings)
     expires_after_seconds = int(live_settings["order_expires_after_seconds"])
+    orphan_orders_canceled = _cancel_orphan_protection_orders(
+        db,
+        remote_positions,
+        raw_frontend_open_orders,
+        trading,
+        expires_after_seconds,
+    )
+
+    if not positions:
+        if orphan_orders_canceled:
+            db.commit()
+        return 0
 
     updated = 0
     now = datetime.now(UTC)
@@ -2326,6 +2502,6 @@ def reconcile_live_positions(
         db.add(position)
         updated += 1
 
-    if updated:
+    if updated or orphan_orders_canceled:
         db.commit()
     return updated

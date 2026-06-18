@@ -109,6 +109,47 @@ def test_position_history_returns_full_history_without_realtime_limit() -> None:
     assert payload["orders"][0]["order_type"] == "stop_loss"
 
 
+def test_realtime_positions_always_include_old_open_positions() -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine)
+    db = SessionLocal()
+    market = Market(
+        exchange="hyperliquid",
+        symbol="VIRTUAL",
+        base="VIRTUAL",
+        quote="USD",
+        market_type="perp",
+        active=True,
+        metadata_json={},
+    )
+    db.add(market)
+    db.flush()
+    recent_closed = [
+        _position(market, idx, closed_at=datetime(2026, 2, 1, tzinfo=UTC) + timedelta(minutes=idx))
+        for idx in range(positions_router.POSITION_HISTORY_LIMIT + 10)
+    ]
+    old_open = _position(
+        market,
+        -100,
+        status="open",
+        closed_at=None,
+    )
+    db.add_all([*recent_closed, old_open])
+    db.commit()
+
+    response = _client(db).get("/api/positions")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert len(payload) == positions_router.POSITION_HISTORY_LIMIT
+    assert any(row["id"] == old_open.id and row["status"] == "open" for row in payload)
+
+
 def test_position_history_filters_mode_market_type_and_limit() -> None:
     engine = create_engine(
         "sqlite://",

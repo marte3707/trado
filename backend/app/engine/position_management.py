@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import time
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -572,7 +571,13 @@ class PositionManagementEngine:
             "at": datetime.now(UTC).isoformat(),
         }
         position.metadata_json = metadata
-        data = {**payload, "attempts": attempts, "reason": reason, "safety_critical": safety_critical}
+        data = {
+            **payload,
+            "attempts": attempts,
+            "replacement_failure_count": attempts,
+            "reason": reason,
+            "safety_critical": safety_critical,
+        }
         db.add(
             DecisionLog(
                 event_type="live_stop_update_submit_failed",
@@ -582,6 +587,16 @@ class PositionManagementEngine:
                 data=data,
             )
         )
+        if payload.get("rate_limit_class") or _error_looks_rate_limit(payload.get("error")):
+            db.add(
+                DecisionLog(
+                    event_type="live_stop_update_pending_retry",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message="Live stop update deferred after Hyperliquid rate limit",
+                    data=data,
+                )
+            )
         if attempts >= self._STUCK_STOP_ALERT_THRESHOLD:
             db.add(
                 DecisionLog(
@@ -637,61 +652,184 @@ class PositionManagementEngine:
             return False
         order_size = _round_size(position.size, sz_decimals)
         expires = int(live_settings["order_expires_after_seconds"])
-        # Backoff piu' lungo (1s→3s→6s, 4 tentativi) per superare una raffica di
-        # 429 di Hyperliquid: i ~2s precedenti (0.5/1.5) rientravano nella stessa
-        # finestra di rate-limit e fallivano tutti.
-        _RETRY_DELAYS = (1.0, 3.0, 6.0)
-        last_exc: Exception | None = None
-        last_response: dict | None = None
-        result = None
-        cloid = uuid.uuid4().hex
-        for attempt in range(len(_RETRY_DELAYS) + 1):
-            if attempt > 0:
-                time.sleep(_RETRY_DELAYS[attempt - 1])
-                cloid = uuid.uuid4().hex  # nuovo cloid per evitare duplicate-cloid rejection su HL
-                logger.warning(
-                    "live_stop_update_retry",
-                    position_id=position.id,
-                    attempt=attempt + 1,
-                    candidate_stop=str(candidate.price),
-                )
+
+        modify_trigger_order = getattr(trading, "modify_trigger_order", None)
+        if old_order is not None and old_order.hyperliquid_order_id and callable(modify_trigger_order):
             try:
-                result = trading.submit_trigger_order(
+                modify_result = modify_trigger_order(
+                    oid=int(old_order.hyperliquid_order_id),
                     coin=coin,
                     is_buy=close_is_buy,
                     size=order_size,
                     trigger_price=candidate.price,
                     tpsl="sl",
                     expires_after_seconds=expires,
-                    cloid=cloid,
+                    cloid=old_order.cloid,
                 )
-                last_exc = None
             except Exception as exc:
-                last_exc = exc
-                last_response = None
-                continue
-            if result.status == "ok":
-                break
-            last_response = result.raw_response
-            result = None
-
-        if result is None:
-            if last_exc is not None:
-                self._record_stop_update_failure(
-                    db,
-                    position,
-                    reason="submit_exception",
-                    payload={"error": str(last_exc), "candidate_stop": str(candidate.price), "attempts": len(_RETRY_DELAYS) + 1},
-                    safety_critical=safety_critical,
+                error = str(exc)
+                db.add(
+                    DecisionLog(
+                        event_type="live_stop_update_modify_failed",
+                        market_id=position.market_id,
+                        position_id=position.id,
+                        message="Live stop modify failed",
+                        data={
+                            "error": error,
+                            "candidate_stop": str(candidate.price),
+                            "active_stop_order_id": old_order.id,
+                            "active_hl_stop": old_order.hyperliquid_order_id,
+                        },
+                    )
                 )
+                if _error_looks_rate_limit(error):
+                    self._record_stop_update_failure(
+                        db,
+                        position,
+                        reason="modify_rate_limited",
+                        payload={
+                            "error": error,
+                            "candidate_stop": str(candidate.price),
+                            "submit_attempts": 0,
+                            "rate_limit_class": "exchange",
+                            "next_retry_after": _next_retry_after_from_error(error),
+                            "active_stop_order_id": old_order.id,
+                            "active_hl_stop": old_order.hyperliquid_order_id,
+                        },
+                        safety_critical=safety_critical,
+                    )
+                    return False
+                if not _error_looks_missing_order(error):
+                    self._record_stop_update_failure(
+                        db,
+                        position,
+                        reason="modify_exception",
+                        payload={
+                            "error": error,
+                            "candidate_stop": str(candidate.price),
+                            "submit_attempts": 0,
+                            "active_stop_order_id": old_order.id,
+                            "active_hl_stop": old_order.hyperliquid_order_id,
+                        },
+                        safety_critical=safety_critical,
+                    )
+                    return False
             else:
-                self._record_stop_update_failure(
-                    db,
-                    position,
-                    reason="submit_rejected",
-                    payload={"response": last_response, "candidate_stop": str(candidate.price), "attempts": len(_RETRY_DELAYS) + 1},
-                    safety_critical=safety_critical,
-                )
+                if modify_result.status == "ok":
+                    old_order.price = candidate.price
+                    old_order.size = position.size
+                    old_order.status = modify_result.status
+                    if modify_result.oid:
+                        old_order.hyperliquid_order_id = modify_result.oid
+                    old_raw = dict(old_order.raw_response or {})
+                    old_raw.update(
+                        {
+                            **(modify_result.raw_response or {}),
+                            "dynamic_stop_update": True,
+                            "modified_in_place": True,
+                        }
+                    )
+                    old_order.raw_response = old_raw
+                    db.add(old_order)
+                    self.apply_stop_update(
+                        db,
+                        position,
+                        candidate,
+                        mode=OrderMode.LIVE.value,
+                        live_order=old_order,
+                    )
+                    db.add(
+                        DecisionLog(
+                            event_type="live_stop_update_modify_succeeded",
+                            market_id=position.market_id,
+                            position_id=position.id,
+                            message="Live stop order modified in place",
+                            data={
+                                "order_id": old_order.id,
+                                "active_hl_stop": old_order.hyperliquid_order_id,
+                                "candidate_stop": str(candidate.price),
+                            },
+                        )
+                    )
+                    metadata = dict(position.metadata_json or {})
+                    metadata["stop_replacement_attempts"] = 0
+                    metadata.pop("last_stop_replacement_failure", None)
+                    position.metadata_json = metadata
+                    return True
+                if not _response_looks_missing_order(modify_result.raw_response):
+                    db.add(
+                        DecisionLog(
+                            event_type="live_stop_update_modify_failed",
+                            market_id=position.market_id,
+                            position_id=position.id,
+                            message="Live stop modify rejected by Hyperliquid",
+                            data={
+                                "response": modify_result.raw_response,
+                                "candidate_stop": str(candidate.price),
+                                "active_stop_order_id": old_order.id,
+                                "active_hl_stop": old_order.hyperliquid_order_id,
+                            },
+                        )
+                    )
+                    self._record_stop_update_failure(
+                        db,
+                        position,
+                        reason="modify_rejected",
+                        payload={
+                            "response": modify_result.raw_response,
+                            "candidate_stop": str(candidate.price),
+                            "submit_attempts": 0,
+                            "active_stop_order_id": old_order.id,
+                            "active_hl_stop": old_order.hyperliquid_order_id,
+                        },
+                        safety_critical=safety_critical,
+                    )
+                    return False
+
+        cloid = uuid.uuid4().hex
+        try:
+            result = trading.submit_trigger_order(
+                coin=coin,
+                is_buy=close_is_buy,
+                size=order_size,
+                trigger_price=candidate.price,
+                tpsl="sl",
+                expires_after_seconds=expires,
+                cloid=cloid,
+            )
+        except Exception as exc:
+            error = str(exc)
+            self._record_stop_update_failure(
+                db,
+                position,
+                reason="submit_exception",
+                payload={
+                    "error": error,
+                    "candidate_stop": str(candidate.price),
+                    "submit_attempts": 1,
+                    "rate_limit_class": "exchange" if _error_looks_rate_limit(error) else None,
+                    "next_retry_after": _next_retry_after_from_error(error),
+                    "active_stop_order_id": old_order.id if old_order is not None else None,
+                    "active_hl_stop": old_order.hyperliquid_order_id if old_order is not None else None,
+                },
+                safety_critical=safety_critical,
+            )
+            return False
+
+        if result.status != "ok":
+            self._record_stop_update_failure(
+                db,
+                position,
+                reason="submit_rejected",
+                payload={
+                    "response": result.raw_response,
+                    "candidate_stop": str(candidate.price),
+                    "submit_attempts": 1,
+                    "active_stop_order_id": old_order.id if old_order is not None else None,
+                    "active_hl_stop": old_order.hyperliquid_order_id if old_order is not None else None,
+                },
+                safety_critical=safety_critical,
+            )
             return False
         # Successo: azzeriamo il contatore degli attempt falliti
         metadata = dict(position.metadata_json or {})
@@ -740,6 +878,20 @@ class PositionManagementEngine:
                 old_order.raw_response = old_raw
                 db.add(old_order)
             except Exception as exc:
+                old_remote_present = None
+                if _error_looks_rate_limit(str(exc)) and self.settings.hyperliquid_account_address:
+                    with contextlib.suppress(Exception):
+                        frontend_orders = trading.frontend_open_orders(
+                            self.settings.hyperliquid_account_address
+                        )
+                        old_remote_present = _remote_order_present(
+                            frontend_orders,
+                            old_order.hyperliquid_order_id,
+                            old_order.cloid,
+                        )
+                        if old_remote_present is False:
+                            old_order.status = "canceled"
+                            db.add(old_order)
                 db.add(
                     DecisionLog(
                         event_type="live_stop_update_cancel_failed",
@@ -750,6 +902,7 @@ class PositionManagementEngine:
                             "error": str(exc),
                             "old_order_id": old_order.id,
                             "new_order_id": new_order.id,
+                            "old_remote_present": old_remote_present,
                         },
                     )
                 )
@@ -1087,6 +1240,55 @@ class PositionManagementEngine:
         with contextlib.suppress(AttributeError):
             query = query.order_by(Order.created_at.desc())
         return query.first()
+
+
+def _error_looks_rate_limit(error: object) -> bool:
+    lower = str(error or "").lower()
+    return (
+        "429" in lower
+        or "rate limit" in lower
+        or "rate-limit" in lower
+        or "too many requests" in lower
+    )
+
+
+def _error_looks_missing_order(error: object) -> bool:
+    lower = str(error or "").lower()
+    return (
+        "not found" in lower
+        or "does not exist" in lower
+        or "missing order" in lower
+        or "unknown oid" in lower
+        or "order was never placed" in lower
+    )
+
+
+def _response_looks_missing_order(response: object) -> bool:
+    return _error_looks_missing_order(response)
+
+
+def _next_retry_after_from_error(error: object) -> str | None:
+    text = str(error or "")
+    marker = "next_retry_after="
+    if marker not in text:
+        return None
+    return text.split(marker, 1)[1].split()[0].strip(";,.")
+
+
+def _remote_order_present(
+    frontend_orders: list[dict[str, Any]],
+    oid: str | None,
+    cloid: str | None,
+) -> bool:
+    target_oid = int(oid) if oid is not None and str(oid).isdigit() else None
+    target_cloid = str(cloid or "").lower().removeprefix("0x")
+    for order in frontend_orders:
+        if target_oid is not None and order.get("oid") == target_oid:
+            return True
+        remote_cloid = str(order.get("cloid") or "").lower().removeprefix("0x")
+        if target_cloid and remote_cloid == target_cloid:
+            return True
+    return False
 
 
 def r_multiple(position: Position, current_price: Decimal, initial_risk: Decimal) -> Decimal:
