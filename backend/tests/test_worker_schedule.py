@@ -356,6 +356,79 @@ def test_worker_sync_pair_selection_staggers_remaining_perps(monkeypatch) -> Non
     assert second_stats["next_cursor_offset"] == 1
 
 
+def test_worker_sync_pair_selection_does_not_starve_remaining_when_priorities_fill_budget(
+    monkeypatch,
+) -> None:
+    db = SyncCursorFakeDb()
+    markets = [
+        _sync_market(1, "BTC"),
+        _sync_market(2, "ETH"),
+        _sync_market(3, "SOL"),
+        _sync_market(4, "DOGE"),
+        _sync_market(5, "XRP"),
+    ]
+    monkeypatch.setattr(
+        worker,
+        "_open_position_market_ids",
+        lambda _db, **kwargs: {1, 2, 3} if kwargs.get("mode") is None else set(),
+    )
+    monkeypatch.setattr(worker, "_recent_signal_market_ids", lambda _db, _now: set())
+
+    first, first_stats = worker.select_worker_sync_pairs(
+        db,
+        markets,
+        ["15m"],
+        budget=2,
+        now=datetime(2026, 6, 19, tzinfo=UTC),
+    )
+    second, second_stats = worker.select_worker_sync_pairs(
+        db,
+        markets,
+        ["15m"],
+        budget=2,
+        now=datetime(2026, 6, 19, tzinfo=UTC),
+    )
+
+    assert [(market.id, timeframe) for market, timeframe in first] == [
+        (1, "15m"),
+        (4, "15m"),
+    ]
+    assert first_stats["priority_pairs"] == 1
+    assert first_stats["next_cursor_offset"] == 1
+    assert [(market.id, timeframe) for market, timeframe in second] == [
+        (2, "15m"),
+        (5, "15m"),
+    ]
+    assert second_stats["priority_pairs"] == 1
+    assert second_stats["next_cursor_offset"] == 0
+
+
+def test_worker_sync_pair_selection_preserves_cursor_when_budget_is_exhausted(
+    monkeypatch,
+) -> None:
+    db = SyncCursorFakeDb()
+    db.settings[worker.WORKER_MARKET_SYNC_CURSOR_KEY] = AppSetting(
+        key=worker.WORKER_MARKET_SYNC_CURSOR_KEY,
+        value={"offset": 7, "priority_offset": 3, "universe_size": 20},
+    )
+    monkeypatch.setattr(worker, "_open_position_market_ids", lambda _db, **_kwargs: set())
+    monkeypatch.setattr(worker, "_recent_signal_market_ids", lambda _db, _now: set())
+
+    pairs, stats = worker.select_worker_sync_pairs(
+        db,
+        [_sync_market(1, "BTC")],
+        ["15m"],
+        budget=0,
+        now=datetime(2026, 6, 19, tzinfo=UTC),
+    )
+
+    assert pairs == []
+    assert stats["cursor_offset"] == 7
+    assert stats["next_cursor_offset"] == 7
+    assert db.settings[worker.WORKER_MARKET_SYNC_CURSOR_KEY].value["offset"] == 7
+    assert db.settings[worker.WORKER_MARKET_SYNC_CURSOR_KEY].value["priority_offset"] == 3
+
+
 def test_worker_sync_pair_selection_restricts_monitoring_only_market_scope(monkeypatch) -> None:
     db = SyncCursorFakeDb()
     markets = [

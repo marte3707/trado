@@ -61,8 +61,10 @@ backend e worker in questo ordine:
 
 ```bash
 launchctl bootout gui/$(id -u)/com.trado.backend
+launchctl bootout gui/$(id -u)/com.trado.marketdata
 launchctl bootout gui/$(id -u)/com.trado.worker
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trado.backend.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trado.marketdata.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trado.worker.plist
 ```
 
@@ -474,4 +476,3 @@ Test utili per aree sensibili:
 - `docs/ARCHITECTURE.md`: architettura e flussi.
 - `docs/AUTO_TUNING.md`: AutoCalibration e AutoTuner.
 - `docs/AUDIT.md`: audit storico e finding tecnici.
-

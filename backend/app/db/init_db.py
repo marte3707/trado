@@ -294,6 +294,34 @@ def seed_defaults(db: Session) -> None:
             if "monitoring_only" not in value:
                 value["monitoring_only"] = []
                 existing_timeframes.value = value
+    if db.get(AppSetting, "market_data_ws") is None:
+        db.add(
+            AppSetting(
+                key="market_data_ws",
+                value={
+                    "enabled": True,
+                    "max_subscriptions": 950,
+                    "subscription_refresh_seconds": 60,
+                    "heartbeat_seconds": 20,
+                    "reconnect_max_seconds": 60,
+                    "writer_flush_seconds": 1,
+                    "writer_batch_size": 500,
+                },
+            )
+        )
+    if db.get(AppSetting, "market_data_ws_state") is None:
+        db.add(
+            AppSetting(
+                key="market_data_ws_state",
+                value={
+                    "connected": False,
+                    "ready": False,
+                    "active_subscriptions": 0,
+                    "expected_subscriptions": 0,
+                    "pending_events": 0,
+                },
+            )
+        )
     if db.get(AppSetting, "alerts") is None:
         db.add(
             AppSetting(

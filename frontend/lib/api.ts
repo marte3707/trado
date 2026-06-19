@@ -33,6 +33,25 @@ export type Health = {
     last_error_at: string | null;
     last_error_message: string | null;
   };
+  market_data?: {
+    enabled: boolean;
+    healthy: boolean;
+    running: boolean;
+    pid: number | null;
+    label: string;
+    source: string;
+    connected?: boolean;
+    ready?: boolean;
+    expected_subscriptions?: number;
+    active_subscriptions?: number;
+    pending_events?: number;
+    writer_queue_depth?: number;
+    reconnect_count?: number;
+    last_error?: string | null;
+    last_message_at?: string | null;
+    last_persisted_at?: string | null;
+    seconds_since_last_message?: number | null;
+  };
   bot?: {
     running: boolean;
     pid: number | null;
@@ -144,7 +163,7 @@ export type CoinGeckoUsage = {
   source: string;
 };
 
-export type SystemService = "backend" | "worker" | "bot";
+export type SystemService = "backend" | "worker" | "marketdata" | "bot";
 export type SystemServiceAction = "start" | "stop" | "reboot";
 
 export type SystemServiceResult = {

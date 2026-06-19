@@ -82,8 +82,36 @@ function botMeta(health: Health): ServiceMeta {
   };
 }
 
+function marketDataMeta(health: Health): ServiceMeta {
+  const marketData = health.market_data;
+  let status: DotStatus = "muted";
+  let statusLabel = "n/d";
+  if (marketData) {
+    status = marketData.healthy ? "ok" : marketData.running ? "warn" : "danger";
+    statusLabel = marketData.healthy ? "streaming" : marketData.running ? "degradato" : "fermo";
+  }
+  const active = marketData?.active_subscriptions ?? 0;
+  const expected = marketData?.expected_subscriptions ?? 0;
+  const age = marketData?.seconds_since_last_message;
+  return {
+    id: "marketdata",
+    label: "Market Data WS",
+    description: "Candele Hyperliquid realtime con coda DB e fallback REST",
+    status,
+    statusLabel,
+    detail: marketData
+      ? `${active}/${expected} subscription · ultimo messaggio ${age != null ? Math.round(age) + "s fa" : "—"} · eventi ${marketData.pending_events ?? 0}`
+      : "Stato websocket non disponibile",
+  };
+}
+
 export function ServicesTab({ health }: Props) {
-  const services: ServiceMeta[] = [backendMeta(health), workerMeta(health), botMeta(health)];
+  const services: ServiceMeta[] = [
+    backendMeta(health),
+    marketDataMeta(health),
+    workerMeta(health),
+    botMeta(health),
+  ];
   const { mutate: action, isPending } = useServiceAction();
 
   return (

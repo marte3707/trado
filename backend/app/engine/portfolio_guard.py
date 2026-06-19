@@ -365,24 +365,22 @@ class PortfolioGuard:
                 )
             )
 
+        active_directional_state: dict[str, dict[str, Any]] = {}
         for key, raw_entry in list(directional_state.items()):
             entry = _state_entry(raw_entry)
             active_until = _parse_dt(entry.get("active_until"))
             if active_until is not None and active_until <= now:
                 entry["expired_at"] = now.isoformat()
                 directional_state[key] = entry
+            elif active_until is not None:
+                active_directional_state[key] = entry
 
         state["directional_reversal"] = directional_state
         _upsert_state(db, state_row, state)
         return {
             "status": "activated" if triggered else "ok",
             "triggered": triggered,
-            "active": {
-                key: entry
-                for key, entry in directional_state.items()
-                if _parse_dt(_state_entry(entry).get("active_until")) is not None
-                and _parse_dt(_state_entry(entry).get("active_until")) > now
-            },
+            "active": active_directional_state,
         }
 
     def evaluate_macro_risk_gate(

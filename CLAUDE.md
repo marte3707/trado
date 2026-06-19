@@ -108,17 +108,19 @@ Next.js 14 (App Router) + TypeScript + Tailwind. Tutte le chiamate API passano p
 
 ## Riavvio servizi dopo modifiche al backend
 
-Dopo ogni modifica a file in `backend/` riavviare backend e worker tramite launchctl:
+Dopo ogni modifica a file in `backend/` riavviare backend, market-data e worker tramite launchctl:
 
 ```bash
 launchctl bootout gui/$(id -u)/com.trado.backend
+launchctl bootout gui/$(id -u)/com.trado.marketdata
 launchctl bootout gui/$(id -u)/com.trado.worker
 
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trado.backend.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trado.marketdata.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trado.worker.plist
 ```
 
-Eseguire i comandi nell'ordine indicato (prima bootout di entrambi, poi bootstrap di entrambi). Non usare `--reload` uvicorn in produzione: i servizi sono gestiti da launchd.
+Eseguire i comandi nell'ordine indicato (prima tutti i bootout, poi tutti i bootstrap). Non usare `--reload` uvicorn in produzione: i servizi sono gestiti da launchd.
 
 ## Dipendenze pinned
 

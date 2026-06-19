@@ -16,7 +16,7 @@ from app.core.runtime_settings import (
 )
 from app.db.init_db import create_schema, seed_defaults
 from app.db.migrations import apply_migrations
-from app.db.models import AppSetting, DecisionLog, Market, Position, Signal
+from app.db.models import AppSetting, DecisionLog, Market, MarketDataEvent, Position, Signal
 from app.db.session import SessionLocal
 from app.engine.btc_macro_protection import BtcMacroProtectionEngine
 from app.engine.calibration import AutoCalibrationEngine
@@ -97,6 +97,7 @@ class _WorkerStats:
 HYPERLIQUID_RATE_LIMIT_SETTING_KEY = "hyperliquid_rate_limit"
 WORKER_MARKET_SYNC_CURSOR_KEY = "worker_market_sync_cursor"
 RECENT_SIGNAL_PRIORITY_LOOKBACK_SECONDS = 6 * 60 * 60
+MARKET_DATA_WS_EVENT_BATCH_SIZE = 120
 DEFAULT_FAST_RISK_RECENT_RECONCILE_TTL_SECONDS = 90
 DEFAULT_HYPERLIQUID_RATE_LIMIT_SETTINGS = {
     "candle_prefetch_budget_per_tick": DEFAULT_CANDLE_PREFETCH_BUDGET,
@@ -184,17 +185,60 @@ def _recent_signal_market_ids(db, now: datetime) -> set[int]:
     return {int(row[0]) for row in rows if row[0] is not None}
 
 
-def _cursor_offset(db) -> int:
+def _pending_market_data_events(db) -> list[MarketDataEvent]:
+    # The DB queue is authoritative. The status snapshot is updated periodically
+    # and may briefly report zero while a newly persisted close event is pending.
+    rows = (
+        db.query(MarketDataEvent)
+        .filter(MarketDataEvent.processed_at.is_(None))
+        .order_by(MarketDataEvent.candle_open_time.desc())
+        .limit(MARKET_DATA_WS_EVENT_BATCH_SIZE)
+        .all()
+    )
+    newest_by_pair: dict[tuple[int, str], MarketDataEvent] = {}
+    for row in rows:
+        newest_by_pair.setdefault((row.market_id, row.timeframe), row)
+    return list(newest_by_pair.values())
+
+
+def _mark_market_data_event_processed(db, event: MarketDataEvent) -> None:
+    processed_at = datetime.now(UTC)
+    (
+        db.query(MarketDataEvent)
+        .filter(
+            MarketDataEvent.market_id == event.market_id,
+            MarketDataEvent.timeframe == event.timeframe,
+            MarketDataEvent.processed_at.is_(None),
+            MarketDataEvent.candle_open_time <= event.candle_open_time,
+        )
+        .update({MarketDataEvent.processed_at: processed_at}, synchronize_session=False)
+    )
+
+
+def _cursor_offsets(db) -> tuple[int, int]:
     setting = db.get(AppSetting, WORKER_MARKET_SYNC_CURSOR_KEY)
     raw = setting.value if setting is not None else {}
     raw_offset = raw.get("offset", 0) if isinstance(raw, dict) else raw
-    return _int_setting(raw_offset, 0, minimum=0)
+    raw_priority_offset = raw.get("priority_offset", 0) if isinstance(raw, dict) else 0
+    return (
+        _int_setting(raw_offset, 0, minimum=0),
+        _int_setting(raw_priority_offset, 0, minimum=0),
+    )
 
 
-def _store_cursor_offset(db, offset: int, *, universe_size: int) -> None:
+def _store_cursor_offsets(
+    db,
+    offset: int,
+    priority_offset: int,
+    *,
+    universe_size: int,
+    priority_universe_size: int,
+) -> None:
     value = {
         "offset": max(0, int(offset)),
+        "priority_offset": max(0, int(priority_offset)),
         "universe_size": max(0, int(universe_size)),
+        "priority_universe_size": max(0, int(priority_universe_size)),
         "updated_at": datetime.now(UTC).isoformat(),
     }
     setting = db.get(AppSetting, WORKER_MARKET_SYNC_CURSOR_KEY)
@@ -202,6 +246,19 @@ def _store_cursor_offset(db, offset: int, *, universe_size: int) -> None:
         db.add(AppSetting(key=WORKER_MARKET_SYNC_CURSOR_KEY, value=value))
     else:
         setting.value = value
+
+
+def _take_rotated_pairs(
+    pairs: list[tuple[Market, str]],
+    cursor: int,
+    limit: int,
+) -> tuple[list[tuple[Market, str]], int]:
+    if not pairs or limit <= 0:
+        return [], 0 if not pairs else cursor % len(pairs)
+    offset = cursor % len(pairs)
+    rotated = pairs[offset:] + pairs[:offset]
+    selected = rotated[:limit]
+    return selected, (offset + len(selected)) % len(pairs)
 
 
 def select_worker_sync_pairs(
@@ -241,14 +298,30 @@ def select_worker_sync_pairs(
         for timeframe in valid_timeframes
         if eligible(market, timeframe)
     )
-    if not perp_markets or not valid_timeframes or budget <= 0:
-        _store_cursor_offset(db, 0, universe_size=0)
+    cursor, priority_cursor = _cursor_offsets(db)
+    if not perp_markets or not valid_timeframes:
+        _store_cursor_offsets(
+            db,
+            0,
+            0,
+            universe_size=0,
+            priority_universe_size=0,
+        )
         return [], {
             "total_pairs": total_pairs,
             "selected_pairs": 0,
             "priority_pairs": 0,
             "cursor_offset": 0,
             "next_cursor_offset": 0,
+        }
+    if budget <= 0:
+        # A temporarily exhausted rate-limit budget must not rewind fairness.
+        return [], {
+            "total_pairs": total_pairs,
+            "selected_pairs": 0,
+            "priority_pairs": 0,
+            "cursor_offset": cursor,
+            "next_cursor_offset": cursor,
         }
 
     live_market_ids = _open_position_market_ids(db, mode=OrderMode.LIVE.value)
@@ -289,23 +362,58 @@ def select_worker_sync_pairs(
         if (market.id, timeframe) not in explicit_priority_keys and eligible(market, timeframe)
     ]
 
-    selected = priority_pairs[:budget]
-    remaining_budget = max(0, budget - len(selected))
-    cursor = _cursor_offset(db)
-    next_cursor = cursor
-    if remaining_budget and remaining_pairs:
-        offset = cursor % len(remaining_pairs)
-        rotated = remaining_pairs[offset:] + remaining_pairs[:offset]
-        selected_remaining = rotated[:remaining_budget]
-        selected.extend(selected_remaining)
-        next_cursor = (offset + len(selected_remaining)) % len(remaining_pairs)
-    elif not remaining_pairs:
-        next_cursor = 0
-    _store_cursor_offset(db, next_cursor, universe_size=len(remaining_pairs))
+    if priority_pairs and remaining_pairs and budget >= 2:
+        priority_budget = (budget + 1) // 2
+        remaining_budget = budget - priority_budget
+    elif priority_pairs:
+        priority_budget = budget
+        remaining_budget = 0
+    else:
+        priority_budget = 0
+        remaining_budget = budget
+
+    selected_priority, next_priority_cursor = _take_rotated_pairs(
+        priority_pairs,
+        priority_cursor,
+        priority_budget,
+    )
+    selected_remaining, next_cursor = _take_rotated_pairs(
+        remaining_pairs,
+        cursor,
+        remaining_budget,
+    )
+    selected = [*selected_priority, *selected_remaining]
+
+    unused_budget = budget - len(selected)
+    if unused_budget > 0 and len(selected_priority) < len(priority_pairs):
+        extra, next_priority_cursor = _take_rotated_pairs(
+            priority_pairs,
+            next_priority_cursor,
+            min(unused_budget, len(priority_pairs) - len(selected_priority)),
+        )
+        selected.extend(extra)
+        selected_priority.extend(extra)
+        unused_budget -= len(extra)
+    if unused_budget > 0 and len(selected_remaining) < len(remaining_pairs):
+        extra, next_cursor = _take_rotated_pairs(
+            remaining_pairs,
+            next_cursor,
+            min(unused_budget, len(remaining_pairs) - len(selected_remaining)),
+        )
+        selected.extend(extra)
+        selected_remaining.extend(extra)
+
+    _store_cursor_offsets(
+        db,
+        next_cursor,
+        next_priority_cursor,
+        universe_size=len(remaining_pairs),
+        priority_universe_size=len(priority_pairs),
+    )
     return selected, {
         "total_pairs": total_pairs,
         "selected_pairs": len(selected),
-        "priority_pairs": min(len(priority_pairs), budget),
+        "priority_pairs": len(selected_priority),
         "cursor_offset": cursor,
         "next_cursor_offset": next_cursor,
     }
@@ -435,6 +543,7 @@ async def run_once(
     managed_sync_timeframes = paper_management_timeframes(db, sync_timeframes)
     active_timeframes = active_timeframes_for_tick(enabled_timeframes, now_ms)
     sync_active_timeframes = active_timeframes_for_tick(managed_sync_timeframes, now_ms)
+    pending_market_data_events = _pending_market_data_events(db)
     rate_limit_settings = effective_hyperliquid_rate_limit_settings(db)
     logger.info(
         "worker_tick",
@@ -485,7 +594,7 @@ async def run_once(
     # (più sotto) — non qui — perché in reverse_mode deve poter agire sui signal flip
     # generati nello stesso ciclo. La protezione legacy live-only era idempotente
     # rispetto all'ordine; con reverse_mode l'ordine conta.
-    if not active_timeframes and not sync_active_timeframes:
+    if not active_timeframes and not sync_active_timeframes and not pending_market_data_events:
         try:
             db.add(DecisionLog(
                 event_type="worker_cycle",
@@ -547,6 +656,20 @@ async def run_once(
         # La latenza di rete è il costo dominante del ciclo: scaricare in parallelo (con
         # concorrenza limitata) invece che una coppia per volta riduce drasticamente la
         # durata del tick. La persistenza resta serializzata sulla sessione condivisa.
+        market_by_id = {market.id: market for market in markets}
+        event_by_pair = {
+            (event.market_id, event.timeframe): event
+            for event in pending_market_data_events
+            if event.market_id in market_by_id and event.timeframe in managed_sync_timeframes
+        }
+        event_pairs = [
+            (market_by_id[market_id], timeframe)
+            for market_id, timeframe in event_by_pair
+        ]
+        event_timeframes = {timeframe for _, timeframe in event_pairs}
+        signal_timeframes = set(active_timeframes) | (
+            event_timeframes & set(enabled_timeframes)
+        )
         monitoring_market_ids = {
             market.id
             for market in markets
@@ -564,15 +687,27 @@ async def run_once(
             if timeframe in monitoring_only_timeframes
             for market_id in monitoring_market_ids
         }
+        rest_sync_timeframes = list(
+            dict.fromkeys([*sync_active_timeframes, *event_timeframes])
+        )
         latest_open_by_pair = await asyncio.to_thread(
             candle_sync.latest_open_map,
             db,
             [market.id for market in markets],
-            sync_active_timeframes,
+            rest_sync_timeframes,
         )
         available_candle_requests = available_hyperliquid_info_request_capacity(
             db,
             request_type="candleSnapshot",
+        )
+        event_l2_markets = {
+            market.id
+            for market, timeframe in event_pairs
+            if timeframe in signal_timeframes
+        }
+        available_candle_requests = max(
+            0,
+            available_candle_requests - len(event_l2_markets),
         )
         if active_timeframes:
             # Each signal market may also need one l2Book request this minute.
@@ -581,7 +716,7 @@ async def run_once(
             rate_limit_settings["candle_prefetch_budget_per_tick"],
             available_candle_requests,
         )
-        sync_pairs, sync_pair_stats = select_worker_sync_pairs(
+        rest_pairs, sync_pair_stats = select_worker_sync_pairs(
             db,
             markets,
             sync_active_timeframes,
@@ -591,9 +726,14 @@ async def run_once(
             restricted_market_ids_by_timeframe=restricted_market_ids_by_timeframe,
             priority_pair_keys=monitoring_priority_pair_keys,
         )
+        event_pair_keys = {(market.id, timeframe) for market, timeframe in event_pairs}
+        rest_pairs = [
+            pair for pair in rest_pairs if (pair[0].id, pair[1]) not in event_pair_keys
+        ]
+        sync_pairs = [*event_pairs, *rest_pairs]
         prefetched_candles = await candle_sync.prefetch(
             db,
-            sync_pairs,
+            rest_pairs,
             attempts=rate_limit_settings["candle_retry_attempts"],
         )
         market_data_breaker_skips = sum(
@@ -605,7 +745,7 @@ async def run_once(
         selected_markets_by_id = {
             market.id: market
             for market, timeframe in sync_pairs
-            if timeframe in active_timeframes
+            if timeframe in signal_timeframes
         }
         selected_markets = list(selected_markets_by_id.values())
         # Prefetch L2 books per i market selezionati prima del loop segnali: evita
@@ -627,17 +767,19 @@ async def run_once(
             hl_coin = (market.metadata_json or {}).get("hl_coin") or market.symbol
             market_oi = perp_oi_map.get(str(hl_coin))
             prefetched = prefetched_candles.get((market.id, timeframe))
+            market_data_event = event_by_pair.get((market.id, timeframe))
             try:
-                if isinstance(prefetched, Exception):
-                    raise prefetched
-                await asyncio.to_thread(
-                    candle_sync.persist_candles,
-                    db,
-                    market,
-                    timeframe,
-                    prefetched or [],
-                    market_oi,
-                )
+                if market_data_event is None:
+                    if isinstance(prefetched, Exception):
+                        raise prefetched
+                    await asyncio.to_thread(
+                        candle_sync.persist_candles,
+                        db,
+                        market,
+                        timeframe,
+                        prefetched or [],
+                        market_oi,
+                    )
             except HyperliquidTransientError as exc:
                 skipped += 1
                 if _is_market_data_breaker_error(exc):
@@ -674,6 +816,9 @@ async def run_once(
             if (market.metadata_json or {}).get("monitoring_only"):
                 # Market osservato solo a scopo macro (es. XYZ100): candele
                 # sincronizzate sopra, ma nessun segnale né posizione.
+                if market_data_event is not None:
+                    _mark_market_data_event_processed(db, market_data_event)
+                    db.commit()
                 continue
             closed += await asyncio.to_thread(
                 executor.close_paper_positions_for_timeframe, db, market, timeframe
@@ -693,9 +838,15 @@ async def run_once(
                     market,
                     timeframe,
                 )
-            if timeframe not in active_timeframes:
+            if timeframe not in signal_timeframes:
+                if market_data_event is not None:
+                    _mark_market_data_event_processed(db, market_data_event)
+                    db.commit()
                 continue
             signal = await asyncio.to_thread(signal_engine.generate, db, market, timeframe)
+            if market_data_event is not None:
+                _mark_market_data_event_processed(db, market_data_event)
+                db.commit()
             if signal is None:
                 continue
             generated += 1
@@ -768,6 +919,7 @@ async def run_once(
                     "rate_limit_settings": rate_limit_settings,
                     "sync_pairs_total": sync_pair_stats["total_pairs"],
                     "sync_pairs_selected": sync_pair_stats["selected_pairs"],
+                    "ws_events_selected": len(event_pairs),
                     "sync_candle_budget": effective_candle_budget,
                     "sync_backlog_completed": completed_sync_backlog,
                     "sync_priority_pairs": sync_pair_stats["priority_pairs"],

@@ -63,6 +63,31 @@ class Candle(Base):
     )
 
 
+class MarketDataEvent(Base):
+    __tablename__ = "market_data_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    market_id: Mapped[int] = mapped_column(
+        ForeignKey("markets.id", ondelete="CASCADE"), index=True
+    )
+    timeframe: Mapped[str] = mapped_column(String(8), index=True)
+    candle_open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    market: Mapped[Market] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "market_id",
+            "timeframe",
+            "candle_open_time",
+            name="uq_market_data_event_candle",
+        ),
+        Index("ix_market_data_events_pending", "processed_at", "created_at"),
+    )
+
+
 class Indicator(Base):
     __tablename__ = "indicators"
 

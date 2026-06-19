@@ -89,6 +89,7 @@ def health(db: Session = Depends(get_db)) -> dict:
             "checks": checks,
         },
         "worker": _worker_status(db),
+        "market_data": _market_data_status(db),
         "bot": _bot_status(),
     }
 
@@ -106,6 +107,11 @@ SYSTEM_SERVICES = {
         "label": "com.trado.worker",
         "plist": FilePath.home() / "Library/LaunchAgents/com.trado.worker.plist",
         "error_log": FilePath.home() / "Library/Logs/trado-worker.err.log",
+    },
+    "marketdata": {
+        "label": "com.trado.marketdata",
+        "plist": FilePath.home() / "Library/LaunchAgents/com.trado.marketdata.plist",
+        "error_log": FilePath.home() / "Library/Logs/trado-marketdata.err.log",
     },
     "bot": {
         "label": "com.trado.bot",
@@ -155,14 +161,8 @@ def _worker_status(db: Session) -> dict:
     }
 
 
-def _bot_status() -> dict:
-    """Stato del bot Telegram letto da launchd.
-
-    Il bot non scrive heartbeat su DB (processo separato che fa long-polling
-    verso Telegram), quindi l'unica fonte affidabile è lo stato del servizio
-    launchd: `launchctl print` espone `state = running` e il pid.
-    """
-    label = str(SYSTEM_SERVICES["bot"]["label"])
+def _launchd_status(service: str) -> dict[str, Any]:
+    label = str(SYSTEM_SERVICES[service]["label"])
     target = f"gui/{os.getuid()}/{label}"
     running = False
     pid: int | None = None
@@ -188,6 +188,39 @@ def _bot_status() -> dict:
                 running = True
         running = running or pid is not None
     return {"running": running, "pid": pid, "label": label, "source": "launchctl"}
+
+
+def _bot_status() -> dict:
+    """Stato del bot Telegram letto da launchd."""
+    return _launchd_status("bot")
+
+
+def _market_data_status(db: Session) -> dict[str, Any]:
+    config_row = db.get(AppSetting, "market_data_ws")
+    config = config_row.value if config_row and isinstance(config_row.value, dict) else {}
+    state_row = db.get(AppSetting, "market_data_ws_state")
+    state = state_row.value if state_row and isinstance(state_row.value, dict) else {}
+    launchd = _launchd_status("marketdata")
+    last_message_at = _coerce_utc_datetime(state.get("last_message_at"))
+    seconds_since_message = (
+        (datetime.now(UTC) - last_message_at).total_seconds() if last_message_at else None
+    )
+    enabled = bool(config.get("enabled", True))
+    healthy = bool(
+        enabled
+        and launchd["running"]
+        and state.get("connected")
+        and state.get("ready")
+        and seconds_since_message is not None
+        and seconds_since_message < 120
+    )
+    return {
+        **state,
+        **launchd,
+        "enabled": enabled,
+        "healthy": healthy,
+        "seconds_since_last_message": seconds_since_message,
+    }
 
 
 def _service_script(service: str, action: str) -> str:
@@ -471,7 +504,7 @@ def system_cycles(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 @router.post("/system/services/{service}/{action}")
 def system_service_action(
-    service: str = Path(..., pattern=r"^(backend|worker|bot)$"),
+    service: str = Path(..., pattern=r"^(backend|worker|marketdata|bot)$"),
     action: str = Path(..., pattern=r"^(start|stop|reboot)$"),
 ) -> dict:
     if service not in SYSTEM_SERVICES or action not in SYSTEM_ACTIONS:
@@ -491,5 +524,4 @@ def system_error_logs(limit: int = Query(20, ge=1, le=200)) -> dict:
         service: _tail_error_log(FilePath(str(config["error_log"])), limit)
         for service, config in SYSTEM_SERVICES.items()
     }
-
 

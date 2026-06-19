@@ -7,18 +7,18 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/marcocantarero/Desktop/projects/trado/venv/bin/python</string>
+        <string>/Users/marcocantarero/projects/trado/venv/bin/python</string>
         <string>-m</string>
         <string>app.bot.main</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/marcocantarero/Desktop/projects/trado/backend</string>
+    <string>/Users/marcocantarero/projects/trado/backend</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/marcocantarero/Desktop/projects/trado/venv/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <string>/Users/marcocantarero/projects/trado/venv/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
     </dict>

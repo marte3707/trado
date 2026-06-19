@@ -14,7 +14,7 @@ from app.engine.portfolio_guard import PortfolioGuard
 class FakeQuery:
     rows: list[Any]
 
-    def filter(self, *_args: Any, **_kwargs: Any) -> "FakeQuery":
+    def filter(self, *_args: Any, **_kwargs: Any) -> FakeQuery:
         rows = list(self.rows)
         for expr in _args:
             key = getattr(getattr(expr, "left", None), "key", None)
@@ -30,7 +30,7 @@ class FakeQuery:
                 rows = [row for row in rows if getattr(row, key) is not value]
         return FakeQuery(rows)
 
-    def order_by(self, *args: Any) -> "FakeQuery":
+    def order_by(self, *args: Any) -> FakeQuery:
         rows = list(self.rows)
         for expr in args:
             key = getattr(getattr(expr, "element", None), "key", None)
