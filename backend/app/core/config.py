@@ -12,7 +12,7 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     operation_mode: OperationMode = OperationMode.SIGNAL_ONLY
-    database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5432/trado"
+    database_url: str = "postgresql+psycopg://postgres:postgres@localhost:5433/trado"
     public_api_base_url: str = "http://localhost:8000"
     api_key: str | None = None
     cors_allowed_origins: Annotated[list[str], NoDecode] = Field(

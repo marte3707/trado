@@ -30,6 +30,11 @@ from app.services.hyperliquid import (
     HyperliquidError,
     HyperliquidTradingClient,
 )
+from app.services.hyperliquid_account_ws import (
+    ACCOUNT_DATA_WS_SETTING_KEY,
+    ACCOUNT_DATA_WS_STATE_KEY,
+    DEFAULT_ACCOUNT_DATA_WS_SETTINGS,
+)
 from app.services.unified_account_ratio import (
     DEFAULT_UAR_RISK_SETTINGS,
     calculate_unified_account_ratio,
@@ -43,6 +48,53 @@ router = APIRouter()
 
 _ACCOUNT_SNAPSHOT_CACHE_TTL_SECONDS = 25.0
 _ACCOUNT_SNAPSHOT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _fresh_account_ws_state(
+    db: Session,
+    settings: Any,
+    checked_at: datetime,
+) -> dict[str, Any] | None:
+    config_row = db.get(AppSetting, ACCOUNT_DATA_WS_SETTING_KEY)
+    config = (
+        config_row.value
+        if config_row is not None and isinstance(config_row.value, dict)
+        else DEFAULT_ACCOUNT_DATA_WS_SETTINGS
+    )
+    if not bool(config.get("enabled", True)):
+        return None
+    state_row = db.get(AppSetting, ACCOUNT_DATA_WS_STATE_KEY)
+    state = state_row.value if state_row is not None and isinstance(state_row.value, dict) else None
+    if not state or not state.get("connected") or not state.get("ready"):
+        return None
+    if state.get("network") != settings.hyperliquid_network:
+        return None
+    if state.get("account_address") != settings.hyperliquid_account_address:
+        return None
+    updated_at = _parse_utc_datetime(state.get("updated_at"))
+    try:
+        stale_seconds = max(1, int(config.get("snapshot_stale_seconds", 90)))
+    except (TypeError, ValueError):
+        stale_seconds = 90
+    if updated_at is None or (checked_at - updated_at).total_seconds() > stale_seconds:
+        return None
+    if not isinstance(state.get("user_state"), dict) or not isinstance(state.get("spot_state"), dict):
+        return None
+    if not isinstance(state.get("open_orders"), list):
+        return None
+    return state
 
 
 def _account_snapshot_cache_key(settings: Any) -> str:
@@ -335,24 +387,51 @@ async def account_equity_history(
 @router.get("/account/snapshot")
 async def account_snapshot(db: Session = Depends(get_db)) -> dict:
     settings = get_settings()
-    cache_key = _account_snapshot_cache_key(settings)
-    cached = _ACCOUNT_SNAPSHOT_CACHE.get(cache_key)
-    if cached is not None:
-        cached_at, cached_payload = cached
-        if perf_counter() - cached_at <= _ACCOUNT_SNAPSHOT_CACHE_TTL_SECONDS:
-            return deepcopy(cached_payload)
-
-    client = HyperliquidClient(settings)
     checked_at = datetime.now(UTC)
-    started = perf_counter()
-    meta, mids, api_error = await _fetch_market_meta(client)
-    api_latency_ms = round((perf_counter() - started) * 1000, 1)
-
+    ws_state = _fresh_account_ws_state(db, settings, checked_at)
+    cache_key = _account_snapshot_cache_key(settings)
     address = settings.hyperliquid_account_address
-    user_state, spot_state, open_orders, user_funding, account_error = await _fetch_account_state(
-        client, address, checked_at
-    )
-    predicted_fundings, predicted_error = await _fetch_predicted_fundings(client)
+    if ws_state is not None:
+        meta = None
+        mids = None
+        api_error = None
+        account_error = None
+        api_latency_ms = 0.0
+        data_source = "websocket"
+        user_state = ws_state["user_state"]
+        spot_state = ws_state["spot_state"]
+        basic_open_orders = ws_state["open_orders"]
+        enriched_open_orders = ws_state.get("frontend_open_orders")
+        open_orders = enriched_open_orders if isinstance(enriched_open_orders, list) else basic_open_orders
+        raw_fundings = ws_state.get("predicted_fundings")
+        predicted_fundings = [
+            item
+            for item in (
+                _predicted_funding_payload(row)
+                for row in (raw_fundings if isinstance(raw_fundings, list) else [])
+            )
+            if item is not None
+        ]
+        raw_user_funding = ws_state.get("user_funding")
+        user_funding = raw_user_funding if isinstance(raw_user_funding, list) else []
+        enrichment_error = ws_state.get("enrichment_error")
+        predicted_error = str(enrichment_error) if enrichment_error else None
+    else:
+        cached = _ACCOUNT_SNAPSHOT_CACHE.get(cache_key)
+        if cached is not None:
+            cached_at, cached_payload = cached
+            if perf_counter() - cached_at <= _ACCOUNT_SNAPSHOT_CACHE_TTL_SECONDS:
+                return deepcopy(cached_payload)
+
+        client = HyperliquidClient(settings)
+        started = perf_counter()
+        meta, mids, api_error = await _fetch_market_meta(client)
+        api_latency_ms = round((perf_counter() - started) * 1000, 1)
+        data_source = "rest"
+        user_state, spot_state, open_orders, user_funding, account_error = await _fetch_account_state(
+            client, address, checked_at
+        )
+        predicted_fundings, predicted_error = await _fetch_predicted_fundings(client)
 
     margin = (user_state or {}).get("marginSummary", {})
     cross_margin = (user_state or {}).get("crossMarginSummary", {})
@@ -455,6 +534,7 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
         "checked_at": checked_at,
         "api": {
             "status": "ok" if api_error is None else "error",
+            "source": data_source,
             "latency_ms": api_latency_ms,
             "info_url": settings.info_url,
             "ws_url": settings.ws_url,
@@ -496,7 +576,7 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
         },
         "last_snapshot": _latest_account_snapshot(db),
     }
-    if api_error is None and account_error is None:
+    if data_source == "rest" and api_error is None and account_error is None:
         _ACCOUNT_SNAPSHOT_CACHE[cache_key] = (perf_counter(), deepcopy(payload))
     return payload
 

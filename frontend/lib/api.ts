@@ -204,6 +204,7 @@ export type AccountMonitor = {
   checked_at: string;
   api: {
     status: string;
+    source: "websocket" | "rest";
     latency_ms: number | null;
     info_url: string;
     ws_url: string;

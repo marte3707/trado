@@ -8,6 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.runtime_settings import effective_strategy_exclusions
 from app.db.models import AppSetting, DecisionLog, Position, StrategyConfig
 from app.engine.diagnostics import equity_slope_normalized
 from app.engine.edge_profile import (
@@ -176,6 +177,15 @@ class AutoCalibrationEngine:
             "recent_slope_exit_cycles": 3,
             "deep_defensive_cooldown_runs": 6,
             "deep_defensive_cooldown_min_new_trades": 3,
+            "weight_change_min_new_trades": 10,
+            # Fase 1 — difesa recency-aware: si attiva quando gli ultimi `recent_window`
+            # trade peggiorano anche se la finestra storica (500) sembra sana.
+            "recent_defensive_enabled": True,
+            "recent_defensive_pf_floor": 0.8,
+            "recent_defensive_exit_pf": 1.0,
+            "recent_defensive_exit_cycles": 3,
+            "recent_defensive_risk_factor": 0.6,
+            "recent_defensive_rr_add": 0.3,
         }
         return {**defaults, **value}
 
@@ -245,6 +255,21 @@ class AutoCalibrationEngine:
         retest_after_trades = int(settings.get("auto_disable_retest_after_trades", 200))
         changes: list[CalibrationChange] = []
         strategies = db.query(StrategyConfig).all()
+        # Cull permanente: forza enabled=False per le strategie nella exclusion list
+        # e non contarle come attive. L'auto-retest più sotto non le riabiliterà.
+        exclusions = effective_strategy_exclusions(db)
+        for strategy in strategies:
+            if strategy.strategy_name in exclusions and strategy.enabled:
+                strategy.enabled = False
+                changes.append(
+                    CalibrationChange(
+                        target="strategy_enabled",
+                        key=f"{strategy.timeframe}:{strategy.strategy_name}",
+                        before=True,
+                        after=False,
+                        reason="culled: strategy in exclusion list (no OOS edge)",
+                    )
+                )
         active_per_timeframe: dict[str, int] = {}
         for strategy in strategies:
             if strategy.enabled:
@@ -275,6 +300,8 @@ class AutoCalibrationEngine:
         for strategy in strategies:
             if strategy.enabled:
                 continue
+            if strategy.strategy_name in exclusions:
+                continue  # cullata: mai riabilitare via auto-retest
             key = f"{strategy.timeframe}:{strategy.strategy_name}"
             disabled_count = disabled_at.get(key)
             if disabled_count is None:
@@ -356,6 +383,14 @@ class AutoCalibrationEngine:
             state_value.get("baseline_drift_at_trade_count") or {}
         )
         baseline_updates: dict[str, int] = {}
+        # Fase 3 — anti-churn: una cella può rimuovere di nuovo il peso solo dopo un
+        # minimo di nuovi trade chiusi dall'ultimo cambio. Smorza le oscillazioni ±1
+        # frequenti (vedi scripts/calibration_stability_report.py) limitando la
+        # *frequenza* dei cambi — ortogonale al baseline drift (che muove l'ancora).
+        weight_change_min_new_trades = int(settings.get("weight_change_min_new_trades", 10))
+        weight_change_at: dict[str, int] = dict(
+            state_value.get("weight_change_at_trade_count") or {}
+        )
         # Fix 4: rileva regime corrente una volta per tutta la calibrazione
         current_regime = self.analyzer.recent_regime(db)
         regime_pos_cache: dict[str, dict[str, list[Position]]] = {}
@@ -363,6 +398,8 @@ class AutoCalibrationEngine:
         contrib_cache: dict[str, dict] = {}
 
         for strategy in strategies:
+            if strategy.strategy_name in exclusions:
+                continue  # cullata: non calibrare i pesi
             if strategy.timeframe not in positions_by_timeframe:
                 positions_by_timeframe[strategy.timeframe] = self.analyzer.strategy_positions(
                     db,
@@ -513,6 +550,15 @@ class AutoCalibrationEngine:
                         )
             if calibrated == strategy.weight:
                 continue
+            # Anti-churn: salta il cambio se il peso di questa cella è stato mosso
+            # troppo di recente (meno di weight_change_min_new_trades trade fa).
+            last_weight_change = weight_change_at.get(key)
+            if (
+                weight_change_min_new_trades > 0
+                and last_weight_change is not None
+                and total_closed - int(last_weight_change) < weight_change_min_new_trades
+            ):
+                continue
             changes.append(
                 CalibrationChange(
                     target="strategy_weight",
@@ -523,6 +569,7 @@ class AutoCalibrationEngine:
                 )
             )
             strategy.weight = calibrated
+            weight_change_at[key] = int(total_closed)
 
         # Persisti il bookkeeping dei disable + storico dei factor (stability tracking).
         # Il merge con il resto del state avviene in _calibrate_risk_settings (che scrive
@@ -530,6 +577,7 @@ class AutoCalibrationEngine:
         state_value["auto_disabled_at_trade_count"] = disabled_at
         state_value["factor_history"] = factor_history
         state_value["baseline_drift_at_trade_count"] = baseline_drift_at
+        state_value["weight_change_at_trade_count"] = weight_change_at
         persisted = state_setting or AppSetting(key="auto_calibration_state", value={})
         persisted.value = state_value
         db.add(persisted)
@@ -560,11 +608,14 @@ class AutoCalibrationEngine:
         wf_min_per_side = int(settings.get("walk_forward_min_per_side", 5))
         changes: list[CalibrationChange] = []
         strategies = db.query(StrategyConfig).all()
+        exclusions = effective_strategy_exclusions(db)
         positions_by_timeframe: dict[str, dict[str, list[Position]]] = (
             positions_cache if positions_cache is not None else {}
         )
 
         for strategy in strategies:
+            if strategy.strategy_name in exclusions:
+                continue  # cullata: non calibrare i params
             if strategy.timeframe not in positions_by_timeframe:
                 positions_by_timeframe[strategy.timeframe] = self.analyzer.strategy_positions(
                     db,
@@ -796,6 +847,53 @@ class AutoCalibrationEngine:
             and recent_stats.profit_factor > 1.0
         )
 
+        # Fase 1 — difesa recency-aware con isteresi. La finestra storica (500 trade)
+        # può mascherare un degrado recente (es. PF 1.08 storico ma 0.65 sugli ultimi
+        # 50): qui un tier difensivo più morbido entra sul *recente*, indipendente da
+        # deep_defensive. Isteresi: entra subito sul deterioramento, esce solo dopo
+        # `exit_cycles` run consecutivi con PF recente recuperato — così non flippa
+        # a ogni run (il churn dei risk setting era il finding di Fase 4).
+        recent_def_enabled = bool(settings.get("recent_defensive_enabled", True))
+        recent_def_pf_floor = float(settings.get("recent_defensive_pf_floor", 0.8))
+        recent_def_exit_pf = float(settings.get("recent_defensive_exit_pf", 1.0))
+        recent_def_exit_cycles = int(settings.get("recent_defensive_exit_cycles", 3))
+        recent_def_risk_factor = float(settings.get("recent_defensive_risk_factor", 0.6))
+        recent_def_rr_add = float(settings.get("recent_defensive_rr_add", 0.3))
+        prev_recent_def = bool(state_value.get("recent_defensive_active", False))
+        prev_recent_def_recovery = int(state_value.get("recent_defensive_recovery_streak", 0))
+        recent_pf = (
+            recent_stats.profit_factor
+            if recent_stats is not None and recent_stats.profit_factor is not None
+            else None
+        )
+        recent_sample_ok = recent_stats is not None and recent_stats.trades >= recent_min_trades
+        recent_deteriorating = (
+            recent_def_enabled
+            and recent_sample_ok
+            and recent_pf is not None
+            and recent_pf < recent_def_pf_floor
+            and recent_slope_value < 0
+        )
+        recent_recovered = (
+            recent_sample_ok and recent_pf is not None and recent_pf >= recent_def_exit_pf
+        )
+        if not recent_def_enabled:
+            recent_defensive_active = False
+            new_recent_def_recovery = 0
+        elif recent_deteriorating:
+            recent_defensive_active = True
+            new_recent_def_recovery = 0
+        elif prev_recent_def:
+            if recent_recovered:
+                new_recent_def_recovery = prev_recent_def_recovery + 1
+                recent_defensive_active = new_recent_def_recovery < recent_def_exit_cycles
+            else:
+                new_recent_def_recovery = 0
+                recent_defensive_active = True
+        else:
+            recent_defensive_active = False
+            new_recent_def_recovery = 0
+
         score_delta = 0
         rr_delta = 0.0
         risk_pct = base_risk
@@ -863,6 +961,18 @@ class AutoCalibrationEngine:
                 rr_delta = 0.25
                 risk_pct = max(min_risk_floor, base_risk * 0.75)
                 reason = "defensive mode after weak historical results"
+        elif recent_defensive_active:
+            # Overall storico sano ma recente in deterioramento: difesa sul recente.
+            # Solo size e RR (score non predittivo, vedi nota deep defensive).
+            _rt = recent_stats.trades if recent_stats is not None else 0
+            _rpf = f"{recent_pf:.2f}" if recent_pf is not None else "n/a"
+            score_delta = 0
+            rr_delta = recent_def_rr_add
+            risk_pct = max(min_risk_floor, base_risk * recent_def_risk_factor)
+            reason = (
+                f"recent defensive: ultimi {_rt} trade deboli "
+                f"(PF={_rpf}, slope={recent_slope_value:.4f})"
+            )
         elif recent_recovering or (
             overall.win_rate >= 0.58
             and overall.realized_pnl > 0
@@ -878,6 +988,8 @@ class AutoCalibrationEngine:
             )
 
         state_value["deep_defensive_active"] = in_deep_defensive
+        state_value["recent_defensive_active"] = recent_defensive_active
+        state_value["recent_defensive_recovery_streak"] = new_recent_def_recovery
         state_value["deep_defensive_positive_streak"] = new_streak
         state_value["deep_defensive_recent_positive_streak"] = new_recent_streak
         state_value["deep_defensive_cooldown_remaining"] = next_cooldown_remaining

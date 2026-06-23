@@ -397,6 +397,131 @@ def test_auto_disable_keeps_at_least_one_strategy_per_timeframe() -> None:
     assert all(c.target != "strategy_enabled" for c in changes)
 
 
+def test_excluded_strategy_is_culled_and_not_calibrated() -> None:
+    # Una strategia nella exclusion list viene disabilitata e i suoi pesi non
+    # vengono calibrati — anche se le sue stats sarebbero ottime.
+    excluded = StrategyConfig(
+        strategy_name="rsi", timeframe="15m", enabled=True,
+        params={"period": 14}, weight=9,
+    )
+    keeper = StrategyConfig(
+        strategy_name="supertrend", timeframe="15m", enabled=True,
+        params={"period": 10, "multiplier": 3.0}, weight=12,
+    )
+    db = FakeStrategyDb([excluded, keeper])
+    db.rows["strategy_exclusions"] = AppSetting(
+        key="strategy_exclusions", value={"strategies": ["rsi"]}
+    )
+    analyzer = FakeAnalyzer(  # type: ignore[arg-type]
+        {
+            "rsi": stats(win_rate=0.90, pnl=500, profit_factor=5.0),
+            "supertrend": stats(win_rate=0.55, pnl=120, profit_factor=1.4),
+        }
+    )
+    changes = AutoCalibrationEngine(analyzer=analyzer)._calibrate_strategy_weights(
+        db,  # type: ignore[arg-type]
+        _weights_settings(),
+    )
+
+    assert excluded.enabled is False
+    cull = [c for c in changes if c.target == "strategy_enabled" and c.key == "15m:rsi"]
+    assert len(cull) == 1
+    assert "culled" in cull[0].reason
+    # Nessuna calibrazione dei pesi per la strategia cullata.
+    assert all(not (c.target == "strategy_weight" and c.key == "15m:rsi") for c in changes)
+
+
+def test_excluded_strategy_not_reenabled_by_auto_retest() -> None:
+    # Una strategia cullata e gia' disabilitata NON deve essere riabilitata
+    # dall'auto-retest, nemmeno quando sono passati abbastanza trade da triggerarlo.
+    culled = StrategyConfig(
+        strategy_name="macd", timeframe="15m", enabled=False,
+        params={"fast": 12, "slow": 26, "signal": 9}, weight=6,
+    )
+    keeper = StrategyConfig(
+        strategy_name="supertrend", timeframe="15m", enabled=True,
+        params={"period": 10, "multiplier": 3.0}, weight=12,
+    )
+    db = FakeStrategyDb([culled, keeper])
+    db.rows["strategy_exclusions"] = AppSetting(
+        key="strategy_exclusions", value={"strategies": ["macd"]}
+    )
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={"auto_disabled_at_trade_count": {"15m:macd": 0}},
+    )
+    analyzer = FakeAnalyzer(  # type: ignore[arg-type]
+        {"supertrend": stats(win_rate=0.55, pnl=120, profit_factor=1.4)}
+    )
+    # total_closed=1000 con disabled_at=0 e retest=50 → senza esclusione il retest
+    # riabiliterebbe macd.
+    changes = AutoCalibrationEngine(analyzer=analyzer)._calibrate_strategy_weights(
+        db,  # type: ignore[arg-type]
+        {**_weights_settings(), "auto_disable_retest_after_trades": 50},
+        total_closed=1000,
+    )
+
+    assert culled.enabled is False
+    assert all(
+        not (c.target == "strategy_enabled" and c.key == "15m:macd" and c.after is True)
+        for c in changes
+    )
+
+
+def _dwell_settings() -> dict:
+    return {**_weights_settings(), "weight_change_min_new_trades": 10, "walk_forward_enabled": False}
+
+
+def test_weight_change_blocked_within_min_dwell() -> None:
+    strat = StrategyConfig(
+        strategy_name="fibonacci", timeframe="15m", enabled=True,
+        params={"lookback": 50}, weight=10,
+    )
+    db = FakeStrategyDb([strat])
+    # Peso mosso di recente: ultimo cambio a 95, ora total_closed=100 → gap 5 < 10.
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={"weight_change_at_trade_count": {"15m:fibonacci": 95}},
+    )
+    analyzer = FakeAnalyzer(  # type: ignore[arg-type]
+        {"fibonacci": stats(win_rate=0.20, pnl=-300, profit_factor=0.4)}
+    )
+    changes = AutoCalibrationEngine(analyzer=analyzer)._calibrate_strategy_weights(
+        db,  # type: ignore[arg-type]
+        _dwell_settings(),
+        total_closed=100,
+    )
+
+    assert strat.weight == 10  # dwell attivo: nessun cambio applicato
+    assert all(c.target != "strategy_weight" for c in changes)
+
+
+def test_weight_change_applies_after_min_dwell() -> None:
+    strat = StrategyConfig(
+        strategy_name="fibonacci", timeframe="15m", enabled=True,
+        params={"lookback": 50}, weight=10,
+    )
+    db = FakeStrategyDb([strat])
+    # Ultimo cambio a 80, ora total_closed=100 → gap 20 >= 10 → consentito.
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={"weight_change_at_trade_count": {"15m:fibonacci": 80}},
+    )
+    analyzer = FakeAnalyzer(  # type: ignore[arg-type]
+        {"fibonacci": stats(win_rate=0.20, pnl=-300, profit_factor=0.4)}
+    )
+    changes = AutoCalibrationEngine(analyzer=analyzer)._calibrate_strategy_weights(
+        db,  # type: ignore[arg-type]
+        _dwell_settings(),
+        total_closed=100,
+    )
+
+    assert strat.weight == 6  # factor 0.6 (underperformer) applicato
+    weight_changes = [c for c in changes if c.target == "strategy_weight"]
+    assert len(weight_changes) == 1
+    assert weight_changes[0].key == "15m:fibonacci"
+
+
 def _risk_settings() -> dict:
     return {
         "min_signal_score_floor": 55,
@@ -637,6 +762,75 @@ def test_defensive_mode_stays_when_recent_profit_factor_below_one() -> None:
     assert risk["min_signal_score"] == 60
     assert risk["min_risk_reward"] == 2.25
     assert risk["max_risk_per_trade_pct"] == 0.75
+
+
+# ---------------------------------------------------------------------------
+# Fase 1 — difesa recency-aware
+# ---------------------------------------------------------------------------
+
+
+def test_recent_defensive_activates_when_recent_weak_but_overall_healthy() -> None:
+    # Overall storico sano (PF 1.1) ma ultimi trade deboli (PF 0.6, slope<0):
+    # senza la Fase 1 il rischio resterebbe al baseline.
+    db = FakeDb({"min_signal_score": 60, "min_risk_reward": 2.0, "max_risk_per_trade_pct": 1.0})
+
+    AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        stats(win_rate=0.52, pnl=120, profit_factor=1.1),
+        _risk_settings(),
+        equity_slope_value=0.1,
+        recent_stats=stats(win_rate=0.35, pnl=-200, profit_factor=0.6),
+        recent_slope_value=-0.2,
+    )
+
+    risk = db.rows["risk"].value
+    state = db.rows["auto_calibration_state"].value
+    assert state["recent_defensive_active"] is True
+    assert state["deep_defensive_active"] is False
+    assert risk["min_signal_score"] == 60  # score invariato (non predittivo)
+    assert risk["min_risk_reward"] == 2.3  # base 2.0 + rr_add 0.3
+    assert risk["max_risk_per_trade_pct"] == 0.6  # base 1.0 * risk_factor 0.6
+
+
+def test_recent_defensive_exits_only_after_consecutive_recoveries() -> None:
+    db = FakeDb({"min_signal_score": 60, "min_risk_reward": 2.0, "max_risk_per_trade_pct": 1.0})
+    db.rows["auto_calibration_state"] = AppSetting(
+        key="auto_calibration_state",
+        value={"recent_defensive_active": True, "recent_defensive_recovery_streak": 0},
+    )
+
+    # exit_cycles=3 → servono 3 run consecutivi con PF recente recuperato per uscire.
+    for expected_streak, expected_active in ((1, True), (2, True), (3, False)):
+        AutoCalibrationEngine()._calibrate_risk_settings(
+            db,  # type: ignore[arg-type]
+            stats(win_rate=0.52, pnl=120, profit_factor=1.1),
+            _risk_settings(),
+            equity_slope_value=0.1,
+            recent_stats=stats(win_rate=0.60, pnl=150, profit_factor=1.2),
+            recent_slope_value=0.1,
+        )
+        state = db.rows["auto_calibration_state"].value
+        assert state["recent_defensive_recovery_streak"] == expected_streak
+        assert state["recent_defensive_active"] is expected_active
+
+
+def test_recent_defensive_disabled_keeps_baseline() -> None:
+    db = FakeDb({"min_signal_score": 60, "min_risk_reward": 2.0, "max_risk_per_trade_pct": 1.0})
+
+    AutoCalibrationEngine()._calibrate_risk_settings(
+        db,  # type: ignore[arg-type]
+        stats(win_rate=0.52, pnl=120, profit_factor=1.1),
+        {**_risk_settings(), "recent_defensive_enabled": False},
+        equity_slope_value=0.1,
+        recent_stats=stats(win_rate=0.35, pnl=-200, profit_factor=0.6),
+        recent_slope_value=-0.2,
+    )
+
+    risk = db.rows["risk"].value
+    state = db.rows["auto_calibration_state"].value
+    assert state["recent_defensive_active"] is False
+    assert risk["max_risk_per_trade_pct"] == 1.0  # nessuna riduzione
+    assert risk["min_risk_reward"] == 2.0
 
 
 # ---------------------------------------------------------------------------

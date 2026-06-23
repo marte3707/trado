@@ -574,7 +574,12 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
 
   const isInitialLoading = snapshot === undefined && !hasSnapshotError;
   const hasDataError = hasSnapshotError;
-  const isStale = snapshot != null && isFetching;
+  const snapshotAgeMs = snapshot?.checked_at
+    ? Date.now() - new Date(snapshot.checked_at).getTime()
+    : null;
+  const isStale = snapshot != null && (
+    hasSnapshotError || snapshotAgeMs == null || snapshotAgeMs > 90_000
+  );
   const snapshotErrorText = hasDataError ? accountSnapshotErrorMessage(snapshotError, snapshot != null) : null;
 
   return (
@@ -585,9 +590,9 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
           <div className="flex items-center gap-3">
             <h1 className="text-xl font-semibold tracking-tight text-fg">Account monitor</h1>
             {isStale && (
-              <span className="inline-flex items-center gap-1 rounded-full bg-fg-4/20 px-2 py-0.5 text-[10px] font-medium text-fg-3">
-                <RefreshCw className="h-2.5 w-2.5 animate-spin" />
-                Aggiornamento
+              <span className="inline-flex items-center gap-1 rounded-full bg-warn/10 px-2 py-0.5 text-[10px] font-medium text-warn">
+                <AlertTriangle className="h-2.5 w-2.5" />
+                Dati non aggiornati
               </span>
             )}
           </div>
@@ -600,7 +605,9 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
             <span className="text-fg-4">·</span>
             <span className="inline-flex items-center gap-1">
               <StatusDot status={statusToDot(snapshot?.api.status ?? "loading")} size={6} />
-              <span className="font-mono">API {snapshot?.api.latency_ms != null ? `${snapshot.api.latency_ms}ms` : "—"}</span>
+              <span className="font-mono">
+                API {snapshot?.api.source === "websocket" ? "WS cache" : snapshot?.api.latency_ms != null ? `${snapshot.api.latency_ms}ms` : "—"}
+              </span>
             </span>
             <span className="text-fg-4">·</span>
             <span className="inline-flex items-center gap-1">

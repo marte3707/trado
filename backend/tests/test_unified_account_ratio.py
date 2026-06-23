@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import FastAPI
@@ -60,13 +61,17 @@ def test_unified_account_ratio_unavailable_when_inputs_missing() -> None:
 
 
 class SnapshotDb:
-    def __init__(self) -> None:
+    def __init__(self, settings: dict[str, dict] | None = None) -> None:
         self.added: list[object] = []
         self.committed = 0
+        self.settings = settings or {}
 
     def get(self, model, key):
-        if model is AppSetting and key == "risk":
-            return AppSetting(key="risk", value={})
+        if model is AppSetting:
+            if key == "risk":
+                return AppSetting(key="risk", value={})
+            if key in self.settings:
+                return AppSetting(key=key, value=self.settings[key])
         return None
 
     def add(self, row: object) -> None:
@@ -174,6 +179,77 @@ def test_account_snapshot_uses_short_lived_cache(monkeypatch) -> None:
     assert calls["account_state"] == 1
     assert db.committed == 1
     account_router._ACCOUNT_SNAPSHOT_CACHE.clear()
+
+
+def test_account_snapshot_prefers_fresh_websocket_state(monkeypatch) -> None:
+    account_router._ACCOUNT_SNAPSHOT_CACHE.clear()
+    address = "0xabc"
+    settings = Settings(hyperliquid_account_address=address)
+    db = SnapshotDb(
+        settings={
+            "account_data_ws": {"enabled": True, "snapshot_stale_seconds": 90},
+            "account_data_ws_state": {
+                "connected": True,
+                "ready": True,
+                "network": settings.hyperliquid_network,
+                "account_address": address,
+                "updated_at": datetime.now(UTC).isoformat(),
+                "user_state": _state("5"),
+                "spot_state": {"balances": [{"coin": "USDC", "total": "25", "hold": "5"}]},
+                "open_orders": [{"coin": "BTC", "oid": 123}],
+                "frontend_open_orders": [{"coin": "BTC", "oid": 123, "isTrigger": False}],
+                "predicted_fundings": [],
+                "user_funding": [],
+            },
+        }
+    )
+
+    async def unexpected(*_args, **_kwargs):
+        raise AssertionError("REST fallback must not run for a fresh websocket snapshot")
+
+    monkeypatch.setattr(
+        account_router,
+        "get_settings",
+        lambda: settings,
+    )
+    monkeypatch.setattr(account_router, "_fetch_market_meta", unexpected)
+    monkeypatch.setattr(account_router, "_fetch_account_state", unexpected)
+    monkeypatch.setattr(account_router, "_fetch_predicted_fundings", unexpected)
+
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[get_db] = lambda: db
+    response = TestClient(app).get("/api/account/snapshot")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["api"]["source"] == "websocket"
+    assert payload["api"]["latency_ms"] == 0.0
+    assert payload["account"]["effective_account_value"] == "1020.000000"
+    assert payload["account"]["open_orders"] == 1
+    assert payload["open_orders"][0]["oid"] == 123
+    account_router._ACCOUNT_SNAPSHOT_CACHE.clear()
+
+
+def test_stale_account_websocket_state_is_rejected() -> None:
+    settings = Settings(hyperliquid_account_address="0xabc")
+    db = SnapshotDb(
+        settings={
+            "account_data_ws": {"enabled": True, "snapshot_stale_seconds": 30},
+            "account_data_ws_state": {
+                "connected": True,
+                "ready": True,
+                "network": settings.hyperliquid_network,
+                "account_address": settings.hyperliquid_account_address,
+                "updated_at": "2020-01-01T00:00:00+00:00",
+                "user_state": _state("5"),
+                "spot_state": {"balances": []},
+                "open_orders": [],
+            },
+        }
+    )
+
+    assert account_router._fresh_account_ws_state(db, settings, datetime.now(UTC)) is None
 
 
 class GuardQuery:

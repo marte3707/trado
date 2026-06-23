@@ -5,10 +5,20 @@ automaticamente backend (`uvicorn`), market-data WebSocket
 (`python -m app.market_data.main`) e worker (`python -m app.worker.main`) al
 login dell'utente, e li rilanciano in caso di crash.
 
+L'avvio e' mediato da uno script wrapper che:
+
+- apre Docker Desktop se non e' gia' attivo;
+- esegue `docker compose up -d postgres`;
+- aspetta che PostgreSQL del compose sia `healthy` su `localhost:5433`;
+- solo dopo esegue il processo Python del servizio.
+
 ## Comportamento
 
 - **All'accensione del Mac**: i servizi partono dopo il login del tuo utente
   (`RunAtLoad: true`).
+- **Dipendenza da Docker**: backend, market-data e worker non vanno piu' in
+  crash se Docker Desktop impiega tempo a salire; restano in preflight finche'
+  il container `postgres` non e' pronto.
 - **Ritorno da standby**: i processi non vengono uccisi durante lo sleep — al
   wake riprendono l'esecuzione da dove erano (asyncio `sleep(60)` del worker e
   socket server di uvicorn rimangono vivi). Se per qualsiasi motivo un processo
@@ -109,16 +119,25 @@ applicherebbe ai `Background`; il worker invece è giustamente Background
 Il `.env` viene letto da pydantic-settings tramite il path `../.env`
 relativo a `WorkingDirectory=backend/`, quindi `<repo>/.env`.
 
+Per questa modalita', `DATABASE_URL` deve puntare al PostgreSQL del compose:
+
+```bash
+DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5433/trado
+```
+
 ## Postgres
 
-Postgres è già gestito come servizio `homebrew.mxcl.postgresql@*`
-(`brew services list`) e parte da solo al login. Non serve un altro
-LaunchAgent.
+Postgres gira nel container Docker definito in `docker-compose.yml`.
+I LaunchAgent provano ad avviare Docker Desktop e il servizio `postgres`
+automaticamente. Se Docker Desktop non e' installato in
+`/Applications/Docker.app`, il preflight fallira' e il motivo comparira' nei
+file `trado-*.err.log`.
 
 Il flusso al boot del Mac è quindi:
 
-1. `brew services` avvia Postgres.
-2. `com.trado.backend` avvia uvicorn → tabelle migrate e seedate al startup.
-3. `com.trado.marketdata` apre le subscription candle e persiste gli eventi chiusi.
-4. `com.trado.worker` consuma gli eventi, genera segnali e mantiene il fallback REST.
-5. AutoTuner riprende lo stato dal DB (se era attivo).
+1. `com.trado.*` parte al login.
+2. Il wrapper apre Docker Desktop se serve.
+3. Il wrapper esegue `docker compose up -d postgres`.
+4. Il wrapper aspetta `postgres` healthy su `localhost:5433`.
+5. Solo allora parte uvicorn / market-data / worker.
+6. AutoTuner riprende lo stato dal DB (se era attivo).

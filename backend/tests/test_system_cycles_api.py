@@ -75,6 +75,50 @@ def test_logs_excludes_system_cycles_by_default() -> None:
     assert filtered_events == ["fast_risk_cycle"]
 
 
+def test_worker_status_clears_error_after_successful_cycle() -> None:
+    db = _session()
+    now = datetime.now(UTC)
+    db.add_all(
+        [
+            DecisionLog(
+                timestamp=now - timedelta(minutes=2),
+                event_type="worker_cycle_failed",
+                message="Worker cycle raised an exception",
+                data={"error": "[Errno 2] No such file or directory"},
+            ),
+            _log("worker_cycle", now - timedelta(minutes=1)),
+        ]
+    )
+    db.commit()
+
+    status = system_router._worker_status(db)
+
+    assert status["last_error_at"] is None
+    assert status["last_error_message"] is None
+
+
+def test_worker_status_keeps_unresolved_error() -> None:
+    db = _session()
+    now = datetime.now(UTC)
+    db.add_all(
+        [
+            _log("worker_cycle", now - timedelta(minutes=2)),
+            DecisionLog(
+                timestamp=now - timedelta(minutes=1),
+                event_type="worker_cycle_failed",
+                message="Worker cycle raised an exception",
+                data={"error": "active failure"},
+            ),
+        ]
+    )
+    db.commit()
+
+    status = system_router._worker_status(db)
+
+    assert status["last_error_message"] == "active failure"
+    assert status["last_error_at"] is not None
+
+
 def test_system_cycles_marks_service_failed_after_failure_threshold() -> None:
     db = _session()
     now = datetime.now(UTC)

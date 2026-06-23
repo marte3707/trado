@@ -135,6 +135,28 @@ LIQUIDATION_STOP_DISTANCE_ABSOLUTE_BUFFER = Decimal("0.10")
 LIQUIDATION_GUARD_SL_SAFETY_BUFFER = Decimal("0.03")
 
 
+def risk_at_open_snapshot(db: Session) -> dict[str, Any]:
+    """Snapshot dei parametri di rischio operativi al momento dell'apertura.
+
+    Forward attribution (Fase 4): persiste su ogni posizione il regime di rischio
+    attivo all'apertura (soglie calibrate + stato defensive), così l'esito del
+    trade è correlabile alle decisioni della calibrazione *di quel momento*. I
+    setting cambiano nel tempo, quindi non sono ricostruibili a posteriori.
+    """
+    risk = db.get(AppSetting, "risk")
+    risk_value = risk.value if risk is not None and isinstance(risk.value, dict) else {}
+    cal = db.get(AppSetting, "auto_calibration_state")
+    cal_value = cal.value if cal is not None and isinstance(cal.value, dict) else {}
+    return {
+        "min_signal_score": risk_value.get("min_signal_score"),
+        "min_risk_reward": risk_value.get("min_risk_reward"),
+        "max_risk_per_trade_pct": risk_value.get("max_risk_per_trade_pct"),
+        "deep_defensive_active": bool(cal_value.get("deep_defensive_active", False)),
+        "recent_defensive_active": bool(cal_value.get("recent_defensive_active", False)),
+        "starvation_override_active": bool(cal_value.get("starvation_override_active", False)),
+    }
+
+
 class OrderExecutionEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -279,6 +301,7 @@ class OrderExecutionEngine:
         regime_info = breakdown.get("_regime") if isinstance(breakdown, dict) else None
         if isinstance(regime_info, dict):
             base_metadata["regime_at_open"] = regime_info.get("regime", "unknown")
+        base_metadata["risk_at_open"] = risk_at_open_snapshot(db)
         metadata = self.position_manager.initial_metadata(
             db,
             signal,
@@ -734,6 +757,7 @@ class OrderExecutionEngine:
         regime_info = breakdown.get("_regime") if isinstance(breakdown, dict) else None
         if isinstance(regime_info, dict):
             live_base["regime_at_open"] = regime_info.get("regime", "unknown")
+        live_base["risk_at_open"] = risk_at_open_snapshot(db)
         metadata = self.position_manager.initial_metadata(
             db,
             signal,

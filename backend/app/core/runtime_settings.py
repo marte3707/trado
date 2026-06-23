@@ -325,6 +325,20 @@ def effective_enabled_timeframes(db: Session, settings: Settings) -> list[str]:
     return _normalized_timeframe_list(settings.enabled_timeframes)
 
 
+def effective_strategy_exclusions(db: Session) -> set[str]:
+    """Strategie cullate permanentemente (sorgente unica di verità).
+
+    Escluse dalla generazione segnali (SignalEngine) e mai riabilitate
+    dall'auto-retest della calibrazione. Popolata dalla Fase 0 edge analysis:
+    strategie senza edge out-of-sample. Reversibile: togliere un nome dalla
+    lista la riabilita, con storico intatto.
+    """
+    raw = setting_value(db, "strategy_exclusions").get("strategies")
+    if not isinstance(raw, list):
+        return set()
+    return {str(item) for item in raw if isinstance(item, str) and item}
+
+
 def effective_monitoring_only_timeframes(db: Session) -> list[str]:
     timeframes = setting_value(db, "timeframes")
     enabled = set(_normalized_timeframe_list(timeframes.get("enabled")))

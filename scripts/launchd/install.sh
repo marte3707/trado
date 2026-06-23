@@ -33,6 +33,9 @@ echo "  launchctl print gui/\$(id -u)/com.trado.backend | head -20"
 echo "  launchctl print gui/\$(id -u)/com.trado.marketdata | head -20"
 echo "  launchctl print gui/\$(id -u)/com.trado.worker  | head -20"
 echo
+echo "I servizi ora avviano Docker Desktop se necessario e fanno"
+echo "docker compose up -d postgres prima di lanciare backend/worker."
+echo
 echo "Log file:"
 echo "  ${LOGS_DIR}/trado-backend.{out,err}.log"
 echo "  ${LOGS_DIR}/trado-marketdata.{out,err}.log"

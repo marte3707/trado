@@ -284,6 +284,10 @@ def test_execute_paper_opens_position_even_if_same_market_already_has_open_paper
     assert position is not None
     assert position.id != 99
     assert position.metadata_json["source_signal_id"] == signal.id
+    # Fase 4 — forward attribution: la posizione registra il regime di rischio
+    # operativo all'apertura.
+    assert "risk_at_open" in position.metadata_json
+    assert "deep_defensive_active" in position.metadata_json["risk_at_open"]
     assert len(db.added_of(Position)) == 1
     assert len(db.added_of(Order)) == 1
     events = [log.event_type for log in db.added_of(DecisionLog)]

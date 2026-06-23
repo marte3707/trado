@@ -10,7 +10,10 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.enums import Direction, SignalStatus
-from app.core.runtime_settings import effective_min_signal_expected_r
+from app.core.runtime_settings import (
+    effective_min_signal_expected_r,
+    effective_strategy_exclusions,
+)
 from app.db.models import AppSetting, Candle, Indicator, Market, Signal, StrategyConfig
 from app.engine.auto_tuner import active_ab_overlay
 from app.engine.edge_profile import signal_threshold_adjustment
@@ -115,6 +118,9 @@ class SignalEngine:
         self._cycle_btc_volume_profile_loaded = False
         self._cycle_btc_volume_profile_context: dict[str, Any] | None = None
         self._cycle_macro_direction: dict[str, Any] | None = None
+        # Cull permanente: strategie escluse dalla generazione segnali. Letto una
+        # volta per ciclo (lista globale, non per market×timeframe).
+        self._cycle_strategy_exclusions: set[str] | None = None
 
     def begin_cycle(self) -> None:
         """Invalidate per-cycle caches at the start of each worker tick."""
@@ -125,6 +131,7 @@ class SignalEngine:
         self._cycle_btc_volume_profile_loaded = False
         self._cycle_btc_volume_profile_context = None
         self._cycle_macro_direction = None
+        self._cycle_strategy_exclusions = None
         # Abilita/invalida la cache per-cycle degli aggregati di performance
         # (global/timeframe stats + conteggi per market) usati da adjusted_weights.
         self.performance.begin_cycle()
@@ -168,6 +175,11 @@ class SignalEngine:
         if not isinstance(disabled, list):
             return set()
         return {str(item) for item in disabled if isinstance(item, str) and item}
+
+    def _get_cycle_strategy_exclusions(self, db: Session) -> set[str]:
+        if self._cycle_strategy_exclusions is None:
+            self._cycle_strategy_exclusions = effective_strategy_exclusions(db)
+        return self._cycle_strategy_exclusions
 
     def _get_cycle_macro_suspension(
         self, db: Session, risk_value: dict[str, Any]
@@ -925,14 +937,16 @@ class SignalEngine:
             .filter(StrategyConfig.timeframe == timeframe, StrategyConfig.enabled.is_(True))
             .all()
         )
-        disabled_strategy_names = self._disabled_strategy_names_for_timeframe(
+        # Unione di: disable tattico per-timeframe (risk setting) + cull permanente
+        # globale (strategy_exclusions). Entrambi escludono la strategia dallo scoring.
+        skip_strategy_names = self._disabled_strategy_names_for_timeframe(
             risk_value, timeframe
-        )
-        if disabled_strategy_names:
+        ) | self._get_cycle_strategy_exclusions(db)
+        if skip_strategy_names:
             configs = [
                 config
                 for config in configs
-                if config.strategy_name not in disabled_strategy_names
+                if config.strategy_name not in skip_strategy_names
             ]
         context = StrategyContext(
             market="hyperliquid",

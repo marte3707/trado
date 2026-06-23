@@ -146,8 +146,16 @@ def _worker_status(db: Session) -> dict:
         .order_by(DecisionLog.timestamp.desc())
         .first()
     )
+    # A completed worker cycle resolves failures from earlier ticks. Keeping the
+    # last historical failure here made both service status panels alarm forever.
+    last_cycle_at = _coerce_utc_datetime(last_cycle.timestamp) if last_cycle is not None else None
+    last_error_at = _coerce_utc_datetime(last_error.timestamp) if last_error is not None else None
+    if last_cycle_at is not None and last_error_at is not None and last_cycle_at > last_error_at:
+        last_error = None
     now = datetime.now(UTC)
     last_run_at = last_heartbeat_at or (last_cycle.timestamp if last_cycle else None)
+    if last_run_at is not None:
+        last_run_at = _coerce_utc_datetime(last_run_at)
     seconds_since = (now - last_run_at).total_seconds() if last_run_at else None
     return {
         "last_run_at": last_run_at.isoformat() if last_run_at else None,
@@ -524,4 +532,3 @@ def system_error_logs(limit: int = Query(20, ge=1, le=200)) -> dict:
         service: _tail_error_log(FilePath(str(config["error_log"])), limit)
         for service, config in SYSTEM_SERVICES.items()
     }
-

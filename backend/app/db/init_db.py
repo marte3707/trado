@@ -322,6 +322,33 @@ def seed_defaults(db: Session) -> None:
                 },
             )
         )
+    if db.get(AppSetting, "account_data_ws") is None:
+        db.add(
+            AppSetting(
+                key="account_data_ws",
+                value={
+                    "enabled": True,
+                    "heartbeat_seconds": 20,
+                    "reconnect_max_seconds": 60,
+                    "writer_flush_seconds": 1,
+                    "enrichment_refresh_seconds": 60,
+                    "funding_refresh_seconds": 300,
+                    "snapshot_stale_seconds": 90,
+                },
+            )
+        )
+    if db.get(AppSetting, "account_data_ws_state") is None:
+        db.add(
+            AppSetting(
+                key="account_data_ws_state",
+                value={
+                    "connected": False,
+                    "ready": False,
+                    "active_subscriptions": 0,
+                    "expected_subscriptions": 3,
+                },
+            )
+        )
     if db.get(AppSetting, "alerts") is None:
         db.add(
             AppSetting(
@@ -391,6 +418,27 @@ def seed_defaults(db: Session) -> None:
                 mutated = True
             if mutated:
                 existing.value = updated
+    if db.get(AppSetting, "strategy_exclusions") is None:
+        # Cull permanente delle strategie senza edge out-of-sample (Fase 0, giu 2026):
+        # negative su PnL reale e profit factor sia in-sample sia OOS. `macd` escluso
+        # anche per dedup — co-spara identico a `supertrend` (Jaccard 1.0) → doppio
+        # voto trend nello scoring. Reversibile: togliere un nome riabilita la strategia
+        # con storico intatto. Vedi backend/scripts/edge_oos_report.py.
+        db.add(
+            AppSetting(
+                key="strategy_exclusions",
+                value={
+                    "strategies": [
+                        "rsi",
+                        "bollinger_bands",
+                        "volume_profile",
+                        "cvd_divergence",
+                        "ob_imbalance",
+                        "macd",
+                    ]
+                },
+            )
+        )
     if db.get(AppSetting, "btc_macro_protection") is None:
         db.add(
             AppSetting(
