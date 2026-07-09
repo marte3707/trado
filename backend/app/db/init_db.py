@@ -425,6 +425,8 @@ def seed_defaults(db: Session) -> None:
         "copy_live_max_open_positions_per_trader": 1,
         "copy_live_max_estimated_notional_usd": "120",
         "copy_live_excluded_coin_prefixes": ["xyz:"],
+        "copy_live_promotion_min_shortlist_days": 3,
+        "copy_live_dry_run_requires_promotion": True,
     }
     leaderboard_alpha = db.get(AppSetting, "leaderboard_alpha")
     if leaderboard_alpha is None:

@@ -18,6 +18,7 @@ import type {
   LeaderboardAlphaSignal,
   LeaderboardAlphaTrader,
   LeaderboardCopyLive,
+  LeaderboardCopyLiveDryRunOrder,
   LeaderboardCopyLiveTrader,
   LeaderboardCopyPaperPosition,
   LeaderboardCopyPaperRanking,
@@ -420,6 +421,23 @@ const LIVE_REASON_LABELS: Record<string, string> = {
   avg_trade_pnl_below_live_min: "avg PnL basso",
   net_pnl_below_live_min: "net PnL basso",
   recent_sample_too_small: "sample recente piccolo",
+  outside_live_trader_cap: "fuori cap trader live",
+  promotion_not_ready: "promozione non matura",
+  trader_not_selected: "trader non selezionato",
+  market_not_found: "market non trovato",
+  market_inactive: "market inattivo",
+  market_not_perp: "market non perp",
+  live_position_already_open_for_market: "live già aperta",
+  notional_below_min_order: "notional sotto minimo",
+  notional_above_live_cap: "notional sopra cap",
+  account_snapshot_missing: "snapshot account mancante",
+  account_value_below_live_min: "equity sotto minimo",
+  max_total_exposure_exceeded: "exposure cap superato",
+  available_margin_unknown: "margine sconosciuto",
+  available_margin_insufficient: "margine insufficiente",
+  max_live_open_positions_reached: "max live raggiunto",
+  depth_not_checked_shadow: "depth non verificata",
+  order_not_submitted: "ordine non inviato",
 };
 
 function reasonLabel(reason: string): string {
@@ -443,6 +461,11 @@ function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
           sub={`max ${plan.summary.max_traders}`}
         />
         <Kpi
+          label="Promossi"
+          value={plan.summary.promoted_traders}
+          sub={`min ${plan.selected_traders[0]?.promotion.min_shortlist_days ?? "—"} giorni`}
+        />
+        <Kpi
           label="Posizioni stimate"
           value={plan.summary.planned_open_positions}
           sub={`max ${plan.summary.max_open_positions}`}
@@ -458,7 +481,11 @@ function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
           sub={plan.enabled ? "flag on" : "flag off"}
           compact
         />
-        <Kpi label="Ordini" value={plan.orders_enabled ? "on" : "off"} sub={plan.reason} compact />
+        <Kpi
+          label="Dry-run"
+          value={`${plan.summary.dry_run_would_submit}/${plan.summary.dry_run_would_submit + plan.summary.dry_run_blocked}`}
+          sub="would submit"
+        />
         <Kpi label="Scartati" value={plan.summary.rejected_traders} sub={skipped || "no skip open"} />
       </div>
 
@@ -525,6 +552,21 @@ function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
           <CopyLiveTraderTable rows={plan.rejected_traders.slice(0, 8)} />
         </div>
       )}
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-[1fr_1fr]">
+        <div>
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-fg-3">
+            Promotion table
+          </div>
+          <CopyLiveTraderTable rows={plan.promotion_table.slice(0, 8)} showPromotion />
+        </div>
+        <div>
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-fg-3">
+            Dry-run order plan
+          </div>
+          <CopyLiveDryRunOrders orders={plan.dry_run_orders} />
+        </div>
+      </div>
     </Card>
   );
 }
@@ -532,9 +574,11 @@ function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
 function CopyLiveTraderTable({
   rows,
   selected = false,
+  showPromotion = false,
 }: {
   rows: LeaderboardCopyLiveTrader[];
   selected?: boolean;
+  showPromotion?: boolean;
 }) {
   return (
     <div className="overflow-x-auto">
@@ -548,7 +592,7 @@ function CopyLiveTraderTable({
             <th className="pb-2 text-right">PF</th>
             <th className="pb-2 text-right">Win</th>
             <th className="pb-2 text-right">Closed</th>
-            <th className="pb-2 text-right">{selected ? "Plan" : "Motivi"}</th>
+            <th className="pb-2 text-right">{showPromotion ? "Promo" : selected ? "Plan" : "Motivi"}</th>
           </tr>
         </thead>
         <tbody>
@@ -575,9 +619,54 @@ function CopyLiveTraderTable({
               <td className="py-2 text-right font-mono">{fmtPct(row.win_rate_pct)}</td>
               <td className="py-2 text-right font-mono">{row.closed_positions}</td>
               <td className="max-w-[220px] py-2 text-right text-xs text-fg-3">
-                {selected
-                  ? `${row.planned_open_positions}/${row.open_positions} open`
-                  : row.reasons.map(reasonLabel).join(", ")}
+                {showPromotion
+                  ? `${row.promotion.status} · ${row.promotion.shortlist_days}/${row.promotion.min_shortlist_days}d`
+                  : selected
+                    ? `${row.planned_open_positions}/${row.open_positions} open · ${row.promotion.status}`
+                    : row.reasons.map(reasonLabel).join(", ")}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function CopyLiveDryRunOrders({ orders }: { orders: LeaderboardCopyLiveDryRunOrder[] }) {
+  if (orders.length === 0) {
+    return (
+      <div className="rounded-md border border-border bg-bg p-3 text-sm text-fg-3">
+        Nessun ordine dry-run: non ci sono posizioni shadow idonee.
+      </div>
+    );
+  }
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-xs uppercase tracking-wider text-fg-3">
+            <th className="pb-2">Coin</th>
+            <th className="pb-2">Dir</th>
+            <th className="pb-2 text-right">Notional</th>
+            <th className="pb-2 text-right">Margin</th>
+            <th className="pb-2 text-right">Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          {orders.map((order) => (
+            <tr key={`${order.paper_position_id}:${order.coin}`} className="border-t border-border">
+              <td className="py-1.5 font-mono">{order.coin}</td>
+              <td className={cn("py-1.5 font-mono text-xs", directionTone(order.direction))}>{order.direction}</td>
+              <td className="py-1.5 text-right font-mono">{fmtUsd(order.effective_notional_usd)}</td>
+              <td className="py-1.5 text-right font-mono">{fmtUsd(order.required_margin_usd)}</td>
+              <td className="max-w-[260px] py-1.5 text-right text-xs">
+                <div className={order.status === "would_submit" ? "text-success" : "text-warn"}>
+                  {order.status}
+                </div>
+                <div className="text-fg-3">
+                  {(order.reasons.length ? order.reasons : order.warnings).map(reasonLabel).join(", ")}
+                </div>
               </td>
             </tr>
           ))}

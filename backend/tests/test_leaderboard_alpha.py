@@ -8,11 +8,13 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
 from app.db.models import (
+    AccountSnapshot,
     Base,
     LeaderboardCopyPaperPosition,
     LeaderboardTrader,
     LeaderboardTraderFill,
     LeaderboardTraderSnapshot,
+    Market,
 )
 from app.services import leaderboard_alpha as alpha
 
@@ -357,6 +359,28 @@ def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() 
         )
         db.add_all([strong, weak_quality, watch])
         db.flush()
+        db.add(
+            Market(
+                exchange="hyperliquid",
+                symbol="BTC",
+                base="BTC",
+                quote="USDC",
+                market_type="perp",
+                active=True,
+                metadata_json={"hl_coin": "BTC"},
+            )
+        )
+        db.add(
+            AccountSnapshot(
+                timestamp=now,
+                total_equity=Decimal("1000"),
+                effective_account_value=Decimal("1000"),
+                available_balance=Decimal("500"),
+                margin_used=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                raw_data={},
+            )
+        )
         _add_snapshot(db, strong, classification="candidate", quality_score=95)
         _add_snapshot(db, weak_quality, classification="candidate", quality_score=70)
         _add_snapshot(db, watch, classification="watch", quality_score=95)
@@ -374,13 +398,29 @@ def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() 
         _add_copy_position(db, strong, idx=501, now=now, status="open", coin="xyz:DRAM")
         db.commit()
 
-        plan = alpha.build_copy_live_shadow_plan(db, now=now)
+        settings = {
+            **alpha.DEFAULT_LEADERBOARD_ALPHA_SETTINGS,
+            "copy_live_promotion_min_shortlist_days": 1,
+        }
+        state: dict = {}
+        plan = alpha.build_copy_live_shadow_plan(
+            db,
+            settings=settings,
+            now=now,
+            state=state,
+            update_promotion_state=True,
+        )
 
         assert plan["orders_enabled"] is False
         assert plan["status"] == "shadow_ready"
         assert [row["trader_label"] for row in plan["selected_traders"]] == ["strong"]
+        assert plan["selected_traders"][0]["promoted"] is True
+        assert plan["selected_traders"][0]["promotion"]["shortlist_days"] == 1
+        assert plan["summary"]["promoted_traders"] == 1
         assert plan["summary"]["planned_open_positions"] == 1
         assert plan["summary"]["estimated_open_notional_usd"] == "40"
+        assert plan["summary"]["dry_run_would_submit"] == 1
+        assert plan["dry_run_orders"][0]["status"] == "would_submit"
         assert plan["summary"]["skipped_open_positions"] == {"excluded_coin_prefix": 1}
         rejected = {row["trader_label"]: row["reasons"] for row in plan["rejected_traders"]}
         assert "quality_below_live_min" in rejected["weak quality"]

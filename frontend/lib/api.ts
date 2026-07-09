@@ -1255,6 +1255,16 @@ export type LeaderboardCopyLiveTrader = {
   quality_score: number | null;
   live_candidate_score: number;
   eligible: boolean;
+  in_shortlist: boolean;
+  promoted: boolean;
+  promotion: {
+    status: "promoted" | "warming_up" | "rejected" | string;
+    shortlist_days: number;
+    consecutive_shortlist_days: number;
+    min_shortlist_days: number;
+    first_seen_at: string | null;
+    last_seen_at: string | null;
+  };
   reasons: string[];
   closed_positions: number;
   open_positions: number;
@@ -1279,6 +1289,30 @@ export type LeaderboardCopyLiveShadowPosition = {
   opened_at: string;
 };
 
+export type LeaderboardCopyLiveDryRunOrder = {
+  status: "would_submit" | "blocked" | string;
+  reasons: string[];
+  warnings: string[];
+  coin: string;
+  direction: "long" | "short" | string;
+  side: "buy" | "sell" | string;
+  trader_id: number;
+  trader_label: string | null;
+  paper_position_id: number | null;
+  market_id: number | null;
+  requested_notional_usd: string | null;
+  effective_notional_usd: string | null;
+  min_order_notional_usd: string | null;
+  order_notional_cap_usd: string | null;
+  account_value_usd: string | null;
+  available_margin_usd: string | null;
+  required_margin_usd: string | null;
+  existing_live_positions: number;
+  existing_live_notional_usd: string | null;
+  max_live_open_positions: number;
+  max_total_exposure_pct: number;
+};
+
 export type LeaderboardCopyLive = {
   enabled: boolean;
   mode: "shadow" | string;
@@ -1289,7 +1323,10 @@ export type LeaderboardCopyLive = {
     evaluated_traders: number;
     selected_traders: number;
     rejected_traders: number;
+    promoted_traders: number;
     planned_open_positions: number;
+    dry_run_would_submit: number;
+    dry_run_blocked: number;
     estimated_open_notional_usd: string | null;
     position_notional_usd: string;
     max_traders: number;
@@ -1298,8 +1335,11 @@ export type LeaderboardCopyLive = {
     skipped_open_positions: Record<string, number>;
   };
   selected_traders: LeaderboardCopyLiveTrader[];
+  promoted_traders: LeaderboardCopyLiveTrader[];
+  promotion_table: LeaderboardCopyLiveTrader[];
   rejected_traders: LeaderboardCopyLiveTrader[];
   shadow_open_positions: LeaderboardCopyLiveShadowPosition[];
+  dry_run_orders: LeaderboardCopyLiveDryRunOrder[];
 };
 
 export type LeaderboardAlphaDashboard = {
@@ -1349,6 +1389,8 @@ export type LeaderboardAlphaDashboard = {
     copy_live_max_open_positions_per_trader: number;
     copy_live_max_estimated_notional_usd: string;
     copy_live_excluded_coin_prefixes: string[];
+    copy_live_promotion_min_shortlist_days: number;
+    copy_live_dry_run_requires_promotion: boolean;
   } & Record<string, unknown>;
   state: Record<string, unknown>;
   summary: {

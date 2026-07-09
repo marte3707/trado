@@ -15,12 +15,17 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.enums import OrderMode
+from app.core.runtime_settings import effective_live_execution_settings
 from app.db.models import (
+    AccountSnapshot,
     AppSetting,
     LeaderboardCopyPaperPosition,
     LeaderboardTrader,
     LeaderboardTraderFill,
     LeaderboardTraderSnapshot,
+    Market,
+    Position,
 )
 from app.services.hyperliquid import HyperliquidClient, HyperliquidTransientError
 from app.services.hyperliquid_rate_limit import available_hyperliquid_info_request_capacity
@@ -76,6 +81,8 @@ DEFAULT_LEADERBOARD_ALPHA_SETTINGS: dict[str, Any] = {
     "copy_live_max_open_positions_per_trader": 1,
     "copy_live_max_estimated_notional_usd": "120",
     "copy_live_excluded_coin_prefixes": ["xyz:"],
+    "copy_live_promotion_min_shortlist_days": 3,
+    "copy_live_dry_run_requires_promotion": True,
 }
 
 
@@ -835,7 +842,21 @@ async def run_leaderboard_alpha_maintenance(
 
     if settings.get("copy_paper_enabled", True):
         result["copy_paper"] = run_copy_paper_replay(db, settings=settings, now=now)
+        stored_state = leaderboard_alpha_state(db)
+        copy_state = {
+            key: value
+            for key, value in stored_state.items()
+            if key.startswith("last_copy_paper")
+        }
+        state = {**state, **copy_state}
 
+    result["copy_live"] = build_copy_live_shadow_plan(
+        db,
+        settings=settings,
+        now=now,
+        state=state,
+        update_promotion_state=True,
+    )
     _store_leaderboard_alpha_state(db, state)
     result["state"] = state
     return result
@@ -1541,7 +1562,93 @@ def _copy_live_candidate_row(
         "win_rate_pct": float(stats["win_rate_pct"]) if stats["win_rate_pct"] is not None else None,
         "recent_closed_positions": stats["recent_closed_positions"],
         "recent_net_pnl_usdc": _short_decimal(stats["recent_net_pnl_usdc"]),
+        "in_shortlist": False,
+        "promoted": False,
+        "promotion": {
+            "status": "rejected",
+            "shortlist_days": 0,
+            "consecutive_shortlist_days": 0,
+            "min_shortlist_days": _int_setting(
+                settings.get("copy_live_promotion_min_shortlist_days"),
+                3,
+            ),
+            "first_seen_at": None,
+            "last_seen_at": None,
+        },
     }
+
+
+def _normalized_date_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item and item not in result:
+            result.append(item)
+    return sorted(result)
+
+
+def _copy_live_consecutive_days(dates: Sequence[str], *, end_date: datetime) -> int:
+    seen = set(dates)
+    current = end_date.date()
+    count = 0
+    while current.isoformat() in seen:
+        count += 1
+        current -= timedelta(days=1)
+    return count
+
+
+def _copy_live_apply_promotion_state(
+    rows: list[dict[str, Any]],
+    *,
+    state: dict[str, Any],
+    selected_ids: set[int],
+    settings: dict[str, Any],
+    now: datetime,
+    update_state: bool,
+) -> None:
+    min_days = _int_setting(settings.get("copy_live_promotion_min_shortlist_days"), 3)
+    today = (_as_utc(now) or now).date().isoformat()
+    raw_promotion = state.get("copy_live_promotion")
+    promotion = dict(raw_promotion) if isinstance(raw_promotion, dict) else {}
+    raw_records = promotion.get("traders")
+    records: dict[str, Any] = dict(raw_records) if isinstance(raw_records, dict) else {}
+
+    if update_state:
+        for trader_id in selected_ids:
+            key = str(trader_id)
+            raw_record = records.get(key)
+            record: dict[str, Any] = dict(raw_record) if isinstance(raw_record, dict) else {}
+            dates = _normalized_date_list(record.get("shortlist_dates"))
+            if today not in dates:
+                dates.append(today)
+            record["shortlist_dates"] = sorted(dates)
+            record["first_seen_at"] = record.get("first_seen_at") or now.isoformat()
+            record["last_seen_at"] = now.isoformat()
+            records[key] = record
+        promotion["traders"] = records
+        promotion["updated_at"] = now.isoformat()
+        state["copy_live_promotion"] = promotion
+
+    for row in rows:
+        trader_id = int(row["trader_id"])
+        in_shortlist = trader_id in selected_ids
+        row["in_shortlist"] = in_shortlist
+        raw_record = records.get(str(trader_id))
+        record = raw_record if isinstance(raw_record, dict) else {}
+        dates = _normalized_date_list(record.get("shortlist_dates"))
+        consecutive_days = _copy_live_consecutive_days(dates, end_date=now)
+        shortlist_days = len(dates)
+        promoted = in_shortlist and shortlist_days >= min_days and today in dates
+        row["promoted"] = promoted
+        row["promotion"] = {
+            "status": "promoted" if promoted else "warming_up" if in_shortlist else "rejected",
+            "shortlist_days": shortlist_days,
+            "consecutive_shortlist_days": consecutive_days,
+            "min_shortlist_days": min_days,
+            "first_seen_at": record.get("first_seen_at"),
+            "last_seen_at": record.get("last_seen_at"),
+        }
 
 
 def _copy_live_shadow_positions(
@@ -1601,14 +1708,203 @@ def _copy_live_shadow_positions(
     return planned, dict(counts), dict(skipped), estimated_notional
 
 
+def _copy_live_market_for_coin(db: Session, coin: str) -> Market | None:
+    markets = (
+        db.query(Market)
+        .filter(
+            Market.exchange == "hyperliquid",
+            Market.market_type == "perp",
+        )
+        .all()
+    )
+    for market in markets:
+        metadata = market.metadata_json if isinstance(market.metadata_json, dict) else {}
+        hl_coin = metadata.get("hl_coin")
+        if market.symbol == coin or market.base == coin or hl_coin == coin:
+            return market
+    return None
+
+
+def _latest_account_snapshot(db: Session) -> AccountSnapshot | None:
+    return db.query(AccountSnapshot).order_by(AccountSnapshot.timestamp.desc()).first()
+
+
+def _account_value(snapshot: AccountSnapshot | None) -> Decimal | None:
+    if snapshot is None:
+        return None
+    return snapshot.effective_account_value or snapshot.total_equity
+
+
+def _available_margin(snapshot: AccountSnapshot | None) -> Decimal | None:
+    if snapshot is None:
+        return None
+    if snapshot.available_balance is not None:
+        return snapshot.available_balance
+    account_value = _account_value(snapshot)
+    if account_value is None or snapshot.margin_used is None:
+        return None
+    return max(Decimal("0"), account_value - snapshot.margin_used)
+
+
+def _risk_float(db: Session, key: str, default: float) -> float:
+    row = db.get(AppSetting, "risk")
+    value = row.value.get(key) if row is not None and isinstance(row.value, dict) else None
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _risk_int(db: Session, key: str, default: int) -> int:
+    return int(_risk_float(db, key, float(default)))
+
+
+def _live_open_notional(db: Session) -> Decimal:
+    rows = (
+        db.query(Position)
+        .filter(
+            Position.mode == OrderMode.LIVE.value,
+            Position.status == "open",
+        )
+        .all()
+    )
+    total = Decimal("0")
+    for row in rows:
+        total += abs(row.entry_price * row.size)
+    return total
+
+
+def _copy_live_dry_run_orders(
+    db: Session,
+    *,
+    shadow_positions: Sequence[dict[str, Any]],
+    selected_rows: Sequence[dict[str, Any]],
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    app_settings = get_settings()
+    live_settings = effective_live_execution_settings(db, app_settings)
+    account_snapshot = _latest_account_snapshot(db)
+    account_value = _account_value(account_snapshot)
+    available_margin = _available_margin(account_snapshot)
+    max_leverage = Decimal(str(_risk_float(db, "max_leverage", app_settings.max_leverage)))
+    max_open_positions = _risk_int(db, "max_open_positions", app_settings.max_open_positions)
+    max_exposure_pct = Decimal(str(_risk_float(db, "max_total_exposure_pct", app_settings.max_total_exposure_pct)))
+    min_account_value = Decimal(str(live_settings["min_account_value_usd"]))
+    min_notional = Decimal(str(live_settings["min_order_notional_usd"]))
+    notional_cap = Decimal(str(live_settings["order_notional_cap_usd"]))
+    bump_to_min_notional = bool(live_settings["bump_to_min_notional"])
+    require_promotion = bool(settings.get("copy_live_dry_run_requires_promotion", True))
+    selected_by_id = {int(row["trader_id"]): row for row in selected_rows}
+    existing_live_positions = (
+        db.query(Position)
+        .filter(
+            Position.mode == OrderMode.LIVE.value,
+            Position.status == "open",
+        )
+        .all()
+    )
+    live_market_ids = {row.market_id for row in existing_live_positions}
+    live_count = len(existing_live_positions)
+    live_notional = _live_open_notional(db)
+    planned_count = 0
+    planned_notional = Decimal("0")
+    planned_market_ids: set[int] = set()
+    orders: list[dict[str, Any]] = []
+
+    for item in shadow_positions:
+        reasons: list[str] = []
+        warnings = ["depth_not_checked_shadow", "order_not_submitted"]
+        trader_id = int(item["trader_id"])
+        selected_row = selected_by_id.get(trader_id)
+        if selected_row is None:
+            reasons.append("trader_not_selected")
+        elif require_promotion and not selected_row.get("promoted"):
+            reasons.append("promotion_not_ready")
+
+        coin = str(item.get("coin") or "")
+        market = _copy_live_market_for_coin(db, coin)
+        if market is None:
+            reasons.append("market_not_found")
+        elif not market.active:
+            reasons.append("market_inactive")
+        elif market.market_type != "perp":
+            reasons.append("market_not_perp")
+        elif market.id in live_market_ids or market.id in planned_market_ids:
+            reasons.append("live_position_already_open_for_market")
+
+        requested_notional = _decimal_setting(item.get("live_notional_usd"), Decimal("0"))
+        effective_notional = requested_notional
+        if bump_to_min_notional and Decimal("0") < effective_notional < min_notional:
+            effective_notional = min_notional
+        if effective_notional < min_notional:
+            reasons.append("notional_below_min_order")
+        if effective_notional > notional_cap:
+            reasons.append("notional_above_live_cap")
+
+        if account_value is None:
+            reasons.append("account_snapshot_missing")
+        else:
+            if account_value < min_account_value:
+                reasons.append("account_value_below_live_min")
+            max_exposure = account_value * max_exposure_pct / Decimal("100")
+            if live_notional + planned_notional + effective_notional > max_exposure:
+                reasons.append("max_total_exposure_exceeded")
+
+        required_margin = effective_notional / max_leverage if max_leverage > 0 else effective_notional
+        if available_margin is None:
+            reasons.append("available_margin_unknown")
+        elif available_margin < required_margin:
+            reasons.append("available_margin_insufficient")
+
+        if live_count + planned_count >= max_open_positions:
+            reasons.append("max_live_open_positions_reached")
+
+        status = "blocked" if reasons else "would_submit"
+        if status == "would_submit":
+            planned_count += 1
+            planned_notional += effective_notional
+            if market is not None:
+                planned_market_ids.add(market.id)
+
+        orders.append(
+            {
+                "status": status,
+                "reasons": reasons,
+                "warnings": warnings,
+                "coin": coin,
+                "direction": item.get("direction"),
+                "side": "buy" if item.get("direction") == "long" else "sell",
+                "trader_id": trader_id,
+                "trader_label": item.get("trader_label"),
+                "paper_position_id": item.get("paper_position_id"),
+                "market_id": market.id if market is not None else None,
+                "requested_notional_usd": _short_decimal(requested_notional),
+                "effective_notional_usd": _short_decimal(effective_notional),
+                "min_order_notional_usd": _short_decimal(min_notional),
+                "order_notional_cap_usd": _short_decimal(notional_cap),
+                "account_value_usd": _short_decimal(account_value),
+                "available_margin_usd": _short_decimal(available_margin),
+                "required_margin_usd": _short_decimal(required_margin),
+                "existing_live_positions": live_count,
+                "existing_live_notional_usd": _short_decimal(live_notional),
+                "max_live_open_positions": max_open_positions,
+                "max_total_exposure_pct": float(max_exposure_pct),
+            }
+        )
+    return orders
+
+
 def build_copy_live_shadow_plan(
     db: Session,
     *,
     settings: dict[str, Any] | None = None,
     now: datetime | None = None,
+    state: dict[str, Any] | None = None,
+    update_promotion_state: bool = False,
 ) -> dict[str, Any]:
     now = now or datetime.now(UTC)
     settings = settings or leaderboard_alpha_settings(db)
+    state = state if state is not None else leaderboard_alpha_state(db)
     recent_days = _int_setting(settings.get("copy_live_recent_days"), 7)
     max_traders = _int_setting(settings.get("copy_live_max_traders"), 3)
     positions = db.query(LeaderboardCopyPaperPosition).all()
@@ -1642,6 +1938,14 @@ def build_copy_live_shadow_plan(
     )
     selected = [row for row in evaluated if row["eligible"]][:max_traders]
     selected_ids = {int(row["trader_id"]) for row in selected}
+    _copy_live_apply_promotion_state(
+        evaluated,
+        state=state,
+        selected_ids=selected_ids,
+        settings=settings,
+        now=now,
+        update_state=update_promotion_state,
+    )
     shadow_positions, position_counts, skipped_positions, estimated_notional = _copy_live_shadow_positions(
         positions=positions,
         traders=traders,
@@ -1650,6 +1954,14 @@ def build_copy_live_shadow_plan(
     )
     for row in selected:
         row["planned_open_positions"] = position_counts.get(int(row["trader_id"]), 0)
+    dry_run_orders = _copy_live_dry_run_orders(
+        db,
+        shadow_positions=shadow_positions,
+        selected_rows=selected,
+        settings=settings,
+    )
+    promoted = [row for row in selected if row.get("promoted")]
+    would_submit = [row for row in dry_run_orders if row["status"] == "would_submit"]
 
     status = "shadow_ready" if selected else "no_live_candidates"
     return {
@@ -1662,7 +1974,10 @@ def build_copy_live_shadow_plan(
             "evaluated_traders": len(evaluated),
             "selected_traders": len(selected),
             "rejected_traders": len([row for row in evaluated if not row["eligible"]]),
+            "promoted_traders": len(promoted),
             "planned_open_positions": len(shadow_positions),
+            "dry_run_would_submit": len(would_submit),
+            "dry_run_blocked": len(dry_run_orders) - len(would_submit),
             "estimated_open_notional_usd": _short_decimal(estimated_notional),
             "position_notional_usd": str(settings.get("copy_live_position_notional_usd") or "40"),
             "max_traders": max_traders,
@@ -1674,8 +1989,11 @@ def build_copy_live_shadow_plan(
             "skipped_open_positions": skipped_positions,
         },
         "selected_traders": selected,
+        "promoted_traders": promoted,
+        "promotion_table": evaluated[:20],
         "rejected_traders": [row for row in evaluated if not row["eligible"]][:20],
         "shadow_open_positions": shadow_positions,
+        "dry_run_orders": dry_run_orders,
     }
 
 
@@ -1931,7 +2249,7 @@ def build_dashboard(db: Session) -> dict[str, Any]:
         },
         "state": state,
         "copy_paper": build_copy_paper_summary(db, settings=settings),
-        "copy_live": build_copy_live_shadow_plan(db, settings=settings),
+        "copy_live": build_copy_live_shadow_plan(db, settings=settings, state=state),
         "traders": serialized_traders,
         "signals": signals,
         "recent_fills": [serialize_fill(fill, trader) for fill, trader in recent_rows],
