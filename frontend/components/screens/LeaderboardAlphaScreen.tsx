@@ -17,6 +17,8 @@ import type {
   LeaderboardAlphaFill,
   LeaderboardAlphaSignal,
   LeaderboardAlphaTrader,
+  LeaderboardCopyLive,
+  LeaderboardCopyLiveTrader,
   LeaderboardCopyPaperPosition,
   LeaderboardCopyPaperRanking,
 } from "@/lib/api";
@@ -227,6 +229,8 @@ export function LeaderboardAlphaScreen() {
         recentClosed={data.copy_paper.recent_closed_positions}
       />
 
+      <CopyLiveShadowPanel plan={data.copy_live} />
+
       <div className="rounded-lg border border-border bg-bg-1 p-4">
         <form onSubmit={onSubmit} className="grid gap-3 lg:grid-cols-[minmax(280px,1fr)_220px_auto]">
           <input
@@ -401,6 +405,185 @@ function CopyPaperLab({
         </div>
       )}
     </Card>
+  );
+}
+
+const LIVE_REASON_LABELS: Record<string, string> = {
+  trader_disabled: "trader off",
+  rank_outside_live_limit: "rank fuori limite",
+  missing_snapshot: "snapshot mancante",
+  classification_not_allowed: "classe non live",
+  quality_below_live_min: "quality bassa",
+  copy_paper_sample_too_small: "sample paper piccolo",
+  profit_factor_below_live_min: "PF basso",
+  win_rate_below_live_min: "win rate basso",
+  avg_trade_pnl_below_live_min: "avg PnL basso",
+  net_pnl_below_live_min: "net PnL basso",
+  recent_sample_too_small: "sample recente piccolo",
+};
+
+function reasonLabel(reason: string): string {
+  return LIVE_REASON_LABELS[reason] ?? reason.replaceAll("_", " ");
+}
+
+function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
+  const skipped = Object.entries(plan.summary.skipped_open_positions ?? {})
+    .map(([key, value]) => `${reasonLabel(key)}: ${value}`)
+    .join(" · ");
+  return (
+    <Card title="Live shadow shortlist">
+      <div className="mb-3 rounded-md border border-warn/30 bg-warn/10 p-3 text-xs text-warn">
+        Modalità live preparatoria: seleziona i trader copiabili e stima le posizioni, ma
+        `orders_enabled=false`, quindi non invia ordini Hyperliquid.
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+        <Kpi
+          label="Trader live"
+          value={`${plan.summary.selected_traders}/${plan.summary.evaluated_traders}`}
+          sub={`max ${plan.summary.max_traders}`}
+        />
+        <Kpi
+          label="Posizioni stimate"
+          value={plan.summary.planned_open_positions}
+          sub={`max ${plan.summary.max_open_positions}`}
+        />
+        <Kpi
+          label="Notional stimato"
+          value={fmtUsd(plan.summary.estimated_open_notional_usd)}
+          sub={`${fmtUsd(plan.summary.position_notional_usd)} cad.`}
+        />
+        <Kpi
+          label="Modalità"
+          value={plan.mode}
+          sub={plan.enabled ? "flag on" : "flag off"}
+          compact
+        />
+        <Kpi label="Ordini" value={plan.orders_enabled ? "on" : "off"} sub={plan.reason} compact />
+        <Kpi label="Scartati" value={plan.summary.rejected_traders} sub={skipped || "no skip open"} />
+      </div>
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-[1.15fr_0.85fr]">
+        <div>
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-fg-3">
+            Trader selezionati
+          </div>
+          {plan.selected_traders.length === 0 ? (
+            <div className="rounded-md border border-border bg-bg p-3 text-sm text-fg-3">
+              Nessun trader passa i filtri live-shadow. Serve più storico paper o soglie meno restrittive.
+            </div>
+          ) : (
+            <CopyLiveTraderTable rows={plan.selected_traders} selected />
+          )}
+        </div>
+
+        <div>
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-fg-3">
+            Open shadow
+          </div>
+          {plan.shadow_open_positions.length === 0 ? (
+            <div className="rounded-md border border-border bg-bg p-3 text-sm text-fg-3">
+              Nessuna posizione aperta idonea dopo cap per trader, cap totale e filtri coin.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs uppercase tracking-wider text-fg-3">
+                    <th className="pb-2">Trader</th>
+                    <th className="pb-2">Coin</th>
+                    <th className="pb-2">Dir</th>
+                    <th className="pb-2 text-right">Live</th>
+                    <th className="pb-2 text-right">Paper</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {plan.shadow_open_positions.map((position) => (
+                    <tr key={position.paper_position_id} className="border-t border-border">
+                      <td className="py-1.5 font-mono text-xs">
+                        {position.trader_label || shortAddress(position.trader_address)}
+                      </td>
+                      <td className="py-1.5 font-mono">{position.coin}</td>
+                      <td className={cn("py-1.5 font-mono text-xs", directionTone(position.direction))}>
+                        {position.direction}
+                      </td>
+                      <td className="py-1.5 text-right font-mono">{fmtUsd(position.live_notional_usd)}</td>
+                      <td className="py-1.5 text-right font-mono">{fmtUsd(position.paper_notional_usd)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {plan.rejected_traders.length > 0 && (
+        <div className="mt-4">
+          <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-fg-3">
+            Scartati principali
+          </div>
+          <CopyLiveTraderTable rows={plan.rejected_traders.slice(0, 8)} />
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function CopyLiveTraderTable({
+  rows,
+  selected = false,
+}: {
+  rows: LeaderboardCopyLiveTrader[];
+  selected?: boolean;
+}) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-left text-xs uppercase tracking-wider text-fg-3">
+            <th className="pb-2">Trader</th>
+            <th className="pb-2 text-right">Live score</th>
+            <th className="pb-2 text-right">Q</th>
+            <th className="pb-2 text-right">PnL</th>
+            <th className="pb-2 text-right">PF</th>
+            <th className="pb-2 text-right">Win</th>
+            <th className="pb-2 text-right">Closed</th>
+            <th className="pb-2 text-right">{selected ? "Plan" : "Motivi"}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.trader_id} className="border-t border-border">
+              <td className="py-2 pr-3">
+                <div className="font-medium">{row.trader_label || shortAddress(row.trader_address)}</div>
+                <div className="text-xs text-fg-3">
+                  {row.leaderboard_rank != null ? `HL #${row.leaderboard_rank}` : shortAddress(row.trader_address)}
+                  {row.classification ? ` · ${row.classification}` : ""}
+                </div>
+              </td>
+              <td className="py-2 text-right font-mono">{fmtNum(row.live_candidate_score, 1)}</td>
+              <td className="py-2 text-right font-mono">{row.quality_score ?? "—"}</td>
+              <td
+                className={cn(
+                  "py-2 text-right font-mono",
+                  (asNumber(row.net_pnl_usdc) ?? 0) >= 0 ? "text-success" : "text-danger",
+                )}
+              >
+                {fmtUsd(row.net_pnl_usdc)}
+              </td>
+              <td className="py-2 text-right font-mono">{fmtNum(row.profit_factor)}</td>
+              <td className="py-2 text-right font-mono">{fmtPct(row.win_rate_pct)}</td>
+              <td className="py-2 text-right font-mono">{row.closed_positions}</td>
+              <td className="max-w-[220px] py-2 text-right text-xs text-fg-3">
+                {selected
+                  ? `${row.planned_open_positions}/${row.open_positions} open`
+                  : row.reasons.map(reasonLabel).join(", ")}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 

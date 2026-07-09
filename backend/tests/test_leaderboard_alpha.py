@@ -12,6 +12,7 @@ from app.db.models import (
     LeaderboardCopyPaperPosition,
     LeaderboardTrader,
     LeaderboardTraderFill,
+    LeaderboardTraderSnapshot,
 )
 from app.services import leaderboard_alpha as alpha
 
@@ -250,6 +251,140 @@ def test_copy_paper_replay_closes_positions_and_is_idempotent() -> None:
         assert second["opened"] == 0
         assert second["closed"] == 0
         assert db.query(LeaderboardCopyPaperPosition).count() == 1
+    finally:
+        db.close()
+
+
+def _add_snapshot(
+    db,
+    trader: LeaderboardTrader,
+    *,
+    classification: str,
+    quality_score: int,
+) -> None:
+    db.add(
+        LeaderboardTraderSnapshot(
+            trader_id=trader.id,
+            lookback_days=30,
+            fills_count=40,
+            closing_fills_count=20,
+            open_fills_count=20,
+            net_pnl_usdc=Decimal("100"),
+            closed_pnl_usdc=Decimal("110"),
+            fees_usdc=Decimal("10"),
+            volume_usdc=Decimal("10000"),
+            win_rate=Decimal("0.60"),
+            profit_factor=Decimal("2.0"),
+            quality_score=quality_score,
+            classification=classification,
+            metrics={},
+        )
+    )
+
+
+def _add_copy_position(
+    db,
+    trader: LeaderboardTrader,
+    *,
+    idx: int,
+    now: datetime,
+    status: str = "closed",
+    net_pnl: Decimal = Decimal("1"),
+    coin: str = "BTC",
+) -> None:
+    fill = LeaderboardTraderFill(
+        trader_id=trader.id,
+        fill_key=f"{trader.id}-open-{idx}",
+        coin=coin,
+        side="buy",
+        direction="long",
+        intent="open",
+        price=Decimal("100"),
+        size=Decimal("1"),
+        notional_usd=Decimal("100"),
+        oid=f"open-{trader.id}-{idx}",
+        raw_data={},
+        filled_at=now - timedelta(hours=idx + 1),
+    )
+    db.add(fill)
+    db.flush()
+    position = LeaderboardCopyPaperPosition(
+        trader_id=trader.id,
+        open_fill_id=fill.id,
+        coin=coin,
+        direction="long",
+        status=status,
+        source_open_order_id=fill.oid,
+        entry_price=Decimal("100"),
+        copy_size=Decimal("1"),
+        copy_notional_usd=Decimal("100"),
+        original_notional_usd=Decimal("100"),
+        entry_fee_usdc=Decimal("0.045"),
+        opened_at=fill.filled_at,
+        metadata_json={},
+    )
+    if status == "closed":
+        position.exit_price = Decimal("101") if net_pnl >= 0 else Decimal("99")
+        position.exit_fee_usdc = Decimal("0.045")
+        position.gross_pnl_usdc = net_pnl + Decimal("0.09")
+        position.net_pnl_usdc = net_pnl
+        position.pnl_pct = net_pnl / Decimal("100")
+        position.closed_at = now - timedelta(hours=idx)
+    db.add(position)
+
+
+def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() -> None:
+    db = _sqlite_db()
+    now = datetime(2026, 7, 9, tzinfo=UTC)
+    try:
+        strong = LeaderboardTrader(
+            address="0x" + "1" * 40,
+            label="strong",
+            enabled=True,
+            metadata_json={"leaderboard": {"rank": 1}},
+        )
+        weak_quality = LeaderboardTrader(
+            address="0x" + "2" * 40,
+            label="weak quality",
+            enabled=True,
+            metadata_json={"leaderboard": {"rank": 2}},
+        )
+        watch = LeaderboardTrader(
+            address="0x" + "3" * 40,
+            label="watch",
+            enabled=True,
+            metadata_json={"leaderboard": {"rank": 3}},
+        )
+        db.add_all([strong, weak_quality, watch])
+        db.flush()
+        _add_snapshot(db, strong, classification="candidate", quality_score=95)
+        _add_snapshot(db, weak_quality, classification="candidate", quality_score=70)
+        _add_snapshot(db, watch, classification="watch", quality_score=95)
+        for idx in range(22):
+            _add_copy_position(
+                db,
+                strong,
+                idx=idx,
+                now=now,
+                net_pnl=Decimal("1") if idx % 5 else Decimal("-0.25"),
+            )
+            _add_copy_position(db, weak_quality, idx=idx + 100, now=now, net_pnl=Decimal("1"))
+            _add_copy_position(db, watch, idx=idx + 200, now=now, net_pnl=Decimal("1"))
+        _add_copy_position(db, strong, idx=500, now=now, status="open", coin="BTC")
+        _add_copy_position(db, strong, idx=501, now=now, status="open", coin="xyz:DRAM")
+        db.commit()
+
+        plan = alpha.build_copy_live_shadow_plan(db, now=now)
+
+        assert plan["orders_enabled"] is False
+        assert plan["status"] == "shadow_ready"
+        assert [row["trader_label"] for row in plan["selected_traders"]] == ["strong"]
+        assert plan["summary"]["planned_open_positions"] == 1
+        assert plan["summary"]["estimated_open_notional_usd"] == "40"
+        assert plan["summary"]["skipped_open_positions"] == {"excluded_coin_prefix": 1}
+        rejected = {row["trader_label"]: row["reasons"] for row in plan["rejected_traders"]}
+        assert "quality_below_live_min" in rejected["weak quality"]
+        assert "classification_not_allowed" in rejected["watch"]
     finally:
         db.close()
 

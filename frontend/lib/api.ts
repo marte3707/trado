@@ -1246,6 +1246,62 @@ export type LeaderboardCopyPaper = {
   }>;
 };
 
+export type LeaderboardCopyLiveTrader = {
+  trader_id: number;
+  trader_label: string | null;
+  trader_address: string | null;
+  leaderboard_rank: number | null;
+  classification: LeaderboardAlphaClassification | null;
+  quality_score: number | null;
+  live_candidate_score: number;
+  eligible: boolean;
+  reasons: string[];
+  closed_positions: number;
+  open_positions: number;
+  planned_open_positions: number;
+  net_pnl_usdc: string | null;
+  avg_trade_pnl_usdc: string | null;
+  profit_factor: number | null;
+  win_rate_pct: number | null;
+  recent_closed_positions: number;
+  recent_net_pnl_usdc: string | null;
+};
+
+export type LeaderboardCopyLiveShadowPosition = {
+  paper_position_id: number;
+  trader_id: number;
+  trader_label: string | null;
+  trader_address: string | null;
+  coin: string;
+  direction: "long" | "short" | string;
+  paper_notional_usd: string | null;
+  live_notional_usd: string | null;
+  opened_at: string;
+};
+
+export type LeaderboardCopyLive = {
+  enabled: boolean;
+  mode: "shadow" | string;
+  orders_enabled: boolean;
+  status: "shadow_ready" | "no_live_candidates" | string;
+  reason: string;
+  summary: {
+    evaluated_traders: number;
+    selected_traders: number;
+    rejected_traders: number;
+    planned_open_positions: number;
+    estimated_open_notional_usd: string | null;
+    position_notional_usd: string;
+    max_traders: number;
+    max_open_positions: number;
+    max_open_positions_per_trader: number;
+    skipped_open_positions: Record<string, number>;
+  };
+  selected_traders: LeaderboardCopyLiveTrader[];
+  rejected_traders: LeaderboardCopyLiveTrader[];
+  shadow_open_positions: LeaderboardCopyLiveShadowPosition[];
+};
+
 export type LeaderboardAlphaDashboard = {
   settings: {
     enabled: boolean;
@@ -1275,6 +1331,24 @@ export type LeaderboardAlphaDashboard = {
     copy_paper_only_auto_top_traders: boolean;
     copy_paper_close_on_opposite_open: boolean;
     copy_paper_replay_batch_size: number;
+    copy_live_enabled: boolean;
+    copy_live_mode: string;
+    copy_live_max_traders: number;
+    copy_live_allowed_rank_limit: number;
+    copy_live_allowed_classes: string[];
+    copy_live_min_quality_score: number;
+    copy_live_min_copy_closed_positions: number;
+    copy_live_min_profit_factor: string;
+    copy_live_min_win_rate_pct: number;
+    copy_live_min_avg_trade_pnl_usdc: string;
+    copy_live_min_net_pnl_usdc: string;
+    copy_live_recent_days: number;
+    copy_live_min_recent_closed_positions: number;
+    copy_live_position_notional_usd: string;
+    copy_live_max_open_positions: number;
+    copy_live_max_open_positions_per_trader: number;
+    copy_live_max_estimated_notional_usd: string;
+    copy_live_excluded_coin_prefixes: string[];
   } & Record<string, unknown>;
   state: Record<string, unknown>;
   summary: {
@@ -1286,6 +1360,7 @@ export type LeaderboardAlphaDashboard = {
     mode: "observe_only";
   };
   copy_paper: LeaderboardCopyPaper;
+  copy_live: LeaderboardCopyLive;
   traders: LeaderboardAlphaTrader[];
   signals: LeaderboardAlphaSignal[];
   recent_fills: LeaderboardAlphaFill[];

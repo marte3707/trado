@@ -58,6 +58,24 @@ DEFAULT_LEADERBOARD_ALPHA_SETTINGS: dict[str, Any] = {
     "copy_paper_only_auto_top_traders": True,
     "copy_paper_close_on_opposite_open": True,
     "copy_paper_replay_batch_size": 1000,
+    "copy_live_enabled": False,
+    "copy_live_mode": "shadow",
+    "copy_live_max_traders": 3,
+    "copy_live_allowed_rank_limit": 20,
+    "copy_live_allowed_classes": ["candidate"],
+    "copy_live_min_quality_score": 80,
+    "copy_live_min_copy_closed_positions": 20,
+    "copy_live_min_profit_factor": "1.15",
+    "copy_live_min_win_rate_pct": 40,
+    "copy_live_min_avg_trade_pnl_usdc": "0",
+    "copy_live_min_net_pnl_usdc": "0",
+    "copy_live_recent_days": 7,
+    "copy_live_min_recent_closed_positions": 2,
+    "copy_live_position_notional_usd": "40",
+    "copy_live_max_open_positions": 3,
+    "copy_live_max_open_positions_per_trader": 1,
+    "copy_live_max_estimated_notional_usd": "120",
+    "copy_live_excluded_coin_prefixes": ["xyz:"],
 }
 
 
@@ -112,6 +130,14 @@ def _parse_dt(value: Any) -> datetime | None:
     return parsed
 
 
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _int_setting(value: Any, default: int, *, minimum: int = 1) -> int:
     if isinstance(value, bool):
         return default
@@ -149,6 +175,13 @@ def _decimal_avg(values: Sequence[Decimal | None]) -> Decimal | None:
     if not valid:
         return None
     return _decimal_sum(valid) / Decimal(len(valid))
+
+
+def _string_list_setting(value: Any, default: Sequence[str]) -> list[str]:
+    if isinstance(value, list):
+        parsed = [item for item in value if isinstance(item, str) and item]
+        return parsed if parsed else list(default)
+    return list(default)
 
 
 def _dt_from_ms(value: Any) -> datetime | None:
@@ -1363,6 +1396,289 @@ def _copy_paper_trader_rankings(
     )
 
 
+def _copy_live_decimal_gte(value: Decimal | None, threshold: Decimal) -> bool:
+    return value is not None and value >= threshold
+
+
+def _copy_live_bounded(value: Decimal, lower: Decimal, upper: Decimal) -> Decimal:
+    return min(max(value, lower), upper)
+
+
+def _copy_live_trader_stats(
+    positions: Sequence[LeaderboardCopyPaperPosition],
+    *,
+    now: datetime,
+    recent_days: int,
+) -> dict[str, Any]:
+    closed = [row for row in positions if row.status == "closed"]
+    open_positions = [row for row in positions if row.status == "open"]
+    wins = [row for row in closed if row.net_pnl_usdc is not None and row.net_pnl_usdc > 0]
+    net_pnl = _decimal_sum([row.net_pnl_usdc for row in closed])
+    avg_trade = _decimal_avg([row.net_pnl_usdc for row in closed])
+    profit_factor = _profit_factor_from_positions(closed)
+    win_rate_pct = (
+        Decimal(len(wins)) / Decimal(len(closed)) * Decimal("100") if closed else None
+    )
+    cutoff = (_as_utc(now) or now) - timedelta(days=max(1, recent_days))
+    recent_closed = [
+        row
+        for row in closed
+        if (closed_at := _as_utc(row.closed_at)) is not None and closed_at >= cutoff
+    ]
+    recent_net = _decimal_sum([row.net_pnl_usdc for row in recent_closed])
+    return {
+        "closed_positions": len(closed),
+        "open_positions": len(open_positions),
+        "net_pnl_usdc": net_pnl,
+        "avg_trade_pnl_usdc": avg_trade,
+        "profit_factor": profit_factor,
+        "win_rate_pct": win_rate_pct,
+        "recent_closed_positions": len(recent_closed),
+        "recent_net_pnl_usdc": recent_net,
+    }
+
+
+def _copy_live_candidate_score(
+    *,
+    snapshot: LeaderboardTraderSnapshot,
+    stats: dict[str, Any],
+    leaderboard_rank: int | None,
+    rank_limit: int,
+) -> float:
+    score = Decimal(snapshot.quality_score)
+    profit_factor = stats.get("profit_factor")
+    if isinstance(profit_factor, Decimal):
+        score += _copy_live_bounded((profit_factor - Decimal("1")) * Decimal("20"), Decimal("-20"), Decimal("40"))
+    net_pnl = stats.get("net_pnl_usdc")
+    if isinstance(net_pnl, Decimal):
+        score += _copy_live_bounded(net_pnl / Decimal("10"), Decimal("-30"), Decimal("30"))
+    avg_trade = stats.get("avg_trade_pnl_usdc")
+    if isinstance(avg_trade, Decimal):
+        score += _copy_live_bounded(avg_trade * Decimal("20"), Decimal("-20"), Decimal("20"))
+    win_rate = stats.get("win_rate_pct")
+    if isinstance(win_rate, Decimal):
+        score += _copy_live_bounded((win_rate - Decimal("50")) * Decimal("0.4"), Decimal("-12"), Decimal("12"))
+    recent_net = stats.get("recent_net_pnl_usdc")
+    if isinstance(recent_net, Decimal):
+        score += _copy_live_bounded(recent_net / Decimal("10"), Decimal("-15"), Decimal("15"))
+    if leaderboard_rank is not None and leaderboard_rank <= rank_limit:
+        score += Decimal(rank_limit + 1 - leaderboard_rank) * Decimal("0.5")
+    return round(float(score), 2)
+
+
+def _copy_live_candidate_row(
+    trader: LeaderboardTrader,
+    *,
+    snapshot: LeaderboardTraderSnapshot | None,
+    stats: dict[str, Any],
+    settings: dict[str, Any],
+) -> dict[str, Any]:
+    rank_limit = _int_setting(
+        settings.get("copy_live_allowed_rank_limit", settings.get("copy_paper_allowed_rank_limit")),
+        20,
+    )
+    allowed_classes = set(_string_list_setting(settings.get("copy_live_allowed_classes"), ["candidate"]))
+    min_quality = _int_setting(settings.get("copy_live_min_quality_score"), 80, minimum=0)
+    min_closed = _int_setting(settings.get("copy_live_min_copy_closed_positions"), 20)
+    min_profit_factor = _decimal_setting(settings.get("copy_live_min_profit_factor"), Decimal("1.15"))
+    min_win_rate = _decimal_setting(settings.get("copy_live_min_win_rate_pct"), Decimal("40"))
+    min_avg_trade = _decimal_setting(settings.get("copy_live_min_avg_trade_pnl_usdc"), Decimal("0"))
+    min_net_pnl = _decimal_setting(settings.get("copy_live_min_net_pnl_usdc"), Decimal("0"))
+    min_recent_closed = _int_setting(settings.get("copy_live_min_recent_closed_positions"), 2, minimum=0)
+    leaderboard_rank = _leaderboard_rank(trader.metadata_json)
+    reasons: list[str] = []
+
+    if not trader.enabled:
+        reasons.append("trader_disabled")
+    if leaderboard_rank is None or leaderboard_rank > rank_limit:
+        reasons.append("rank_outside_live_limit")
+    if snapshot is None:
+        reasons.append("missing_snapshot")
+    else:
+        if snapshot.classification not in allowed_classes:
+            reasons.append("classification_not_allowed")
+        if snapshot.quality_score < min_quality:
+            reasons.append("quality_below_live_min")
+    if stats["closed_positions"] < min_closed:
+        reasons.append("copy_paper_sample_too_small")
+    if not _copy_live_decimal_gte(stats.get("profit_factor"), min_profit_factor):
+        reasons.append("profit_factor_below_live_min")
+    if not _copy_live_decimal_gte(stats.get("win_rate_pct"), min_win_rate):
+        reasons.append("win_rate_below_live_min")
+    if not _copy_live_decimal_gte(stats.get("avg_trade_pnl_usdc"), min_avg_trade):
+        reasons.append("avg_trade_pnl_below_live_min")
+    if not _copy_live_decimal_gte(stats.get("net_pnl_usdc"), min_net_pnl):
+        reasons.append("net_pnl_below_live_min")
+    if stats["recent_closed_positions"] < min_recent_closed:
+        reasons.append("recent_sample_too_small")
+
+    score = (
+        _copy_live_candidate_score(
+            snapshot=snapshot,
+            stats=stats,
+            leaderboard_rank=leaderboard_rank,
+            rank_limit=rank_limit,
+        )
+        if snapshot is not None
+        else 0.0
+    )
+    return {
+        "trader_id": trader.id,
+        "trader_label": trader.label,
+        "trader_address": trader.address,
+        "leaderboard_rank": leaderboard_rank,
+        "classification": snapshot.classification if snapshot is not None else None,
+        "quality_score": snapshot.quality_score if snapshot is not None else None,
+        "live_candidate_score": score,
+        "eligible": len(reasons) == 0,
+        "reasons": reasons,
+        "closed_positions": stats["closed_positions"],
+        "open_positions": stats["open_positions"],
+        "planned_open_positions": 0,
+        "net_pnl_usdc": _short_decimal(stats["net_pnl_usdc"]),
+        "avg_trade_pnl_usdc": _short_decimal(stats["avg_trade_pnl_usdc"]),
+        "profit_factor": float(stats["profit_factor"]) if stats["profit_factor"] is not None else None,
+        "win_rate_pct": float(stats["win_rate_pct"]) if stats["win_rate_pct"] is not None else None,
+        "recent_closed_positions": stats["recent_closed_positions"],
+        "recent_net_pnl_usdc": _short_decimal(stats["recent_net_pnl_usdc"]),
+    }
+
+
+def _copy_live_shadow_positions(
+    *,
+    positions: Sequence[LeaderboardCopyPaperPosition],
+    traders: dict[int, LeaderboardTrader],
+    selected_trader_ids: set[int],
+    settings: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[int, int], dict[str, int], Decimal]:
+    max_total = _int_setting(settings.get("copy_live_max_open_positions"), 3)
+    max_per_trader = _int_setting(settings.get("copy_live_max_open_positions_per_trader"), 1)
+    live_notional = _decimal_setting(settings.get("copy_live_position_notional_usd"), Decimal("40"))
+    max_notional = _decimal_setting(settings.get("copy_live_max_estimated_notional_usd"), Decimal("120"))
+    excluded_prefixes = _string_list_setting(settings.get("copy_live_excluded_coin_prefixes"), ["xyz:"])
+    open_positions = sorted(
+        [
+            row
+            for row in positions
+            if row.status == "open" and row.trader_id in selected_trader_ids
+        ],
+        key=lambda row: (row.opened_at, row.id),
+        reverse=True,
+    )
+    planned: list[dict[str, Any]] = []
+    counts: dict[int, int] = defaultdict(int)
+    skipped: dict[str, int] = defaultdict(int)
+    estimated_notional = Decimal("0")
+    for position in open_positions:
+        if any(position.coin.startswith(prefix) for prefix in excluded_prefixes):
+            skipped["excluded_coin_prefix"] += 1
+            continue
+        if len(planned) >= max_total:
+            skipped["max_total_open_positions"] += 1
+            continue
+        if counts[position.trader_id] >= max_per_trader:
+            skipped["max_open_positions_per_trader"] += 1
+            continue
+        if estimated_notional + live_notional > max_notional:
+            skipped["max_estimated_notional"] += 1
+            continue
+        trader = traders.get(position.trader_id)
+        planned.append(
+            {
+                "paper_position_id": position.id,
+                "trader_id": position.trader_id,
+                "trader_label": trader.label if trader else None,
+                "trader_address": trader.address if trader else None,
+                "coin": position.coin,
+                "direction": position.direction,
+                "paper_notional_usd": _short_decimal(position.copy_notional_usd),
+                "live_notional_usd": _short_decimal(live_notional),
+                "opened_at": position.opened_at,
+            }
+        )
+        counts[position.trader_id] += 1
+        estimated_notional += live_notional
+    return planned, dict(counts), dict(skipped), estimated_notional
+
+
+def build_copy_live_shadow_plan(
+    db: Session,
+    *,
+    settings: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(UTC)
+    settings = settings or leaderboard_alpha_settings(db)
+    recent_days = _int_setting(settings.get("copy_live_recent_days"), 7)
+    max_traders = _int_setting(settings.get("copy_live_max_traders"), 3)
+    positions = db.query(LeaderboardCopyPaperPosition).all()
+    snapshots = _latest_snapshots(db)
+    traders = {
+        row.id: row
+        for row in db.query(LeaderboardTrader)
+        .filter(LeaderboardTrader.enabled.is_(True))
+        .all()
+    }
+    grouped: dict[int, list[LeaderboardCopyPaperPosition]] = defaultdict(list)
+    for position in positions:
+        grouped[position.trader_id].append(position)
+
+    evaluated = [
+        _copy_live_candidate_row(
+            trader,
+            snapshot=snapshots.get(trader.id),
+            stats=_copy_live_trader_stats(grouped.get(trader.id, []), now=now, recent_days=recent_days),
+            settings=settings,
+        )
+        for trader in traders.values()
+    ]
+    evaluated.sort(
+        key=lambda row: (
+            bool(row["eligible"]),
+            float(row["live_candidate_score"] or 0),
+            int(row["closed_positions"] or 0),
+        ),
+        reverse=True,
+    )
+    selected = [row for row in evaluated if row["eligible"]][:max_traders]
+    selected_ids = {int(row["trader_id"]) for row in selected}
+    shadow_positions, position_counts, skipped_positions, estimated_notional = _copy_live_shadow_positions(
+        positions=positions,
+        traders=traders,
+        selected_trader_ids=selected_ids,
+        settings=settings,
+    )
+    for row in selected:
+        row["planned_open_positions"] = position_counts.get(int(row["trader_id"]), 0)
+
+    status = "shadow_ready" if selected else "no_live_candidates"
+    return {
+        "enabled": bool(settings.get("copy_live_enabled", False)),
+        "mode": str(settings.get("copy_live_mode") or "shadow"),
+        "orders_enabled": False,
+        "status": status,
+        "reason": "shadow_only_no_live_order_dispatch",
+        "summary": {
+            "evaluated_traders": len(evaluated),
+            "selected_traders": len(selected),
+            "rejected_traders": len([row for row in evaluated if not row["eligible"]]),
+            "planned_open_positions": len(shadow_positions),
+            "estimated_open_notional_usd": _short_decimal(estimated_notional),
+            "position_notional_usd": str(settings.get("copy_live_position_notional_usd") or "40"),
+            "max_traders": max_traders,
+            "max_open_positions": _int_setting(settings.get("copy_live_max_open_positions"), 3),
+            "max_open_positions_per_trader": _int_setting(
+                settings.get("copy_live_max_open_positions_per_trader"),
+                1,
+            ),
+            "skipped_open_positions": skipped_positions,
+        },
+        "selected_traders": selected,
+        "rejected_traders": [row for row in evaluated if not row["eligible"]][:20],
+        "shadow_open_positions": shadow_positions,
+    }
+
+
 def build_copy_paper_summary(
     db: Session,
     *,
@@ -1615,6 +1931,7 @@ def build_dashboard(db: Session) -> dict[str, Any]:
         },
         "state": state,
         "copy_paper": build_copy_paper_summary(db, settings=settings),
+        "copy_live": build_copy_live_shadow_plan(db, settings=settings),
         "traders": serialized_traders,
         "signals": signals,
         "recent_fills": [serialize_fill(fill, trader) for fill, trader in recent_rows],
