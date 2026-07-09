@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from app.api import routes
 from app.api.routers import account as account_router
 from app.core.config import Settings
-from app.db.models import AccountSnapshot, AppSetting, DecisionLog, Market, Position
+from app.db.models import AppSetting, DecisionLog, Market, Position
 from app.db.session import get_db
 from app.services.hyperliquid import HyperliquidOrderResult
 from app.services.unified_account_ratio import calculate_unified_account_ratio
@@ -81,7 +81,6 @@ class SnapshotDb:
         self.committed += 1
 
     def query(self, model):
-        assert model in (AccountSnapshot, Position)
         return SnapshotQuery()
 
 
@@ -101,9 +100,117 @@ class SnapshotQuery:
     def all(self):
         return []
 
+    def scalar(self):
+        return Decimal("0")
+
+
+async def _no_account_transfers(_settings, _checked_at):
+    return [], None
+
+
+async def _no_account_performance_components(_settings, _checked_at):
+    return account_router._performance_components_payload([], [])
+
+
+def test_ledger_transfer_payload_filters_deposits_and_withdrawals() -> None:
+    deposit = account_router._ledger_transfer_payload(
+        {"time": "1700000000000", "hash": "0xabc", "delta": {"type": "deposit", "usdc": "100.25"}}
+    )
+    withdrawal = account_router._ledger_transfer_payload(
+        {"time": 1700000001000, "hash": "0xdef", "delta": {"type": "withdraw", "usdc": "25.5"}}
+    )
+    spot_to_trading = account_router._ledger_transfer_payload(
+        {
+            "time": 1700000002000,
+            "hash": "0xghi",
+            "delta": {
+                "type": "send",
+                "amount": "65.98",
+                "token": "USDC",
+                "sourceDex": "spot",
+                "destinationDex": "",
+            },
+        }
+    )
+    ignored = account_router._ledger_transfer_payload(
+        {"time": 1700000003000, "delta": {"type": "referralReward", "usdc": "1"}}
+    )
+
+    assert deposit == {
+        "time": 1700000000000,
+        "kind": "deposit",
+        "label": "Deposito",
+        "raw_type": "deposit",
+        "asset": "USDC",
+        "amount": "100.25",
+        "signed_amount": "100.25",
+        "hash": "0xabc",
+    }
+    assert withdrawal == {
+        "time": 1700000001000,
+        "kind": "withdrawal",
+        "label": "Prelievo",
+        "raw_type": "withdraw",
+        "asset": "USDC",
+        "amount": "25.5",
+        "signed_amount": "-25.5",
+        "hash": "0xdef",
+    }
+    assert spot_to_trading == {
+        "time": 1700000002000,
+        "kind": "deposit",
+        "label": "Deposito",
+        "raw_type": "send",
+        "asset": "USDC",
+        "amount": "65.98",
+        "signed_amount": "65.98",
+        "hash": "0xghi",
+    }
+    assert ignored is None
+
+
+def test_account_performance_reconciles_equity_against_deposits() -> None:
+    transfers = [
+        {"asset": "USDC", "signed_amount": "65.98"},
+        {"asset": "USDC", "signed_amount": "30.29"},
+        {"asset": "USDC", "signed_amount": "112"},
+        {"asset": "USDC", "signed_amount": "11.86"},
+    ]
+    performance = account_router._build_account_performance(
+        transfers=transfers,
+        transfers_error=None,
+        effective_account_value=Decimal("145.424233"),
+        open_unrealized_pnl=Decimal("-0.327050"),
+        components=account_router._performance_components_payload(
+            [
+                {"closedPnl": "-49.738146", "fee": "22.017151"},
+            ],
+            [
+                {"delta": {"usdc": "-0.863762"}},
+            ],
+        ),
+        local={
+            "local_closed_realized_pnl_usdc": Decimal("-39.5857859707"),
+            "local_open_unrealized_pnl_usdc": Decimal("-0.7773500000"),
+            "local_filled_fees_usdc": Decimal("5.4953050000"),
+        },
+    )
+
+    assert performance["status"] == "ok"
+    assert performance["net_deposits_usdc"] == "220.130000"
+    assert performance["account_pnl_usdc"] == "-74.705767"
+    assert performance["account_return_pct"] == "-33.937113"
+    assert performance["known_components_pnl_usdc"] == "-72.946109"
+    assert performance["reconciliation_gap_usdc"] == "-1.759658"
+    assert performance["local_closed_realized_pnl_usdc"] == "-39.585786"
+    assert performance["fill_count"] == 1
+    assert performance["funding_count"] == 1
+
 
 def test_account_snapshot_exposes_unified_account_ratio_fields(monkeypatch) -> None:
     account_router._ACCOUNT_SNAPSHOT_CACHE.clear()
+    account_router._ACCOUNT_LEDGER_CACHE.clear()
+    account_router._ACCOUNT_PERFORMANCE_CACHE.clear()
 
     async def market_meta(_client):
         return {"universe": [{}]}, {"BTC": "100"}, None
@@ -124,6 +231,8 @@ def test_account_snapshot_exposes_unified_account_ratio_fields(monkeypatch) -> N
     monkeypatch.setattr(account_router, "_fetch_market_meta", market_meta)
     monkeypatch.setattr(account_router, "_fetch_account_state", account_state)
     monkeypatch.setattr(account_router, "_fetch_predicted_fundings", predicted)
+    monkeypatch.setattr(account_router, "_fetch_account_transfers", _no_account_transfers)
+    monkeypatch.setattr(account_router, "_fetch_account_performance_components", _no_account_performance_components)
 
     db = SnapshotDb()
     app = FastAPI()
@@ -138,10 +247,20 @@ def test_account_snapshot_exposes_unified_account_ratio_fields(monkeypatch) -> N
     assert account["unified_account_ratio_threshold_pct"] == "95.000000"
     assert account["unified_account_ratio_numerator"] == "950.000000"
     assert account["unified_account_ratio_denominator"] == "1000.000000"
+    assert response.json()["ledger"] == {
+        "status": "ok",
+        "lookback_days": 365,
+        "transfers": [],
+        "error": None,
+    }
+    assert response.json()["performance"]["status"] == "unavailable"
+    assert response.json()["performance"]["local_closed_realized_pnl_usdc"] == "0.000000"
 
 
 def test_account_snapshot_uses_short_lived_cache(monkeypatch) -> None:
     account_router._ACCOUNT_SNAPSHOT_CACHE.clear()
+    account_router._ACCOUNT_LEDGER_CACHE.clear()
+    account_router._ACCOUNT_PERFORMANCE_CACHE.clear()
     calls = {"account_state": 0}
 
     async def market_meta(_client):
@@ -164,6 +283,8 @@ def test_account_snapshot_uses_short_lived_cache(monkeypatch) -> None:
     monkeypatch.setattr(account_router, "_fetch_market_meta", market_meta)
     monkeypatch.setattr(account_router, "_fetch_account_state", account_state)
     monkeypatch.setattr(account_router, "_fetch_predicted_fundings", predicted)
+    monkeypatch.setattr(account_router, "_fetch_account_transfers", _no_account_transfers)
+    monkeypatch.setattr(account_router, "_fetch_account_performance_components", _no_account_performance_components)
 
     db = SnapshotDb()
     app = FastAPI()
@@ -183,6 +304,8 @@ def test_account_snapshot_uses_short_lived_cache(monkeypatch) -> None:
 
 def test_account_snapshot_prefers_fresh_websocket_state(monkeypatch) -> None:
     account_router._ACCOUNT_SNAPSHOT_CACHE.clear()
+    account_router._ACCOUNT_LEDGER_CACHE.clear()
+    account_router._ACCOUNT_PERFORMANCE_CACHE.clear()
     address = "0xabc"
     settings = Settings(hyperliquid_account_address=address)
     db = SnapshotDb(
@@ -215,6 +338,8 @@ def test_account_snapshot_prefers_fresh_websocket_state(monkeypatch) -> None:
     monkeypatch.setattr(account_router, "_fetch_market_meta", unexpected)
     monkeypatch.setattr(account_router, "_fetch_account_state", unexpected)
     monkeypatch.setattr(account_router, "_fetch_predicted_fundings", unexpected)
+    monkeypatch.setattr(account_router, "_fetch_account_transfers", _no_account_transfers)
+    monkeypatch.setattr(account_router, "_fetch_account_performance_components", _no_account_performance_components)
 
     app = FastAPI()
     app.include_router(routes.router)

@@ -207,6 +207,7 @@ class LiveExecutionSettings(BaseModel):
     min_account_value_usd: float | None = Field(default=None, ge=0)
     order_notional_cap_usd: float | None = Field(default=None, ge=0)
     min_order_notional_usd: float | None = Field(default=None, ge=0)
+    min_reduce_only_notional_usd: float | None = Field(default=None, ge=0)
     max_slippage_pct: float | None = Field(default=None, ge=0, le=100)
     order_expires_after_seconds: int | None = Field(default=None, ge=0)
 

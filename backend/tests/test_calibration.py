@@ -9,6 +9,7 @@ from app.engine import calibration as calibration_module
 from app.engine.calibration import AutoCalibrationEngine
 from app.engine.edge_profile import edge_adjustment_for_stats, signal_threshold_adjustment
 from app.engine.performance import PerformanceStats, SignalPerformanceAnalyzer
+from app.engine.pre_tp1_validation import DEFAULT_PRE_TP1_SETTINGS
 
 
 def _positions_matching(target: PerformanceStats) -> list[Position]:
@@ -241,6 +242,80 @@ def test_edge_calibration_clears_recovered_penalties(monkeypatch: pytest.MonkeyP
     assert risk["directional_score_adjustments"] == {}
     assert risk["score_bucket_adjustments"] == {}
     assert any(change.key == "directional_score_adjustments" for change in changes)
+
+
+def _edge_risk_with_defaults(overrides: dict | None = None) -> dict:
+    risk = {
+        "directional_score_adjustments": {},
+        "score_bucket_adjustments": {},
+        "market_score_adjustments": {},
+        "timeframe_score_adjustments": {},
+        "directional_min_score_adjustments": {},
+        "directional_blocklist": {},
+        "directional_blocklist_enabled": True,
+        "direction_strategy_weight_overrides": {},
+        "allow_ob_imbalance_only_signals": False,
+        "entry_quality_filter_enabled": True,
+        "entry_quality_ema_period": 21,
+        "entry_quality_long_ob_imbalance_min": 0.05,
+        "entry_quality_short_ob_imbalance_max": 0.0,
+        **DEFAULT_PRE_TP1_SETTINGS,
+        "max_combined_score_adjustment": calibration_module.DEFAULT_MAX_COMBINED_SCORE_ADJUSTMENT,
+    }
+    if overrides:
+        risk.update(overrides)
+    return risk
+
+
+def test_edge_calibration_ignores_stats_only_churn(monkeypatch: pytest.MonkeyPatch) -> None:
+    previous = {"LONG:5m": {"adjustment": 12, "stats": {"trades": 30}}}
+    fresh = {"LONG:5m": {"adjustment": 12, "stats": {"trades": 31}}}
+    db = FakeDb(_edge_risk_with_defaults({"directional_score_adjustments": previous}))
+    monkeypatch.setattr(
+        calibration_module,
+        "compute_edge_adjustments",
+        lambda *args, **kwargs: {
+            "directional_score_adjustments": fresh,
+            "score_bucket_adjustments": {},
+            "market_score_adjustments": {},
+            "timeframe_score_adjustments": {},
+        },
+    )
+
+    changes = AutoCalibrationEngine()._calibrate_edge_adjustments(
+        db,  # type: ignore[arg-type]
+        {"lookback_trades": 500, "edge_adjustment_ignore_stats_churn": True},
+    )
+
+    assert changes == []
+    assert db.rows["risk"].value["directional_score_adjustments"] == previous
+
+
+def test_edge_calibration_can_persist_stats_refresh_when_churn_guard_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous = {"LONG:5m": {"adjustment": 12, "stats": {"trades": 30}}}
+    fresh = {"LONG:5m": {"adjustment": 12, "stats": {"trades": 31}}}
+    db = FakeDb(_edge_risk_with_defaults({"directional_score_adjustments": previous}))
+    monkeypatch.setattr(
+        calibration_module,
+        "compute_edge_adjustments",
+        lambda *args, **kwargs: {
+            "directional_score_adjustments": fresh,
+            "score_bucket_adjustments": {},
+            "market_score_adjustments": {},
+            "timeframe_score_adjustments": {},
+        },
+    )
+
+    changes = AutoCalibrationEngine()._calibrate_edge_adjustments(
+        db,  # type: ignore[arg-type]
+        {"lookback_trades": 500, "edge_adjustment_ignore_stats_churn": False},
+    )
+
+    assert len(changes) == 1
+    assert changes[0].key == "directional_score_adjustments"
+    assert db.rows["risk"].value["directional_score_adjustments"] == fresh
 
 
 class FakeQuery:

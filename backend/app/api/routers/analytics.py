@@ -17,12 +17,23 @@ from app.db.models import (
     Market,
     Position,
     Signal,
+    StrategyConfig,
 )
 from app.db.session import get_db
 from app.engine.diagnostics import build_diagnostics_report, build_equity_slope_diagnostics
 from app.engine.edge_profile import build_outcome_profile
+from app.engine.live_eligibility import build_live_eligibility_report
 from app.engine.macro_direction import btc_macro_direction, suspended_penalty_family
 from app.engine.performance import SignalPerformanceAnalyzer, serialize_stats
+from app.engine.pre_tp1_validation import (
+    DEFAULT_LOOKBACK as PRE_TP1_DEFAULT_LOOKBACK,
+)
+from app.engine.pre_tp1_validation import (
+    build_pre_tp1_validation_table_from_db,
+)
+from app.engine.pre_tp1_validation import (
+    serialize_table as serialize_pre_tp1_table,
+)
 from app.engine.score_calibration import (
     DEFAULT_LOOKBACK as CALIBRATION_DEFAULT_LOOKBACK,
 )
@@ -146,6 +157,242 @@ def analytics_strategy_attribution(
     return build_strategy_attribution(db, lookback=lookback, recent_window=recent_window)
 
 
+def _pf_value(payload: dict[str, Any] | None) -> float | None:
+    if not payload:
+        return None
+    raw = payload.get("profit_factor")
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _oos_verdict(test_payload: dict[str, Any] | None) -> str:
+    pf = _pf_value(test_payload)
+    if test_payload is None or int(test_payload.get("trades", 0)) <= 0:
+        return "INSUFF"
+    if pf is None:
+        return "no-loss"
+    if pf >= 1.2:
+        return "EDGE+"
+    if pf >= 1.0:
+        return "marg+"
+    if pf >= 0.9:
+        return "marg-"
+    return "NEG"
+
+
+def _oos_concordant(train_payload: dict[str, Any] | None, test_payload: dict[str, Any] | None) -> bool:
+    train_pf = _pf_value(train_payload)
+    test_pf = _pf_value(test_payload)
+    return train_pf is not None and test_pf is not None and train_pf >= 0.95 and test_pf >= 1.0
+
+
+def _cell_classification(
+    *,
+    full: dict[str, Any],
+    train: dict[str, Any] | None,
+    test: dict[str, Any] | None,
+) -> str:
+    full_pf = _pf_value(full)
+    test_pf = _pf_value(test)
+    test_trades = int(test.get("trades", 0)) if test else 0
+    full_trades = int(full.get("trades", 0))
+    if test_trades >= 10 and _oos_concordant(train, test) and test_pf is not None and test_pf >= 1.2:
+        return "robust"
+    if test_trades >= 10 and test_pf is not None and test_pf >= 1.2:
+        return "promising"
+    if (test_trades >= 10 and test_pf is not None and test_pf < 0.9) or (
+        full_trades >= 20 and full_pf is not None and full_pf < 0.8
+    ):
+        return "negative"
+    return "insufficient"
+
+
+def _strategy_classification(payload: dict[str, Any]) -> str:
+    participation = payload.get("participation") or {}
+    if participation.get("inert") is True:
+        return "inert"
+    overall = payload.get("overall") or {}
+    recent = payload.get("recent") or {}
+    overall_pf = _pf_value(overall)
+    recent_pf = _pf_value(recent)
+    overall_trades = int(overall.get("trades", 0))
+    recent_trades = int(recent.get("trades", 0))
+    if (
+        overall_trades >= 50
+        and recent_trades >= 20
+        and overall_pf is not None
+        and recent_pf is not None
+        and overall_pf >= 1.2
+        and recent_pf >= 1.0
+    ):
+        return "robust"
+    if (
+        (recent_trades >= 20 and recent_pf is not None and recent_pf < 0.8)
+        or (overall_trades >= 20 and overall_pf is not None and overall_pf < 0.8)
+    ):
+        return "negative"
+    if overall_trades >= 20 and overall_pf is not None and overall_pf >= 1.0:
+        return "promising"
+    return "insufficient"
+
+
+@router.get("/analytics/strategy-edge")
+def analytics_strategy_edge(
+    lookback: int = Query(2000, ge=50, le=100000),
+    recent_window: int = Query(150, ge=20, le=500),
+    min_test_samples: int = Query(10, ge=5, le=100),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Sintesi OOS + attribution per decidere quali strategie/celle meritano fiducia."""
+    analyzer = SignalPerformanceAnalyzer()
+    positions = analyzer.closed_paper_positions(db, limit=lookback)
+    overall = analyzer.summarize_positions(positions)
+    split = SignalPerformanceAnalyzer.holdout_split_stats(
+        positions,
+        train_ratio=0.7,
+        min_samples_per_side=min_test_samples,
+    )
+    train_stats = split[0] if split else None
+    test_stats = split[1] if split else None
+    time_weighted = SignalPerformanceAnalyzer.time_weighted_summarize(
+        positions,
+        half_life=50,
+    )
+
+    configs = db.query(StrategyConfig).all()
+    enabled_by_cell = {
+        f"{config.timeframe}:{config.strategy_name}": bool(config.enabled)
+        for config in configs
+    }
+    cells: list[dict[str, Any]] = []
+    for timeframe in sorted({config.timeframe for config in configs}):
+        by_strategy = analyzer.strategy_positions(db, timeframe=timeframe, limit=lookback)
+        for strategy_name, strategy_positions in by_strategy.items():
+            full_stats = analyzer.summarize_positions(strategy_positions)
+            cell_split = SignalPerformanceAnalyzer.holdout_split_stats(
+                strategy_positions,
+                train_ratio=0.7,
+                min_samples_per_side=min_test_samples,
+            )
+            cell_train = serialize_stats(cell_split[0]) if cell_split else None
+            cell_test = serialize_stats(cell_split[1]) if cell_split else None
+            full_payload = serialize_stats(full_stats)
+            classification = _cell_classification(
+                full=full_payload,
+                train=cell_train,
+                test=cell_test,
+            )
+            key = f"{timeframe}:{strategy_name}"
+            cells.append(
+                {
+                    "key": key,
+                    "timeframe": timeframe,
+                    "strategy": strategy_name,
+                    "enabled": enabled_by_cell.get(key, False),
+                    "classification": classification,
+                    "verdict": _oos_verdict(cell_test),
+                    "full": full_payload,
+                    "train": cell_train,
+                    "test": cell_test,
+                }
+            )
+
+    attribution = build_strategy_attribution(
+        db,
+        lookback=lookback,
+        recent_window=recent_window,
+    )
+    strategies: list[dict[str, Any]] = []
+    for strategy_name, payload in sorted((attribution.get("strategies") or {}).items()):
+        strategies.append(
+            {
+                "name": strategy_name,
+                "classification": _strategy_classification(payload),
+                "overall": payload.get("overall") or {},
+                "recent": payload.get("recent") or {},
+                "avg_contribution": payload.get("avg_contribution"),
+                "participation": payload.get("participation") or {},
+            }
+        )
+
+    cell_counts = dict.fromkeys(("robust", "promising", "negative", "insufficient"), 0)
+    for cell in cells:
+        cell_counts[cell["classification"]] = cell_counts.get(cell["classification"], 0) + 1
+    strategy_counts = dict.fromkeys(
+        ("robust", "promising", "negative", "inert", "insufficient"), 0
+    )
+    for strategy in strategies:
+        strategy_counts[strategy["classification"]] = (
+            strategy_counts.get(strategy["classification"], 0) + 1
+        )
+
+    return {
+        "filters": {
+            "lookback": lookback,
+            "recent_window": recent_window,
+            "min_test_samples": min_test_samples,
+        },
+        "overall": {
+            "full": serialize_stats(overall),
+            "train": serialize_stats(train_stats) if train_stats else None,
+            "test": serialize_stats(test_stats) if test_stats else None,
+            "time_weighted": serialize_stats(time_weighted),
+            "verdict": _oos_verdict(serialize_stats(test_stats) if test_stats else None),
+            "classification": _cell_classification(
+                full=serialize_stats(overall),
+                train=serialize_stats(train_stats) if train_stats else None,
+                test=serialize_stats(test_stats) if test_stats else None,
+            ),
+        },
+        "summary": {
+            "cells": cell_counts,
+            "strategies": strategy_counts,
+            "positions_linked": attribution.get("positions_linked", 0),
+        },
+        "cells": cells,
+        "strategies": strategies,
+        "note": (
+            "robust richiede train/test concordi e PF_test >= 1.20; promising include "
+            "edge OOS non concorde o edge totale positivo; negative segnala PF recente "
+            "o OOS sotto soglia."
+        ),
+    }
+
+
+@router.get("/analytics/live-eligibility")
+def analytics_live_eligibility(
+    lookback: int = Query(2000, ge=50, le=100000),
+    recent_window: int = Query(200, ge=20, le=1000),
+    min_trades: int = Query(30, ge=5, le=500),
+    min_recent_trades: int = Query(10, ge=3, le=200),
+    min_net_profit_factor: float = Query(1.05, ge=0.0, le=10.0),
+    min_recent_net_profit_factor: float = Query(1.0, ge=0.0, le=10.0),
+    min_avg_net_r: float = Query(0.02, ge=-5.0, le=5.0),
+    min_recent_avg_net_r: float = Query(0.0, ge=-5.0, le=5.0),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Preview read-only delle coorti paper candidabili al live.
+
+    La metrica è paper-first e cost-adjusted: ogni trade viene normalizzato in R
+    e decurtato di fee taker round-trip simulate. Non cambia guardrail o live
+    execution: serve a decidere cosa promuovere manualmente.
+    """
+    return build_live_eligibility_report(
+        db,
+        lookback=lookback,
+        recent_window=recent_window,
+        taker_fee_rate=get_settings().live_taker_fee_rate,
+        min_trades=min_trades,
+        min_recent_trades=min_recent_trades,
+        min_net_profit_factor=min_net_profit_factor,
+        min_recent_net_profit_factor=min_recent_net_profit_factor,
+        min_avg_net_r=min_avg_net_r,
+        min_recent_avg_net_r=min_recent_avg_net_r,
+    )
+
+
 @router.get("/analytics/macro-direction")
 def analytics_macro_direction(db: Session = Depends(get_db)) -> dict:
     """Direzione macro strutturale BTC usata per la sospensione regime-aware
@@ -176,6 +423,21 @@ def analytics_expected_r_calibration(
         enforce_monotonic=enforce_monotonic,
     )
     return serialize_table(table)
+
+
+@router.get("/analytics/pre-tp1-validation")
+def analytics_pre_tp1_validation(
+    lookback: int = Query(PRE_TP1_DEFAULT_LOOKBACK, ge=50, le=2000),
+    min_samples: int = Query(30, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Empirical TP1-before-stop cohorts used by the pre-entry validation gate."""
+    table = build_pre_tp1_validation_table_from_db(
+        db,
+        lookback=lookback,
+        min_samples_for_use=min_samples,
+    )
+    return serialize_pre_tp1_table(table)
 
 
 @router.get("/analytics/score-calibration")
@@ -398,5 +660,3 @@ def signal_rejections(db: Session = Depends(get_db), limit: int = Query(50, ge=1
             "reasons": reasons,
         })
     return {"total": len(rows), "by_reason": reason_counts, "recent": recent[:10]}
-
-

@@ -32,6 +32,8 @@ def test_risk_controls_preserves_unmodelled_fields() -> None:
 def test_live_execution_rejects_negative_notional() -> None:
     with pytest.raises(ValidationError):
         LiveExecutionSettings.model_validate({"order_notional_cap_usd": -5})
+    with pytest.raises(ValidationError):
+        LiveExecutionSettings.model_validate({"min_reduce_only_notional_usd": -1})
 
 
 def test_live_execution_accepts_valid_payload_with_extra() -> None:

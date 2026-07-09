@@ -33,6 +33,57 @@ def mark_timeframes_run(timeframes: list[str], started_ms: int) -> None:
         _LAST_TIMEFRAME_RUN_MS[timeframe] = started_ms
 
 
+def _position_source_timeframe(db, position: Position) -> str | None:
+    metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+    source_timeframe = metadata.get("source_timeframe")
+    if isinstance(source_timeframe, str) and source_timeframe:
+        return source_timeframe
+
+    source_signal_id = metadata.get("source_signal_id", 0)
+    try:
+        signal_id = int(source_signal_id)
+    except (TypeError, ValueError):
+        return None
+    signal = db.get(Signal, signal_id)
+    if signal is not None and isinstance(signal.timeframe, str):
+        return signal.timeframe
+    return None
+
+
+def open_position_trailing_market_ids_by_timeframe(db) -> dict[str, set[int]]:
+    """Markets that need each timeframe synced for open-position trailing stops."""
+    positions = (
+        db.query(Position)
+        .filter(
+            Position.mode.in_([OrderMode.PAPER.value, OrderMode.LIVE.value]),
+            Position.status == "open",
+        )
+        .all()
+    )
+    check_intervals = (
+        effective_position_management_settings(db)
+        .get("trailingStop", {})
+        .get("checkIntervalByTimeframe", {})
+    )
+    result: dict[str, set[int]] = {}
+    for position in positions:
+        source_timeframe = _position_source_timeframe(db, position)
+        if not isinstance(source_timeframe, str) or source_timeframe not in TIMEFRAME_MS:
+            continue
+        reference = check_intervals.get(source_timeframe)
+        if (
+            not isinstance(reference, str)
+            or reference not in TIMEFRAME_MS
+            or TIMEFRAME_MS[reference] > TIMEFRAME_MS[source_timeframe]
+        ):
+            reference = source_timeframe
+        market_id = getattr(position, "market_id", None)
+        if market_id is None:
+            continue
+        result.setdefault(reference, set()).add(int(market_id))
+    return result
+
+
 def paper_management_timeframes(db, enabled_timeframes: list[str]) -> list[str]:
     """Keep open positions manageable even after timeframe config changes.
 
@@ -63,18 +114,7 @@ def paper_management_timeframes(db, enabled_timeframes: list[str]) -> list[str]:
     )
     discovered: set[str] = set()
     for position in positions:
-        metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
-        source_timeframe = metadata.get("source_timeframe")
-        if not isinstance(source_timeframe, str) or not source_timeframe:
-            source_signal_id = metadata.get("source_signal_id", 0)
-            try:
-                signal_id = int(source_signal_id)
-            except (TypeError, ValueError):
-                signal_id = None
-            if signal_id is not None:
-                signal = db.get(Signal, signal_id)
-                if signal is not None and isinstance(signal.timeframe, str):
-                    source_timeframe = signal.timeframe
+        source_timeframe = _position_source_timeframe(db, position)
         if isinstance(source_timeframe, str) and source_timeframe in TIMEFRAME_MS:
             # Sia il timeframe sorgente (necessario per ATR/EMA) sia quello di
             # riferimento del trailing (cadenza di controllo + prezzo intraday)
@@ -93,5 +133,4 @@ def paper_management_timeframes(db, enabled_timeframes: list[str]) -> list[str]:
             managed.append(timeframe)
             seen.add(timeframe)
     return managed
-
 

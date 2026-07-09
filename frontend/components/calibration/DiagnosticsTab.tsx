@@ -10,16 +10,29 @@ import { SignalFunnelChart } from "@/components/calibration/SignalFunnelChart";
 import { RejectionReasonsList } from "@/components/calibration/RejectionReasonsList";
 import { fmt } from "@/components/atoms";
 import { cn } from "@/lib/utils";
-import { useOutcomeProfile, useEquitySlope, useExpectedRCalibration, useSystemCycles } from "@/lib/hooks/queries";
+import {
+  useOutcomeProfile,
+  useEquitySlope,
+  useExpectedRCalibration,
+  useLiveEligibility,
+  useSystemCycles,
+  useStrategyEdge,
+} from "@/lib/hooks/queries";
 import type {
   Calibration,
   CalibrationHistoryEntry,
   CalibrationStats,
   ExpectedRBucket,
   ExpectedRCalibration,
+  LiveEligibilityClass,
+  LiveEligibilityCohort,
+  LiveEligibilityReport,
   OutcomeProfile,
   Signal,
   SignalRejections,
+  StrategyEdgeCell,
+  StrategyEdgeReport,
+  StrategyEdgeStrategy,
   SystemCycleService,
   WorkerCycle,
 } from "@/lib/api";
@@ -97,6 +110,8 @@ export function DiagnosticsTab({
   const [outcomeMode, setOutcomeMode] = useState<"paper" | "live" | null>("paper");
   const { data: outcomeProfile } = useOutcomeProfile(500, outcomeMode);
   const { data: expectedRCalibration } = useExpectedRCalibration();
+  const { data: strategyEdge } = useStrategyEdge();
+  const { data: liveEligibility } = useLiveEligibility();
   const { data: systemCycles } = useSystemCycles();
   const overall = calibration.overall;
   const winRate = overall?.win_rate ?? null;
@@ -157,6 +172,10 @@ export function DiagnosticsTab({
         mode={outcomeMode}
         onModeChange={setOutcomeMode}
       />
+
+      <StrategyEdgePanel data={strategyEdge} />
+
+      <LiveEligibilityPanel data={liveEligibility} />
 
       <ExpectedRCalibrationPanel data={expectedRCalibration} />
 
@@ -891,6 +910,431 @@ function expectedRTone(value: number | null | undefined): "success" | "warn" | "
   if (value >= 0.2) return "success";
   if (value >= 0) return "warn";
   return "danger";
+}
+
+function pfText(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return value.toFixed(2);
+}
+
+function edgeTone(classification: string): string {
+  if (classification === "robust") return "border-success/40 bg-success/10 text-success";
+  if (classification === "promising") return "border-info/40 bg-info/10 text-info";
+  if (classification === "negative") return "border-danger/40 bg-danger/10 text-danger";
+  if (classification === "inert") return "border-warn/40 bg-warn/10 text-warn";
+  return "border-border bg-surface-1 text-fg-3";
+}
+
+function eligibilityTone(classification: LiveEligibilityClass): string {
+  if (classification === "eligible") return "border-success/40 bg-success/10 text-success";
+  if (classification === "watch") return "border-info/40 bg-info/10 text-info";
+  if (classification === "quarantine") return "border-danger/40 bg-danger/10 text-danger";
+  return "border-border bg-surface-1 text-fg-3";
+}
+
+function rText(value: number | null | undefined) {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}R`;
+}
+
+function eligibilitySortValue(cohort: LiveEligibilityCohort) {
+  return cohort.recent.avg_net_r ?? cohort.full.avg_net_r ?? Number.NEGATIVE_INFINITY;
+}
+
+function LiveEligibilityRow({ cohort }: { cohort: LiveEligibilityCohort }) {
+  return (
+    <div className="grid grid-cols-[1fr_4rem_4rem] items-center gap-2 rounded border border-border px-3 py-2">
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span
+            className={cn(
+              "shrink-0 font-mono text-[10px] font-semibold",
+              cohort.direction === "LONG" ? "text-success" : "text-danger",
+            )}
+          >
+            {cohort.direction}
+          </span>
+          <span className="min-w-0 truncate font-mono text-xs text-fg">{cohort.key}</span>
+        </div>
+        <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-1.5">
+          <Badge variant="outline" className={cn("font-mono text-[9px] uppercase", eligibilityTone(cohort.classification))}>
+            {cohort.classification}
+          </Badge>
+          <span className="font-mono text-[10px] text-fg-3">
+            n {cohort.full.trades}/{cohort.recent.trades} rec
+          </span>
+          {cohort.active_risk_overlays.length > 0 && (
+            <span className="rounded bg-warn/10 px-1.5 py-0.5 font-mono text-[9px] text-warn">
+              risk {cohort.active_risk_overlays.length}
+            </span>
+          )}
+          {cohort.reasons[0] && (
+            <span className="min-w-0 truncate text-[10px] text-fg-3">{cohort.reasons[0]}</span>
+          )}
+        </div>
+      </div>
+      <div className="font-mono text-[11px] text-fg-2">PF {pfText(cohort.recent.net_profit_factor)}</div>
+      <div
+        className={cn(
+          "text-right font-mono text-[11px]",
+          (cohort.recent.avg_net_r ?? cohort.full.avg_net_r ?? 0) >= 0 ? "text-success" : "text-danger",
+        )}
+      >
+        {rText(cohort.recent.avg_net_r ?? cohort.full.avg_net_r)}
+      </div>
+    </div>
+  );
+}
+
+function LiveEligibilityPanel({ data }: { data: LiveEligibilityReport | null | undefined }) {
+  const cohorts = useMemo(
+    () => [...(data?.direction_timeframes ?? []), ...(data?.strategies ?? [])],
+    [data],
+  );
+  const eligible = useMemo(
+    () =>
+      cohorts
+        .filter((cohort) => cohort.classification === "eligible")
+        .sort((a, b) => eligibilitySortValue(b) - eligibilitySortValue(a))
+        .slice(0, 6),
+    [cohorts],
+  );
+  const watch = useMemo(
+    () =>
+      cohorts
+        .filter((cohort) => cohort.classification === "watch")
+        .sort((a, b) => eligibilitySortValue(b) - eligibilitySortValue(a))
+        .slice(0, 6),
+    [cohorts],
+  );
+  const quarantine = useMemo(
+    () =>
+      cohorts
+        .filter((cohort) => cohort.classification === "quarantine")
+        .sort((a, b) => eligibilitySortValue(a) - eligibilitySortValue(b))
+        .slice(0, 6),
+    [cohorts],
+  );
+  const excluded = useMemo(
+    () =>
+      Object.values(data?.summary.excluded ?? {}).reduce(
+        (sum, value) => sum + Number(value || 0),
+        0,
+      ),
+    [data],
+  );
+  const macroDirection = String(data?.macro_context.direction ?? "unknown");
+  const conflicts = data?.setting_conflicts ?? [];
+
+  return (
+    <Card className="p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+            Live eligibility preview
+          </div>
+          <div className="mt-0.5 text-xs text-fg-3">
+            Paper-first: R netto stimato dopo fee taker round-trip, senza modificare live execution.
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="outline" className="font-mono text-[10px] border-border text-fg-3">
+            macro {macroDirection}
+          </Badge>
+          <Badge variant="outline" className="font-mono text-[10px] border-border text-fg-3">
+            fee {(Number(data?.filters.taker_fee_rate ?? 0) * 100).toFixed(3)}%
+          </Badge>
+          <Badge variant="outline" className="font-mono text-[10px] border-border text-fg-3">
+            usable {data?.summary.paper_trades_usable ?? "—"}/{data?.summary.paper_trades_loaded ?? "—"}
+          </Badge>
+          {data && (
+            <Badge
+              variant="outline"
+              className={cn(
+                "font-mono text-[10px]",
+                conflicts.length > 0 ? "border-warn/40 bg-warn/10 text-warn" : "border-border text-fg-3",
+              )}
+            >
+              conflicts {conflicts.length}
+            </Badge>
+          )}
+        </div>
+      </div>
+
+      {!data ? (
+        <div className="mt-5 text-xs text-fg-3">Eligibility report non disponibile.</div>
+      ) : (
+        <>
+          <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
+            <MetricChip label="Eligible" value={data.summary.eligible ?? 0} tone="success" />
+            <MetricChip label="Watch" value={data.summary.watch ?? 0} tone="info" />
+            <MetricChip label="Quarantine" value={data.summary.quarantine ?? 0} tone="danger" />
+            <MetricChip label="Insufficient" value={data.summary.insufficient ?? 0} tone="muted" />
+            <MetricChip label="Excluded" value={excluded} tone={excluded > 0 ? "muted" : "success"} />
+          </div>
+
+          {conflicts.length > 0 && (
+            <div className="mt-4 rounded-md border border-warn/30 bg-warn/5 p-3">
+              <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-warn">
+                Setting conflicts
+              </div>
+              <div className="space-y-1.5">
+                {conflicts.slice(0, 4).map((conflict) => (
+                  <div key={`${conflict.type}:${conflict.cohort_key}`} className="flex flex-wrap items-center gap-2 text-[11px]">
+                    <Badge variant="outline" className={cn("font-mono text-[9px]", conflict.severity === "warn" ? "border-warn/40 text-warn" : "border-info/40 text-info")}>
+                      {conflict.type}
+                    </Badge>
+                    <span className="font-mono text-fg-2">{conflict.cohort_key}</span>
+                    <span className="text-fg-3">{conflict.active_risk_overlays.map((item) => item.key).join(", ")}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="mt-5 grid grid-cols-1 gap-4 xl:grid-cols-3">
+            <div>
+              <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+                Candidati live
+              </div>
+              <div className="space-y-2">
+                {eligible.length > 0 ? (
+                  eligible.map((cohort) => <LiveEligibilityRow key={cohort.key} cohort={cohort} />)
+                ) : (
+                  <div className="rounded border border-border px-3 py-3 text-xs text-fg-3">
+                    Nessuna coorte eleggibile con le soglie correnti.
+                  </div>
+                )}
+              </div>
+            </div>
+            <div>
+              <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+                Watchlist
+              </div>
+              <div className="space-y-2">
+                {watch.length > 0 ? (
+                  watch.map((cohort) => <LiveEligibilityRow key={cohort.key} cohort={cohort} />)
+                ) : (
+                  <div className="rounded border border-border px-3 py-3 text-xs text-fg-3">
+                    Nessuna coorte in watchlist.
+                  </div>
+                )}
+              </div>
+            </div>
+            <div>
+              <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+                Quarantena paper-only
+              </div>
+              <div className="space-y-2">
+                {quarantine.length > 0 ? (
+                  quarantine.map((cohort) => <LiveEligibilityRow key={cohort.key} cohort={cohort} />)
+                ) : (
+                  <div className="rounded border border-border px-3 py-3 text-xs text-fg-3">
+                    Nessuna coorte in quarantena.
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function cellSortValue(cell: StrategyEdgeCell) {
+  return cell.test?.realized_pnl ?? cell.full.realized_pnl;
+}
+
+function strategySortValue(strategy: StrategyEdgeStrategy) {
+  return strategy.recent?.realized_pnl ?? strategy.overall.realized_pnl;
+}
+
+function EdgeCellRow({ cell }: { cell: StrategyEdgeCell }) {
+  return (
+    <div className="grid grid-cols-[1fr_3rem_4rem_4rem] items-center gap-2 rounded border border-border px-3 py-2">
+      <div className="min-w-0">
+        <div className="truncate font-mono text-xs text-fg">{cell.key}</div>
+        <div className="mt-0.5 flex items-center gap-1.5">
+          <Badge variant="outline" className={cn("font-mono text-[9px] uppercase", edgeTone(cell.classification))}>
+            {cell.classification}
+          </Badge>
+          <span className="font-mono text-[10px] text-fg-3">{cell.verdict}</span>
+          {!cell.enabled && <span className="font-mono text-[10px] text-fg-3">off</span>}
+        </div>
+      </div>
+      <div className="font-mono text-[11px] text-fg-2">n={cell.test?.trades ?? 0}</div>
+      <div className="font-mono text-[11px] text-fg-2">PF {pfText(cell.test?.profit_factor)}</div>
+      <div
+        className={cn(
+          "text-right font-mono text-[11px]",
+          (cell.test?.realized_pnl ?? 0) >= 0 ? "text-success" : "text-danger",
+        )}
+      >
+        {fmt.pnl(cell.test?.realized_pnl)}
+      </div>
+    </div>
+  );
+}
+
+function EdgeStrategyRow({ strategy }: { strategy: StrategyEdgeStrategy }) {
+  return (
+    <div className="grid grid-cols-[1fr_4rem_4rem] items-center gap-2 rounded border border-border px-3 py-2">
+      <div className="min-w-0">
+        <div className="truncate font-mono text-xs text-fg">{strategy.name}</div>
+        <div className="mt-0.5 flex items-center gap-1.5">
+          <Badge variant="outline" className={cn("font-mono text-[9px] uppercase", edgeTone(strategy.classification))}>
+            {strategy.classification}
+          </Badge>
+          <span className="font-mono text-[10px] text-fg-3">
+            share {strategy.participation.traded_share != null ? pct(strategy.participation.traded_share) : "—"}
+          </span>
+        </div>
+      </div>
+      <div className="font-mono text-[11px] text-fg-2">PF {pfText(strategy.recent?.profit_factor)}</div>
+      <div
+        className={cn(
+          "text-right font-mono text-[11px]",
+          (strategy.recent?.realized_pnl ?? 0) >= 0 ? "text-success" : "text-danger",
+        )}
+      >
+        {fmt.pnl(strategy.recent?.realized_pnl)}
+      </div>
+    </div>
+  );
+}
+
+function StrategyEdgePanel({ data }: { data: StrategyEdgeReport | null | undefined }) {
+  const negativeCells = useMemo(
+    () =>
+      (data?.cells ?? [])
+        .filter((cell) => cell.classification === "negative")
+        .sort((a, b) => cellSortValue(a) - cellSortValue(b))
+        .slice(0, 6),
+    [data],
+  );
+  const promisingCells = useMemo(
+    () =>
+      (data?.cells ?? [])
+        .filter((cell) => cell.classification === "robust" || cell.classification === "promising")
+        .sort((a, b) => cellSortValue(b) - cellSortValue(a))
+        .slice(0, 6),
+    [data],
+  );
+  const negativeStrategies = useMemo(
+    () =>
+      (data?.strategies ?? [])
+        .filter((strategy) => strategy.classification === "negative")
+        .sort((a, b) => strategySortValue(a) - strategySortValue(b))
+        .slice(0, 6),
+    [data],
+  );
+
+  return (
+    <Card className="p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+            OOS / Strategy edge
+          </div>
+          <div className="mt-0.5 text-xs text-fg-3">
+            Walk-forward 70/30 su {data?.overall.full.trades ?? "—"} trade paper · recent window{" "}
+            {data?.filters.recent_window ?? "—"}
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant="outline" className={cn("font-mono uppercase", edgeTone(data?.overall.classification ?? "insufficient"))}>
+            {data?.overall.classification ?? "loading"}
+          </Badge>
+          <Badge variant="outline" className="font-mono text-[10px] border-border text-fg-3">
+            test PF {pfText(data?.overall.test?.profit_factor)}
+          </Badge>
+          <Badge variant="outline" className="font-mono text-[10px] border-border text-fg-3">
+            TW PF {pfText(data?.overall.time_weighted.profit_factor)}
+          </Badge>
+        </div>
+      </div>
+
+      {!data ? (
+        <div className="mt-5 text-xs text-fg-3">Edge report non disponibile.</div>
+      ) : (
+        <>
+          <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <MetricChip label="Robuste" value={data.summary.cells.robust ?? 0} tone="success" />
+            <MetricChip label="Promettenti" value={data.summary.cells.promising ?? 0} tone="info" />
+            <MetricChip label="Negative" value={data.summary.cells.negative ?? 0} tone="danger" />
+            <MetricChip label="Strategie neg." value={data.summary.strategies.negative ?? 0} tone="danger" />
+          </div>
+
+          <div className="mt-5 grid grid-cols-1 gap-4 xl:grid-cols-3">
+            <div>
+              <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+                Celle negative
+              </div>
+              <div className="space-y-2">
+                {negativeCells.length > 0 ? (
+                  negativeCells.map((cell) => <EdgeCellRow key={cell.key} cell={cell} />)
+                ) : (
+                  <div className="rounded border border-border px-3 py-3 text-xs text-fg-3">Nessuna cella negativa.</div>
+                )}
+              </div>
+            </div>
+            <div>
+              <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+                Celle promettenti
+              </div>
+              <div className="space-y-2">
+                {promisingCells.length > 0 ? (
+                  promisingCells.map((cell) => <EdgeCellRow key={cell.key} cell={cell} />)
+                ) : (
+                  <div className="rounded border border-border px-3 py-3 text-xs text-fg-3">Nessuna cella robusta.</div>
+                )}
+              </div>
+            </div>
+            <div>
+              <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-fg-3">
+                Strategie deboli recenti
+              </div>
+              <div className="space-y-2">
+                {negativeStrategies.length > 0 ? (
+                  negativeStrategies.map((strategy) => (
+                    <EdgeStrategyRow key={strategy.name} strategy={strategy} />
+                  ))
+                ) : (
+                  <div className="rounded border border-border px-3 py-3 text-xs text-fg-3">Nessuna strategia negativa.</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function MetricChip({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: number;
+  tone: "success" | "info" | "danger" | "muted";
+}) {
+  const toneClass =
+    tone === "success"
+      ? "border-success/40 bg-success/10 text-success"
+      : tone === "info"
+        ? "border-info/40 bg-info/10 text-info"
+        : tone === "danger"
+          ? "border-danger/40 bg-danger/10 text-danger"
+          : "border-border bg-surface-1 text-fg-3";
+  return (
+    <div className={cn("rounded border px-3 py-2", toneClass)}>
+      <div className="text-[10px] uppercase tracking-wider opacity-80">{label}</div>
+      <div className="mt-1 font-mono text-lg font-semibold leading-none">{value}</div>
+    </div>
+  );
 }
 
 function ExpectedRCalibrationPanel({ data }: { data: ExpectedRCalibration | null | undefined }) {

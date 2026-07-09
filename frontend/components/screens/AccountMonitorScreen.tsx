@@ -18,6 +18,7 @@ import { StatusDot, type DotStatus } from "@/components/shell/StatusDot";
 import { cn } from "@/lib/utils";
 import {
   AccountFunding,
+  AccountLedgerTransfer,
   AccountMonitor,
   AccountOpenOrder,
   AccountPosition,
@@ -50,11 +51,15 @@ type TradingSummary = {
   longPnl: number | null;
   shortPnl: number | null;
   expectedLimitPnl: number | null;
+  stopScenarioPnl: number | null;
   openOrderNotional: number;
   longPositions: number;
   shortPositions: number;
   positivePositions: number;
   negativePositions: number;
+  positionsWithStop: number;
+  averageStopDistancePct: number | null;
+  averageTakeProfitDistancePct: number | null;
 };
 
 type ConfirmDialog = {
@@ -63,6 +68,30 @@ type ConfirmDialog = {
   description: string;
   detail: string | null;
   onConfirm: () => void;
+};
+
+type ProtectionKind = "take_profit" | "stop_loss";
+
+type ProtectionPoint = {
+  price: number;
+  distancePct: number | null;
+  pnl: number | null;
+  coveragePct: number | null;
+  orderCount: number;
+};
+
+type PositionProtectionSnapshot = {
+  markPrice: number | null;
+  currentPnl: number | null;
+  takeProfit: ProtectionPoint | null;
+  stopLoss: ProtectionPoint | null;
+};
+
+type TransferTotal = {
+  asset: string;
+  deposits: number;
+  withdrawals: number;
+  net: number;
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -139,6 +168,24 @@ function accountRatioHint(status: string | null | undefined, threshold: string |
   return "Non disponibile";
 }
 
+function pnlTone(value: string | number | null | undefined): "success" | "danger" | "muted" {
+  const parsed = asNumber(value);
+  if (parsed == null) return "muted";
+  return parsed >= 0 ? "success" : "danger";
+}
+
+function metricPnlTone(value: string | number | null | undefined): "long" | "short" | undefined {
+  const parsed = asNumber(value);
+  if (parsed == null) return undefined;
+  return parsed >= 0 ? "long" : "short";
+}
+
+function metricCostTone(value: string | number | null | undefined): "long" | "short" | undefined {
+  const parsed = asNumber(value);
+  if (parsed == null || parsed === 0) return undefined;
+  return parsed > 0 ? "short" : "long";
+}
+
 function fmtTime(ms: number | null | undefined): string {
   if (!ms) return "-";
   return new Intl.DateTimeFormat("it-IT", {
@@ -147,6 +194,40 @@ function fmtTime(ms: number | null | undefined): string {
     day: "2-digit",
     month: "2-digit",
   }).format(new Date(ms));
+}
+
+function shortHash(value: string | null | undefined): string {
+  if (!value) return "-";
+  if (value.length <= 14) return value;
+  return `${value.slice(0, 6)}...${value.slice(-6)}`;
+}
+
+function fmtTransferAmount(row: AccountLedgerTransfer): string {
+  const signed = asNumber(row.signed_amount);
+  const amount = signed ?? asNumber(row.amount);
+  if (amount == null) return "-";
+  const asset = (row.asset ?? "USDC").toUpperCase();
+  return fmtAssetAmount(amount, asset);
+}
+
+function fmtAssetAmount(value: number, asset: string): string {
+  if (asset === "USDC" || asset === "USD") return fmtUsdPrecise(value);
+  return `${value.toLocaleString("en-US", { maximumFractionDigits: 6 })} ${asset}`;
+}
+
+function transferTotals(rows: AccountLedgerTransfer[]): TransferTotal[] {
+  const totals = new Map<string, TransferTotal>();
+  for (const row of rows) {
+    const amount = asNumber(row.signed_amount) ?? asNumber(row.amount);
+    if (amount == null) continue;
+    const asset = (row.asset ?? "USDC").toUpperCase();
+    const total = totals.get(asset) ?? { asset, deposits: 0, withdrawals: 0, net: 0 };
+    if (amount >= 0) total.deposits += amount;
+    else total.withdrawals += Math.abs(amount);
+    total.net += amount;
+    totals.set(asset, total);
+  }
+  return [...totals.values()].sort((a, b) => a.asset.localeCompare(b.asset));
 }
 
 function fmtDateTime(value: string | null | undefined): string {
@@ -196,7 +277,7 @@ function protectionTone(protection: AccountPosition["protection"]): "ok" | "warn
 
 function protectionLabel(protection: AccountPosition["protection"]): string {
   if (!protection || protection.status === "untracked") return "Untracked";
-  if (protection.needs_intervention) return "Needs repair";
+  if (protection.needs_intervention) return "Needs attention";
   return "OK";
 }
 
@@ -295,9 +376,21 @@ function expectedLimitPnl(row: AccountOpenOrder, position: AccountPosition | und
   return (limit - entry) * size * multiplier;
 }
 
-function positionRealtimePnl(position: AccountPosition, midPrices: Record<string, number>): number | null {
+function positionMarkPrice(position: AccountPosition, midPrices: Record<string, number>): number | null {
   const coin = position.coin ?? "";
   const mid = midPrices[coin];
+  if (mid != null && mid > 0) return mid;
+  const entry = asNumber(position.entry_price);
+  const size = asNumber(position.size);
+  const pnl = asNumber(position.unrealized_pnl);
+  if (entry == null || size == null || size <= 0 || pnl == null || !position.side) return null;
+  const sideMultiplier = position.side === "short" ? -1 : 1;
+  const mark = entry + pnl / (size * sideMultiplier);
+  return Number.isFinite(mark) && mark > 0 ? mark : null;
+}
+
+function positionRealtimePnl(position: AccountPosition, midPrices: Record<string, number>): number | null {
+  const mid = positionMarkPrice(position, midPrices);
   const entry = asNumber(position.entry_price);
   const size = asNumber(position.size);
   if (mid == null || entry == null || size == null || size <= 0) {
@@ -307,24 +400,167 @@ function positionRealtimePnl(position: AccountPosition, midPrices: Record<string
   return (mid - entry) * size * sideMultiplier;
 }
 
+function positionPnlAtPrice(position: AccountPosition, price: number, sizeOverride?: number | null): number | null {
+  const entry = asNumber(position.entry_price);
+  const positionSize = asNumber(position.size);
+  if (entry == null || positionSize == null || positionSize <= 0 || !position.side || price <= 0) return null;
+  const size = sizeOverride != null && sizeOverride > 0
+    ? Math.min(Math.abs(sizeOverride), Math.abs(positionSize))
+    : Math.abs(positionSize);
+  const sideMultiplier = position.side === "short" ? -1 : 1;
+  return (price - entry) * size * sideMultiplier;
+}
+
+function orderTriggerKind(row: AccountOpenOrder): ProtectionKind | null {
+  const ot = row.orderType;
+  if (ot && typeof ot === "object" && "trigger" in (ot as object)) {
+    const trigger = (ot as Record<string, unknown>).trigger as Record<string, unknown> | undefined;
+    const tpsl = String(trigger?.tpsl ?? "").toLowerCase();
+    if (tpsl === "tp") return "take_profit";
+    if (tpsl === "sl") return "stop_loss";
+  }
+  const triggerCondition = String(row.triggerCondition ?? "").toLowerCase();
+  if (triggerCondition === "tp") return "take_profit";
+  if (triggerCondition === "sl") return "stop_loss";
+  const label = orderTypeLabel(row).toLowerCase();
+  if (label.includes("take profit")) return "take_profit";
+  if (label.includes("stop")) return "stop_loss";
+  return null;
+}
+
+function orderClosesPosition(row: AccountOpenOrder, position: AccountPosition): boolean {
+  const side = orderSide(row);
+  if (position.side === "long" && side === "sell") return true;
+  if (position.side === "short" && side === "buy") return true;
+  return row.reduceOnly === true;
+}
+
+function orderProtectionKind(row: AccountOpenOrder, position: AccountPosition): ProtectionKind | null {
+  if (!orderClosesPosition(row, position)) return null;
+  const triggerKind = orderTriggerKind(row);
+  if (triggerKind) return triggerKind;
+  const triggerPx = orderTriggerPx(row);
+  if (row.reduceOnly === true && triggerPx != null && triggerPx > 0 && position.side) {
+    const entry = asNumber(position.entry_price);
+    if (entry != null) {
+      if (position.side === "long") return triggerPx >= entry ? "take_profit" : "stop_loss";
+      if (position.side === "short") return triggerPx <= entry ? "take_profit" : "stop_loss";
+    }
+  }
+  const expectedPnl = expectedLimitPnl(row, position);
+  if (row.reduceOnly === true && expectedPnl != null && expectedPnl > 0) return "take_profit";
+  return null;
+}
+
+function protectionDistancePct(
+  position: AccountPosition,
+  markPrice: number | null,
+  price: number,
+  kind: ProtectionKind,
+): number | null {
+  if (markPrice == null || markPrice <= 0 || price <= 0 || !position.side) return null;
+  if (kind === "take_profit") {
+    return position.side === "long"
+      ? ((price - markPrice) / markPrice) * 100
+      : ((markPrice - price) / markPrice) * 100;
+  }
+  return position.side === "long"
+    ? ((markPrice - price) / markPrice) * 100
+    : ((price - markPrice) / markPrice) * 100;
+}
+
+function selectProtectionPoint(
+  position: AccountPosition,
+  orders: AccountOpenOrder[],
+  markPrice: number | null,
+  kind: ProtectionKind,
+): ProtectionPoint | null {
+  const positionSize = asNumber(position.size);
+  const points = orders
+    .filter((order) => orderProtectionKind(order, position) === kind)
+    .map((order) => {
+      const price = orderEffectivePx(order);
+      const orderSize = orderEffectiveSz(order, positionSize);
+      if (price == null || price <= 0) return null;
+      return {
+        price,
+        distancePct: protectionDistancePct(position, markPrice, price, kind),
+        pnl: positionPnlAtPrice(position, price),
+        coveragePct:
+          positionSize != null && positionSize > 0 && orderSize != null && orderSize > 0
+            ? Math.min(100, (Math.abs(orderSize) / Math.abs(positionSize)) * 100)
+            : null,
+        orderCount: 0,
+      };
+    })
+    .filter((point): point is ProtectionPoint => point !== null);
+
+  if (points.length === 0) return null;
+  const sortDistance = (point: ProtectionPoint) => {
+    if (point.distancePct == null) return Number.POSITIVE_INFINITY;
+    return point.distancePct >= 0 ? point.distancePct : Math.abs(point.distancePct) + 1_000;
+  };
+  const selected = [...points].sort((a, b) => sortDistance(a) - sortDistance(b))[0];
+  return { ...selected, orderCount: points.length };
+}
+
+function buildPositionProtectionSnapshot(
+  position: AccountPosition,
+  orders: AccountOpenOrder[],
+  midPrices: Record<string, number>,
+): PositionProtectionSnapshot {
+  const markPrice = positionMarkPrice(position, midPrices);
+  return {
+    markPrice,
+    currentPnl: positionRealtimePnl(position, midPrices),
+    takeProfit: selectProtectionPoint(position, orders, markPrice, "take_profit"),
+    stopLoss: selectProtectionPoint(position, orders, markPrice, "stop_loss"),
+  };
+}
+
+function average(values: number[]): number | null {
+  if (values.length === 0) return null;
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
 function summarizeTrading(positions: AccountPosition[], orders: AccountOpenOrder[], midPrices: Record<string, number>): TradingSummary {
   const positionsMap = positionByCoin(positions);
   let longPnl: number | null = null;
   let shortPnl: number | null = null;
   let positivePositions = 0;
   let negativePositions = 0;
+  let stopScenarioPnl: number | null = null;
+  const stopDistances: number[] = [];
+  const takeProfitDistances: number[] = [];
+  let positionsWithStop = 0;
   for (const pos of positions) {
     const pnl = positionRealtimePnl(pos, midPrices) ?? 0;
     if (pnl > 0.000001) positivePositions += 1;
     else if (pnl < -0.000001) negativePositions += 1;
     if (pos.side === "long") longPnl = (longPnl ?? 0) + pnl;
     else if (pos.side === "short") shortPnl = (shortPnl ?? 0) + pnl;
+    const coinOrders = orders.filter((order) => String(order.coin ?? "") === String(pos.coin ?? ""));
+    const protection = buildPositionProtectionSnapshot(pos, coinOrders, midPrices);
+    if (protection.stopLoss?.pnl != null) {
+      stopScenarioPnl = (stopScenarioPnl ?? 0) + protection.stopLoss.pnl;
+      positionsWithStop += 1;
+    }
+    if (protection.stopLoss?.distancePct != null && protection.stopLoss.distancePct >= 0) {
+      stopDistances.push(protection.stopLoss.distancePct);
+    }
+    if (protection.takeProfit?.distancePct != null && protection.takeProfit.distancePct >= 0) {
+      takeProfitDistances.push(protection.takeProfit.distancePct);
+    }
   }
   const openPnl = positions.length > 0
     ? positions.reduce((sum, p) => sum + (positionRealtimePnl(p, midPrices) ?? 0), 0)
     : null;
   const expectedValues = orders
-    .map((o) => expectedLimitPnl(o, positionsMap.get(String(o.coin ?? ""))))
+    .map((o) => {
+      const position = positionsMap.get(String(o.coin ?? ""));
+      if (!position || orderProtectionKind(o, position) === "stop_loss") return null;
+      return expectedLimitPnl(o, position);
+    })
     .filter((v): v is number => v !== null);
   const openOrderNotional = orders.reduce((sum, o) => {
     const pos = positionsMap.get(String(o.coin ?? ""));
@@ -337,11 +573,15 @@ function summarizeTrading(positions: AccountPosition[], orders: AccountOpenOrder
     longPnl,
     shortPnl,
     expectedLimitPnl: expectedValues.length > 0 ? expectedValues.reduce((s, v) => s + v, 0) : null,
+    stopScenarioPnl,
     openOrderNotional,
     longPositions: positions.filter((p) => p.side === "long").length,
     shortPositions: positions.filter((p) => p.side === "short").length,
     positivePositions,
     negativePositions,
+    positionsWithStop,
+    averageStopDistancePct: average(stopDistances),
+    averageTakeProfitDistancePct: average(takeProfitDistances),
   };
 }
 
@@ -503,6 +743,8 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
     () => snapshot?.positions.reduce((sum, p) => sum + (positionRealtimePnl(p, midPrices) ?? 0), 0) ?? null,
     [midPrices, snapshot?.positions],
   );
+  const accountPerformance = snapshot?.performance ?? null;
+  const accountPnl = accountPerformance?.account_pnl_usdc ?? null;
   const tradingSummary = useMemo(
     () => summarizeTrading(snapshot?.positions ?? [], snapshot?.open_orders ?? [], midPrices),
     [midPrices, snapshot?.open_orders, snapshot?.positions],
@@ -676,17 +918,25 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
       {!isInitialLoading && (
         <>
           {/* KPI cards */}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
             <KpiTile
               label="Equity"
               value={fmtUsd(snapshot?.account.effective_account_value ?? snapshot?.account.account_value)}
               hint={`Withdrawable ${fmtUsd(snapshot?.account.withdrawable)}`}
             />
             <KpiTile
-              label="Unrealized PnL"
+              label="P&L account reale"
+              value={fmtUsd(accountPnl)}
+              tone={pnlTone(accountPnl)}
+              hint={`vs depositi ${fmtUsd(accountPerformance?.net_deposits_usdc)} · ${fmtPct(accountPerformance?.account_return_pct)}`}
+              tooltip="Performance contabile: equity effettiva meno depositi/prelievi netti USDC nel ledger HL."
+            />
+            <KpiTile
+              label="Open PnL"
               value={fmtUsd(totalUnrealized)}
               tone={(totalUnrealized ?? 0) >= 0 ? "success" : "danger"}
               hint={`${tradingSummary.positivePositions}▲ positivi · ${tradingSummary.negativePositions}▼ negativi · ${tradingSummary.longPositions} long · ${tradingSummary.shortPositions} short`}
+              tooltip="Solo P&L non realizzato delle posizioni aperte; non include capitale versato, fee/funding storici o trade chiusi."
             />
             <KpiTile
               label="Margin used"
@@ -714,7 +964,22 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
               value={fmtUsd(snapshot?.account.total_notional_position)}
               hint={`${snapshot?.account.open_orders ?? 0} ordini open`}
             />
+            <KpiTile
+              label="Scenario stop"
+              value={fmtUsd(tradingSummary.stopScenarioPnl)}
+              tone={
+                tradingSummary.stopScenarioPnl == null
+                  ? "muted"
+                  : tradingSummary.stopScenarioPnl >= 0
+                    ? "success"
+                    : "danger"
+              }
+              hint={`${tradingSummary.positionsWithStop}/${snapshot?.positions.length ?? 0} con SL · dist. media ${fmtPct(tradingSummary.averageStopDistancePct)}`}
+              tooltip="PnL stimato se ogni posizione raggiungesse lo stop loss corrente più vicino. Usa gli ordini protettivi live aperti; le posizioni senza SL non entrano nel totale."
+            />
           </div>
+
+          <AccountPerformancePanel performance={accountPerformance} />
 
           {/* Margin Analysis + P&L/Funding */}
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
@@ -725,6 +990,7 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
           {/* Unified Positions + Funding table */}
           <UnifiedPositionsTable
             positions={snapshot?.positions ?? []}
+            openOrders={snapshot?.open_orders ?? []}
             fundingByCoin={fundingByCoin}
             midPrices={midPrices}
             actionKey={action.key}
@@ -765,6 +1031,8 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
               }}
             />
           </div>
+
+          <AccountTransfers ledger={snapshot?.ledger ?? null} />
 
           <RecentClosedLivePositionsTable
             rows={recentClosedLivePositions}
@@ -919,6 +1187,93 @@ function CrossMarginHealth({ account }: { account: AccountMonitor["account"] | n
   );
 }
 
+// ── AccountPerformancePanel ──────────────────────────────────────────────────
+
+function AccountPerformancePanel({ performance }: { performance: AccountMonitor["performance"] | null }) {
+  const statusText =
+    performance?.status === "ok"
+      ? "riconciliato"
+      : performance?.status === "partial"
+        ? "parziale"
+        : "non disponibile";
+  return (
+    <Card className="overflow-hidden">
+      <div className="flex items-center justify-between border-b border-border px-6 py-4">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+          Performance account reale
+        </span>
+        <div className="flex items-center gap-2">
+          <span className="badge muted">ultimi {performance?.lookback_days ?? 365}g</span>
+          <span className="badge muted">{statusText}</span>
+        </div>
+      </div>
+      {performance?.error && (
+        <div className="border-b border-warn/30 bg-warn/5 px-6 py-3 text-xs text-warn">
+          Riconciliazione parziale. Error id: <span className="font-mono">{performance.error}</span>
+        </div>
+      )}
+      <div className="space-y-5 p-6">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <Metric label="Depositi netti" value={fmtUsd(performance?.net_deposits_usdc)} />
+          <Metric label="Equity effettiva" value={fmtUsd(performance?.effective_equity_usdc)} />
+          <Metric
+            label="P&L account"
+            value={fmtUsd(performance?.account_pnl_usdc)}
+            tone={metricPnlTone(performance?.account_pnl_usdc)}
+          />
+          <Metric
+            label="Return account"
+            value={fmtPct(performance?.account_return_pct)}
+            tone={metricPnlTone(performance?.account_return_pct)}
+          />
+        </div>
+
+        <div className="grid gap-4 rounded-md bg-bg-2 px-4 py-3 sm:grid-cols-2 lg:grid-cols-5">
+          <Metric
+            label={`Closed PnL HL (${performance?.fill_count ?? 0})`}
+            value={fmtUsd(performance?.hl_closed_pnl_gross_usdc)}
+            tone={metricPnlTone(performance?.hl_closed_pnl_gross_usdc)}
+          />
+          <Metric label="Fee HL" value={fmtUsd(performance?.hl_fees_usdc)} tone={metricCostTone(performance?.hl_fees_usdc)} />
+          <Metric
+            label={`Funding HL (${performance?.funding_count ?? 0})`}
+            value={fmtUsdPrecise(asNumber(performance?.hl_funding_usdc))}
+            tone={metricPnlTone(performance?.hl_funding_usdc)}
+          />
+          <Metric
+            label="Open PnL"
+            value={fmtUsd(performance?.open_unrealized_pnl_usdc)}
+            tone={metricPnlTone(performance?.open_unrealized_pnl_usdc)}
+          />
+          <Metric
+            label="Gap"
+            value={fmtUsd(performance?.reconciliation_gap_usdc)}
+            tone={metricPnlTone(performance?.reconciliation_gap_usdc)}
+          />
+        </div>
+
+        <div className="grid gap-4 border-t border-border pt-4 sm:grid-cols-3">
+          <Metric
+            label="P&L locale trade chiusi"
+            value={fmtUsd(performance?.local_closed_realized_pnl_usdc)}
+            tone={metricPnlTone(performance?.local_closed_realized_pnl_usdc)}
+          />
+          <Metric
+            label="Open PnL locale"
+            value={fmtUsd(performance?.local_open_unrealized_pnl_usdc)}
+            tone={metricPnlTone(performance?.local_open_unrealized_pnl_usdc)}
+          />
+          <Metric
+            label="Fee locali filled"
+            value={fmtUsd(performance?.local_filled_fees_usdc)}
+            tone={metricCostTone(performance?.local_filled_fees_usdc)}
+          />
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 // ── PnlFundingPanel ───────────────────────────────────────────────────────────
 
 function PnlFundingPanel({
@@ -956,6 +1311,20 @@ function PnlFundingPanel({
             label="P&L atteso (TP/limit)"
             value={fmtUsd(tradingSummary.expectedLimitPnl)}
             tone={tradingSummary.expectedLimitPnl != null ? (tradingSummary.expectedLimitPnl >= 0 ? "long" : "short") : undefined}
+          />
+          <Metric
+            label={`P&L @ SL (${tradingSummary.positionsWithStop})`}
+            value={fmtUsd(tradingSummary.stopScenarioPnl)}
+            tone={tradingSummary.stopScenarioPnl != null ? (tradingSummary.stopScenarioPnl >= 0 ? "long" : "short") : undefined}
+          />
+          <Metric
+            label="Distanza media TP/SL"
+            value={`${fmtPct(tradingSummary.averageTakeProfitDistancePct)} / ${fmtPct(tradingSummary.averageStopDistancePct)}`}
+            tone={
+              tradingSummary.averageStopDistancePct != null && tradingSummary.averageStopDistancePct < 1
+                ? "warn"
+                : undefined
+            }
           />
           <Metric
             label="Funding accumulato"
@@ -1056,6 +1425,170 @@ function SideBadge({ side }: { side: string | null | undefined }) {
   if (normalized === "long") return <span className="dir mono long">↑ LONG</span>;
   if (normalized === "short") return <span className="dir mono short">↓ SHORT</span>;
   return <span className="badge muted">-</span>;
+}
+
+function fmtDistancePct(value: number | null | undefined): string {
+  if (value == null) return "—";
+  if (value < -0.01) return `oltre ${Math.abs(value).toFixed(2)}%`;
+  const digits = Math.abs(value) < 1 ? 2 : 1;
+  return `${Math.max(0, value).toFixed(digits)}%`;
+}
+
+function proximityFill(value: number | null | undefined): number {
+  if (value == null) return 0;
+  const distance = Math.max(0, value);
+  return Math.max(5, Math.min(100, 100 - (distance / 12) * 100));
+}
+
+function ProtectionDistanceLine({
+  label,
+  point,
+  tone,
+}: {
+  label: string;
+  point: ProtectionPoint | null;
+  tone: "success" | "danger";
+}) {
+  const color = tone === "success" ? "var(--success)" : "var(--danger)";
+  if (!point) {
+    return (
+      <div className="grid items-center gap-2" style={{ gridTemplateColumns: "22px 46px 1fr" }}>
+        <span className="text-[10px] font-medium text-fg-3">{label}</span>
+        <span className="mono text-[11px] text-fg-4">—</span>
+        <div style={{ height: 4, borderRadius: 2, background: "var(--border)" }} />
+      </div>
+    );
+  }
+  const coverage = point.coveragePct != null && point.coveragePct < 99.5
+    ? ` · ${point.coveragePct.toFixed(0)}% cov`
+    : "";
+  const extraOrders = point.orderCount > 1 ? ` · ${point.orderCount} ordini` : "";
+  return (
+    <div
+      className="grid items-center gap-2"
+      style={{ gridTemplateColumns: "22px 46px 1fr" }}
+      title={`${label} ${fmt.price(point.price)} · distanza ${fmtDistancePct(point.distancePct)}${coverage}${extraOrders}`}
+    >
+      <span className="text-[10px] font-medium text-fg-3">{label}</span>
+      <span className="mono text-[11px]" style={{ color }}>{fmtDistancePct(point.distancePct)}</span>
+      <div style={{ height: 4, overflow: "hidden", borderRadius: 2, background: "var(--border)" }}>
+        <div
+          style={{
+            width: `${proximityFill(point.distancePct)}%`,
+            height: "100%",
+            background: color,
+            transition: "width 0.3s ease",
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function ProtectionDistanceCell({ snapshot }: { snapshot: PositionProtectionSnapshot }) {
+  return (
+    <div style={{ minWidth: 160 }}>
+      <ProtectionDistanceLine label="TP" point={snapshot.takeProfit} tone="success" />
+      <div style={{ height: 5 }} />
+      <ProtectionDistanceLine label="SL" point={snapshot.stopLoss} tone="danger" />
+    </div>
+  );
+}
+
+function AccountTransfers({ ledger }: { ledger: AccountMonitor["ledger"] | null }) {
+  const rows = useMemo(() => ledger?.transfers ?? [], [ledger?.transfers]);
+  const lookback = ledger?.lookback_days ?? 365;
+  const totals = useMemo(() => transferTotals(rows), [rows]);
+  return (
+    <Card className="overflow-hidden">
+      <div className="flex items-center justify-between border-b border-border px-6 py-4">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+          Depositi e prelievi HL
+        </span>
+        <div className="flex items-center gap-2">
+          <span className="badge muted">ultimi {lookback}g</span>
+          <span className="badge muted">{rows.length}</span>
+        </div>
+      </div>
+      {ledger?.error && (
+        <div className="border-b border-warn/30 bg-warn/5 px-6 py-3 text-xs text-warn">
+          Ledger HL non disponibile. Error id: <span className="font-mono">{ledger.error}</span>
+        </div>
+      )}
+      <div className="overflow-x-auto">
+        <table className="tbl" style={{ minWidth: 760 }}>
+          <thead>
+            <tr>
+              <th>Ora</th>
+              <th>Tipo</th>
+              <th style={{ textAlign: "right" }}>Importo</th>
+              <th>Asset</th>
+              <th>Hash</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, index) => {
+              const isWithdrawal = row.kind === "withdrawal";
+              const amount = fmtTransferAmount(row);
+              return (
+                <tr key={`${row.time ?? "no-time"}-${row.hash ?? index}`}>
+                  <td className="mono" style={{ whiteSpace: "nowrap" }}>{fmtTime(row.time)}</td>
+                  <td>
+                    <span
+                      className="badge muted"
+                      title={row.raw_type ?? row.label}
+                      style={{ color: isWithdrawal ? "var(--short)" : "var(--long)" }}
+                    >
+                      {row.label}
+                    </span>
+                  </td>
+                  <td
+                    className="mono"
+                    style={{
+                      textAlign: "right",
+                      color: isWithdrawal ? "var(--short)" : "var(--long)",
+                    }}
+                    title={amount}
+                  >
+                    {amount}
+                  </td>
+                  <td className="mono">{row.asset ?? "-"}</td>
+                  <td className="mono" title={row.hash ?? undefined}>{shortHash(row.hash)}</td>
+                </tr>
+              );
+            })}
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={5} className="muted">
+                  {ledger?.status === "error"
+                    ? "Nessun movimento mostrabile dal ledger HL."
+                    : `Nessun deposito o prelievo negli ultimi ${lookback} giorni.`}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      {totals.length > 0 && (
+        <div className="border-t border-border px-6 py-4">
+          <div className="mb-2 text-[10px] font-medium uppercase tracking-wider text-fg-3">Totali movimenti</div>
+          <div className="space-y-3">
+            {totals.map((total) => (
+              <div key={total.asset} className="grid gap-3 rounded-md bg-bg-2 px-3 py-2 sm:grid-cols-3">
+                <Metric label={`Depositi ${total.asset}`} value={fmtAssetAmount(total.deposits, total.asset)} tone="long" />
+                <Metric label={`Prelievi ${total.asset}`} value={fmtAssetAmount(total.withdrawals, total.asset)} tone={total.withdrawals > 0 ? "short" : undefined} />
+                <Metric
+                  label={`Netto ${total.asset}`}
+                  value={fmtAssetAmount(total.net, total.asset)}
+                  tone={total.net >= 0 ? "long" : "short"}
+                />
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </Card>
+  );
 }
 
 function RecentClosedLivePositionsTable({
@@ -1163,17 +1696,18 @@ function RecentClosedLivePositionsTable({
 
 // ── UnifiedPositionsTable ─────────────────────────────────────────────────────
 
-type PositionSortKey = "coin" | "side" | "leverage" | "size" | "entry" | "value" | "pnl" | "roe" | "liq";
+type PositionSortKey = "coin" | "side" | "leverage" | "size" | "entry" | "mark" | "value" | "pnl" | "roe" | "liq";
 
-function positionSortValue(row: AccountPosition, key: PositionSortKey): string | number {
+function positionSortValue(row: AccountPosition, key: PositionSortKey, midPrices: Record<string, number>): string | number {
   switch (key) {
     case "coin": return row.coin ?? "";
     case "side": return row.side ?? "";
     case "leverage": return asNumber((row.leverage as Record<string, string | number | null> | null)?.value) ?? 0;
     case "size": return Math.abs(asNumber(row.size) ?? 0);
     case "entry": return asNumber(row.entry_price) ?? 0;
+    case "mark": return positionMarkPrice(row, midPrices) ?? 0;
     case "value": return asNumber(row.position_value) ?? 0;
-    case "pnl": return asNumber(row.unrealized_pnl) ?? 0;
+    case "pnl": return positionRealtimePnl(row, midPrices) ?? 0;
     case "roe": return asNumber(row.return_on_equity) ?? 0;
     case "liq": return asNumber(row.liquidation_price) ?? 0;
   }
@@ -1201,6 +1735,7 @@ function SortTh({
 
 function UnifiedPositionsTable({
   positions,
+  openOrders,
   fundingByCoin,
   midPrices,
   actionKey,
@@ -1210,6 +1745,7 @@ function UnifiedPositionsTable({
   onClose,
 }: {
   positions: AccountPosition[];
+  openOrders: AccountOpenOrder[];
   fundingByCoin: Map<string, AccountFunding>;
   midPrices: Record<string, number>;
   actionKey: string | null;
@@ -1226,14 +1762,26 @@ function UnifiedPositionsTable({
     else { setSortKey(key); setSortDir("desc"); }
   }
 
+  const openOrdersByCoin = useMemo(() => {
+    const map = new Map<string, AccountOpenOrder[]>();
+    for (const order of openOrders) {
+      const coin = String(order.coin ?? "");
+      if (!coin) continue;
+      const rows = map.get(coin) ?? [];
+      rows.push(order);
+      map.set(coin, rows);
+    }
+    return map;
+  }, [openOrders]);
+
   const sorted = useMemo(() => {
     return [...positions].sort((a, b) => {
-      const av = positionSortValue(a, sortKey);
-      const bv = positionSortValue(b, sortKey);
+      const av = positionSortValue(a, sortKey, midPrices);
+      const bv = positionSortValue(b, sortKey, midPrices);
       const cmp = typeof av === "string" ? av.localeCompare(bv as string) : (av as number) - (bv as number);
       return sortDir === "asc" ? cmp : -cmp;
     });
-  }, [positions, sortKey, sortDir]);
+  }, [midPrices, positions, sortKey, sortDir]);
 
   const thProps = { current: sortKey, dir: sortDir, onSort: handleSort };
 
@@ -1244,7 +1792,7 @@ function UnifiedPositionsTable({
         <span className="badge muted">{positions.length}</span>
       </div>
       <div style={{ overflowX: "auto" }}>
-        <table className="tbl" style={{ minWidth: 1080 }}>
+        <table className="tbl" style={{ minWidth: 1320 }}>
           <thead>
             <tr>
               <SortTh label="Coin" sortKey="coin" {...thProps} />
@@ -1252,9 +1800,12 @@ function UnifiedPositionsTable({
               <SortTh label="Leva" sortKey="leverage" {...thProps} />
               <SortTh label="Size" sortKey="size" {...thProps} />
               <SortTh label="Entry" sortKey="entry" {...thProps} />
+              <SortTh label="Mark" sortKey="mark" {...thProps} />
               <SortTh label="Value" sortKey="value" {...thProps} />
               <SortTh label="PnL" sortKey="pnl" {...thProps} />
               <SortTh label="ROE" sortKey="roe" {...thProps} />
+              <th style={{ whiteSpace: "nowrap" }} title="Distanza dal take profit più vicino e dallo stop loss corrente più vicino, calcolata dal mark price live.">TP / SL ⓘ</th>
+              <th style={{ whiteSpace: "nowrap" }} title="PnL stimato se il mark raggiunge lo stop loss corrente più vicino.">P&amp;L @ SL</th>
               <SortTh label="Liq" sortKey="liq" {...thProps} />
               <th style={{ whiteSpace: "nowrap" }} title="Distanza % tra il prezzo mid live e il liquidationPx (isolated). Non è la distanza dall'entry — se il prezzo si è mosso verso la liquidazione, questa percentuale può essere piccola anche con alta leva.">Dist. liq ⓘ</th>
               <th style={{ whiteSpace: "nowrap" }}>FR 8h</th>
@@ -1267,7 +1818,8 @@ function UnifiedPositionsTable({
           <tbody>
             {sorted.map((row, index) => {
               const coin = row.coin ?? "";
-              const pnl = asNumber(row.unrealized_pnl);
+              const protectionSnapshot = buildPositionProtectionSnapshot(row, openOrdersByCoin.get(coin) ?? [], midPrices);
+              const pnl = protectionSnapshot.currentPnl;
               const roe = asNumber(row.return_on_equity);
               const running = actionKey === `close-position-${coin}`;
               const isSelected = selectedCoin === coin;
@@ -1300,12 +1852,38 @@ function UnifiedPositionsTable({
                   <td className="mono">{leverageLabel(row.leverage)}</td>
                   <td className="mono">{fmtNum(row.size)}</td>
                   <td className="mono">{fmt.price(row.entry_price)}</td>
+                  <td className="mono">{fmt.price(protectionSnapshot.markPrice)}</td>
                   <td className="mono">{fmtUsd(row.position_value)}</td>
                   <td className="mono" style={{ color: (pnl ?? 0) >= 0 ? "var(--long)" : "var(--short)" }}>
                     {fmtUsd(pnl)}
                   </td>
                   <td className="mono" style={{ color: (roe ?? 0) >= 0 ? "var(--long)" : "var(--short)" }}>
                     {fmtPct(roe != null ? roe * 100 : null)}
+                  </td>
+                  <td>
+                    <ProtectionDistanceCell snapshot={protectionSnapshot} />
+                  </td>
+                  <td
+                    className="mono"
+                    style={{
+                      color:
+                        protectionSnapshot.stopLoss?.pnl == null
+                          ? "var(--fg-3)"
+                          : protectionSnapshot.stopLoss.pnl >= 0
+                            ? "var(--long)"
+                            : "var(--short)",
+                    }}
+                    title={
+                      protectionSnapshot.stopLoss
+                        ? `Stop ${fmt.price(protectionSnapshot.stopLoss.price)} · distanza ${fmtDistancePct(protectionSnapshot.stopLoss.distancePct)}${
+                            protectionSnapshot.stopLoss.coveragePct != null
+                              ? ` · coverage ${protectionSnapshot.stopLoss.coveragePct.toFixed(0)}%`
+                              : ""
+                          }`
+                        : "Nessuno stop loss live rilevato"
+                    }
+                  >
+                    {protectionSnapshot.stopLoss?.pnl != null ? fmtUsd(protectionSnapshot.stopLoss.pnl) : "—"}
                   </td>
                   <td className="mono">{fmt.price(row.liquidation_price)}</td>
                   <td>
@@ -1405,7 +1983,7 @@ function UnifiedPositionsTable({
               );
             })}
             {positions.length === 0 && (
-              <tr><td colSpan={15} className="muted">Nessuna posizione perp aperta.</td></tr>
+              <tr><td colSpan={18} className="muted">Nessuna posizione perp aperta.</td></tr>
             )}
           </tbody>
         </table>

@@ -67,9 +67,11 @@ SOURCE_AB_SEQUENCE: list[dict[str, Any]] = [
 ]
 
 STRATEGY_TEST_ALLOWLIST: dict[str, tuple[str, ...]] = {
-    "5m": ("cvd_divergence", "volume_profile"),
-    "15m": ("cvd_divergence", "volume_profile"),
+    "5m": ("cvd_divergence", "volume_profile", "trend_following_adaptive"),
+    "15m": ("cvd_divergence", "volume_profile", "trend_following_adaptive"),
 }
+
+STRATEGY_ENABLE_TESTS = {"trend_following_adaptive"}
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": False,
@@ -92,6 +94,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ab_test_assignment_salt": "trado-v1",
     "sequence": DEFAULT_SEQUENCE,
 }
+
+
+def _strategy_test_timeframe_from_key(step_key: str) -> str | None:
+    parts = step_key.split(":", 2)
+    if len(parts) == 3 and parts[0] == "strategy_test" and parts[1]:
+        return parts[1]
+    return None
 
 
 def active_ab_overlay(
@@ -124,6 +133,9 @@ def active_ab_overlay(
         return None
     step_key = state.get("current_step_key")
     if not step_key:
+        return None
+    target_timeframe = _strategy_test_timeframe_from_key(str(step_key))
+    if target_timeframe is not None and timeframe != target_timeframe:
         return None
     allocation = float(ab_block.get("allocation", 0.5))
     allocation = max(0.0, min(1.0, allocation))
@@ -1152,10 +1164,14 @@ class AutoTuner:
         return f"strategy_test:{timeframe}:{strategy}"
 
     def _strategy_test_step(self, timeframe: str, strategy: str) -> dict[str, Any]:
+        if strategy in STRATEGY_ENABLE_TESTS:
+            patch = {"enabled_strategies_by_timeframe": {timeframe: [strategy]}}
+        else:
+            patch = {"disabled_strategies_by_timeframe": {timeframe: [strategy]}}
         return {
             "key": self._strategy_test_key(timeframe, strategy),
             "label": f"Strategy test {timeframe}/{strategy}",
-            "patch": {"disabled_strategies_by_timeframe": {timeframe: [strategy]}},
+            "patch": patch,
             "revert": {},
             "strategy_test": {
                 "timeframe": timeframe,
@@ -1343,6 +1359,7 @@ class AutoTuner:
             return out
         if cutoff.tzinfo is None:
             cutoff = cutoff.replace(tzinfo=UTC)
+        target_timeframe = _strategy_test_timeframe_from_key(step_key)
         for position in positions:
             closed_at = position.closed_at
             if closed_at is None:
@@ -1352,6 +1369,11 @@ class AutoTuner:
             if closed_at <= cutoff:
                 continue
             meta = position.metadata_json or {}
+            if (
+                target_timeframe is not None
+                and meta.get("source_timeframe") != target_timeframe
+            ):
+                continue
             tag = meta.get("_auto_tuner")
             if not isinstance(tag, dict):
                 continue

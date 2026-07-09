@@ -3,6 +3,7 @@ import {
   Bell,
   LayoutDashboard,
   LineChart,
+  Radar,
   RefreshCcw,
   Settings,
   SlidersHorizontal,
@@ -20,6 +21,7 @@ export type Route =
   | "strategies"
   | "calibration"
   | "performance"
+  | "leaderboard"
   | "funnel"
   | "alerts"
   | "settings";
@@ -43,6 +45,7 @@ export const ROUTES: RouteMeta[] = [
 
   { id: "calibration", label: "Calibration",group: "analytics", icon: RefreshCcw,        description: "Auto-tuner e stability" },
   { id: "performance", label: "Performance",group: "analytics", icon: TrendingUp,        description: "Equity, drawdown e distribuzione P&L" },
+  { id: "leaderboard", label: "Alpha",      group: "analytics", icon: Radar,             description: "Watchlist leaderboard Hyperliquid" },
   { id: "funnel",      label: "Funnel",     group: "analytics", icon: Users,             description: "Bot Telegram: iscritti, conversione, source" },
 
   { id: "strategies",  label: "Strategie",  group: "config",    icon: SlidersHorizontal, description: "Pesi, parametri e analisi (strategy lab)" },

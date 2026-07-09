@@ -288,6 +288,37 @@ def test_paper_management_timeframes_fall_back_to_signal_timeframe() -> None:
     ) == ["5m", "1h", "4h"]
 
 
+def test_open_position_trailing_market_ids_include_reference_timeframes() -> None:
+    positions = [
+        Position(
+            market_id=19,
+            mode="live",
+            status="open",
+            metadata_json={"source_timeframe": "15m"},
+        ),
+        Position(
+            market_id=20,
+            mode="paper",
+            status="open",
+            metadata_json={"source_signal_id": "42"},
+        ),
+        Position(
+            market_id=21,
+            mode="paper",
+            status="open",
+            metadata_json={"source_timeframe": "2m"},
+        ),
+    ]
+    signals = {42: Signal(timeframe="4h")}
+
+    assert worker.open_position_trailing_market_ids_by_timeframe(
+        FakeDb(positions=positions, signals=signals)
+    ) == {
+        "5m": {19},
+        "1h": {20},
+    }
+
+
 def test_worker_sync_pair_selection_uses_only_perps_and_prioritizes_open_or_recent(
     monkeypatch,
 ) -> None:
@@ -454,6 +485,44 @@ def test_worker_sync_pair_selection_restricts_monitoring_only_market_scope(monke
         (1, "5m"),
     ]
     assert stats["total_pairs"] == 2
+
+
+def test_monitoring_sync_scope_includes_open_position_trailing_markets(monkeypatch) -> None:
+    db = SyncCursorFakeDb()
+    markets = [
+        _sync_market(1, "BTC"),
+        _sync_market(2, "ETH"),
+        _sync_market(3, "LINK"),
+        _sync_market(4, "SOL"),
+    ]
+    restrictions, priority_pairs = worker._monitoring_sync_scope(
+        markets,
+        sync_active_timeframes=["15m", "5m"],
+        monitoring_only_timeframes=["5m"],
+        active_timeframes=["15m"],
+        trailing_market_ids_by_timeframe={"5m": {3}},
+    )
+    monkeypatch.setattr(worker, "_open_position_market_ids", lambda _db, **_kwargs: set())
+    monkeypatch.setattr(worker, "_recent_signal_market_ids", lambda _db, _now: set())
+
+    pairs, stats = worker.select_worker_sync_pairs(
+        db,
+        markets,
+        ["5m"],
+        budget=10,
+        now=datetime(2026, 6, 18, 12, 7, tzinfo=UTC),
+        restricted_market_ids_by_timeframe=restrictions,
+        priority_pair_keys=priority_pairs,
+    )
+
+    assert restrictions == {"5m": {1, 2, 3}}
+    assert priority_pairs == {(1, "5m"), (2, "5m"), (3, "5m")}
+    assert [(market.id, timeframe) for market, timeframe in pairs] == [
+        (1, "5m"),
+        (2, "5m"),
+        (3, "5m"),
+    ]
+    assert stats["total_pairs"] == 3
 
 
 def test_worker_sync_pair_selection_skips_current_closed_candles(monkeypatch) -> None:

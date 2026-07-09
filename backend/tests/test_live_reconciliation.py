@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from app.core.enums import OperationMode
-from app.db.models import DecisionLog, Market, Order, Position, PositionStopUpdate
+from app.db.models import AppSetting, DecisionLog, Market, Order, Position, PositionStopUpdate
 from app.services.live_reconciliation import (
     _close_companion_paper_position,
     _handle_companion_paper_after_live_reconcile,
@@ -42,13 +42,16 @@ class FakeDb:
     orders: list[Order] = field(default_factory=list)
     added: list[Any] = field(default_factory=list)
     committed: int = 0
+    settings: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def query(self, model: type[Any]) -> _Query:
         if model is Order:
             return _Query(rows=self.orders)
         return _Query(rows=self.positions)
 
-    def get(self, _model: type[Any], _key: Any) -> None:
+    def get(self, _model: type[Any], _key: Any) -> AppSetting | None:
+        if _model is AppSetting and _key in self.settings:
+            return AppSetting(key=_key, value=self.settings[_key])
         return None
 
     def add(self, row: Any) -> None:
@@ -79,6 +82,7 @@ class _FakeOrderResult:
     raw_response: dict[str, Any] = field(default_factory=dict)
     avg_price: Any = None
     filled_size: Any = None
+    fee: Any = None
 
 
 class FakeTrading:
@@ -105,6 +109,7 @@ class FakeTrading:
         self._resubmit_immediately_filled = resubmit_immediately_filled
         self.resubmitted: list[dict[str, Any]] = []
         self.canceled: list[dict[str, Any]] = []
+        self.market_closed: list[dict[str, Any]] = []
 
     def user_state(self, _address: str, *, max_age_seconds: float | None = None) -> dict[str, Any]:
         return {"assetPositions": [{"position": p} for p in self._remote]}
@@ -159,6 +164,31 @@ class FakeTrading:
                 filled_size=size,
             )
         return _FakeOrderResult(oid=self._resubmit_oid, status="ok")
+
+    def submit_market_close(
+        self,
+        *,
+        coin: str,
+        is_buy: bool,
+        size: Any,
+        max_slippage_pct: float,
+        expires_after_seconds: int,
+    ) -> _FakeOrderResult:
+        self.market_closed.append(
+            {
+                "coin": coin,
+                "is_buy": is_buy,
+                "size": size,
+                "max_slippage_pct": max_slippage_pct,
+                "expires_after_seconds": expires_after_seconds,
+            }
+        )
+        return _FakeOrderResult(
+            oid=f"close-{len(self.market_closed)}",
+            status="ok",
+            avg_price=Decimal("111.5"),
+            filled_size=size,
+        )
 
     def cancel_order(self, coin: str, oid: int, expires_after_seconds: int) -> dict[str, Any]:
         self.canceled.append(
@@ -217,17 +247,83 @@ def _ensure_hl_address(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "hyperliquid_account_address", "0xabc", raising=False)
 
 
-def test_reconciliation_closes_position_missing_remote() -> None:
+def test_reconciliation_closes_position_missing_remote_with_confirmed_fill() -> None:
     position = _make_position()
-    db = FakeDb(positions=[position])
-    trading = FakeTrading(remote_positions=[])
+    stop_order = Order(
+        id=20,
+        position_id=position.id,
+        mode="live",
+        order_type="stop_loss",
+        side="sell",
+        price=Decimal("90"),
+        size=Decimal("1"),
+        status="open",
+        reduce_only=True,
+        hyperliquid_order_id="111",
+        cloid="stopcloid",
+        raw_response={},
+    )
+    db = FakeDb(positions=[position], orders=[stop_order])
+    trading = FakeTrading(
+        remote_positions=[],
+        fills=[
+            {
+                "coin": "BTC",
+                "oid": 111,
+                "cloid": "0xstopcloid",
+                "sz": "1",
+                "px": "90",
+                "closedPnl": "-10",
+            }
+        ],
+    )
 
     updated = reconcile_live_positions(db, trading_client=trading)
 
     assert updated == 1
     assert position.status == "closed"
+    assert position.size == Decimal("0")
+    assert position.realized_pnl == Decimal("-10")
+    assert stop_order.status == "filled"
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_position_reconciled_closed" in events
+
+
+def test_reconciliation_keeps_position_open_when_remote_missing_without_confirmed_fill() -> None:
+    position = _make_position()
+    stop_order = Order(
+        id=20,
+        position_id=position.id,
+        mode="live",
+        order_type="stop_loss",
+        side="sell",
+        price=Decimal("90"),
+        size=Decimal("1"),
+        status="open",
+        reduce_only=True,
+        hyperliquid_order_id="111",
+        cloid="stopcloid",
+        raw_response={},
+    )
+    db = FakeDb(positions=[position], orders=[stop_order])
+    trading = FakeTrading(
+        remote_positions=[],
+        frontend_open_orders=[
+            {"coin": "BTC", "oid": 111, "reduceOnly": True, "isTrigger": True}
+        ],
+    )
+
+    updated = reconcile_live_positions(db, trading_client=trading)
+
+    assert updated == 1
+    assert position.status == "open"
+    assert position.size == Decimal("1")
+    assert stop_order.status == "open"
+    assert trading.canceled == []
+    assert position.metadata_json["remote_missing_unconfirmed_count"] == 1
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert "live_reconciliation_remote_missing_unconfirmed" in events
+    assert "live_position_reconciled_closed" not in events
 
 
 def test_reconciliation_cancels_only_orphan_reduce_only_triggers() -> None:
@@ -1263,6 +1359,148 @@ def test_protection_state_matches_frontend_rounded_prices_and_latest_stop() -> N
     assert set(state["active_orders"]) == {"stop_loss", "tp1", "tp2"}
 
 
+def test_protection_state_flags_skipped_tp_when_absent_from_hl() -> None:
+    position = _make_short_position(size="3.6")
+    position.market.symbol = "LINK"
+    position.market.metadata_json = {"hl_coin": "LINK"}
+    position.stop_loss = Decimal("7.9524")
+    position.metadata_json = {
+        "take_profit_plan": [
+            {"level": "tp1", "price": "7.718678", "allocation": "0.3", "filled": True},
+            {
+                "level": "tp2",
+                "price": "7.3968391447",
+                "allocation": "0.2",
+                "filled": False,
+                "skipped": True,
+                "skip_reason": "tp_price_already_breached",
+            },
+            {"level": "runner", "runner": True, "allocation": "0.5", "filled": False},
+        ]
+    }
+    stop = Order(
+        id=1,
+        position_id=position.id,
+        mode="live",
+        order_type="stop_loss",
+        side="buy",
+        price=Decimal("7.9524"),
+        size=Decimal("3.6"),
+        status="ok",
+        hyperliquid_order_id="476839018519",
+    )
+    tp2 = Order(
+        id=2,
+        position_id=position.id,
+        mode="live",
+        order_type="tp2",
+        side="buy",
+        price=Decimal("7.3968391447"),
+        size=Decimal("0.7"),
+        status="open",
+        hyperliquid_order_id="478806226236",
+        raw_response={"resubmit_blocked": {"reason": "max_total_attempts"}},
+    )
+    db = FakeDb(positions=[position], orders=[stop, tp2])
+
+    state = protection_state_for_live_position(
+        db,
+        position,
+        frontend_orders=[
+            {
+                "coin": "LINK",
+                "oid": 476839018519,
+                "orderType": "Stop Market",
+                "isTrigger": True,
+                "reduceOnly": True,
+                "triggerPx": "7.9524",
+                "sz": "3.6",
+            }
+        ],
+    )
+
+    assert state["needs_intervention"] is True
+    assert state["repairable"] is False
+    assert state["missing_orders"] == []
+    assert state["rejected_orders"] == []
+    assert state["skipped_orders"] == ["tp2"]
+    assert "skipped:tp2" in state["issues"]
+    assert state["summary"] == "Skipped tp2"
+
+
+def test_protection_state_ignores_skipped_tp_when_frontend_order_exists() -> None:
+    position = _make_short_position(size="146")
+    position.market.symbol = "FET"
+    position.market.metadata_json = {"hl_coin": "FET"}
+    position.stop_loss = Decimal("0.19216")
+    position.metadata_json = {
+        "take_profit_plan": [
+            {"level": "tp1", "price": "0.1833516839", "allocation": "0.3", "filled": True},
+            {
+                "level": "tp2",
+                "price": "0.1699073105",
+                "allocation": "0.2",
+                "filled": False,
+                "skipped": True,
+                "skip_reason": "tp_price_already_breached",
+            },
+        ]
+    }
+    stop = Order(
+        id=1,
+        position_id=position.id,
+        mode="live",
+        order_type="stop_loss",
+        side="buy",
+        price=Decimal("0.19216"),
+        size=Decimal("146"),
+        status="ok",
+        hyperliquid_order_id="475375698767",
+    )
+    tp2 = Order(
+        id=2,
+        position_id=position.id,
+        mode="live",
+        order_type="tp2",
+        side="buy",
+        price=Decimal("0.1699073105"),
+        size=Decimal("29"),
+        status="open",
+        hyperliquid_order_id="478530660650",
+        raw_response={"resubmit_blocked": {"reason": "tp_price_already_breached"}},
+    )
+    db = FakeDb(positions=[position], orders=[stop, tp2])
+
+    state = protection_state_for_live_position(
+        db,
+        position,
+        frontend_orders=[
+            {
+                "coin": "FET",
+                "oid": 475375698767,
+                "orderType": "Stop Market",
+                "isTrigger": True,
+                "reduceOnly": True,
+                "triggerPx": "0.19216",
+                "sz": "146",
+            },
+            {
+                "coin": "FET",
+                "oid": 478530660650,
+                "orderType": "Take Profit Market",
+                "isTrigger": True,
+                "reduceOnly": True,
+                "triggerPx": "0.16991",
+                "sz": "29",
+            },
+        ],
+    )
+
+    assert state["needs_intervention"] is False
+    assert state["skipped_orders"] == []
+    assert set(state["active_orders"]) == {"stop_loss", "tp2"}
+
+
 # ---------------------------------------------------------------------------
 # Tests for companion paper-position close on live reconciliation
 # ---------------------------------------------------------------------------
@@ -1509,9 +1747,9 @@ def test_create_missing_tp_rescue_when_short_mark_breaches_target() -> None:
     assert "live_protection_order_tp_rescued" in events
 
 
-def test_create_missing_tp_skipped_when_rescue_would_overlap_next_tp() -> None:
-    """Se il rescue calcolato finirebbe oltre il TP successivo, restiamo sul fallback
-    (skipped) per non sovrapporre i livelli."""
+def test_create_missing_tp_market_closes_when_rescue_would_overlap_next_tp() -> None:
+    """Se il rescue calcolato finirebbe oltre il TP successivo, chiudiamo la
+    tranche a mercato invece di lasciare il livello scoperto."""
     # mark=110.9 con buffer fallback ~0.3% → new_tp1 ~ 111.23 ≥ TP2=111 → blocked
     position = _make_position_with_tp_plan(side="long", tp1_price="110", tp2_price="111")
     sl_order = _make_sl_order(oid=8888)
@@ -1528,10 +1766,14 @@ def test_create_missing_tp_skipped_when_rescue_would_overlap_next_tp() -> None:
 
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_protection_order_tp_rescued" not in events
-    assert "live_protection_order_tp_already_passed" in events
+    assert "live_protection_order_tp_market_rescued" in events
     plan = position.metadata_json["take_profit_plan"]
     tp1_entry = next(e for e in plan if e.get("level") == "tp1")
-    assert tp1_entry.get("skipped") is True
+    assert tp1_entry.get("filled") is True
+    assert tp1_entry.get("market_rescued") is True
+    assert not tp1_entry.get("skipped")
+    assert trading.market_closed[0]["size"] == Decimal("0.5")
+    assert position.size == Decimal("0.5")
 
 
 def test_resubmit_tp_rescue_updates_order_price_and_submits() -> None:
@@ -1567,8 +1809,8 @@ def test_resubmit_tp_rescue_updates_order_price_and_submits() -> None:
 
 
 def test_resubmit_tp_rescue_count_caps_after_max_attempts() -> None:
-    """Dopo _MAX_TP_RESCUE_PER_LEVEL rescue, il livello deve essere marcato skipped
-    invece di essere riposizionato ulteriormente."""
+    """Dopo _MAX_TP_RESCUE_PER_LEVEL rescue, il livello deve essere chiuso a
+    mercato invece di essere riposizionato ulteriormente."""
     position = _make_position_with_tp_plan(side="long", tp1_price="110", tp2_price="200")
     plan = position.metadata_json["take_profit_plan"]
     tp1_entry = next(e for e in plan if e.get("level") == "tp1")
@@ -1591,14 +1833,123 @@ def test_resubmit_tp_rescue_count_caps_after_max_attempts() -> None:
 
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_protection_order_tp_rescued" not in events
-    assert "live_protection_order_tp_already_passed" in events
+    assert "live_protection_order_tp_market_rescued" in events
     # TP1 non resubmittato (rescue capped)
     tp_resubmits = [item for item in trading.resubmitted if item["tpsl"] == "tp"]
     assert tp_resubmits == []
-    # Skipped marcato
+    assert trading.market_closed[0]["size"] == Decimal("0.5")
     plan_after = position.metadata_json["take_profit_plan"]
     tp1_after = next(e for e in plan_after if e.get("level") == "tp1")
-    assert tp1_after.get("skipped") is True
+    assert tp1_after.get("filled") is True
+    assert tp1_after.get("market_rescued") is True
+    assert not tp1_after.get("skipped")
+    assert tp1_order.status == "filled"
+    assert position.size == Decimal("0.5")
+
+
+def test_resubmit_tp_market_rescue_skips_below_min_notional() -> None:
+    position = _make_position_with_tp_plan(
+        side="short",
+        entry="7.9524",
+        stop="8.196122",
+        tp1_price="7.718678",
+        tp2_price="7.3968391447",
+    )
+    position.size = Decimal("3.6")
+    plan = position.metadata_json["take_profit_plan"]
+    tp1_entry = next(e for e in plan if e.get("level") == "tp1")
+    tp1_entry["filled"] = True
+    tp1_entry["filled_size"] = "1.5"
+    tp2_entry = next(e for e in plan if e.get("level") == "tp2")
+    tp2_entry["allocation"] = "0.2"
+    tp2_entry["rescue_count"] = 3
+    tp2_entry["rescued"] = True
+    runner = next(e for e in plan if e.get("level") == "runner")
+    runner["allocation"] = "0.5"
+    sl_order = _make_sl_order(oid=8888)
+    sl_order.side = "buy"
+    tp2_order = _make_tp_order(
+        cloid="tp2",
+        level="tp2",
+        price="7.3968391447",
+        size="0.7",
+        oid_str="9998",
+    )
+    db = FakeDb(
+        positions=[position],
+        orders=[sl_order, tp2_order],
+        settings={"live_execution": {"min_order_notional_usd": 10}},
+    )
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "BTC", "szi": "-3.6", "entryPx": "7.9524", "markPx": "7.2866"}
+        ],
+        open_order_oids=[8888],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    skipped = [
+        r for r in db.added
+        if isinstance(r, DecisionLog)
+        and r.event_type == "live_protection_order_tp_market_rescue_skipped"
+    ]
+    assert trading.market_closed == []
+    assert "live_protection_order_tp_market_rescue_rejected" not in events
+    assert skipped
+    assert skipped[-1].data["reason"] == "below_min_notional"
+    assert Decimal(skipped[-1].data["size"]) == Decimal("0.72")
+    assert Decimal(skipped[-1].data["notional"]) < Decimal(skipped[-1].data["min_notional"])
+    assert tp2_order.status != "error"
+    assert tp2_order.raw_response["market_close_rescue"]["status"] == "skipped"
+    assert tp2_order.raw_response["market_close_rescue"]["reason"] == "below_min_notional"
+    assert tp2_entry.get("skipped") is True
+
+
+def test_resubmit_tp_ignores_plan_entry_already_marked_skipped() -> None:
+    position = _make_position_with_tp_plan(
+        side="short",
+        entry="7.9524",
+        stop="8.196122",
+        tp1_price="7.718678",
+        tp2_price="7.3968391447",
+    )
+    position.size = Decimal("3.6")
+    plan = position.metadata_json["take_profit_plan"]
+    tp1_entry = next(e for e in plan if e.get("level") == "tp1")
+    tp1_entry["filled"] = True
+    tp1_entry["filled_size"] = "1.5"
+    tp2_entry = next(e for e in plan if e.get("level") == "tp2")
+    tp2_entry["skipped"] = True
+    tp2_entry["skip_reason"] = "tp_price_already_breached"
+    sl_order = _make_sl_order(oid=8888)
+    sl_order.side = "buy"
+    tp2_order = _make_tp_order(
+        cloid="tp2",
+        level="tp2",
+        price="7.3968391447",
+        size="0.7",
+        oid_str="9998",
+    )
+    db = FakeDb(positions=[position], orders=[sl_order, tp2_order])
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "BTC", "szi": "-3.6", "entryPx": "7.9524", "markPx": "7.2866"}
+        ],
+        open_order_oids=[8888],
+        resubmit_oid="77777",
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
+    assert trading.market_closed == []
+    assert "live_protection_order_tp_market_rescue_skipped" not in events
+    assert "live_protection_order_tp_market_rescue_rejected" not in events
+    assert "live_protection_order_tp_already_passed" not in events
+    assert "market_close_rescue" not in tp2_order.raw_response
 
 
 def test_rescue_bypasses_max_total_attempts_cap_and_resets_state() -> None:
@@ -1673,9 +2024,9 @@ def test_rescue_uses_all_mids_fallback_when_user_state_omits_mark_px() -> None:
     assert Decimal(tp1_entry["price"]) > Decimal("112")
 
 
-def test_resubmit_tp_rescue_skipped_when_below_stop_loss() -> None:
+def test_resubmit_tp_market_closes_when_rescue_would_be_below_stop_loss() -> None:
     """Se lo stop loss è già oltre il mark price (caso patologico), il rescue
-    non deve produrre un TP che finirebbe dietro lo stop."""
+    non deve produrre un TP dietro lo stop: chiude la tranche a mercato."""
     position = _make_position_with_tp_plan(side="long", tp1_price="110", tp2_price="200")
     position.stop_loss = Decimal("115")  # SL "sopra" il mark — caso patologico
     tp1_order = _make_tp_order(oid_str="9999", price="110", size="0.5")
@@ -1693,4 +2044,7 @@ def test_resubmit_tp_rescue_skipped_when_below_stop_loss() -> None:
     # mark=112, buffer fallback ~0.3% → new_tp ~ 112.336 < stop=115 → reject_reason=below_stop_loss
     events = [r.event_type for r in db.added if isinstance(r, DecisionLog)]
     assert "live_protection_order_tp_rescued" not in events
-    assert "live_protection_order_tp_already_passed" in events
+    assert "live_protection_order_tp_market_rescued" in events
+    assert trading.market_closed[0]["size"] == Decimal("0.5")
+    assert tp1_order.status == "filled"
+    assert position.size == Decimal("0.5")

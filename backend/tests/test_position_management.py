@@ -7,6 +7,7 @@ from typing import Any
 
 from app.core.config import Settings
 from app.db.models import (
+    AccountSnapshot,
     AppSetting,
     Candle,
     DecisionLog,
@@ -48,6 +49,7 @@ class FakeDb:
     signals: dict[int, Signal] = field(default_factory=dict)
     orders: list[Order] = field(default_factory=list)
     positions: list[Position] = field(default_factory=list)
+    snapshots: list[AccountSnapshot] = field(default_factory=list)
     markets: dict[int, Market] = field(default_factory=dict)
     candles: list[Candle] = field(default_factory=list)
     added: list[Any] = field(default_factory=list)
@@ -71,12 +73,16 @@ class FakeDb:
             return _Query(self.positions)
         if model is Candle:
             return _Query(self.candles)
+        if model is AccountSnapshot:
+            return _Query(self.snapshots)
         return _Query([])
 
     def add(self, row: Any) -> None:
         if isinstance(row, Order) and row.id is None:
             row.id = self.next_order_id
             self.next_order_id += 1
+        if isinstance(row, AppSetting):
+            self.settings[row.key] = row
         self.added.append(row)
 
     def flush(self) -> None:
@@ -144,9 +150,15 @@ class FakeTrading:
 
 
 class FakeModifyTrading(FakeTrading):
-    def __init__(self, *, raise_modify: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        raise_modify: Exception | None = None,
+        modify_response: HyperliquidOrderResult | None = None,
+    ) -> None:
         super().__init__()
         self.raise_modify = raise_modify
+        self.modify_response = modify_response
         self.modified: list[dict[str, Any]] = []
 
     def modify_trigger_order(
@@ -175,6 +187,8 @@ class FakeModifyTrading(FakeTrading):
         )
         if self.raise_modify is not None:
             raise self.raise_modify
+        if self.modify_response is not None:
+            return self.modify_response
         return HyperliquidOrderResult(
             status="ok",
             oid=str(oid),
@@ -327,6 +341,43 @@ def test_trailing_short_moves_stop_down() -> None:
     assert position.stop_loss <= Decimal("100")
 
 
+def test_pre_tp_profit_lock_moves_short_stop_before_tp1() -> None:
+    engine = PositionManagementEngine(Settings())
+    db = _db()
+    position = _position("short", "110")
+    candles = _candles("92.1")
+
+    assert engine.manage_paper_position_for_candle(db, _market(), position, candles, candles[-1])
+
+    assert position.stop_loss is not None
+    assert Decimal("92.1") < position.stop_loss < Decimal("100")
+    assert position.metadata_json["last_stop_update_reason"] == "pre_tp_profit_lock"
+
+
+def test_pre_tp_profit_lock_handles_ada_like_half_r_profit() -> None:
+    engine = PositionManagementEngine(Settings())
+    db = _db()
+    position = _position("short", "110")
+    candles = _candles("94.7")
+
+    assert engine.manage_paper_position_for_candle(db, _market(), position, candles, candles[-1])
+
+    assert position.stop_loss is not None
+    assert Decimal("94.7") < position.stop_loss < Decimal("100")
+    assert position.metadata_json["last_stop_update_reason"] == "pre_tp_profit_lock"
+
+
+def test_pre_tp_profit_lock_skips_below_activation_r() -> None:
+    engine = PositionManagementEngine(Settings())
+    db = _db()
+    position = _position("short", "110")
+    candles = _candles("95.1")
+
+    assert not engine.manage_paper_position_for_candle(db, _market(), position, candles, candles[-1])
+
+    assert position.stop_loss == Decimal("110")
+
+
 def test_trailing_uses_reference_timeframe_for_slow_positions() -> None:
     engine = PositionManagementEngine(Settings())
     db = _db()
@@ -453,6 +504,78 @@ def test_kill_switch_or_inactive_market_skips_update() -> None:
     assert not engine.manage_paper_position_for_candle(
         _db(), _market(active=False), position, candles, candles[-1]
     )
+
+
+def test_live_portfolio_profit_lock_respects_live_guardrails() -> None:
+    db = _db()
+    engine = PositionManagementEngine(
+        Settings(hyperliquid_account_address="", hyperliquid_private_key="")
+    )
+
+    missing_creds = engine.manage_live_portfolio_profit_lock(db, FakeTrading())
+
+    assert missing_creds == {
+        "status": "skipped",
+        "reason": "missing_live_credentials",
+        "updated": 0,
+    }
+
+    guarded_engine = PositionManagementEngine(
+        Settings(
+            operation_mode="AUTO_TRADE",
+            enable_live_trading=True,
+            hyperliquid_account_address="0xabc",
+            hyperliquid_private_key="0xdef",
+        )
+    )
+    kill_switch = guarded_engine.manage_live_portfolio_profit_lock(_db(kill=True), FakeTrading())
+
+    assert kill_switch == {"status": "skipped", "reason": "kill_switch", "updated": 0}
+
+
+def test_live_portfolio_profit_lock_logs_trigger_once_per_peak() -> None:
+    db = _db()
+    db.settings["live_portfolio_profit_lock_state"] = AppSetting(
+        key="live_portfolio_profit_lock_state",
+        value={
+            "armed": True,
+            "peak_effective_account_value": "175",
+            "peak_unrealized_pnl": "20",
+        },
+    )
+    db.snapshots.append(
+        AccountSnapshot(
+            id=1,
+            timestamp=datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+            effective_account_value=Decimal("160"),
+            unrealized_pnl=Decimal("10"),
+            raw_data={},
+        )
+    )
+    position = _position("short", "110", mode="live")
+    position.unrealized_pnl = Decimal("10")
+    db.positions.append(position)
+    engine = PositionManagementEngine(
+        Settings(
+            hyperliquid_account_address="0xabc",
+            hyperliquid_private_key="0xdef",
+        )
+    )
+
+    first = engine.manage_live_portfolio_profit_lock(db, FakeTrading())
+    second = engine.manage_live_portfolio_profit_lock(db, FakeTrading())
+
+    triggered_events = [
+        row
+        for row in db.added
+        if isinstance(row, DecisionLog)
+        and row.event_type == "live_portfolio_profit_lock_triggered"
+    ]
+    assert first["status"] == "triggered"
+    assert first["logged"] is True
+    assert second["status"] == "already_triggered"
+    assert second["logged"] is False
+    assert len(triggered_events) == 1
 
 
 def test_tp1_tp2_runner_and_no_double_trigger() -> None:
@@ -614,6 +737,67 @@ def test_live_stop_modify_429_records_pending_without_mutating_stop() -> None:
     assert pending[-1].data["next_retry_after"] == "2026-06-17T12:00:10+00:00"
 
 
+def test_live_stop_modify_canceled_or_filled_replaces_stale_order() -> None:
+    engine = PositionManagementEngine(Settings())
+    db = _db()
+    position = _position("long", "90", mode="live")
+    old_order = Order(
+        id=55,
+        position_id=10,
+        hyperliquid_order_id="111",
+        cloid="old",
+        mode="live",
+        order_type="stop_loss",
+        side="sell",
+        price=Decimal("90"),
+        size=Decimal("10"),
+        status="ok",
+        reduce_only=True,
+        raw_response={},
+    )
+    db.orders.append(old_order)
+    candidate = StopCandidate(
+        price=Decimal("95"),
+        reason="breakeven",
+        indicators={"current_price": "105"},
+        r_multiple=Decimal("1"),
+    )
+    trading = FakeModifyTrading(
+        modify_response=HyperliquidOrderResult(
+            status="error",
+            oid=None,
+            avg_price=None,
+            filled_size=None,
+            raw_response={
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {
+                        "statuses": [
+                            {"error": "Cannot modify canceled or filled order"},
+                        ],
+                    },
+                },
+            },
+        )
+    )
+
+    assert engine.replace_live_stop_order(db, _market(), position, candidate, trading)
+
+    assert trading.modified[0]["oid"] == 111
+    assert len(trading.submitted) == 1
+    assert trading.canceled == []
+    assert old_order.status == "canceled"
+    assert old_order.raw_response["remote_missing"] is True
+    assert position.stop_loss == Decimal("95")
+    assert position.metadata_json["stop_replacement_attempts"] == 0
+    assert any(
+        isinstance(row, DecisionLog)
+        and row.event_type == "live_stop_update_stale_order_replaced"
+        for row in db.added
+    )
+
+
 def test_signal_only_mode_blocks_live_replacement() -> None:
     engine = PositionManagementEngine(Settings(operation_mode="SIGNAL_ONLY", enable_live_trading=False))
     db = _db()
@@ -677,11 +861,62 @@ def test_periodic_liquidation_guard_audit_records_failures() -> None:
 
     result = engine.audit_live_positions_against_liquidation(db, trading_client=trading)
 
-    assert result == {"checked": 2, "failed": 1, "skipped": 0}
+    assert result == {"checked": 2, "failed": 1, "skipped": 0, "recovered": 0}
     assert long_position.metadata_json["last_liquidation_guard_status"] == "ok"
     assert short_position.metadata_json["last_liquidation_guard_status"] == "failed"
     assert any(
         isinstance(row, DecisionLog) and row.event_type == "live_liquidation_guard_cycle"
+        for row in db.added
+    )
+
+
+def test_periodic_liquidation_guard_recovers_live_stop_before_liq() -> None:
+    engine = PositionManagementEngine(
+        Settings(
+            hyperliquid_account_address="0xabc",
+            hyperliquid_private_key="0xdef",
+        )
+    )
+    db = _db()
+    position = _position("long", "90", mode="live")
+    position.market = _market()
+    db.positions.append(position)
+    old_order = Order(
+        id=55,
+        position_id=10,
+        hyperliquid_order_id="111",
+        cloid="old",
+        mode="live",
+        order_type="stop_loss",
+        side="sell",
+        price=Decimal("90"),
+        size=Decimal("10"),
+        status="ok",
+        reduce_only=True,
+        raw_response={},
+    )
+    db.orders.append(old_order)
+    trading = FakeTrading(
+        user_state_positions=[
+            {
+                "coin": "BTC",
+                "szi": "10",
+                "liquidationPx": "95",
+            }
+        ]
+    )
+
+    result = engine.audit_live_positions_against_liquidation(db, trading_client=trading)
+
+    recovered_stop = Decimal("95") * Decimal("1.03")
+    assert result == {"checked": 1, "failed": 0, "skipped": 0, "recovered": 1}
+    assert position.stop_loss == recovered_stop
+    assert trading.submitted[0]["trigger_price"] == recovered_stop
+    assert trading.canceled[0]["oid"] == 111
+    assert old_order.status == "canceled"
+    assert any(
+        isinstance(row, DecisionLog)
+        and row.event_type == "live_liquidation_guard_periodic_recovered"
         for row in db.added
     )
 

@@ -68,6 +68,7 @@ def _position(
     closed_at: datetime,
     arm: str | None = None,
     step_key: str = "regime_filter",
+    source_timeframe: str | None = None,
 ) -> Position:
     position = Position(
         market_id=1,
@@ -82,6 +83,8 @@ def _position(
     meta: dict = {}
     if arm is not None:
         meta["_auto_tuner"] = {"step_key": step_key, "arm": arm}
+    if source_timeframe is not None:
+        meta["source_timeframe"] = source_timeframe
     position.metadata_json = meta
     return position
 
@@ -419,7 +422,12 @@ def _ab_config(**overrides) -> AppSetting:
 
 
 def _tagged_positions(
-    count: int, pnl: float, start: datetime, arm: str, step_key: str = "regime_filter"
+    count: int,
+    pnl: float,
+    start: datetime,
+    arm: str,
+    step_key: str = "regime_filter",
+    source_timeframe: str | None = None,
 ) -> list[Position]:
     return [
         _position(
@@ -427,6 +435,7 @@ def _tagged_positions(
             closed_at=start + timedelta(minutes=i),
             arm=arm,
             step_key=step_key,
+            source_timeframe=source_timeframe,
         )
         for i in range(count)
     ]
@@ -635,6 +644,40 @@ def test_ab_mode_ignores_untagged_positions_in_partition() -> None:
     assert len(arms["test"]) == 0
 
 
+def test_strategy_ab_partition_only_counts_target_timeframe() -> None:
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+    activated = datetime(2026, 5, 14, 12, tzinfo=UTC)
+    step_key = "strategy_test:15m:volume_profile"
+    positions = [
+        _position(
+            pnl=1.0,
+            closed_at=activated + timedelta(minutes=1),
+            arm="control",
+            step_key=step_key,
+            source_timeframe="15m",
+        ),
+        _position(
+            pnl=2.0,
+            closed_at=activated + timedelta(minutes=2),
+            arm="test",
+            step_key=step_key,
+            source_timeframe="4h",
+        ),
+        _position(
+            pnl=3.0,
+            closed_at=activated + timedelta(minutes=3),
+            arm="test",
+            step_key=step_key,
+        ),
+    ]
+
+    arms = tuner._partition_by_arm(positions, activated.isoformat(), step_key)
+
+    assert len(arms["control"]) == 1
+    assert arms["control"][0].realized_pnl == Decimal("1.0")
+    assert len(arms["test"]) == 0
+
+
 def test_active_ab_overlay_returns_none_when_not_in_ab_mode() -> None:
     db = FakeDb()
     db.app_settings["auto_tuner_config"] = _config(enabled=True)  # mode="sequential"
@@ -676,6 +719,47 @@ def test_active_ab_overlay_returns_arm_when_ab_active() -> None:
     assert overlay["step_key"] == "regime_filter"
     assert overlay["arm"] == "test"
     assert overlay["overlay"] == {"regime_filter_enabled": True}
+
+
+def test_strategy_ab_overlay_only_applies_to_target_timeframe() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(ab_test_assignment_salt="tf-test")
+    db.app_settings["auto_tuner_state"] = AppSetting(
+        key="auto_tuner_state",
+        value={
+            "current_step_index": 0,
+            "current_step_key": "strategy_test:15m:volume_profile",
+            "mode": "ab_test",
+            "ab_test": {
+                "control_overlay": {},
+                "test_overlay": {
+                    "disabled_strategies_by_timeframe": {"15m": ["volume_profile"]}
+                },
+                "allocation": 1.0,
+            },
+        },
+    )
+    candle_time = datetime(2026, 5, 14, 12, tzinfo=UTC)
+
+    assert active_ab_overlay(
+        db,
+        market_id=1,
+        timeframe="4h",
+        source_candle_open_time=candle_time,
+    ) is None
+    overlay = active_ab_overlay(
+        db,
+        market_id=1,
+        timeframe="15m",
+        source_candle_open_time=candle_time,
+    )
+
+    assert overlay is not None
+    assert overlay["step_key"] == "strategy_test:15m:volume_profile"
+    assert overlay["arm"] == "test"
+    assert overlay["overlay"] == {
+        "disabled_strategies_by_timeframe": {"15m": ["volume_profile"]}
+    }
 
 
 def test_active_ab_overlay_is_deterministic_with_signal_context() -> None:
@@ -884,8 +968,10 @@ def test_strategy_tests_lists_only_supported_pairs_and_last_recommendation() -> 
     assert pairs == {
         ("5m", "cvd_divergence"),
         ("5m", "volume_profile"),
+        ("5m", "trend_following_adaptive"),
         ("15m", "cvd_divergence"),
         ("15m", "volume_profile"),
+        ("15m", "trend_following_adaptive"),
     }
     row = next(
         item
@@ -921,6 +1007,24 @@ def test_start_strategy_test_creates_dynamic_ab_sequence_without_mutating_risk()
     assert state["ab_test"]["control_overlay"] == {}
     assert state["ab_test"]["test_overlay"] == {
         "disabled_strategies_by_timeframe": {"5m": ["cvd_divergence"]}
+    }
+
+
+def test_start_candidate_strategy_test_enables_only_test_arm() -> None:
+    db = FakeDb()
+    db.app_settings["auto_tuner_config"] = _ab_config(enabled=False)
+    db.app_settings["risk"] = AppSetting(key="risk", value={"min_signal_score": 70})
+    tuner = AutoTuner(analyzer=FakeAnalyzer([]))
+
+    result = tuner.start_strategy_test(db, "15m", "trend-following-adaptive")
+
+    assert result["ok"] is True
+    assert result["mode"] == "ab_test"
+    assert result["step"] == "strategy_test:15m:trend_following_adaptive"
+    state = db.app_settings["auto_tuner_state"].value
+    assert state["ab_test"]["control_overlay"] == {}
+    assert state["ab_test"]["test_overlay"] == {
+        "enabled_strategies_by_timeframe": {"15m": ["trend_following_adaptive"]}
     }
 
 
@@ -981,6 +1085,7 @@ def test_ab_strategy_test_evaluates_without_mutating_risk_and_sets_recommendatio
             closed_at=activated + timedelta(minutes=i + 1),
             arm="control",
             step_key="strategy_test:5m:cvd_divergence",
+            source_timeframe="5m",
         )
         for i in range(20)
     ]
@@ -990,6 +1095,7 @@ def test_ab_strategy_test_evaluates_without_mutating_risk_and_sets_recommendatio
             closed_at=activated + timedelta(minutes=i + 50),
             arm="test",
             step_key="strategy_test:5m:cvd_divergence",
+            source_timeframe="5m",
         )
         for i in range(20)
     ]
@@ -1046,6 +1152,7 @@ def test_status_exposes_active_strategy_test_target() -> None:
             activated + timedelta(minutes=1),
             "control",
             step_key="strategy_test:15m:volume_profile",
+            source_timeframe="15m",
         )
         + _tagged_positions(
             6,
@@ -1053,6 +1160,7 @@ def test_status_exposes_active_strategy_test_target() -> None:
             activated + timedelta(minutes=20),
             "test",
             step_key="strategy_test:15m:volume_profile",
+            source_timeframe="15m",
         )
     )
     tuner = AutoTuner(analyzer=FakeAnalyzer(positions))

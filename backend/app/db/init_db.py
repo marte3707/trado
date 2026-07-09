@@ -15,6 +15,7 @@ from app.core.runtime_settings import (
 )
 from app.db.models import AppSetting, Base, Market, StrategyConfig
 from app.db.session import engine
+from app.engine.pre_tp1_validation import DEFAULT_PRE_TP1_SETTINGS
 from app.services.unified_account_ratio import DEFAULT_UAR_RISK_SETTINGS
 
 DEFAULT_STRATEGIES = {
@@ -46,6 +47,26 @@ DEFAULT_STRATEGIES = {
         "lvn_percentile": 0.20,
         "value_area_pct": 0.70,
     },
+    "trend_following_adaptive": {
+        "fast_ema": 21,
+        "slow_ema": 55,
+        "trend_ema": 200,
+        "donchian_lookback": 55,
+        "adx_period": 14,
+        "min_adx": 18.0,
+        "atr_period": 14,
+        "atr_stop_multiplier": 2.5,
+        "reward_r_multiple": 2.0,
+        "volume_lookback": 20,
+        "min_volume_ratio": 0.8,
+        "breakout_atr_buffer": 0.05,
+    },
+}
+
+DEFAULT_DISABLED_STRATEGIES = {
+    # New strategy candidates must be explicitly enabled or tested before they
+    # influence scoring/live paths.
+    "trend_following_adaptive",
 }
 
 DEFAULT_STRATEGY_WEIGHTS = {
@@ -68,6 +89,7 @@ DEFAULT_STRATEGY_WEIGHTS = {
     # liquidation_cascade: segnale raro, pochi dati — peso ridotto da 10
     "liquidation_cascade": 5,
     "volume_profile": 9,
+    "trend_following_adaptive": 10,
 }
 
 LEGACY_DEFAULT_STRATEGY_WEIGHTS = {
@@ -102,6 +124,7 @@ DEFAULT_EDGE_RISK_SETTINGS = {
     "entry_quality_ema_period": 21,
     "entry_quality_long_ob_imbalance_min": 0.05,
     "entry_quality_short_ob_imbalance_max": 0.0,
+    **DEFAULT_PRE_TP1_SETTINGS,
     "max_combined_score_adjustment": 15,
     "btc_volume_profile_gate_enabled": True,
     "btc_volume_profile_exchange": "HYPERLIQUID_FUTURES",
@@ -183,6 +206,8 @@ def seed_defaults(db: Session) -> None:
                 value={
                     "min_account_value_usd": settings.live_min_account_value_usd,
                     "order_notional_cap_usd": settings.live_order_notional_cap_usd,
+                    "min_order_notional_usd": settings.live_min_order_notional_usd,
+                    "min_reduce_only_notional_usd": 10.0,
                     "max_slippage_pct": settings.live_max_slippage_pct,
                     "order_expires_after_seconds": settings.live_order_expires_after_seconds,
                     "enable_mainnet_live_trading": settings.enable_mainnet_live_trading,
@@ -196,6 +221,11 @@ def seed_defaults(db: Session) -> None:
             value = dict(live_execution.value)
             if "close_companion_paper_on_live_reconcile" not in value:
                 value["close_companion_paper_on_live_reconcile"] = False
+            if "min_reduce_only_notional_usd" not in value:
+                value["min_reduce_only_notional_usd"] = 10.0
+            if "min_order_notional_usd" not in value:
+                value["min_order_notional_usd"] = settings.live_min_order_notional_usd
+            if value != live_execution.value:
                 live_execution.value = value
     if db.get(AppSetting, "risk") is None:
         db.add(
@@ -349,6 +379,55 @@ def seed_defaults(db: Session) -> None:
                 },
             )
         )
+    leaderboard_alpha_defaults = {
+        "enabled": True,
+        "mode": "observe_only",
+        "lookback_days": 30,
+        "recent_signal_hours": 24,
+        "min_traders_for_signal": 1,
+        "min_quality_score": 55,
+        "max_entry_lag_pct": 0.35,
+        "sync_limit_per_run": 5,
+        "auto_import_top_traders": True,
+        "auto_import_limit": 20,
+        "auto_import_window": "week",
+        "auto_import_min_volume_usd": "0",
+        "auto_import_refresh_hours": 4,
+        "auto_sync_enabled": True,
+        "auto_sync_interval_hours": 4,
+        "include_auto_imported_in_signals": True,
+        "copy_paper_enabled": True,
+        "copy_paper_starting_equity_usd": "10000",
+        "copy_paper_position_notional_usd": "100",
+        "copy_paper_fee_rate": "0.00045",
+        "copy_paper_min_source_notional_usd": "25",
+        "copy_paper_max_open_positions": 80,
+        "copy_paper_max_open_positions_per_trader": 10,
+        "copy_paper_allowed_rank_limit": 20,
+        "copy_paper_only_auto_top_traders": True,
+        "copy_paper_close_on_opposite_open": True,
+        "copy_paper_replay_batch_size": 1000,
+    }
+    leaderboard_alpha = db.get(AppSetting, "leaderboard_alpha")
+    if leaderboard_alpha is None:
+        db.add(
+            AppSetting(
+                key="leaderboard_alpha",
+                value=leaderboard_alpha_defaults,
+            )
+        )
+    elif isinstance(leaderboard_alpha.value, dict):
+        merged = {**leaderboard_alpha_defaults, **leaderboard_alpha.value}
+        if leaderboard_alpha.value.get("recent_signal_hours") == 6:
+            merged["recent_signal_hours"] = 24
+        if leaderboard_alpha.value.get("min_traders_for_signal") == 2:
+            merged["min_traders_for_signal"] = 1
+        if leaderboard_alpha.value.get("sync_limit_per_run") == 25:
+            merged["sync_limit_per_run"] = 5
+        leaderboard_alpha.value = merged
+        db.add(leaderboard_alpha)
+    if db.get(AppSetting, "leaderboard_alpha_state") is None:
+        db.add(AppSetting(key="leaderboard_alpha_state", value={}))
     if db.get(AppSetting, "alerts") is None:
         db.add(
             AppSetting(
@@ -547,7 +626,7 @@ def seed_timeframe(db: Session, timeframe: str) -> None:
                 StrategyConfig(
                     strategy_name=strategy_name,
                     timeframe=timeframe,
-                    enabled=True,
+                    enabled=strategy_name not in DEFAULT_DISABLED_STRATEGIES,
                     params=params,
                     weight=DEFAULT_STRATEGY_WEIGHTS[strategy_name],
                 )

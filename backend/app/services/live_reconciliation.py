@@ -63,6 +63,7 @@ _TP_RESCUE_ATR_MULTIPLIER = Decimal("0.6")
 _TP_RESCUE_PCT_FALLBACK = Decimal("0.003")  # 0.3%
 _TP_RESCUE_MIN_BUFFER_PCT = Decimal("0.0005")  # 0.05% — pavimento contro tick troppo piccoli
 _MAX_TP_RESCUE_PER_LEVEL = 3
+_POSITION_DUST_THRESHOLD = Decimal("0.0000000001")
 HYPERLIQUID_LIVE_RECONCILIATION_CURSOR_KEY = "hyperliquid_live_reconciliation_cursor"
 
 
@@ -582,8 +583,10 @@ def _cancel_orphan_protection_orders(
     frontend_open_orders: list[dict],
     trading: HyperliquidTradingClient,
     expires_after_seconds: int,
+    local_open_position_coins: set[str] | None = None,
 ) -> int:
     """Cancel reduce-only triggers for coins with no remote HL position."""
+    protected_coins = local_open_position_coins or set()
     local_pending = (
         db.query(Order)
         .filter(
@@ -609,6 +612,7 @@ def _cancel_orphan_protection_orders(
             or not coin
             or not isinstance(oid, int)
             or coin in remote_positions
+            or coin in protected_coins
             or item.get("reduceOnly") is not True
             or item.get("isTrigger") is not True
         ):
@@ -657,6 +661,13 @@ def _cancel_orphan_protection_orders(
         )
         canceled += 1
     return canceled
+
+
+def _remote_missing_count(metadata: dict[str, Any]) -> int:
+    try:
+        return int(metadata.get("remote_missing_unconfirmed_count") or 0) + 1
+    except (TypeError, ValueError):
+        return 1
 
 
 def _frontend_order_tpsl(order: dict, position: Position) -> str | None:
@@ -800,6 +811,20 @@ def _expected_protection_order_types(position: Position) -> list[str]:
     return expected
 
 
+def _skipped_unfilled_protection_order_types(position: Position) -> list[str]:
+    skipped: list[str] = []
+    plan = (position.metadata_json or {}).get("take_profit_plan") or []
+    for entry in plan:
+        if not isinstance(entry, dict) or entry.get("runner") or bool(entry.get("filled")):
+            continue
+        if not bool(entry.get("skipped")):
+            continue
+        level = str(entry.get("level", ""))
+        if level in {"tp1", "tp2", "tp3"}:
+            skipped.append(level)
+    return skipped
+
+
 def _planned_protection_price(position: Position, order_type: str) -> Decimal | None:
     if order_type == "stop_loss":
         return position.stop_loss
@@ -864,7 +889,7 @@ def _create_missing_protection_orders(
     sz_decimals: int,
     remote_size: Decimal | None,
     remote_position: dict | None = None,
-) -> None:
+) -> Decimal:
     expected_types = _expected_protection_order_types(position)
     existing_orders = (
         db.query(Order)
@@ -878,6 +903,7 @@ def _create_missing_protection_orders(
     existing_types = {order.order_type for order in existing_orders}
     close_is_buy = position.side.lower() == "short"
     signal_id = _source_signal_id(position)
+    market_closed_size = Decimal("0")
 
     for order_type in expected_types:
         if order_type in existing_types:
@@ -931,6 +957,27 @@ def _create_missing_protection_orders(
                         coin=coin,
                     )
                 else:
+                    closed_size = _market_close_breached_tp_tranche(
+                        db,
+                        position,
+                        coin,
+                        order_type,
+                        trading,
+                        expires_after_seconds,
+                        float(effective_live_execution_settings(db, get_settings())["max_slippage_pct"]),
+                        sz_decimals,
+                        remote_size,
+                        mark_px,
+                        price,
+                        rescue_count,
+                        rescue_indicators,
+                        order=None,
+                    )
+                    market_closed_size += closed_size
+                    if closed_size > 0:
+                        if position.status != "open":
+                            break
+                        continue
                     _mark_tp_plan_entry_skipped(position, order_type, mark_px)
                     db.add(position)
                     db.add(
@@ -1041,6 +1088,7 @@ def _create_missing_protection_orders(
                 },
             )
         )
+    return market_closed_size
 
 
 def protection_state_for_live_position(
@@ -1066,6 +1114,7 @@ def protection_state_for_live_position(
 
     missing: list[str] = []
     rejected: list[str] = []
+    skipped: list[str] = []
     active: list[str] = []
 
     for order_type in expected_types:
@@ -1090,6 +1139,25 @@ def protection_state_for_live_position(
         else:
             missing.append(order_type)
 
+    for order_type in _skipped_unfilled_protection_order_types(position):
+        protection_order = latest_by_type.get(order_type)
+        if protection_order is not None and protection_order.status == "filled":
+            continue
+        if protection_order is not None:
+            match = _match_frontend_protection_order(frontend_orders, protection_order, position)
+        else:
+            price = _planned_protection_price(position, order_type)
+            match = (
+                _match_frontend_order_for_missing(frontend_orders, position, order_type, price)
+                if price is not None
+                else None
+            )
+        if match is not None:
+            if order_type not in active:
+                active.append(order_type)
+            continue
+        skipped.append(order_type)
+
     metadata = dict(position.metadata_json or {})
     stop_failure = metadata.get("last_stop_replacement_failure")
     stop_attempts = int(metadata.get("stop_replacement_attempts") or 0)
@@ -1101,6 +1169,8 @@ def protection_state_for_live_position(
         issues.extend([f"missing:{item}" for item in missing])
     if rejected:
         issues.extend([f"rejected:{item}" for item in rejected])
+    if skipped:
+        issues.extend([f"skipped:{item}" for item in skipped])
     if stop_failure:
         issues.append("stop_update_failed")
     needs_intervention = bool(issues)
@@ -1110,6 +1180,8 @@ def protection_state_for_live_position(
             summary_parts.append("Missing " + ", ".join(missing))
         if rejected:
             summary_parts.append("Rejected " + ", ".join(rejected))
+        if skipped:
+            summary_parts.append("Skipped " + ", ".join(skipped))
         if stop_failure:
             summary_parts.append("stop update failed")
         summary = " | ".join(summary_parts)
@@ -1119,17 +1191,335 @@ def protection_state_for_live_position(
     return {
         "status": "intervention_required" if needs_intervention else "ok",
         "needs_intervention": needs_intervention,
-        "repairable": True,
+        "repairable": bool(missing or rejected or stop_failure),
         "expected_orders": expected_types,
         "active_orders": active,
         "missing_orders": missing,
         "rejected_orders": rejected,
+        "skipped_orders": skipped,
         "issues": issues,
         "summary": summary,
         "local_position_id": position.id,
         "stop_update_failed": bool(stop_failure),
         "stop_replacement_attempts": stop_attempts,
     }
+
+
+def _mark_tp_plan_entry_market_filled(
+    position: Position,
+    order_type: str,
+    exit_price: Decimal,
+    exit_size: Decimal,
+    mark_price: Decimal,
+    original_target: Decimal,
+    now: datetime,
+) -> None:
+    metadata = dict(position.metadata_json or {})
+    plan = metadata.get("take_profit_plan")
+    if isinstance(plan, list):
+        for entry in plan:
+            if not isinstance(entry, dict) or entry.get("level") != order_type:
+                continue
+            entry["filled"] = True
+            entry["filled_price"] = str(exit_price)
+            entry["filled_size"] = str(exit_size)
+            entry["market_rescued"] = True
+            entry["market_rescue_reason"] = "tp_price_already_breached"
+            entry["market_rescue_at"] = now.isoformat()
+            entry["market_rescue_mark_price"] = str(mark_price)
+            entry["market_rescue_target_price"] = str(original_target)
+            entry.pop("skipped", None)
+            entry.pop("skip_reason", None)
+            break
+    metadata["partial_exit_count"] = int(metadata.get("partial_exit_count") or 0) + 1
+    metadata["remaining_size"] = str(position.size)
+    metadata["last_exit_price"] = str(exit_price)
+    metadata["last_exit_reason"] = order_type
+    if order_type == "tp1":
+        metadata["tp1_hit"] = True
+    elif order_type == "tp2":
+        metadata["tp2_hit"] = True
+        metadata["runner_active"] = True
+    if position.status == "closed":
+        metadata["exit_price"] = str(exit_price)
+        metadata["exit_reason"] = order_type
+    position.metadata_json = metadata
+
+
+def _market_close_breached_tp_tranche(
+    db: Session,
+    position: Position,
+    coin: str,
+    order_type: str,
+    trading: HyperliquidTradingClient,
+    expires_after_seconds: int,
+    max_slippage_pct: float,
+    sz_decimals: int,
+    remote_size: Decimal | None,
+    mark_price: Decimal,
+    target_price: Decimal,
+    rescue_count: int,
+    rescue_indicators: dict,
+    order: Order | None = None,
+) -> Decimal:
+    allocation = _planned_protection_allocation(position, order_type)
+    if remote_size is None or remote_size <= 0 or allocation is None or allocation <= 0:
+        db.add(
+            DecisionLog(
+                event_type="live_protection_order_tp_market_rescue_skipped",
+                market_id=position.market_id,
+                position_id=position.id,
+                message=f"Protection order {order_type} market rescue skipped: invalid size or allocation",
+                data={
+                    "coin": coin,
+                    "order_id": order.id if order is not None else None,
+                    "order_type": order_type,
+                    "remote_size": str(remote_size) if remote_size is not None else None,
+                    "allocation": str(allocation) if allocation is not None else None,
+                    "target_price": str(target_price),
+                    "mark_price": str(mark_price),
+                },
+            )
+        )
+        return Decimal("0")
+
+    submit_size = _round_size(remote_size * allocation, sz_decimals)
+    if submit_size <= 0:
+        db.add(
+            DecisionLog(
+                event_type="live_protection_order_tp_market_rescue_skipped",
+                market_id=position.market_id,
+                position_id=position.id,
+                message=f"Protection order {order_type} market rescue skipped: rounded size is zero",
+                data={
+                    "coin": coin,
+                    "order_id": order.id if order is not None else None,
+                    "order_type": order_type,
+                    "remote_size": str(remote_size),
+                    "allocation": str(allocation),
+                    "rounded_size": str(submit_size),
+                    "target_price": str(target_price),
+                    "mark_price": str(mark_price),
+                },
+            )
+        )
+        return Decimal("0")
+
+    now = datetime.now(UTC)
+    live_settings = effective_live_execution_settings(db, get_settings())
+    min_notional = Decimal(str(live_settings["min_reduce_only_notional_usd"]))
+    submit_notional = abs(submit_size * mark_price)
+    if submit_notional < min_notional:
+        raw = dict(order.raw_response or {}) if order is not None else {}
+        raw["market_close_rescue"] = {
+            "attempted_at": now.isoformat(),
+            "status": "skipped",
+            "reason": "below_min_notional",
+            "target_price": str(target_price),
+            "mark_price": str(mark_price),
+            "size": str(submit_size),
+            "notional": str(submit_notional),
+            "min_notional": str(min_notional),
+        }
+        if order is not None:
+            _set_order_raw_response(order, raw)
+            db.add(order)
+        db.add(
+            DecisionLog(
+                event_type="live_protection_order_tp_market_rescue_skipped",
+                market_id=position.market_id,
+                position_id=position.id,
+                message=(
+                    f"Protection order {order_type} market rescue skipped: "
+                    f"notional {submit_notional} below minimum {min_notional}"
+                ),
+                data={
+                    "coin": coin,
+                    "order_id": order.id if order is not None else None,
+                    "order_type": order_type,
+                    "target_price": str(target_price),
+                    "mark_price": str(mark_price),
+                    "size": str(submit_size),
+                    "notional": str(submit_notional),
+                    "min_notional": str(min_notional),
+                    "reason": "below_min_notional",
+                },
+            )
+        )
+        return Decimal("0")
+
+    close_is_buy = position.side.lower() == "short"
+    try:
+        result = trading.submit_market_close(
+            coin=coin,
+            is_buy=close_is_buy,
+            size=submit_size,
+            max_slippage_pct=max_slippage_pct,
+            expires_after_seconds=expires_after_seconds,
+        )
+    except Exception as exc:
+        if order is not None:
+            raw = dict(order.raw_response or {})
+            raw["market_close_rescue"] = {
+                "attempted_at": now.isoformat(),
+                "status": "error",
+                "error": str(exc),
+                "target_price": str(target_price),
+                "mark_price": str(mark_price),
+                "size": str(submit_size),
+            }
+            _set_order_raw_response(order, raw)
+            order.status = "error"
+            db.add(order)
+        db.add(
+            DecisionLog(
+                event_type="live_protection_order_tp_market_rescue_failed",
+                market_id=position.market_id,
+                position_id=position.id,
+                message=f"Protection order {order_type} market rescue failed",
+                data={
+                    "coin": coin,
+                    "order_id": order.id if order is not None else None,
+                    "order_type": order_type,
+                    "target_price": str(target_price),
+                    "mark_price": str(mark_price),
+                    "size": str(submit_size),
+                    "error": str(exc),
+                },
+            )
+        )
+        return Decimal("0")
+
+    filled_size = result.filled_size
+    if result.status != "ok" or filled_size is None or filled_size <= 0:
+        raw = dict(order.raw_response or {}) if order is not None else {}
+        raw["market_close_rescue"] = {
+            "attempted_at": now.isoformat(),
+            "status": result.status,
+            "response": result.raw_response,
+            "target_price": str(target_price),
+            "mark_price": str(mark_price),
+            "size": str(submit_size),
+        }
+        if order is not None:
+            _set_order_raw_response(order, raw)
+            order.status = "error"
+            db.add(order)
+        db.add(
+            DecisionLog(
+                event_type="live_protection_order_tp_market_rescue_rejected",
+                market_id=position.market_id,
+                position_id=position.id,
+                message=f"Protection order {order_type} market rescue rejected or unfilled",
+                data={
+                    "coin": coin,
+                    "order_id": order.id if order is not None else None,
+                    "order_type": order_type,
+                    "target_price": str(target_price),
+                    "mark_price": str(mark_price),
+                    "size": str(submit_size),
+                    "status": result.status,
+                    "response": result.raw_response,
+                },
+            )
+        )
+        return Decimal("0")
+
+    exit_size = min(filled_size, position.size)
+    if exit_size <= 0:
+        return Decimal("0")
+    exit_price = result.avg_price or mark_price
+    side = position.side.lower()
+    pnl_multiplier = Decimal("1") if side == "long" else Decimal("-1")
+    realized_pnl = (exit_price - position.entry_price) * exit_size * pnl_multiplier
+    position.realized_pnl = Decimal(position.realized_pnl or 0) + realized_pnl
+    remaining_size = position.size - exit_size
+    if remaining_size <= _POSITION_DUST_THRESHOLD:
+        position.status = "closed"
+        position.closed_at = now
+        position.size = Decimal("0")
+        position.unrealized_pnl = Decimal("0")
+    else:
+        position.size = remaining_size
+    _mark_tp_plan_entry_market_filled(
+        position,
+        order_type,
+        exit_price,
+        exit_size,
+        mark_price,
+        target_price,
+        now,
+    )
+    db.add(position)
+
+    raw = dict(order.raw_response or {}) if order is not None else {}
+    raw["market_close_rescue"] = {
+        "attempted_at": now.isoformat(),
+        "status": result.status,
+        "oid": result.oid,
+        "response": result.raw_response,
+        "target_price": str(target_price),
+        "mark_price": str(mark_price),
+        "exit_price": str(exit_price),
+        "filled_size": str(exit_size),
+        "rescue_count": rescue_count,
+        "rescue_indicators": rescue_indicators,
+    }
+    signal_id = _source_signal_id(position)
+    if order is not None:
+        order.hyperliquid_order_id = result.oid or order.hyperliquid_order_id
+        order.status = "filled"
+        order.price = exit_price
+        order.size = exit_size
+        order.fee = result.fee
+        _set_order_raw_response(order, raw)
+        db.add(order)
+        order_id = order.id
+    else:
+        created = Order(
+            position_id=position.id,
+            signal_id=signal_id,
+            hyperliquid_order_id=result.oid,
+            mode=OrderMode.LIVE.value,
+            order_type=order_type,
+            side="buy" if close_is_buy else "sell",
+            price=exit_price,
+            size=exit_size,
+            status="filled",
+            reduce_only=True,
+            fee=result.fee,
+            raw_response=raw,
+        )
+        db.add(created)
+        order_id = None
+
+    db.add(
+        DecisionLog(
+            event_type="live_protection_order_tp_market_rescued",
+            market_id=position.market_id,
+            position_id=position.id,
+            signal_id=signal_id,
+            message=(
+                f"Protection order {order_type} market-rescued: target {target_price} "
+                f"was already breached at mark {mark_price}; closed {exit_size} @ {exit_price}"
+            ),
+            data={
+                "coin": coin,
+                "order_id": order_id,
+                "order_type": order_type,
+                "target_price": str(target_price),
+                "mark_price": str(mark_price),
+                "exit_price": str(exit_price),
+                "filled_size": str(exit_size),
+                "remaining_size": str(position.size),
+                "realized_pnl": str(realized_pnl),
+                "rescue_count": rescue_count,
+                "rescue_indicators": rescue_indicators,
+                "oid": result.oid,
+            },
+        )
+    )
+    return exit_size
 
 
 def _violates_liquidation_guard(position: Position, stop_price: Decimal, remote_position: dict | None) -> bool:
@@ -1157,7 +1547,7 @@ def _resubmit_missing_protection_orders(
     remote_position: dict | None = None,
     remote_size: Decimal | None = None,
     force_repair: bool = False,
-) -> None:
+) -> Decimal:
     """Detect protection orders that have disappeared from HL and re-submit them.
 
     An order is considered missing when its recorded oid (and cloid) are absent
@@ -1184,7 +1574,7 @@ def _resubmit_missing_protection_orders(
         .all()
     )
     if not pending_orders:
-        return
+        return Decimal("0")
     latest_by_type: dict[str, Order] = {}
     for order in pending_orders:
         current = latest_by_type.get(order.order_type)
@@ -1194,6 +1584,9 @@ def _resubmit_missing_protection_orders(
 
     close_is_buy = position.side.lower() == "short"
     allocation_map = _tp_allocation_map(position)
+    live_settings = effective_live_execution_settings(db, get_settings())
+    max_slippage_pct = float(live_settings["max_slippage_pct"])
+    market_closed_size = Decimal("0")
 
     for order in pending_orders:
         if order.status in _TERMINAL_ORDER_STATUSES:
@@ -1221,6 +1614,10 @@ def _resubmit_missing_protection_orders(
         if frontend_match is not None:
             _sync_order_from_frontend_open_order(db, position, order, frontend_match)
             continue
+        if order.order_type in {"tp1", "tp2", "tp3"}:
+            entry = _tp_plan_entry(position, order.order_type)
+            if isinstance(entry, dict) and bool(entry.get("skipped")):
+                continue
 
         if order.price is None:
             continue
@@ -1299,6 +1696,28 @@ def _resubmit_missing_protection_orders(
                     )
                     # Fall through al normale flow di resubmit con il nuovo prezzo.
                 else:
+                    closed_size = _market_close_breached_tp_tranche(
+                        db,
+                        position,
+                        coin,
+                        order.order_type,
+                        trading,
+                        expires_after_seconds,
+                        max_slippage_pct,
+                        sz_decimals,
+                        remote_size,
+                        mark_px,
+                        order.price,
+                        rescue_count,
+                        rescue_indicators,
+                        order=order,
+                    )
+                    market_closed_size += closed_size
+                    if closed_size > 0:
+                        if position.status != "open":
+                            break
+                        continue
+                    raw = dict(order.raw_response or {})
                     raw["resubmit_blocked"] = {
                         "reason": "tp_price_already_breached",
                         "blocked_at": now.isoformat(),
@@ -1620,6 +2039,7 @@ def _resubmit_missing_protection_orders(
                 order_type=order.order_type,
                 error=str(exc),
             )
+    return market_closed_size
 
 
 def _resize_local_stop_orders(
@@ -2196,12 +2616,19 @@ def reconcile_live_positions(
 
     live_settings = effective_live_execution_settings(db, settings)
     expires_after_seconds = int(live_settings["order_expires_after_seconds"])
+    local_open_position_coins: set[str] = set()
+    for position in positions:
+        if position.market is None:
+            continue
+        with contextlib.suppress(ValueError):
+            local_open_position_coins.add(_coin_for_market(position.market))
     orphan_orders_canceled = _cancel_orphan_protection_orders(
         db,
         remote_positions,
         raw_frontend_open_orders,
         trading,
         expires_after_seconds,
+        local_open_position_coins,
     )
 
     if not positions:
@@ -2230,7 +2657,33 @@ def reconcile_live_positions(
             )
             metadata["realized_pnl"] = str(position.realized_pnl)
         if remote is None:
-            original_size = position.size
+            hl_fill = (
+                _find_close_fill(coin, position.opened_at, fills_by_coin)
+                if fill_match.last_exit_price is None
+                else None
+            )
+            if fill_match.last_exit_price is None and hl_fill is None:
+                metadata["remote_missing_unconfirmed_at"] = now.isoformat()
+                metadata["remote_missing_unconfirmed_count"] = _remote_missing_count(metadata)
+                metadata["remote_missing_unconfirmed_reason"] = "no_remote_position_without_close_fill"
+                position.metadata_json = metadata
+                db.add(position)
+                db.add(
+                    DecisionLog(
+                        event_type="live_reconciliation_remote_missing_unconfirmed",
+                        market_id=position.market_id,
+                        position_id=position.id,
+                        message="Live position missing from HL snapshot but no close fill was confirmed",
+                        data={
+                            "coin": coin,
+                            "local_size": str(position.size),
+                            "remote_missing_count": metadata["remote_missing_unconfirmed_count"],
+                        },
+                    )
+                )
+                updated += 1
+                continue
+
             position.status = "closed"
             position.closed_at = now
             position.size = Decimal("0")
@@ -2241,12 +2694,22 @@ def reconcile_live_positions(
                 if fill_match.last_exit_reason is not None:
                     metadata["exit_reason"] = fill_match.last_exit_reason
 
+            if (
+                fill_match.last_exit_price is not None
+                and realized_delta == 0
+                and position.realized_pnl is None
+            ):
+                position.realized_pnl = Decimal("0")
+                metadata["realized_pnl"] = "0"
+
             if realized_delta == 0 and position.realized_pnl is None:
                 # Fill not matched via cloid/oid. Strategy (highest accuracy first):
                 # 1. Search the already-fetched HL fills for a close fill on this coin
                 #    — gives exact avg price + true P&L (includes funding/fees).
-                # 2. Fall back to the most recent pending SL/TP order's trigger price.
-                hl_fill = _find_close_fill(coin, position.opened_at, fills_by_coin)
+                # If neither source confirms a fill, keep the local position open.
+                # A transient/incomplete user_state payload must not cancel
+                # protection orders or turn real live exposure into an untracked
+                # position.
                 if hl_fill is not None:
                     hl_px = _decimal(hl_fill.get("px"))
                     hl_pnl = _decimal(hl_fill.get("closedPnl"))
@@ -2266,44 +2729,6 @@ def reconcile_live_positions(
                                     "exit_price": str(hl_px),
                                     "realized_pnl": str(hl_pnl),
                                     "fill": hl_fill,
-                                },
-                            )
-                        )
-                else:
-                    # No HL fill found: fall back to pending SL/TP trigger price
-                    pending_exit = (
-                        db.query(Order)
-                        .filter(
-                            Order.position_id == position.id,
-                            Order.mode == OrderMode.LIVE.value,
-                            Order.order_type.in_(_RECONCILED_EXIT_TYPES),
-                            Order.status.notin_(_TERMINAL_ORDER_STATUSES),
-                        )
-                        .order_by(Order.created_at.desc())
-                        .first()
-                    )
-                    if pending_exit is not None and pending_exit.price is not None:
-                        exit_sz = pending_exit.size or original_size
-                        pnl_sign = Decimal("1") if position.side.lower() == "long" else Decimal("-1")
-                        est_pnl = (pending_exit.price - position.entry_price) * exit_sz * pnl_sign
-                        position.realized_pnl = est_pnl
-                        metadata["realized_pnl"] = str(est_pnl)
-                        metadata["exit_price"] = str(pending_exit.price)
-                        metadata["exit_reason"] = pending_exit.order_type
-                        pending_exit.status = "filled"
-                        db.add(pending_exit)
-                        db.add(
-                            DecisionLog(
-                                event_type="live_reconciliation_sl_fallback",
-                                market_id=position.market_id,
-                                position_id=position.id,
-                                message="SL/TP fill not in HL history; P&L estimated from trigger price",
-                                data={
-                                    "coin": coin,
-                                    "order_id": pending_exit.id,
-                                    "exit_price": str(pending_exit.price),
-                                    "exit_size": str(exit_sz),
-                                    "realized_pnl": str(est_pnl),
                                 },
                             )
                         )
@@ -2351,6 +2776,9 @@ def reconcile_live_positions(
 
         # Compute remote_abs early so _resubmit_missing_protection_orders can
         # use the actual HL position size to derive correct TP/SL sizes.
+        metadata.pop("remote_missing_unconfirmed_at", None)
+        metadata.pop("remote_missing_unconfirmed_count", None)
+        metadata.pop("remote_missing_unconfirmed_reason", None)
         remote_size_raw = _decimal(remote.get("szi"))
         remote_abs: Decimal | None = abs(remote_size_raw) if remote_size_raw is not None else None
         close_fill = (
@@ -2386,7 +2814,7 @@ def reconcile_live_positions(
                     )
 
         if open_orders_available:
-            _create_missing_protection_orders(
+            market_closed_size = _create_missing_protection_orders(
                 db,
                 position,
                 coin,
@@ -2397,20 +2825,31 @@ def reconcile_live_positions(
                 remote_abs,
                 remote_position=remote,
             )
-            _resubmit_missing_protection_orders(
-                db,
-                position,
-                coin,
-                hl_open_oids,
-                hl_open_cloids,
-                frontend_open_orders_by_coin.get(coin, []),
-                trading,
-                expires_after_seconds,
-                _sz_decimals(position.market),
-                remote_position=remote,
-                remote_size=remote_abs,
-                force_repair=force_repair,
-            )
+            if position.status == "open":
+                market_closed_size += _resubmit_missing_protection_orders(
+                    db,
+                    position,
+                    coin,
+                    hl_open_oids,
+                    hl_open_cloids,
+                    frontend_open_orders_by_coin.get(coin, []),
+                    trading,
+                    expires_after_seconds,
+                    _sz_decimals(position.market),
+                    remote_position=remote,
+                    remote_size=remote_abs,
+                    force_repair=force_repair,
+                )
+            if market_closed_size > 0 and remote_size_raw is not None:
+                adjusted_remote_abs = max(Decimal("0"), abs(remote_size_raw) - market_closed_size)
+                remote_size_raw = adjusted_remote_abs if remote_size_raw > 0 else -adjusted_remote_abs
+                remote["szi"] = str(remote_size_raw)
+                metadata = dict(position.metadata_json or {})
+                position.metadata_json = metadata
+                if position.status != "open":
+                    db.add(position)
+                    updated += 1
+                    continue
 
         remote_size = remote_size_raw
         if remote_size is not None:

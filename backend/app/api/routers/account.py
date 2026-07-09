@@ -7,7 +7,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from app.api.routers.common import _decimal, _log_and_redact, _string_decimal
@@ -48,6 +48,12 @@ router = APIRouter()
 
 _ACCOUNT_SNAPSHOT_CACHE_TTL_SECONDS = 25.0
 _ACCOUNT_SNAPSHOT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_ACCOUNT_LEDGER_CACHE_TTL_SECONDS = 300.0
+_ACCOUNT_LEDGER_LOOKBACK_DAYS = 365
+_ACCOUNT_LEDGER_LIMIT = 50
+_ACCOUNT_LEDGER_CACHE: dict[str, tuple[float, list[dict[str, Any]], str | None]] = {}
+_ACCOUNT_PERFORMANCE_CACHE_TTL_SECONDS = 300.0
+_ACCOUNT_PERFORMANCE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def _parse_utc_datetime(value: Any) -> datetime | None:
@@ -101,6 +107,14 @@ def _account_snapshot_cache_key(settings: Any) -> str:
     return f"{settings.hyperliquid_network}:{settings.hyperliquid_account_address or 'none'}"
 
 
+def _account_ledger_cache_key(settings: Any) -> str:
+    return f"{settings.hyperliquid_network}:{settings.hyperliquid_account_address or 'none'}:ledger"
+
+
+def _account_performance_cache_key(settings: Any) -> str:
+    return f"{settings.hyperliquid_network}:{settings.hyperliquid_account_address or 'none'}:performance"
+
+
 def _uar_setting_decimal(risk: dict, key: str) -> Decimal:
     default = DEFAULT_UAR_RISK_SETTINGS[key]
     return decimal_or_none(risk.get(key, default)) or Decimal(str(default))
@@ -144,6 +158,7 @@ def _merge_protection_states(states: list[dict[str, Any]]) -> dict[str, Any]:
             "active_orders": [],
             "missing_orders": [],
             "rejected_orders": [],
+            "skipped_orders": [],
             "issues": [],
             "summary": "No Trado live position linked to this Hyperliquid position",
             "local_position_ids": [],
@@ -154,26 +169,31 @@ def _merge_protection_states(states: list[dict[str, Any]]) -> dict[str, Any]:
     active = sorted({item for state in states for item in state.get("active_orders", [])})
     missing = sorted({item for state in states for item in state.get("missing_orders", [])})
     rejected = sorted({item for state in states for item in state.get("rejected_orders", [])})
+    skipped = sorted({item for state in states for item in state.get("skipped_orders", [])})
     issues = [issue for state in states for issue in state.get("issues", [])]
     position_ids = [int(state["local_position_id"]) for state in states if state.get("local_position_id") is not None]
     stop_update_failed = any(bool(state.get("stop_update_failed")) for state in states)
     stop_attempts = max((int(state.get("stop_replacement_attempts") or 0) for state in states), default=0)
-    needs_intervention = bool(missing or rejected or stop_update_failed)
+    needs_intervention = bool(missing or rejected or skipped or stop_update_failed)
+    repairable = any(bool(state.get("repairable")) for state in states)
     summary_parts: list[str] = []
     if missing:
         summary_parts.append("Missing " + ", ".join(missing))
     if rejected:
         summary_parts.append("Rejected " + ", ".join(rejected))
+    if skipped:
+        summary_parts.append("Skipped " + ", ".join(skipped))
     if stop_update_failed:
         summary_parts.append("stop update failed")
     return {
         "status": "intervention_required" if needs_intervention else "ok",
         "needs_intervention": needs_intervention,
-        "repairable": True,
+        "repairable": repairable,
         "expected_orders": expected,
         "active_orders": active,
         "missing_orders": missing,
         "rejected_orders": rejected,
+        "skipped_orders": skipped,
         "issues": issues,
         "summary": " | ".join(summary_parts) if summary_parts else "All expected protection orders are present",
         "local_position_ids": position_ids,
@@ -227,6 +247,265 @@ def _predicted_funding_payload(row: Any) -> dict | None:
     return {"coin": coin, "hyperliquid": hyperliquid, "exchanges": compact_exchanges}
 
 
+def _ledger_row_time(row: dict[str, Any]) -> int | None:
+    value = row.get("time")
+    if not isinstance(value, (int, str)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ledger_delta(row: dict[str, Any]) -> dict[str, Any]:
+    delta = row.get("delta")
+    return delta if isinstance(delta, dict) else {}
+
+
+def _ledger_amount(delta: dict[str, Any]) -> tuple[Any, str | None]:
+    for key, asset in (
+        ("usdc", "USDC"),
+        ("amount", None),
+        ("totalAmount", None),
+        ("tokenAmount", None),
+        ("hype", "HYPE"),
+    ):
+        value = delta.get(key)
+        if value is not None:
+            inferred_asset = asset or delta.get("coin") or delta.get("token") or delta.get("asset")
+            return value, str(inferred_asset) if inferred_asset else None
+    return None, None
+
+
+def _ledger_label(raw_type: str, kind: str) -> str:
+    labels = {
+        "deposit": "Deposito",
+        "withdraw": "Prelievo",
+        "vaultDeposit": "Deposito vault",
+        "vaultWithdraw": "Prelievo vault",
+        "cDeposit": "Deposito core",
+        "cWithdraw": "Prelievo core",
+    }
+    if raw_type in labels:
+        return labels[raw_type]
+    return "Deposito" if kind == "deposit" else "Prelievo"
+
+
+def _ledger_transfer_kind(delta: dict[str, Any], raw_type: str) -> str | None:
+    normalized = raw_type.lower()
+    if "withdraw" in normalized:
+        return "withdrawal"
+    if "deposit" in normalized:
+        return "deposit"
+    if normalized == "send":
+        source_dex = str(delta.get("sourceDex") or "").lower()
+        destination_dex = str(delta.get("destinationDex") or "").lower()
+        if source_dex == "spot" and destination_dex == "":
+            return "deposit"
+        if source_dex == "" and destination_dex == "spot":
+            return "withdrawal"
+    return None
+
+
+def _ledger_transfer_payload(row: dict[str, Any]) -> dict[str, Any] | None:
+    delta = _ledger_delta(row)
+    raw_type = str(delta.get("type") or row.get("type") or "")
+    kind = _ledger_transfer_kind(delta, raw_type)
+    if kind is None:
+        return None
+    amount_raw, asset = _ledger_amount(delta)
+    amount = _decimal(amount_raw)
+    signed_amount = None
+    if amount is not None:
+        signed_amount = -abs(amount) if kind == "withdrawal" else abs(amount)
+    hash_value = row.get("hash")
+    return {
+        "time": _ledger_row_time(row),
+        "kind": kind,
+        "label": _ledger_label(raw_type, kind),
+        "raw_type": raw_type or None,
+        "asset": asset or "USDC",
+        "amount": _string_decimal(amount_raw),
+        "signed_amount": str(signed_amount) if signed_amount is not None else None,
+        "hash": str(hash_value) if hash_value else None,
+    }
+
+
+def _decimal_sum(values: list[Decimal | None]) -> Decimal:
+    return sum((value or Decimal("0") for value in values), Decimal("0"))
+
+
+def _transfer_net_usdc(transfers: list[dict[str, Any]]) -> Decimal:
+    total = Decimal("0")
+    for transfer in transfers:
+        asset = str(transfer.get("asset") or "USDC").upper()
+        if asset != "USDC":
+            continue
+        amount = _decimal(transfer.get("signed_amount"))
+        if amount is not None:
+            total += amount
+    return total
+
+
+def _funding_usdc(row: dict[str, Any]) -> Decimal | None:
+    delta = row.get("delta")
+    if isinstance(delta, dict):
+        for key in ("usdc", "funding", "amount"):
+            value = _decimal(delta.get(key))
+            if value is not None:
+                return value
+    for key in ("usdc", "funding", "amount"):
+        value = _decimal(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _performance_components_payload(
+    fills: list[dict[str, Any]],
+    funding_rows: list[dict[str, Any]],
+    *,
+    fill_error: str | None = None,
+    funding_error: str | None = None,
+) -> dict[str, Any]:
+    closed_pnl = _decimal_sum([
+        _decimal(row.get("closedPnl")) for row in fills if isinstance(row, dict)
+    ])
+    fees = _decimal_sum([
+        _decimal(row.get("fee")) for row in fills if isinstance(row, dict)
+    ])
+    funding = _decimal_sum([
+        _funding_usdc(row) for row in funding_rows if isinstance(row, dict)
+    ])
+    errors = [error for error in (fill_error, funding_error) if error]
+    return {
+        "hl_closed_pnl_gross_usdc": closed_pnl,
+        "hl_fees_usdc": fees,
+        "hl_funding_usdc": funding,
+        "fill_count": len([row for row in fills if isinstance(row, dict)]),
+        "funding_count": len([row for row in funding_rows if isinstance(row, dict)]),
+        "error": " | ".join(errors) if errors else None,
+    }
+
+
+async def _fetch_account_performance_components(
+    settings: Any,
+    checked_at: datetime,
+) -> dict[str, Any]:
+    address = settings.hyperliquid_account_address
+    if not address:
+        return _performance_components_payload([], [])
+    cache_key = _account_performance_cache_key(settings)
+    cached = _ACCOUNT_PERFORMANCE_CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, cached_payload = cached
+        if perf_counter() - cached_at <= _ACCOUNT_PERFORMANCE_CACHE_TTL_SECONDS:
+            return deepcopy(cached_payload)
+
+    client = HyperliquidClient(settings)
+    fills: list[dict[str, Any]] = []
+    funding_rows: list[dict[str, Any]] = []
+    fill_error = None
+    funding_error = None
+    end_ms = int(checked_at.timestamp() * 1000)
+    start_ms = end_ms - (_ACCOUNT_LEDGER_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+    try:
+        fills = await client.user_fills(address)
+    except Exception as exc:
+        fill_error = _log_and_redact("account_snapshot_user_fills_error", exc)
+    try:
+        funding_rows = await client.user_funding(address, start_ms, end_ms)
+    except Exception as exc:
+        funding_error = _log_and_redact("account_snapshot_user_funding_error", exc)
+
+    payload = _performance_components_payload(
+        fills if isinstance(fills, list) else [],
+        funding_rows if isinstance(funding_rows, list) else [],
+        fill_error=fill_error,
+        funding_error=funding_error,
+    )
+    _ACCOUNT_PERFORMANCE_CACHE[cache_key] = (perf_counter(), deepcopy(payload))
+    return payload
+
+
+def _scalar_decimal(query: Any) -> Decimal:
+    value = query.scalar()
+    return _decimal(value) or Decimal("0")
+
+
+def _local_live_performance_payload(db: Session) -> dict[str, Decimal]:
+    return {
+        "local_closed_realized_pnl_usdc": _scalar_decimal(
+            db.query(func.coalesce(func.sum(Position.realized_pnl), Decimal("0")))
+            .filter(Position.mode == "live", Position.status == "closed")
+        ),
+        "local_open_unrealized_pnl_usdc": _scalar_decimal(
+            db.query(func.coalesce(func.sum(Position.unrealized_pnl), Decimal("0")))
+            .filter(Position.mode == "live", Position.status == "open")
+        ),
+        "local_filled_fees_usdc": _scalar_decimal(
+            db.query(func.coalesce(func.sum(Order.fee), Decimal("0")))
+            .filter(Order.mode == "live", Order.status == "filled")
+        ),
+    }
+
+
+def _build_account_performance(
+    *,
+    transfers: list[dict[str, Any]],
+    transfers_error: str | None,
+    effective_account_value: Decimal | None,
+    open_unrealized_pnl: Decimal,
+    components: dict[str, Any],
+    local: dict[str, Decimal],
+) -> dict[str, Any]:
+    net_deposits = _transfer_net_usdc(transfers)
+    closed_pnl = components.get("hl_closed_pnl_gross_usdc")
+    fees = components.get("hl_fees_usdc")
+    funding = components.get("hl_funding_usdc")
+    component_error = components.get("error")
+    account_pnl = None
+    return_pct = None
+    if effective_account_value is not None and net_deposits != Decimal("0"):
+        account_pnl = effective_account_value - net_deposits
+        if net_deposits > Decimal("0"):
+            return_pct = (account_pnl / net_deposits) * Decimal("100")
+    known_components_pnl = None
+    reconciliation_gap = None
+    if isinstance(closed_pnl, Decimal) and isinstance(fees, Decimal) and isinstance(funding, Decimal):
+        known_components_pnl = closed_pnl - fees + funding + open_unrealized_pnl
+        if account_pnl is not None:
+            reconciliation_gap = account_pnl - known_components_pnl
+    if account_pnl is None:
+        status = "unavailable"
+    elif transfers_error or component_error:
+        status = "partial"
+    else:
+        status = "ok"
+    errors = [error for error in (transfers_error, component_error) if error]
+    return {
+        "status": status,
+        "basis": "effective_equity_minus_net_deposits",
+        "lookback_days": _ACCOUNT_LEDGER_LOOKBACK_DAYS,
+        "net_deposits_usdc": quantized_decimal(net_deposits),
+        "effective_equity_usdc": quantized_decimal(effective_account_value),
+        "account_pnl_usdc": quantized_decimal(account_pnl),
+        "account_return_pct": quantized_decimal(return_pct),
+        "open_unrealized_pnl_usdc": quantized_decimal(open_unrealized_pnl),
+        "hl_closed_pnl_gross_usdc": quantized_decimal(closed_pnl if isinstance(closed_pnl, Decimal) else None),
+        "hl_fees_usdc": quantized_decimal(fees if isinstance(fees, Decimal) else None),
+        "hl_funding_usdc": quantized_decimal(funding if isinstance(funding, Decimal) else None),
+        "known_components_pnl_usdc": quantized_decimal(known_components_pnl),
+        "reconciliation_gap_usdc": quantized_decimal(reconciliation_gap),
+        "local_closed_realized_pnl_usdc": quantized_decimal(local["local_closed_realized_pnl_usdc"]),
+        "local_open_unrealized_pnl_usdc": quantized_decimal(local["local_open_unrealized_pnl_usdc"]),
+        "local_filled_fees_usdc": quantized_decimal(local["local_filled_fees_usdc"]),
+        "fill_count": int(components.get("fill_count") or 0),
+        "funding_count": int(components.get("funding_count") or 0),
+        "error": " | ".join(errors) if errors else None,
+    }
+
+
 def _latest_account_snapshot(db: Session) -> dict | None:
     row = db.query(AccountSnapshot).order_by(AccountSnapshot.timestamp.desc()).first()
     if row is None:
@@ -276,6 +555,38 @@ async def _fetch_predicted_fundings(client: HyperliquidClient) -> tuple[list[dic
         ], None
     except Exception as exc:
         return [], _log_and_redact("account_snapshot_predicted_error", exc)
+
+
+async def _fetch_account_transfers(
+    settings: Any,
+    checked_at: datetime,
+) -> tuple[list[dict[str, Any]], str | None]:
+    address = settings.hyperliquid_account_address
+    if not address:
+        return [], None
+    cache_key = _account_ledger_cache_key(settings)
+    cached = _ACCOUNT_LEDGER_CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, cached_rows, cached_error = cached
+        if perf_counter() - cached_at <= _ACCOUNT_LEDGER_CACHE_TTL_SECONDS:
+            return deepcopy(cached_rows), cached_error
+
+    end_ms = int(checked_at.timestamp() * 1000)
+    start_ms = end_ms - (_ACCOUNT_LEDGER_LOOKBACK_DAYS * 24 * 60 * 60 * 1000)
+    try:
+        rows = await HyperliquidClient(settings).user_non_funding_ledger_updates(address, start_ms, end_ms)
+        transfers = [
+            item
+            for item in (_ledger_transfer_payload(row) for row in rows if isinstance(row, dict))
+            if item is not None
+        ]
+        transfers.sort(key=lambda item: item.get("time") or 0, reverse=True)
+        _ACCOUNT_LEDGER_CACHE[cache_key] = (perf_counter(), deepcopy(transfers), None)
+        return transfers, None
+    except Exception as exc:
+        error = _log_and_redact("account_snapshot_ledger_error", exc)
+        _ACCOUNT_LEDGER_CACHE[cache_key] = (perf_counter(), [], error)
+        return [], error
 
 
 def _hl_period_for_days(days: int) -> str:
@@ -432,6 +743,8 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
             client, address, checked_at
         )
         predicted_fundings, predicted_error = await _fetch_predicted_fundings(client)
+    transfers, transfers_error = await _fetch_account_transfers(settings, checked_at)
+    performance_components = await _fetch_account_performance_components(settings, checked_at)
 
     margin = (user_state or {}).get("marginSummary", {})
     cross_margin = (user_state or {}).get("crossMarginSummary", {})
@@ -527,6 +840,14 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
             )
         )
         db.commit()
+    performance = _build_account_performance(
+        transfers=transfers,
+        transfers_error=transfers_error,
+        effective_account_value=effective_account_value,
+        open_unrealized_pnl=unrealized_pnl,
+        components=performance_components,
+        local=_local_live_performance_payload(db),
+    )
 
     payload = {
         "status": "ok" if api_error is None and account_error is None else "degraded",
@@ -574,6 +895,13 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
             "user_last_24h": user_funding[:50],
             "error": predicted_error,
         },
+        "ledger": {
+            "status": "ok" if transfers_error is None else "error",
+            "lookback_days": _ACCOUNT_LEDGER_LOOKBACK_DAYS,
+            "transfers": transfers[:_ACCOUNT_LEDGER_LIMIT],
+            "error": transfers_error,
+        },
+        "performance": performance,
         "last_snapshot": _latest_account_snapshot(db),
     }
     if data_source == "rest" and api_error is None and account_error is None:

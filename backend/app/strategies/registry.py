@@ -10,6 +10,7 @@ from app.strategies.oi_trend_strategy import OITrendStrategy
 from app.strategies.rsi_strategy import RsiStrategy
 from app.strategies.supertrend_strategy import SupertrendStrategy
 from app.strategies.support_resistance_strategy import SupportResistanceStrategy
+from app.strategies.trend_following_adaptive_strategy import TrendFollowingAdaptiveStrategy
 from app.strategies.volume_profile_strategy import VolumeProfileStrategy
 from app.strategies.volume_spike import VolumeSpikeStrategy
 from app.strategies.vwap_strategy import VwapStrategy
@@ -33,5 +34,6 @@ def strategy_registry() -> dict[str, Strategy]:
         CvdDivergenceStrategy(),
         LiquidationCascadeStrategy(),
         VolumeProfileStrategy(),
+        TrendFollowingAdaptiveStrategy(),
     ]
     return {strategy.name: strategy for strategy in strategies}

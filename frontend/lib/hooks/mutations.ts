@@ -9,6 +9,10 @@ import {
   apiPost,
   ApiError,
   type AppSettings,
+  type LeaderboardAlphaImportResult,
+  type LeaderboardAlphaSyncResult,
+  type LeaderboardAlphaTrader,
+  type LeaderboardCopyPaperRunResult,
   type Strategy,
   type SystemService,
   type SystemServiceAction,
@@ -247,6 +251,95 @@ export function useClearQueuedStrategyTest() {
       qc.invalidateQueries({ queryKey: qk.tunerStrategyTests });
     },
     onError: (err) => toast.error(`Rimozione coda fallita: ${errorMessage(err)}`),
+  });
+}
+
+/* ── Leaderboard alpha ───────────────────────────────────────────────── */
+
+export function useCreateLeaderboardTrader() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: { address: string; label?: string; notes?: string }) =>
+      apiPost<LeaderboardAlphaTrader>("/api/leaderboard-alpha/traders", payload),
+    onSuccess: () => {
+      toast.success("Trader aggiunto alla watchlist");
+      qc.invalidateQueries({ queryKey: qk.leaderboardAlpha });
+    },
+    onError: (err) => toast.error(`Trader non aggiunto: ${errorMessage(err)}`),
+  });
+}
+
+export function useImportLeaderboardTopTraders() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => apiPost<LeaderboardAlphaImportResult>("/api/leaderboard-alpha/import-top"),
+    onSuccess: (data) => {
+      toast.success(`Top ROI importati: ${data.inserted} nuovi, ${data.updated} aggiornati`);
+      qc.invalidateQueries({ queryKey: qk.leaderboardAlpha });
+    },
+    onError: (err) => toast.error(`Import top trader fallito: ${errorMessage(err)}`),
+  });
+}
+
+export function useUpdateLeaderboardTrader() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      id,
+      patch,
+    }: {
+      id: number;
+      patch: Partial<Pick<LeaderboardAlphaTrader, "label" | "enabled" | "notes">>;
+    }) => apiPatch<LeaderboardAlphaTrader>(`/api/leaderboard-alpha/traders/${id}`, patch),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.leaderboardAlpha });
+    },
+    onError: (err) => toast.error(`Trader non aggiornato: ${errorMessage(err)}`),
+  });
+}
+
+export function useSyncLeaderboardTrader() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (id: number) =>
+      apiPost<LeaderboardAlphaSyncResult>(`/api/leaderboard-alpha/traders/${id}/sync`),
+    onSuccess: (data) => {
+      if (data.status === "rate_limited") {
+        toast.warning("Sync rimandata: budget Hyperliquid userFillsByTime esaurito");
+      } else {
+        toast.success(`Sync completata: ${data.inserted ?? 0} fill nuovi`);
+      }
+      qc.invalidateQueries({ queryKey: qk.leaderboardAlpha });
+    },
+    onError: (err) => toast.error(`Sync trader fallita: ${errorMessage(err)}`),
+  });
+}
+
+export function useSyncLeaderboardWatchlist() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => apiPost<LeaderboardAlphaSyncResult>("/api/leaderboard-alpha/sync"),
+    onSuccess: (data) => {
+      if ((data.rate_limited ?? 0) > 0) {
+        toast.warning(`Sync parziale: ${data.synced ?? 0} trader, budget HL esaurito`);
+      } else {
+        toast.success(`Watchlist sincronizzata: ${data.synced ?? 0} trader`);
+      }
+      qc.invalidateQueries({ queryKey: qk.leaderboardAlpha });
+    },
+    onError: (err) => toast.error(`Sync watchlist fallita: ${errorMessage(err)}`),
+  });
+}
+
+export function useRunLeaderboardCopyPaper() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () => apiPost<LeaderboardCopyPaperRunResult>("/api/leaderboard-alpha/copy-paper/run"),
+    onSuccess: (data) => {
+      toast.success(`Copy-paper aggiornato: ${data.opened ?? 0} aperte, ${data.closed ?? 0} chiuse`);
+      qc.invalidateQueries({ queryKey: qk.leaderboardAlpha });
+    },
+    onError: (err) => toast.error(`Copy-paper fallito: ${errorMessage(err)}`),
   });
 }
 

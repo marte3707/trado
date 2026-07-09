@@ -20,6 +20,7 @@ from app.core.runtime_settings import (
     effective_position_management_settings,
 )
 from app.db.models import (
+    AccountSnapshot,
     AppSetting,
     Candle,
     DecisionLog,
@@ -37,6 +38,7 @@ logger = structlog.get_logger()
 
 POSITION_DUST_THRESHOLD = Decimal("0.0000000001")
 TERMINAL_ORDER_STATUSES = frozenset({"filled", "canceled"})
+LIQUIDATION_GUARD_SL_SAFETY_BUFFER = Decimal("0.03")
 
 
 @dataclass(frozen=True)
@@ -375,6 +377,17 @@ class PositionManagementEngine:
             )
             candidates.append((locked, "lock_profit"))
 
+        pre_tp_candidate = self._pre_tp_profit_lock_price(
+            position=position,
+            current_price=candle.close,
+            current_r=current_r,
+            risk_per_unit=risk_per_unit,
+            config=config.get("preTpProfitLock", {}),
+            upper_r=move_be_at,
+        )
+        if pre_tp_candidate is not None:
+            candidates.append((pre_tp_candidate, "pre_tp_profit_lock"))
+
         activation = _decimal(trailing.get("activationR"), Decimal("1"))
         if activation is not None and current_r >= activation:
             atr_mult = self._atr_multiplier(trailing, position)
@@ -470,6 +483,281 @@ class PositionManagementEngine:
             indicators=indicators,
             r_multiple=current_r,
         )
+
+    def _pre_tp_profit_lock_price(
+        self,
+        *,
+        position: Position,
+        current_price: Decimal,
+        current_r: Decimal,
+        risk_per_unit: Decimal,
+        config: dict[str, Any],
+        upper_r: Decimal | None = Decimal("1"),
+    ) -> Decimal | None:
+        if not bool(config.get("enabled", True)):
+            return None
+        activation_r = _decimal(config.get("activationR"), Decimal("0.5"))
+        if activation_r is None or current_r < activation_r:
+            return None
+        if upper_r is not None and current_r >= upper_r:
+            return None
+        if position.size <= 0 or risk_per_unit <= 0:
+            return None
+
+        side = position.side.lower()
+        if side == "long":
+            estimated_profit = (current_price - position.entry_price) * position.size
+        elif side == "short":
+            estimated_profit = (position.entry_price - current_price) * position.size
+        else:
+            return None
+        min_profit = _decimal(config.get("minProfitUsd"), Decimal("1.5")) or Decimal("0")
+        if estimated_profit < min_profit:
+            return None
+
+        lock_fraction = _decimal(config.get("lockFractionOfR"), Decimal("0.35")) or Decimal("0")
+        min_lock_r = _decimal(config.get("minLockR"), Decimal("0.15")) or Decimal("0")
+        max_lock_r = _decimal(config.get("maxLockR"), Decimal("0.35")) or Decimal("0.35")
+        lock_r = current_r * lock_fraction
+        if lock_r < min_lock_r:
+            lock_r = min_lock_r
+        if max_lock_r > 0 and lock_r > max_lock_r:
+            lock_r = max_lock_r
+        if lock_r <= 0 or lock_r >= current_r:
+            return None
+
+        candidate = (
+            position.entry_price + risk_per_unit * lock_r
+            if side == "long"
+            else position.entry_price - risk_per_unit * lock_r
+        )
+        current_stop = position.stop_loss
+        if side == "long":
+            if candidate >= current_price:
+                return None
+            if current_stop is not None and candidate <= current_stop:
+                return None
+        else:
+            if candidate <= current_price:
+                return None
+            if current_stop is not None and candidate >= current_stop:
+                return None
+        return candidate
+
+    def pre_tp_profit_lock_candidate_for_price(
+        self,
+        position: Position,
+        current_price: Decimal,
+        *,
+        config: dict[str, Any],
+        source: str,
+    ) -> StopCandidate | None:
+        metadata = self.ensure_position_state(position)
+        risk_per_unit = _decimal(metadata.get("initial_risk_per_unit"), None)
+        initial_stop = _decimal(metadata.get("initial_stop_loss"), position.stop_loss)
+        if risk_per_unit is None and initial_stop is not None:
+            risk_per_unit = abs(position.entry_price - initial_stop)
+        if risk_per_unit is None or risk_per_unit <= 0:
+            return None
+        current_r = r_multiple(position, current_price, risk_per_unit)
+        price = self._pre_tp_profit_lock_price(
+            position=position,
+            current_price=current_price,
+            current_r=current_r,
+            risk_per_unit=risk_per_unit,
+            config=config,
+            upper_r=Decimal("1"),
+        )
+        if price is None:
+            return None
+        side = position.side.lower()
+        estimated_profit = (
+            (current_price - position.entry_price) * position.size
+            if side == "long"
+            else (position.entry_price - current_price) * position.size
+        )
+        return StopCandidate(
+            price=price,
+            reason="pre_tp_profit_lock",
+            indicators={
+                "current_price": str(current_price),
+                "estimated_profit_usd": str(estimated_profit),
+                "source": source,
+            },
+            r_multiple=current_r,
+        )
+
+    def manage_live_portfolio_profit_lock(
+        self,
+        db: Session,
+        trading_client: HyperliquidTradingClient | None = None,
+    ) -> dict[str, Any]:
+        config = effective_position_management_settings(db).get("livePortfolioProfitLock", {})
+        if not bool(config.get("enabled", True)):
+            return {"status": "disabled", "updated": 0}
+        if not self._live_updates_allowed(db):
+            return {"status": "skipped", "reason": "live_updates_disabled", "updated": 0}
+        if not self.settings.hyperliquid_account_address or not self.settings.hyperliquid_private_key:
+            return {"status": "skipped", "reason": "missing_live_credentials", "updated": 0}
+        if self._kill_switch_enabled(db):
+            return {"status": "skipped", "reason": "kill_switch", "updated": 0}
+
+        snapshot = db.query(AccountSnapshot).order_by(AccountSnapshot.timestamp.desc()).first()
+        if snapshot is None:
+            return {"status": "skipped", "reason": "missing_snapshot", "updated": 0}
+        current_effective = _decimal(snapshot.effective_account_value, None)
+        current_unrealized = _decimal(snapshot.unrealized_pnl, None)
+        if current_effective is None or current_unrealized is None:
+            return {"status": "skipped", "reason": "incomplete_snapshot", "updated": 0}
+
+        now = datetime.now(UTC)
+        state_setting = db.get(AppSetting, "live_portfolio_profit_lock_state")
+        if state_setting is None:
+            state_setting = AppSetting(key="live_portfolio_profit_lock_state", value={})
+            db.add(state_setting)
+        state = dict(state_setting.value or {})
+        peak_effective = _decimal(state.get("peak_effective_account_value"), current_effective)
+        peak_unrealized = _decimal(state.get("peak_unrealized_pnl"), current_unrealized)
+
+        if current_unrealized <= 0:
+            state.pop("last_trigger_key", None)
+            state.update(
+                {
+                    "armed": False,
+                    "peak_effective_account_value": str(current_effective),
+                    "peak_unrealized_pnl": str(current_unrealized),
+                    "last_seen_at": now.isoformat(),
+                }
+            )
+            state_setting.value = state
+            db.add(state_setting)
+            return {"status": "idle", "reason": "non_positive_unrealized", "updated": 0}
+
+        if peak_effective is None or current_effective > peak_effective:
+            peak_effective = current_effective
+        if peak_unrealized is None or current_unrealized > peak_unrealized:
+            peak_unrealized = current_unrealized
+
+        activation = _decimal(config.get("activationUnrealizedPnlUsd"), Decimal("10")) or Decimal("10")
+        armed = bool(state.get("armed")) or peak_unrealized >= activation
+        state.update(
+            {
+                "armed": armed,
+                "peak_effective_account_value": str(peak_effective),
+                "peak_unrealized_pnl": str(peak_unrealized),
+                "last_effective_account_value": str(current_effective),
+                "last_unrealized_pnl": str(current_unrealized),
+                "last_seen_at": now.isoformat(),
+            }
+        )
+        if not armed or peak_unrealized <= 0:
+            state_setting.value = state
+            db.add(state_setting)
+            return {"status": "idle", "reason": "not_armed", "updated": 0}
+
+        giveback = peak_unrealized - current_unrealized
+        giveback_pct = (giveback / peak_unrealized) * Decimal("100")
+        threshold_pct = _decimal(config.get("givebackPct"), Decimal("35")) or Decimal("35")
+        trigger_key = "|".join(
+            [
+                str(peak_effective),
+                str(peak_unrealized),
+                str(threshold_pct),
+            ]
+        )
+        if giveback_pct < threshold_pct:
+            state_setting.value = state
+            db.add(state_setting)
+            return {
+                "status": "armed",
+                "updated": 0,
+                "giveback_pct": str(giveback_pct),
+                "threshold_pct": str(threshold_pct),
+            }
+
+        pre_tp_config = effective_position_management_settings(db).get("preTpProfitLock", {})
+        min_position_profit = (
+            _decimal(config.get("minPositionProfitUsd"), Decimal("1.5")) or Decimal("1.5")
+        )
+        updated = 0
+        checked = 0
+        trading = trading_client
+        positions = (
+            db.query(Position)
+            .filter(
+                Position.mode == OrderMode.LIVE.value,
+                Position.status == "open",
+            )
+            .all()
+        )
+        for position in positions:
+            checked += 1
+            if (position.unrealized_pnl or Decimal("0")) < min_position_profit:
+                continue
+            market = position.market or db.get(Market, position.market_id)
+            if market is None or not self._position_update_allowed(db, market, position):
+                continue
+            current_price = self._current_price_from_unrealized_pnl(position)
+            if current_price is None:
+                continue
+            candidate = self.pre_tp_profit_lock_candidate_for_price(
+                position,
+                current_price,
+                config=pre_tp_config,
+                source="live_portfolio_profit_lock",
+            )
+            if candidate is None:
+                continue
+            if trading is None:
+                trading = HyperliquidTradingClient(self.settings)
+            if self.replace_live_stop_order(db, market, position, candidate, trading_client=trading):
+                updated += 1
+
+        already_logged = state.get("last_trigger_key") == trigger_key
+        should_log_trigger = updated > 0 or not already_logged
+        state.update(
+            {
+                "last_trigger_checked_at": now.isoformat(),
+                "last_updated_positions": updated,
+            }
+        )
+        if should_log_trigger:
+            state.update(
+                {
+                    "last_trigger_key": trigger_key,
+                    "last_triggered_at": now.isoformat(),
+                    "last_triggered_peak_unrealized_pnl": str(peak_unrealized),
+                    "last_triggered_unrealized_pnl": str(current_unrealized),
+                    "last_triggered_giveback_pct": str(giveback_pct),
+                }
+            )
+        state_setting.value = state
+        db.add(state_setting)
+        if should_log_trigger:
+            db.add(
+                DecisionLog(
+                    event_type="live_portfolio_profit_lock_triggered",
+                    message="Live portfolio profit lock triggered",
+                    data={
+                        "peak_effective_account_value": str(peak_effective),
+                        "current_effective_account_value": str(current_effective),
+                        "peak_unrealized_pnl": str(peak_unrealized),
+                        "current_unrealized_pnl": str(current_unrealized),
+                        "giveback_pct": str(giveback_pct),
+                        "threshold_pct": str(threshold_pct),
+                        "checked_positions": checked,
+                        "updated_positions": updated,
+                        "market_close_enabled": bool(config.get("marketCloseEnabled", False)),
+                    },
+                )
+            )
+        return {
+            "status": "triggered" if should_log_trigger else "already_triggered",
+            "updated": updated,
+            "checked": checked,
+            "giveback_pct": str(giveback_pct),
+            "logged": should_log_trigger,
+        }
 
     def apply_stop_update(
         self,
@@ -628,6 +916,8 @@ class PositionManagementEngine:
         trading = trading_client or HyperliquidTradingClient(self.settings)
         coin = _coin_for_market(market)
         sz_decimals = _sz_decimals(market)
+        old_order_remote_missing = False
+        old_order_missing_payload: dict[str, Any] | None = None
         guard = self.check_liquidation_guard(
             db,
             position,
@@ -714,6 +1004,8 @@ class PositionManagementEngine:
                         safety_critical=safety_critical,
                     )
                     return False
+                old_order_remote_missing = True
+                old_order_missing_payload = {"error": error}
             else:
                 if modify_result.status == "ok":
                     old_order.price = candidate.price
@@ -785,6 +1077,8 @@ class PositionManagementEngine:
                         safety_critical=safety_critical,
                     )
                     return False
+                old_order_remote_missing = True
+                old_order_missing_payload = {"response": modify_result.raw_response}
 
         cloid = uuid.uuid4().hex
         try:
@@ -866,46 +1160,75 @@ class PositionManagementEngine:
             old_live_order=old_order,
         )
         if old_order is not None and old_order.hyperliquid_order_id:
-            try:
-                trading.cancel_order(
-                    coin,
-                    int(old_order.hyperliquid_order_id),
-                    int(live_settings["order_expires_after_seconds"]),
-                )
+            if old_order_remote_missing:
                 old_order.status = "canceled"
                 old_raw = dict(old_order.raw_response or {})
-                old_raw["replaced_by_order_id"] = new_order.id
+                old_raw.update(
+                    {
+                        "remote_missing": True,
+                        "remote_missing_at": datetime.now(UTC).isoformat(),
+                        "remote_missing_payload": old_order_missing_payload,
+                        "replaced_by_order_id": new_order.id,
+                    }
+                )
                 old_order.raw_response = old_raw
                 db.add(old_order)
-            except Exception as exc:
-                old_remote_present = None
-                if _error_looks_rate_limit(str(exc)) and self.settings.hyperliquid_account_address:
-                    with contextlib.suppress(Exception):
-                        frontend_orders = trading.frontend_open_orders(
-                            self.settings.hyperliquid_account_address
-                        )
-                        old_remote_present = _remote_order_present(
-                            frontend_orders,
-                            old_order.hyperliquid_order_id,
-                            old_order.cloid,
-                        )
-                        if old_remote_present is False:
-                            old_order.status = "canceled"
-                            db.add(old_order)
                 db.add(
                     DecisionLog(
-                        event_type="live_stop_update_cancel_failed",
+                        event_type="live_stop_update_stale_order_replaced",
                         market_id=position.market_id,
                         position_id=position.id,
-                        message="New live stop submitted but old stop cancel failed",
+                        message="Stale live stop order replaced after remote modify reported missing",
                         data={
-                            "error": str(exc),
                             "old_order_id": old_order.id,
+                            "old_hyperliquid_order_id": old_order.hyperliquid_order_id,
                             "new_order_id": new_order.id,
-                            "old_remote_present": old_remote_present,
+                            "candidate_stop": str(candidate.price),
+                            "missing_payload": old_order_missing_payload,
                         },
                     )
                 )
+            else:
+                try:
+                    trading.cancel_order(
+                        coin,
+                        int(old_order.hyperliquid_order_id),
+                        int(live_settings["order_expires_after_seconds"]),
+                    )
+                    old_order.status = "canceled"
+                    old_raw = dict(old_order.raw_response or {})
+                    old_raw["replaced_by_order_id"] = new_order.id
+                    old_order.raw_response = old_raw
+                    db.add(old_order)
+                except Exception as exc:
+                    old_remote_present = None
+                    if _error_looks_rate_limit(str(exc)) and self.settings.hyperliquid_account_address:
+                        with contextlib.suppress(Exception):
+                            frontend_orders = trading.frontend_open_orders(
+                                self.settings.hyperliquid_account_address
+                            )
+                            old_remote_present = _remote_order_present(
+                                frontend_orders,
+                                old_order.hyperliquid_order_id,
+                                old_order.cloid,
+                            )
+                            if old_remote_present is False:
+                                old_order.status = "canceled"
+                                db.add(old_order)
+                    db.add(
+                        DecisionLog(
+                            event_type="live_stop_update_cancel_failed",
+                            market_id=position.market_id,
+                            position_id=position.id,
+                            message="New live stop submitted but old stop cancel failed",
+                            data={
+                                "error": str(exc),
+                                "old_order_id": old_order.id,
+                                "new_order_id": new_order.id,
+                                "old_remote_present": old_remote_present,
+                            },
+                        )
+                    )
         return True
 
     def ensure_position_state(self, position: Position) -> dict[str, Any]:
@@ -960,6 +1283,7 @@ class PositionManagementEngine:
         checked = 0
         failed = 0
         skipped = 0
+        recovered = 0
         for position in positions:
             market = position.market or db.get(Market, position.market_id)
             if market is None:
@@ -985,7 +1309,19 @@ class PositionManagementEngine:
                 )
             checked += 1
             if result.failed:
-                failed += 1
+                if (
+                    market is not None
+                    and self._recover_periodic_liquidation_guard_stop(
+                        db,
+                        market,
+                        position,
+                        result,
+                        trading,
+                    )
+                ):
+                    recovered += 1
+                else:
+                    failed += 1
             elif result.status == "skipped":
                 skipped += 1
         db.add(
@@ -996,11 +1332,89 @@ class PositionManagementEngine:
                     "checked": checked,
                     "failed": failed,
                     "skipped": skipped,
+                    "recovered": recovered,
                 },
             )
         )
         db.commit()
-        return {"checked": checked, "failed": failed, "skipped": skipped}
+        return {"checked": checked, "failed": failed, "skipped": skipped, "recovered": recovered}
+
+    def _recover_periodic_liquidation_guard_stop(
+        self,
+        db: Session,
+        market: Market,
+        position: Position,
+        guard: LiquidationGuardResult,
+        trading: HyperliquidTradingClient,
+    ) -> bool:
+        if not self._live_updates_allowed(db):
+            return False
+        if not self.settings.hyperliquid_private_key:
+            return False
+        if not self._position_update_allowed(db, market, position):
+            return False
+        safe_stop = self._liquidation_guard_safe_stop(position, guard)
+        if safe_stop is None:
+            return False
+
+        candidate = StopCandidate(
+            price=safe_stop,
+            reason="liquidation_guard_recovery",
+            indicators={
+                "source": "periodic_liquidation_guard",
+                "liquidation_price": str(guard.liquidation_price),
+                "original_stop": str(guard.stop_loss) if guard.stop_loss is not None else None,
+            },
+            r_multiple=Decimal("0"),
+        )
+        updated = self.replace_live_stop_order(db, market, position, candidate, trading_client=trading)
+        if updated:
+            db.add(
+                DecisionLog(
+                    event_type="live_liquidation_guard_periodic_recovered",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message="Periodic liquidation guard recovered live stop",
+                    data={
+                        "coin": guard.coin,
+                        "side": position.side,
+                        "original_stop": str(guard.stop_loss) if guard.stop_loss is not None else None,
+                        "recovered_stop": str(safe_stop),
+                        "liquidation_price": str(guard.liquidation_price)
+                        if guard.liquidation_price is not None
+                        else None,
+                        "safety_buffer_pct": str(LIQUIDATION_GUARD_SL_SAFETY_BUFFER * 100),
+                    },
+                )
+            )
+        return updated
+
+    def _liquidation_guard_safe_stop(
+        self,
+        position: Position,
+        guard: LiquidationGuardResult,
+    ) -> Decimal | None:
+        liq_price = guard.liquidation_price
+        if liq_price is None or liq_price <= 0:
+            return None
+        side = position.side.lower()
+        entry = position.entry_price
+        current_stop = guard.stop_loss
+        if side == "long":
+            safe_stop = liq_price * (Decimal("1") + LIQUIDATION_GUARD_SL_SAFETY_BUFFER)
+            if safe_stop >= entry:
+                return None
+            if current_stop is not None and safe_stop <= current_stop:
+                return None
+            return safe_stop
+        if side == "short":
+            safe_stop = liq_price * (Decimal("1") - LIQUIDATION_GUARD_SL_SAFETY_BUFFER)
+            if safe_stop <= entry:
+                return None
+            if current_stop is not None and safe_stop >= current_stop:
+                return None
+            return safe_stop
+        return None
 
     def check_liquidation_guard(
         self,
@@ -1207,15 +1621,30 @@ class PositionManagementEngine:
             return False
         if not market.active:
             return False
+        return not self._kill_switch_enabled(db)
+
+    def _kill_switch_enabled(self, db: Session) -> bool:
         kill_switch = db.get(AppSetting, "kill_switch")
-        if kill_switch is not None and isinstance(kill_switch.value, dict):
-            if kill_switch.value.get("enabled"):
-                return False
-        return True
+        return bool(
+            kill_switch is not None
+            and isinstance(kill_switch.value, dict)
+            and kill_switch.value.get("enabled")
+        )
 
     def _live_updates_allowed(self, db: Session) -> bool:
         mode = effective_operation_mode(db, self.settings)
         return mode == OperationMode.AUTO_TRADE and effective_live_trading_enabled(db, self.settings)
+
+    @staticmethod
+    def _current_price_from_unrealized_pnl(position: Position) -> Decimal | None:
+        if position.size <= 0 or position.unrealized_pnl is None:
+            return None
+        per_unit = position.unrealized_pnl / position.size
+        if position.side.lower() == "long":
+            return position.entry_price + per_unit
+        if position.side.lower() == "short":
+            return position.entry_price - per_unit
+        return None
 
     def _atr_multiplier(self, trailing: dict[str, Any], position: Position) -> Decimal:
         metadata = position.metadata_json or {}
@@ -1260,6 +1689,10 @@ def _error_looks_missing_order(error: object) -> bool:
         or "missing order" in lower
         or "unknown oid" in lower
         or "order was never placed" in lower
+        or "cannot modify canceled or filled order" in lower
+        or "cannot modify cancelled or filled order" in lower
+        or "canceled or filled order" in lower
+        or "cancelled or filled order" in lower
     )
 
 

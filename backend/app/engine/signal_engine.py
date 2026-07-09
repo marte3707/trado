@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import time
 from decimal import Decimal
 from typing import Any
@@ -14,7 +15,7 @@ from app.core.runtime_settings import (
     effective_min_signal_expected_r,
     effective_strategy_exclusions,
 )
-from app.db.models import AppSetting, Candle, Indicator, Market, Signal, StrategyConfig
+from app.db.models import AppSetting, Candle, DecisionLog, Indicator, Market, Signal, StrategyConfig
 from app.engine.auto_tuner import active_ab_overlay
 from app.engine.edge_profile import signal_threshold_adjustment
 from app.engine.macro_direction import btc_macro_direction, suspended_penalty_family
@@ -27,6 +28,10 @@ from app.engine.orderbook import (
     update_obi_stats,
 )
 from app.engine.performance import SignalPerformanceAnalyzer
+from app.engine.pre_tp1_validation import (
+    cached_pre_tp1_validation_table,
+    evaluate_pre_tp1_entry,
+)
 from app.engine.regime import apply_regime_filter
 from app.engine.risk import RiskManager
 from app.engine.score_calibration import cached_calibration_table, serialize_metrics
@@ -69,6 +74,22 @@ _TF_MINUTES: dict[str, int] = {
     "1m": 1, "5m": 5, "15m": 15, "30m": 30,
     "1h": 60, "2h": 120, "4h": 240, "1d": 1440,
 }
+
+_VOLATILITY_SHADOW_EVENT = "volatility_filter_shadow_sample"
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def apply_timeframe_min_score_override(
@@ -121,6 +142,7 @@ class SignalEngine:
         # Cull permanente: strategie escluse dalla generazione segnali. Letto una
         # volta per ciclo (lista globale, non per market×timeframe).
         self._cycle_strategy_exclusions: set[str] | None = None
+        self._cycle_volatility_shadow_samples = 0
 
     def begin_cycle(self) -> None:
         """Invalidate per-cycle caches at the start of each worker tick."""
@@ -132,6 +154,7 @@ class SignalEngine:
         self._cycle_btc_volume_profile_context = None
         self._cycle_macro_direction = None
         self._cycle_strategy_exclusions = None
+        self._cycle_volatility_shadow_samples = 0
         # Abilita/invalida la cache per-cycle degli aggregati di performance
         # (global/timeframe stats + conteggi per market) usati da adjusted_weights.
         self.performance.begin_cycle()
@@ -163,6 +186,77 @@ class SignalEngine:
     def _record_skip(self, reason: str) -> None:
         self._cycle_skip_counts[reason] = self._cycle_skip_counts.get(reason, 0) + 1
 
+    def _should_sample_volatility_skip(
+        self,
+        risk_value: dict[str, Any],
+        *,
+        market_id: int,
+        timeframe: str,
+        source_candle_open_time: Any,
+    ) -> bool:
+        if not bool(risk_value.get("volatility_filter_shadow_sample_enabled", True)):
+            return False
+        max_per_cycle = max(
+            0,
+            _safe_int(risk_value.get("volatility_filter_shadow_max_per_cycle"), 5),
+        )
+        if max_per_cycle == 0 or self._cycle_volatility_shadow_samples >= max_per_cycle:
+            return False
+        sample_rate = _safe_float(risk_value.get("volatility_filter_shadow_sample_rate"), 0.05)
+        sample_rate = max(0.0, min(1.0, sample_rate))
+        if sample_rate <= 0:
+            return False
+        if sample_rate >= 1:
+            return True
+        raw_key = f"{market_id}:{timeframe}:{source_candle_open_time}"
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+        bucket = int(digest[:8], 16) / 0xFFFFFFFF
+        return bucket < sample_rate
+
+    def _record_volatility_shadow_sample(
+        self,
+        db: Session,
+        *,
+        market: Market,
+        timeframe: str,
+        source_candle_open_time: Any,
+        volatility_info: dict[str, Any] | None,
+        risk_value: dict[str, Any],
+        candle_count: int,
+    ) -> None:
+        if not self._should_sample_volatility_skip(
+            risk_value,
+            market_id=market.id,
+            timeframe=timeframe,
+            source_candle_open_time=source_candle_open_time,
+        ):
+            return
+        self._cycle_volatility_shadow_samples += 1
+        db.add(
+            DecisionLog(
+                event_type=_VOLATILITY_SHADOW_EVENT,
+                market_id=market.id,
+                message="Volatility filter shadow sample",
+                data={
+                    "market": market.symbol,
+                    "timeframe": timeframe,
+                    "source_candle_open_time": (
+                        source_candle_open_time.isoformat()
+                        if hasattr(source_candle_open_time, "isoformat")
+                        else str(source_candle_open_time)
+                    ),
+                    "volatility": volatility_info or {},
+                    "candle_count": candle_count,
+                    "sample_rate": _safe_float(
+                        risk_value.get("volatility_filter_shadow_sample_rate"), 0.05
+                    ),
+                    "max_per_cycle": _safe_int(
+                        risk_value.get("volatility_filter_shadow_max_per_cycle"), 5
+                    ),
+                },
+            )
+        )
+
     @staticmethod
     def _disabled_strategy_names_for_timeframe(
         risk_value: dict[str, Any],
@@ -175,6 +269,19 @@ class SignalEngine:
         if not isinstance(disabled, list):
             return set()
         return {str(item) for item in disabled if isinstance(item, str) and item}
+
+    @staticmethod
+    def _enabled_strategy_names_for_timeframe(
+        risk_value: dict[str, Any],
+        timeframe: str,
+    ) -> set[str]:
+        raw = risk_value.get("enabled_strategies_by_timeframe")
+        if not isinstance(raw, dict):
+            return set()
+        enabled = raw.get(timeframe)
+        if not isinstance(enabled, list):
+            return set()
+        return {str(item) for item in enabled if isinstance(item, str) and item}
 
     def _get_cycle_strategy_exclusions(self, db: Session) -> set[str]:
         if self._cycle_strategy_exclusions is None:
@@ -892,6 +999,15 @@ class SignalEngine:
                 timeframe=timeframe,
                 volatility=volatility_info,
             )
+            self._record_volatility_shadow_sample(
+                db,
+                market=market,
+                timeframe=timeframe,
+                source_candle_open_time=latest_candle_open_time,
+                volatility_info=volatility_info,
+                risk_value=risk_value,
+                candle_count=len(candles),
+            )
             self._record_skip("volatility_filter")
             db.commit()
             return None
@@ -934,9 +1050,17 @@ class SignalEngine:
             return None
         configs = (
             db.query(StrategyConfig)
-            .filter(StrategyConfig.timeframe == timeframe, StrategyConfig.enabled.is_(True))
+            .filter(StrategyConfig.timeframe == timeframe)
             .all()
         )
+        force_enabled_strategy_names = self._enabled_strategy_names_for_timeframe(
+            risk_value, timeframe
+        )
+        configs = [
+            config
+            for config in configs
+            if config.enabled or config.strategy_name in force_enabled_strategy_names
+        ]
         # Unione di: disable tattico per-timeframe (risk setting) + cull permanente
         # globale (strategy_exclusions). Entrambi escludono la strategia dallo scoring.
         skip_strategy_names = self._disabled_strategy_names_for_timeframe(
@@ -1457,6 +1581,42 @@ class SignalEngine:
             self._record_skip("ob_imbalance_only")
             db.commit()
             return None
+        if bool(risk_value.get("pre_tp1_validation_enabled", True)):
+            pre_tp1_min_samples = max(
+                1,
+                _safe_int(risk_value.get("pre_tp1_validation_min_samples"), 30),
+            )
+            pre_tp1_lookback = max(
+                50,
+                min(2000, _safe_int(risk_value.get("pre_tp1_validation_lookback"), 500)),
+            )
+            pre_tp1_table = cached_pre_tp1_validation_table(
+                db,
+                lookback=pre_tp1_lookback,
+                min_samples_for_use=pre_tp1_min_samples,
+            )
+            pre_tp1_passed, pre_tp1_info = evaluate_pre_tp1_entry(
+                pre_tp1_table,
+                direction=score.direction,
+                timeframe=timeframe,
+                score=score.score,
+                market_id=market.id,
+                strategy_breakdown=score.breakdown,
+                risk_value=risk_value,
+            )
+            score.breakdown["_pre_tp1_validation"] = pre_tp1_info
+            if not pre_tp1_passed:
+                logger.debug(
+                    "signal_skipped_pre_tp1_validation",
+                    market=market.symbol,
+                    timeframe=timeframe,
+                    direction=score.direction.value,
+                    score=score.score,
+                    pre_tp1_validation=pre_tp1_info,
+                )
+                self._record_skip("pre_tp1_validation_filter")
+                db.commit()
+                return None
         if bool(risk_value.get("entry_quality_filter_enabled", True)):
             entry_quality_passed, entry_quality_info = self._entry_quality_result(
                 candles,

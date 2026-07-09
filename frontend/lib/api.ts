@@ -198,6 +198,17 @@ export type AccountEquityHistory = {
   hl_error: string | null;
 };
 
+export type AccountLedgerTransfer = {
+  time: number | null;
+  kind: "deposit" | "withdrawal";
+  label: string;
+  raw_type: string | null;
+  asset: string | null;
+  amount: string | null;
+  signed_amount: string | null;
+  hash: string | null;
+};
+
 export type AccountMonitor = {
   status: string;
   network: string;
@@ -244,6 +255,33 @@ export type AccountMonitor = {
     user_last_24h: Record<string, unknown>[];
     error: string | null;
   };
+  ledger: {
+    status: string;
+    lookback_days: number;
+    transfers: AccountLedgerTransfer[];
+    error: string | null;
+  };
+  performance: {
+    status: string;
+    basis: string;
+    lookback_days: number;
+    net_deposits_usdc: string | null;
+    effective_equity_usdc: string | null;
+    account_pnl_usdc: string | null;
+    account_return_pct: string | null;
+    open_unrealized_pnl_usdc: string | null;
+    hl_closed_pnl_gross_usdc: string | null;
+    hl_fees_usdc: string | null;
+    hl_funding_usdc: string | null;
+    known_components_pnl_usdc: string | null;
+    reconciliation_gap_usdc: string | null;
+    local_closed_realized_pnl_usdc: string | null;
+    local_open_unrealized_pnl_usdc: string | null;
+    local_filled_fees_usdc: string | null;
+    fill_count: number;
+    funding_count: number;
+    error: string | null;
+  };
   last_snapshot: {
     timestamp: string;
     total_equity: string | null;
@@ -276,6 +314,7 @@ export type AccountPositionProtection = {
   active_orders: string[];
   missing_orders: string[];
   rejected_orders: string[];
+  skipped_orders: string[];
   issues: string[];
   summary: string;
   local_position_ids: number[];
@@ -906,6 +945,393 @@ export type ExpectedRCalibration = {
   excluded_count: number;
   prior_strength: number;
   min_samples_for_use: number;
+};
+
+export type StrategyEdgeClassification =
+  | "robust"
+  | "promising"
+  | "negative"
+  | "inert"
+  | "insufficient";
+
+export type StrategyEdgeOverall = {
+  full: CalibrationStats;
+  train: CalibrationStats | null;
+  test: CalibrationStats | null;
+  time_weighted: CalibrationStats;
+  verdict: string;
+  classification: StrategyEdgeClassification;
+};
+
+export type StrategyEdgeCell = {
+  key: string;
+  timeframe: string;
+  strategy: string;
+  enabled: boolean;
+  classification: Exclude<StrategyEdgeClassification, "inert">;
+  verdict: string;
+  full: CalibrationStats;
+  train: CalibrationStats | null;
+  test: CalibrationStats | null;
+};
+
+export type StrategyEdgeStrategy = {
+  name: string;
+  classification: StrategyEdgeClassification;
+  overall: CalibrationStats;
+  recent: CalibrationStats;
+  avg_contribution: number | null;
+  participation: {
+    aligned_signals_recent?: number;
+    traded_positions?: number;
+    traded_share?: number | null;
+    inert?: boolean;
+  };
+};
+
+export type StrategyEdgeSummary = {
+  cells: Record<string, number>;
+  strategies: Record<string, number>;
+  positions_linked: number;
+};
+
+export type StrategyEdgeReport = {
+  filters: {
+    lookback: number;
+    recent_window: number;
+    min_test_samples: number;
+  };
+  overall: StrategyEdgeOverall;
+  summary: StrategyEdgeSummary;
+  cells: StrategyEdgeCell[];
+  strategies: StrategyEdgeStrategy[];
+  note: string;
+};
+
+export type LiveEligibilityClass =
+  | "eligible"
+  | "watch"
+  | "quarantine"
+  | "insufficient";
+
+export type LiveEligibilityStats = {
+  trades: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  gross_r: number;
+  fee_r: number;
+  net_r: number;
+  gross_profit_r: number;
+  gross_loss_r: number;
+  net_profit_factor: number | null;
+  avg_net_r: number | null;
+  median_net_r: number | null;
+  avg_fee_r: number | null;
+};
+
+export type LiveEligibilityCohort = {
+  key: string;
+  type: "direction_timeframe" | "strategy" | "score_bucket";
+  direction: "LONG" | "SHORT";
+  timeframe: string;
+  strategy: string | null;
+  score_bucket: string | null;
+  classification: LiveEligibilityClass;
+  recommended_action: string;
+  reasons: string[];
+  active_risk_overlays: Array<{
+    type: string;
+    key: string;
+    adjustment: number | null;
+    payload: unknown;
+  }>;
+  full: LiveEligibilityStats;
+  recent: LiveEligibilityStats;
+  train: LiveEligibilityStats | null;
+  test: LiveEligibilityStats | null;
+};
+
+export type LiveEligibilitySettingConflict = {
+  severity: "info" | "warn";
+  type: string;
+  cohort_key: string;
+  cohort_type: string;
+  classification: LiveEligibilityClass;
+  active_risk_overlays: LiveEligibilityCohort["active_risk_overlays"];
+  message: string;
+};
+
+export type LiveEligibilityReport = {
+  filters: {
+    lookback: number;
+    recent_window: number;
+    taker_fee_rate: number;
+  };
+  thresholds: {
+    min_trades: number;
+    min_recent_trades: number;
+    min_net_profit_factor: number;
+    min_recent_net_profit_factor: number;
+    min_avg_net_r: number;
+    min_recent_avg_net_r: number;
+  };
+  macro_context: Record<string, unknown> & {
+    direction?: string;
+    reason?: string;
+    suspended_penalty_family?: string | null;
+  };
+  summary: Record<LiveEligibilityClass, number> & {
+    total_cohorts: number;
+    paper_trades_loaded: number;
+    paper_trades_usable: number;
+    setting_conflicts: number;
+    excluded: Record<string, number>;
+  };
+  overall: {
+    full: LiveEligibilityStats;
+    recent: LiveEligibilityStats;
+  };
+  direction_timeframes: LiveEligibilityCohort[];
+  strategies: LiveEligibilityCohort[];
+  score_buckets: LiveEligibilityCohort[];
+  setting_conflicts: LiveEligibilitySettingConflict[];
+  note: string;
+};
+
+export type LeaderboardAlphaClassification =
+  | "candidate"
+  | "watch"
+  | "quarantine"
+  | "insufficient";
+
+export type LeaderboardAlphaSnapshot = {
+  id: number;
+  lookback_days: number;
+  fills_count: number;
+  closing_fills_count: number;
+  open_fills_count: number;
+  net_pnl_usdc: string | null;
+  closed_pnl_usdc: string | null;
+  fees_usdc: string | null;
+  volume_usdc: string | null;
+  win_rate: number | null;
+  win_rate_pct: number | null;
+  profit_factor: number | null;
+  quality_score: number;
+  classification: LeaderboardAlphaClassification;
+  metrics: Record<string, unknown>;
+  created_at: string;
+};
+
+export type LeaderboardAlphaTrader = {
+  id: number;
+  address: string;
+  label: string | null;
+  source: string;
+  enabled: boolean;
+  notes: string | null;
+  last_sync_at: string | null;
+  last_sync_status: string | null;
+  last_sync_error: string | null;
+  last_seen_fill_at: string | null;
+  metadata_json: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+  latest_snapshot: LeaderboardAlphaSnapshot | null;
+};
+
+export type LeaderboardAlphaFill = {
+  id: number;
+  trader_id: number;
+  trader_label: string | null;
+  trader_address: string | null;
+  coin: string;
+  side: string | null;
+  direction: string | null;
+  intent: string | null;
+  price: string | null;
+  size: string | null;
+  notional_usd: string | null;
+  closed_pnl: string | null;
+  fee: string | null;
+  crossed: boolean | null;
+  filled_at: string;
+};
+
+export type LeaderboardAlphaSignal = {
+  coin: string;
+  direction: "long" | "short" | string;
+  trader_count: number;
+  fill_count: number;
+  notional_usd: string | null;
+  latest_fill_at: string;
+  avg_quality_score: number | null;
+  mode: "confirm_only";
+  confirmation_level: "single" | "cluster" | string;
+  traders: Array<{
+    id: number;
+    label: string | null;
+    address: string;
+    quality_score: number | null;
+    fill_notional_usd: string | null;
+    filled_at: string;
+  }>;
+};
+
+export type LeaderboardCopyPaperPosition = {
+  id: number;
+  trader_id: number;
+  trader_label: string | null;
+  trader_address: string | null;
+  coin: string;
+  direction: "long" | "short" | string;
+  status: "open" | "closed" | string;
+  entry_price: string | null;
+  exit_price: string | null;
+  copy_size: string | null;
+  copy_notional_usd: string | null;
+  original_notional_usd: string | null;
+  entry_fee_usdc: string | null;
+  exit_fee_usdc: string | null;
+  gross_pnl_usdc: string | null;
+  net_pnl_usdc: string | null;
+  pnl_pct: number | null;
+  opened_at: string;
+  closed_at: string | null;
+  close_reason: string | null;
+  metadata_json: Record<string, unknown>;
+};
+
+export type LeaderboardCopyPaperRanking = {
+  trader_id: number;
+  trader_label: string | null;
+  trader_address: string | null;
+  leaderboard_rank: number | null;
+  open_positions: number;
+  closed_positions: number;
+  net_pnl_usdc: string | null;
+  win_rate_pct: number | null;
+  profit_factor: number | null;
+  avg_trade_pnl_usdc: string | null;
+};
+
+export type LeaderboardCopyPaper = {
+  enabled: boolean;
+  summary: {
+    starting_equity_usd: string | null;
+    equity_usd: string | null;
+    realized_pnl_usdc: string | null;
+    return_pct: number | null;
+    open_positions: number;
+    closed_positions: number;
+    total_positions: number;
+    win_rate_pct: number | null;
+    profit_factor: number | null;
+    avg_trade_pnl_usdc: string | null;
+    total_fees_usdc: string | null;
+    copied_traders: number;
+    position_notional_usd: string;
+    fee_rate: string;
+  };
+  open_positions: LeaderboardCopyPaperPosition[];
+  recent_closed_positions: LeaderboardCopyPaperPosition[];
+  trader_rankings: LeaderboardCopyPaperRanking[];
+  by_status: Record<string, number>;
+  tracked_traders: Array<{
+    trader_id: number;
+    label: string | null;
+    address: string;
+    leaderboard_rank: number | null;
+  }>;
+};
+
+export type LeaderboardAlphaDashboard = {
+  settings: {
+    enabled: boolean;
+    mode: "observe_only" | string;
+    lookback_days: number;
+    recent_signal_hours: number;
+    min_traders_for_signal: number;
+    min_quality_score: number;
+    max_entry_lag_pct: number;
+    sync_limit_per_run: number;
+    auto_import_top_traders: boolean;
+    auto_import_limit: number;
+    auto_import_window: string;
+    auto_import_min_volume_usd: string;
+    auto_import_refresh_hours: number;
+    auto_sync_enabled: boolean;
+    auto_sync_interval_hours: number;
+    include_auto_imported_in_signals: boolean;
+    copy_paper_enabled: boolean;
+    copy_paper_starting_equity_usd: string;
+    copy_paper_position_notional_usd: string;
+    copy_paper_fee_rate: string;
+    copy_paper_min_source_notional_usd: string;
+    copy_paper_max_open_positions: number;
+    copy_paper_max_open_positions_per_trader: number;
+    copy_paper_allowed_rank_limit: number;
+    copy_paper_only_auto_top_traders: boolean;
+    copy_paper_close_on_opposite_open: boolean;
+    copy_paper_replay_batch_size: number;
+  } & Record<string, unknown>;
+  state: Record<string, unknown>;
+  summary: {
+    traders: number;
+    enabled_traders: number;
+    candidates: number;
+    signals: number;
+    last_sync_at: string | null;
+    mode: "observe_only";
+  };
+  copy_paper: LeaderboardCopyPaper;
+  traders: LeaderboardAlphaTrader[];
+  signals: LeaderboardAlphaSignal[];
+  recent_fills: LeaderboardAlphaFill[];
+};
+
+export type LeaderboardAlphaSyncResult = {
+  status: string;
+  reason?: string | null;
+  synced?: number;
+  rate_limited?: number;
+  fetched?: number;
+  inserted?: number;
+  trader?: LeaderboardAlphaTrader;
+  snapshot?: LeaderboardAlphaSnapshot | null;
+  results?: Array<{
+    trader_id: number;
+    address: string;
+    status?: string;
+    reason?: string | null;
+    fetched: number;
+    inserted: number;
+    snapshot: LeaderboardAlphaSnapshot | null;
+  }>;
+};
+
+export type LeaderboardAlphaImportResult = {
+  status: string;
+  source_rows: number;
+  selected: number;
+  inserted: number;
+  updated: number;
+  window: string;
+  min_volume_usd: string | null;
+};
+
+export type LeaderboardCopyPaperRunResult = {
+  status: string;
+  reason?: string | null;
+  eligible_traders?: number;
+  fills_seen?: number;
+  batch_size?: number;
+  seeded_cursor?: boolean;
+  opened?: number;
+  closed?: number;
+  skipped?: number;
+  summary?: LeaderboardCopyPaper;
 };
 
 export type BotFunnelUser = {

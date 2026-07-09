@@ -19,6 +19,7 @@ DIAGNOSTIC_REPORT_INTERVAL_SECONDS = 86400  # ogni 24h
 LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS = 10800  # ogni 3 ore
 UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS = 60
 DATA_RETENTION_INTERVAL_SECONDS = 86400  # ogni 24h
+LEADERBOARD_ALPHA_CHECK_INTERVAL_SECONDS = 300  # verifica leggera; i sync restano ogni 4h per trader
 ERROR_NOTIFY_COOLDOWN_SECONDS = 1800  # max 1 notifica errore ogni 30 min
 DAILY_RECAP_HOUR_ROME = 10
 ROME_TZ = ZoneInfo("Europe/Rome")
@@ -76,6 +77,7 @@ class PeriodicScheduler:
         self.next_live_liquidation_guard = 0.0
         self.next_unified_account_ratio_guard = 0.0
         self.next_data_retention = _next_daily_job_timestamp(now, last_data_retention_at, DATA_RETENTION_INTERVAL_SECONDS)
+        self.next_leaderboard_alpha = now + 60
         self.last_error_notify = 0.0
 
     def _due_interval(self, now: float, attr: str, interval: int) -> bool:
@@ -100,6 +102,13 @@ class PeriodicScheduler:
 
     def due_data_retention(self, now: float) -> bool:
         return self._due_interval(now, "next_data_retention", DATA_RETENTION_INTERVAL_SECONDS)
+
+    def due_leaderboard_alpha(self, now: float) -> bool:
+        return self._due_interval(
+            now,
+            "next_leaderboard_alpha",
+            LEADERBOARD_ALPHA_CHECK_INTERVAL_SECONDS,
+        )
 
     def due_live_liquidation_guard(self, now: float) -> bool:
         return self._due_interval(

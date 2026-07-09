@@ -347,6 +347,135 @@ class BotUser(Base):
     )
 
 
+class LeaderboardTrader(Base):
+    __tablename__ = "leaderboard_traders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    address: Mapped[str] = mapped_column(String(42), unique=True, index=True)
+    label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source: Mapped[str] = mapped_column(String(64), default="hyperliquid_leaderboard", index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_seen_fill_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class LeaderboardTraderFill(Base):
+    __tablename__ = "leaderboard_trader_fills"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    trader_id: Mapped[int] = mapped_column(
+        ForeignKey("leaderboard_traders.id", ondelete="CASCADE"), index=True
+    )
+    fill_key: Mapped[str] = mapped_column(String(128))
+    coin: Mapped[str] = mapped_column(String(64), index=True)
+    side: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    direction: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    intent: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    price: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    size: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    notional_usd: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    closed_pnl: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    fee: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    crossed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    oid: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    raw_data: Mapped[dict] = mapped_column(JSONB, default=dict)
+    filled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    trader: Mapped[LeaderboardTrader] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("trader_id", "fill_key", name="uq_leaderboard_trader_fill"),
+        Index("ix_leaderboard_fills_trader_time", "trader_id", "filled_at"),
+        Index("ix_leaderboard_fills_coin_direction_time", "coin", "direction", "filled_at"),
+    )
+
+
+class LeaderboardTraderSnapshot(Base):
+    __tablename__ = "leaderboard_trader_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    trader_id: Mapped[int] = mapped_column(
+        ForeignKey("leaderboard_traders.id", ondelete="CASCADE"), index=True
+    )
+    lookback_days: Mapped[int] = mapped_column(Integer, default=30, index=True)
+    fills_count: Mapped[int] = mapped_column(Integer, default=0)
+    closing_fills_count: Mapped[int] = mapped_column(Integer, default=0)
+    open_fills_count: Mapped[int] = mapped_column(Integer, default=0)
+    net_pnl_usdc: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    closed_pnl_usdc: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    fees_usdc: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    volume_usdc: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    win_rate: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    profit_factor: Mapped[Decimal | None] = mapped_column(Numeric(18, 6), nullable=True)
+    quality_score: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    classification: Mapped[str] = mapped_column(String(32), default="insufficient", index=True)
+    metrics: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    trader: Mapped[LeaderboardTrader] = relationship()
+
+    __table_args__ = (
+        Index("ix_leaderboard_snapshots_trader_created", "trader_id", "created_at"),
+    )
+
+
+class LeaderboardCopyPaperPosition(Base):
+    __tablename__ = "leaderboard_copy_paper_positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    trader_id: Mapped[int] = mapped_column(
+        ForeignKey("leaderboard_traders.id", ondelete="CASCADE"), index=True
+    )
+    open_fill_id: Mapped[int] = mapped_column(
+        ForeignKey("leaderboard_trader_fills.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    close_fill_id: Mapped[int | None] = mapped_column(
+        ForeignKey("leaderboard_trader_fills.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    coin: Mapped[str] = mapped_column(String(64), index=True)
+    direction: Mapped[str] = mapped_column(String(16), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
+    source_open_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    source_close_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric(28, 10))
+    exit_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    copy_size: Mapped[Decimal] = mapped_column(Numeric(28, 10))
+    copy_notional_usd: Mapped[Decimal] = mapped_column(Numeric(28, 10))
+    original_notional_usd: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    entry_fee_usdc: Mapped[Decimal] = mapped_column(Numeric(28, 10), default=Decimal("0"))
+    exit_fee_usdc: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    gross_pnl_usdc: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    net_pnl_usdc: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    pnl_pct: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    close_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    trader: Mapped[LeaderboardTrader] = relationship()
+    open_fill: Mapped[LeaderboardTraderFill] = relationship(foreign_keys=[open_fill_id])
+    close_fill: Mapped[LeaderboardTraderFill | None] = relationship(foreign_keys=[close_fill_id])
+
+    __table_args__ = (
+        Index("ix_leaderboard_copy_trader_status", "trader_id", "status"),
+        Index("ix_leaderboard_copy_coin_status", "coin", "status"),
+        Index("ix_leaderboard_copy_closed_at", "closed_at"),
+    )
+
+
 class DecisionLog(Base):
     __tablename__ = "decision_logs"
 

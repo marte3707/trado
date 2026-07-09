@@ -38,6 +38,7 @@ from app.services.hyperliquid import (
     fetch_perp_open_interests,
 )
 from app.services.hyperliquid_rate_limit import available_hyperliquid_info_request_capacity
+from app.services.leaderboard_alpha import run_leaderboard_alpha_maintenance
 from app.services.live_reconciliation import reconcile_live_positions
 from app.services.market_sync import MarketSyncService
 from app.services.position_pnl import refresh_open_position_pnls
@@ -61,6 +62,7 @@ from app.worker.live_close_notifications import (
 from app.worker.scheduler import (
     DATA_RETENTION_INTERVAL_SECONDS,
     DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
+    LEADERBOARD_ALPHA_CHECK_INTERVAL_SECONDS,
     LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
     UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
     PeriodicScheduler,
@@ -69,6 +71,7 @@ from app.worker.scheduler import (
 from app.worker.timeframe_schedule import (
     active_timeframes_for_tick,
     mark_timeframes_run,
+    open_position_trailing_market_ids_by_timeframe,
     paper_management_timeframes,
 )
 from app.worker.uar_guard import audit_unified_account_ratio_guard
@@ -419,6 +422,36 @@ def select_worker_sync_pairs(
     }
 
 
+def _monitoring_sync_scope(
+    markets: list[Market],
+    sync_active_timeframes: list[str],
+    monitoring_only_timeframes: list[str],
+    active_timeframes: list[str],
+    trailing_market_ids_by_timeframe: dict[str, set[int]],
+) -> tuple[dict[str, set[int]], set[tuple[int, str]]]:
+    monitoring_market_ids = {
+        market.id
+        for market in markets
+        if market.base in {"BTC", "ETH"}
+        or bool((market.metadata_json or {}).get("monitoring_only"))
+    }
+    monitoring_only_set = set(monitoring_only_timeframes)
+    active_set = set(active_timeframes)
+    restricted_market_ids_by_timeframe: dict[str, set[int]] = {}
+    priority_pair_keys: set[tuple[int, str]] = set()
+
+    for timeframe in sync_active_timeframes:
+        if timeframe not in monitoring_only_set:
+            continue
+        allowed_market_ids = set(monitoring_market_ids)
+        allowed_market_ids.update(trailing_market_ids_by_timeframe.get(timeframe, set()))
+        if timeframe not in active_set:
+            restricted_market_ids_by_timeframe[timeframe] = allowed_market_ids
+        priority_pair_keys.update((market_id, timeframe) for market_id in allowed_market_ids)
+
+    return restricted_market_ids_by_timeframe, priority_pair_keys
+
+
 def _fast_risk_reconcile_recent(db, *, now: float, ttl_seconds: int) -> bool:
     last_ok = _last_cycle_ok_at(db, "fast_risk_cycle")
     return last_ok is not None and now - last_ok <= ttl_seconds
@@ -555,6 +588,7 @@ async def run_once(
     pnl_updated = 0
     live_reconciled = 0
     live_reconcile_skipped_reason: str | None = None
+    portfolio_profit_lock_result: dict = {"status": "not_run", "updated": 0}
     try:
         if settings.fast_risk_loop_enabled:
             live_reconcile_skipped_reason = (
@@ -569,6 +603,10 @@ async def run_once(
         else:
             live_reconciled = await asyncio.to_thread(reconcile_live_positions, db)
         pnl_updated = await refresh_open_position_pnls(db)
+        portfolio_profit_lock_result = await asyncio.to_thread(
+            executor.position_manager.manage_live_portfolio_profit_lock,
+            db,
+        )
     except HyperliquidTransientError as exc:
         logger.warning("position_pnl_refresh_transient_failed", error=str(exc))
         db.rollback()
@@ -612,6 +650,7 @@ async def run_once(
                     "pnl_updated": pnl_updated,
                     "live_reconciled": live_reconciled,
                     "live_reconcile_skipped_reason": live_reconcile_skipped_reason,
+                    "portfolio_profit_lock": portfolio_profit_lock_result,
                     "live_stop_updates": 0,
                     "btc_protection_updates": btc_protection_updates,
                     "time_stop_paper_closed": time_stop_result.get("paper_closed", 0),
@@ -670,23 +709,20 @@ async def run_once(
         signal_timeframes = set(active_timeframes) | (
             event_timeframes & set(enabled_timeframes)
         )
-        monitoring_market_ids = {
-            market.id
-            for market in markets
-            if market.base in {"BTC", "ETH"}
-            or bool((market.metadata_json or {}).get("monitoring_only"))
-        }
-        restricted_market_ids_by_timeframe = {
-            timeframe: monitoring_market_ids
-            for timeframe in sync_active_timeframes
-            if timeframe in monitoring_only_timeframes and timeframe not in active_timeframes
-        }
-        monitoring_priority_pair_keys = {
-            (market_id, timeframe)
-            for timeframe in sync_active_timeframes
-            if timeframe in monitoring_only_timeframes
-            for market_id in monitoring_market_ids
-        }
+        trailing_market_ids_by_timeframe = await asyncio.to_thread(
+            open_position_trailing_market_ids_by_timeframe,
+            db,
+        )
+        (
+            restricted_market_ids_by_timeframe,
+            monitoring_priority_pair_keys,
+        ) = _monitoring_sync_scope(
+            markets,
+            sync_active_timeframes,
+            monitoring_only_timeframes,
+            active_timeframes,
+            trailing_market_ids_by_timeframe,
+        )
         rest_sync_timeframes = list(
             dict.fromkeys([*sync_active_timeframes, *event_timeframes])
         )
@@ -908,6 +944,7 @@ async def run_once(
                     "pnl_updated": pnl_updated,
                     "live_reconciled": live_reconciled,
                     "live_reconcile_skipped_reason": live_reconcile_skipped_reason,
+                    "portfolio_profit_lock": portfolio_profit_lock_result,
                     "live_stop_updates": live_stop_updates,
                     "btc_protection_updates": btc_protection_updates,
                     "time_stop_paper_closed": time_stop_result.get("paper_closed", 0),
@@ -1093,6 +1130,21 @@ async def main() -> None:
                 work=lambda db: asyncio.to_thread(prune_old_data, db),
                 ok_message="Data retention cycle completed",
                 failed_message="Data retention cycle failed",
+            )
+
+        if scheduler.due_leaderboard_alpha(now):
+            await run_periodic_cycle(
+                cycle_id="leaderboard_alpha_cycle",
+                label="Leaderboard Alpha Cycle",
+                expected_interval_seconds=LEADERBOARD_ALPHA_CHECK_INTERVAL_SECONDS,
+                work=lambda db: run_leaderboard_alpha_maintenance(db),
+                ok_message="Leaderboard alpha cycle completed",
+                failed_message="Leaderboard alpha cycle failed",
+                ok_status=lambda result: (
+                    "skipped"
+                    if (result or {}).get("status") in {"skipped", "rate_limited", "disabled"}
+                    else "ok"
+                ),
             )
 
         # Quando il fast_risk loop e' attivo possiede gia' il liquidation guard

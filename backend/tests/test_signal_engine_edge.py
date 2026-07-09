@@ -119,6 +119,36 @@ def test_disabled_strategy_names_for_timeframe_ignores_unknown_or_invalid_entrie
     assert disabled_15m == set()
 
 
+def test_enabled_strategy_names_for_timeframe_filters_only_target_timeframe() -> None:
+    risk_value = {
+        "enabled_strategies_by_timeframe": {
+            "5m": ["trend_following_adaptive"],
+            "15m": ["volume_profile"],
+        }
+    }
+
+    enabled_5m = SignalEngine._enabled_strategy_names_for_timeframe(risk_value, "5m")
+    enabled_15m = SignalEngine._enabled_strategy_names_for_timeframe(risk_value, "15m")
+
+    assert enabled_5m == {"trend_following_adaptive"}
+    assert enabled_15m == {"volume_profile"}
+
+
+def test_enabled_strategy_names_for_timeframe_ignores_unknown_or_invalid_entries() -> None:
+    risk_value = {
+        "enabled_strategies_by_timeframe": {
+            "5m": ["trend_following_adaptive", "", 123],
+            "1h": "volume_profile",
+        }
+    }
+
+    enabled_5m = SignalEngine._enabled_strategy_names_for_timeframe(risk_value, "5m")
+    enabled_15m = SignalEngine._enabled_strategy_names_for_timeframe(risk_value, "15m")
+
+    assert enabled_5m == {"trend_following_adaptive"}
+    assert enabled_15m == set()
+
+
 def test_strategy_config_filter_leaves_other_internal_strategies_untouched() -> None:
     configs = [
         StrategyConfig(strategy_name="cvd_divergence", timeframe="5m", enabled=True, params={}, weight=10),
@@ -178,3 +208,65 @@ def test_timeframe_min_score_override_ignores_invalid_values() -> None:
         )
         == 65
     )
+
+
+def test_volatility_shadow_sampling_respects_config_and_cycle_cap() -> None:
+    engine = SignalEngine()
+    source_time = datetime(2026, 1, 1, tzinfo=UTC)
+
+    assert (
+        engine._should_sample_volatility_skip(
+            {"volatility_filter_shadow_sample_enabled": False},
+            market_id=1,
+            timeframe="5m",
+            source_candle_open_time=source_time,
+        )
+        is False
+    )
+    assert (
+        engine._should_sample_volatility_skip(
+            {"volatility_filter_shadow_sample_rate": 0},
+            market_id=1,
+            timeframe="5m",
+            source_candle_open_time=source_time,
+        )
+        is False
+    )
+    assert engine._should_sample_volatility_skip(
+        {
+            "volatility_filter_shadow_sample_rate": 1,
+            "volatility_filter_shadow_max_per_cycle": 1,
+        },
+        market_id=1,
+        timeframe="5m",
+        source_candle_open_time=source_time,
+    ) is True
+
+    engine._cycle_volatility_shadow_samples = 1
+    assert (
+        engine._should_sample_volatility_skip(
+            {
+                "volatility_filter_shadow_sample_rate": 1,
+                "volatility_filter_shadow_max_per_cycle": 1,
+            },
+            market_id=1,
+            timeframe="5m",
+            source_candle_open_time=source_time,
+        )
+        is False
+    )
+
+
+def test_volatility_shadow_sampling_invalid_config_falls_back_safely() -> None:
+    engine = SignalEngine()
+
+    result = engine._should_sample_volatility_skip(
+        {
+            "volatility_filter_shadow_sample_rate": "bad",
+            "volatility_filter_shadow_max_per_cycle": "bad",
+        },
+        market_id=1,
+        timeframe="15m",
+        source_candle_open_time=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert isinstance(result, bool)

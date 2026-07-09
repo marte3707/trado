@@ -21,8 +21,10 @@ import {
   type EquitySlopeDiagnostics,
   type ExpectedRCalibration,
   type Health,
-  type Market,
+  type LeaderboardAlphaDashboard,
+  type LiveEligibilityReport,
   type MacroCorrelation,
+  type Market,
   type MarketDashboardSnapshot,
   type MarketIntelligence,
   type Order,
@@ -35,6 +37,7 @@ import {
   type SignalRejections,
   type SignalSnapshot,
   type Strategy,
+  type StrategyEdgeReport,
   type SystemCycleDiagnostics,
   type WorkerCycle,
 } from "@/lib/api";
@@ -340,10 +343,37 @@ export function useExpectedRCalibration(opts?: QueryOpts<ExpectedRCalibration | 
   });
 }
 
+export function useStrategyEdge(opts?: QueryOpts<StrategyEdgeReport | null>) {
+  return useQuery({
+    queryKey: qk.strategyEdge,
+    queryFn: () => apiGet<StrategyEdgeReport>("/api/analytics/strategy-edge").catch(() => null),
+    refetchInterval: 5 * 60_000,
+    ...opts,
+  });
+}
+
+export function useLiveEligibility(opts?: QueryOpts<LiveEligibilityReport | null>) {
+  return useQuery({
+    queryKey: qk.liveEligibility,
+    queryFn: () => apiGet<LiveEligibilityReport>("/api/analytics/live-eligibility").catch(() => null),
+    refetchInterval: 5 * 60_000,
+    ...opts,
+  });
+}
+
 export function useDiagnostics(opts?: QueryOpts<DiagnosticReport | null>) {
   return useQuery({
     queryKey: qk.diagnostics,
     queryFn: () => apiGet<DiagnosticReport>("/api/analytics/diagnostics").catch(() => null),
+    refetchInterval: 60_000,
+    ...opts,
+  });
+}
+
+export function useLeaderboardAlpha(opts?: QueryOpts<LeaderboardAlphaDashboard>) {
+  return useQuery({
+    queryKey: qk.leaderboardAlpha,
+    queryFn: () => apiGet<LeaderboardAlphaDashboard>("/api/leaderboard-alpha"),
     refetchInterval: 60_000,
     ...opts,
   });

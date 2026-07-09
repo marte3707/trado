@@ -16,6 +16,7 @@ from app.engine.edge_profile import (
     compute_edge_adjustments,
 )
 from app.engine.performance import PerformanceStats, SignalPerformanceAnalyzer, serialize_stats
+from app.engine.pre_tp1_validation import DEFAULT_PRE_TP1_SETTINGS
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,7 @@ class AutoCalibrationEngine:
             "recent_defensive_exit_cycles": 3,
             "recent_defensive_risk_factor": 0.6,
             "recent_defensive_rr_add": 0.3,
+            "edge_adjustment_ignore_stats_churn": True,
         }
         return {**defaults, **value}
 
@@ -1086,6 +1088,7 @@ class AutoCalibrationEngine:
             "entry_quality_ema_period": 21,
             "entry_quality_long_ob_imbalance_min": 0.05,
             "entry_quality_short_ob_imbalance_max": 0.0,
+            **DEFAULT_PRE_TP1_SETTINGS,
             "max_combined_score_adjustment": DEFAULT_MAX_COMBINED_SCORE_ADJUSTMENT,
         }
         changes: list[CalibrationChange] = []
@@ -1106,6 +1109,11 @@ class AutoCalibrationEngine:
             before = risk.get(key)
             if before == value:
                 continue
+            if bool(settings.get("edge_adjustment_ignore_stats_churn", True)) and (
+                self._edge_adjustment_signature(before)
+                == self._edge_adjustment_signature(value)
+            ):
+                continue
             risk[key] = value
             changes.append(
                 CalibrationChange(
@@ -1121,6 +1129,36 @@ class AutoCalibrationEngine:
             risk_setting.value = risk
             db.add(risk_setting)
         return changes
+
+    @staticmethod
+    def _edge_adjustment_signature(value: Any) -> dict[str, Any] | None:
+        """Rappresenta solo l'effetto operativo di un adjustment.
+
+        Gli edge-adjustment includono `stats` diagnostici che cambiano quasi a ogni
+        trade chiuso. Se i key e l'adjustment effettivo sono identici, riscrivere
+        `risk` produce churn nei log senza cambiare il comportamento del motore.
+        """
+        if not isinstance(value, dict):
+            return None
+        signature: dict[str, Any] = {}
+        for key, payload in value.items():
+            if isinstance(payload, dict):
+                if "adjustment" in payload:
+                    try:
+                        signature[str(key)] = int(payload.get("adjustment") or 0)
+                    except (TypeError, ValueError):
+                        signature[str(key)] = 0
+                elif "reason" in payload or "stats" in payload:
+                    signature[str(key)] = True
+                else:
+                    signature[str(key)] = {
+                        str(inner_key): inner_value
+                        for inner_key, inner_value in payload.items()
+                        if inner_key != "stats"
+                    }
+            else:
+                signature[str(key)] = payload
+        return signature
 
     # Range del factor continuo: più ampio dei vecchi 5 valori discreti
     # {0.6, 0.8, 1.0, 1.1, 1.2} che impedivano al calibratore di esprimere

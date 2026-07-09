@@ -18,7 +18,11 @@ from app.core.runtime_settings import (
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, Signal
 from app.engine.order_validation import LiveOrderPlan, OrderValidator
 from app.engine.portfolio_guard import PortfolioGuard, PortfolioGuardDecision
-from app.engine.position_management import LiquidationGuardResult, PositionManagementEngine
+from app.engine.position_management import (
+    LIQUIDATION_GUARD_SL_SAFETY_BUFFER,
+    LiquidationGuardResult,
+    PositionManagementEngine,
+)
 from app.engine.risk import calculate_position_size
 from app.services.hyperliquid import (
     HyperliquidError,
@@ -79,6 +83,38 @@ def _safe_error_message(exc: Exception, max_length: int = 500) -> str:
     return f"{message[:max_length]}..."
 
 
+def _depth_estimate_data(depth_estimate: Any | None) -> dict[str, Any]:
+    if depth_estimate is None:
+        return {}
+    data: dict[str, Any] = {}
+    fields = {
+        "limit_px": "limit_price",
+        "best_bid": "best_bid",
+        "best_ask": "best_ask",
+        "side_level_count": "side_level_count",
+        "fillable_level_count": "fillable_level_count",
+    }
+    for attr, key in fields.items():
+        value = getattr(depth_estimate, attr, None)
+        if value is None:
+            continue
+        data[key] = str(value) if isinstance(value, Decimal) else value
+    return data
+
+
+def _depth_price_outside_slippage(depth_estimate: Any | None, *, is_long: bool) -> bool:
+    if depth_estimate is None:
+        return False
+    limit_px = getattr(depth_estimate, "limit_px", None)
+    side_px = getattr(depth_estimate, "best_ask" if is_long else "best_bid", None)
+    if limit_px is None or side_px is None:
+        return False
+    try:
+        return side_px > limit_px if is_long else side_px < limit_px
+    except (InvalidOperation, TypeError):
+        return False
+
+
 _HYPERLIQUID_RATE_LIMIT_COOLDOWN_SECONDS = 600
 _HYPERLIQUID_RATE_LIMIT_EVENTS = {
     "fast_risk_cycle_failed",
@@ -132,8 +168,6 @@ TP_FINAL_CLOSE_ALLOCATION = Decimal("0.20")
 LIQUIDATION_STOP_DISTANCE_ABSOLUTE_BUFFER = Decimal("0.10")
 # Buffer applicato allo stop aggiustato rispetto al liq price quando il guard fallisce:
 # lo stop viene posizionato a liq_price * (1 ± BUFFER) per restare sul lato sicuro.
-LIQUIDATION_GUARD_SL_SAFETY_BUFFER = Decimal("0.03")
-
 
 def risk_at_open_snapshot(db: Session) -> dict[str, Any]:
     """Snapshot dei parametri di rischio operativi al momento dell'apertura.
@@ -457,13 +491,25 @@ class OrderExecutionEngine:
         is_long = plan.side == "long"
         order_notional = order_size * signal.entry_price
         depth_threshold = max(min_notional_dec, order_notional * Decimal("1.2"))
+        max_slippage_pct = float(live_settings["max_slippage_pct"])
+        depth_estimate: Any | None = None
         try:
-            fillable = trading.available_fill_notional(
-                coin=coin,
-                is_buy=is_long,
-                slippage_pct=float(live_settings["max_slippage_pct"]),
-                mid_price=float(signal.entry_price),
-            )
+            available_fill_depth = getattr(trading, "available_fill_depth", None)
+            if callable(available_fill_depth):
+                depth_estimate = available_fill_depth(
+                    coin=coin,
+                    is_buy=is_long,
+                    slippage_pct=max_slippage_pct,
+                    mid_price=float(signal.entry_price),
+                )
+                fillable = depth_estimate.fillable_notional
+            else:
+                fillable = trading.available_fill_notional(
+                    coin=coin,
+                    is_buy=is_long,
+                    slippage_pct=max_slippage_pct,
+                    mid_price=float(signal.entry_price),
+                )
         except Exception as exc:
             db.add(
                 DecisionLog(
@@ -476,6 +522,17 @@ class OrderExecutionEngine:
             )
             db.commit()
             raise PermissionError(f"book depth unavailable for {coin}") from exc
+        depth_log_data = {
+            "coin": coin,
+            "fillable_notional": str(fillable),
+            "order_notional": str(order_notional),
+            "depth_threshold": str(depth_threshold),
+            "min_notional": str(min_notional_dec),
+            "is_long": is_long,
+            "reference_price": str(signal.entry_price),
+            "max_slippage_pct": str(max_slippage_pct),
+            **_depth_estimate_data(depth_estimate),
+        }
         if not fillable.is_finite():
             db.add(
                 DecisionLog(
@@ -483,42 +540,52 @@ class OrderExecutionEngine:
                     market_id=signal.market_id,
                     signal_id=signal.id,
                     message=f"Trade skippato: depth book non disponibile per {coin}",
-                    data={
-                        "coin": coin,
-                        "fillable_notional": str(fillable),
-                        "order_notional": str(order_notional),
-                        "depth_threshold": str(depth_threshold),
-                        "min_notional": str(min_notional_dec),
-                        "is_long": is_long,
-                    },
+                    data=depth_log_data,
                 )
             )
             db.commit()
             raise PermissionError(f"book depth unavailable for {coin}")
         if fillable < depth_threshold:
+            price_outside_slippage = fillable == 0 and _depth_price_outside_slippage(
+                depth_estimate,
+                is_long=is_long,
+            )
+            if price_outside_slippage:
+                assert depth_estimate is not None
+                side_label = "best ask" if is_long else "best bid"
+                comparison = ">" if is_long else "<"
+                side_price = depth_estimate.best_ask if is_long else depth_estimate.best_bid
+                limit_px = depth_estimate.limit_px
+                event_type = "live_order_skipped_price_outside_slippage"
+                message = (
+                    f"Trade skippato: prezzo book fuori slippage per {coin} "
+                    f"({side_label} {side_price} {comparison} limite {limit_px})"
+                )
+                permission_message = (
+                    f"price outside slippage for {coin}: {side_label} {side_price} "
+                    f"{comparison} limit {limit_px}"
+                )
+            else:
+                event_type = "live_order_skipped_insufficient_depth"
+                message = (
+                    f"Trade skippato: depth book insufficiente per {coin} "
+                    f"(fillable ${float(fillable):.2f} < soglia ${float(depth_threshold):.2f})"
+                )
+                permission_message = (
+                    f"insufficient book depth for {coin}: fillable ${float(fillable):.2f} "
+                    f"< threshold ${float(depth_threshold):.2f}"
+                )
             db.add(
                 DecisionLog(
-                    event_type="live_order_skipped_insufficient_depth",
+                    event_type=event_type,
                     market_id=signal.market_id,
                     signal_id=signal.id,
-                    message=(
-                        f"Trade skippato: depth book insufficiente per {coin} "
-                        f"(fillable ${float(fillable):.2f} < soglia ${float(depth_threshold):.2f})"
-                    ),
-                    data={
-                        "coin": coin,
-                        "fillable_notional": str(fillable),
-                        "order_notional": str(order_notional),
-                        "depth_threshold": str(depth_threshold),
-                        "min_notional": str(min_notional_dec),
-                        "is_long": is_long,
-                    },
+                    message=message,
+                    data=depth_log_data,
                 )
             )
             db.commit()
-            raise PermissionError(
-                f"insufficient book depth for {coin}: fillable ${float(fillable):.2f} < threshold ${float(depth_threshold):.2f}"
-            )
+            raise PermissionError(permission_message)
 
         hl_max_lev = (market.metadata_json or {}).get("raw", {}).get("maxLeverage")
         safe_leverage = (
@@ -781,6 +848,14 @@ class OrderExecutionEngine:
         )
         db.add(position)
         db.flush()
+        market = db.get(Market, signal.market_id)
+        sz_decimals = _sz_decimals(market) if market is not None else 8
+        self._rescale_live_take_profit_plan_min_notional(
+            db,
+            position,
+            signal,
+            sz_decimals,
+        )
         db.add(
             Order(
                 position_id=position.id,
@@ -814,6 +889,113 @@ class OrderExecutionEngine:
             )
         )
         return position
+
+    def _rescale_live_take_profit_plan_min_notional(
+        self,
+        db: Session,
+        position: Position,
+        signal: Signal,
+        sz_decimals: int,
+    ) -> None:
+        metadata = dict(position.metadata_json or {})
+        plan = metadata.get("take_profit_plan")
+        if not isinstance(plan, list) or not plan:
+            return
+        live_settings = effective_live_execution_settings(db, self.settings)
+        min_reduce_notional = Decimal(str(live_settings["min_reduce_only_notional_usd"]))
+        if min_reduce_notional <= 0:
+            return
+        initial_size = Decimal(str(metadata.get("initial_size") or position.size))
+        original_plan = [dict(item) for item in plan if isinstance(item, dict)]
+        rescaled: list[dict[str, Any]] = []
+        changes: list[dict[str, Any]] = []
+
+        for item in original_plan:
+            if item.get("runner") or item.get("filled") or item.get("skipped"):
+                rescaled.append(dict(item))
+                continue
+            level = str(item.get("level", ""))
+            if level not in {"tp1", "tp2", "tp3"}:
+                rescaled.append(dict(item))
+                continue
+            try:
+                price = Decimal(str(item["price"]))
+                allocation = Decimal(str(item["allocation"]))
+            except Exception:
+                continue
+            tp_size = _round_size(initial_size * allocation, sz_decimals)
+            notional = abs(tp_size * price)
+            if tp_size > 0 and notional >= min_reduce_notional:
+                rescaled.append(dict(item))
+                continue
+
+            previous_tp = next(
+                (
+                    entry
+                    for entry in reversed(rescaled)
+                    if isinstance(entry, dict)
+                    and not entry.get("runner")
+                    and not entry.get("filled")
+                    and not entry.get("skipped")
+                    and str(entry.get("level", "")) in {"tp1", "tp2", "tp3"}
+                ),
+                None,
+            )
+            if previous_tp is not None:
+                previous_allocation = Decimal(str(previous_tp["allocation"]))
+                previous_tp["allocation"] = str(previous_allocation + allocation)
+                changes.append(
+                    {
+                        "level": level,
+                        "action": "merged_into_previous_tp",
+                        "merged_into": previous_tp.get("level"),
+                        "allocation": str(allocation),
+                        "notional": str(notional),
+                    }
+                )
+                continue
+
+            skipped = dict(item)
+            skipped["skipped"] = True
+            skipped["skip_reason"] = "below_min_reduce_only_notional"
+            skipped["notional_at_skip"] = str(notional)
+            skipped["min_reduce_only_notional"] = str(min_reduce_notional)
+            rescaled.append(skipped)
+            changes.append(
+                {
+                    "level": level,
+                    "action": "skipped",
+                    "allocation": str(allocation),
+                    "notional": str(notional),
+                }
+            )
+
+        if not changes:
+            return
+        metadata["take_profit_plan"] = rescaled
+        metadata["take_profit_plan_min_notional_rescaled"] = True
+        metadata["take_profit_plan_min_notional_rescale"] = {
+            "min_reduce_only_notional_usd": str(min_reduce_notional),
+            "changes": changes,
+        }
+        position.metadata_json = metadata
+        db.add(position)
+        db.add(
+            DecisionLog(
+                event_type="live_take_profit_plan_min_notional_rescaled",
+                market_id=signal.market_id,
+                signal_id=signal.id,
+                position_id=position.id,
+                message="Live take-profit plan rescaled for reduce-only minimum notional",
+                data={
+                    "min_reduce_only_notional_usd": str(min_reduce_notional),
+                    "initial_size": str(initial_size),
+                    "original_plan": original_plan,
+                    "rescaled_plan": rescaled,
+                    "changes": changes,
+                },
+            )
+        )
 
     def _build_live_order_plan(
         self,
@@ -921,6 +1103,7 @@ class OrderExecutionEngine:
     ) -> None:
         live_settings = effective_live_execution_settings(db, self.settings)
         expires_after_seconds = int(live_settings["order_expires_after_seconds"])
+        min_reduce_notional = Decimal(str(live_settings["min_reduce_only_notional_usd"]))
         close_is_buy = position.side.lower() == "short"
         protection_errors: list[str] = []
         submitted_parts: list[str] = []
@@ -1030,6 +1213,39 @@ class OrderExecutionEngine:
                     level=level,
                     allocation=str(allocation),
                     initial_size=str(initial_size),
+                )
+                continue
+            tp_notional = abs(tp_size * price)
+            if min_reduce_notional > 0 and tp_notional < min_reduce_notional:
+                skipped_tp_levels.append(
+                    {
+                        "level": level,
+                        "allocation": str(allocation),
+                        "size": str(tp_size),
+                        "price": str(price),
+                        "notional": str(tp_notional),
+                        "min_reduce_only_notional": str(min_reduce_notional),
+                        "reason": "below_min_reduce_only_notional",
+                    }
+                )
+                metadata = dict(position.metadata_json or {})
+                plan = metadata.get("take_profit_plan")
+                if isinstance(plan, list):
+                    for entry in plan:
+                        if isinstance(entry, dict) and entry.get("level") == level:
+                            entry["skipped"] = True
+                            entry["skip_reason"] = "below_min_reduce_only_notional"
+                            entry["notional_at_skip"] = str(tp_notional)
+                            entry["min_reduce_only_notional"] = str(min_reduce_notional)
+                    position.metadata_json = metadata
+                    db.add(position)
+                logger.warning(
+                    "live_protection_tp_below_min_reduce_only_notional",
+                    signal_id=signal.id,
+                    position_id=position.id,
+                    level=level,
+                    notional=str(tp_notional),
+                    min_reduce_only_notional=str(min_reduce_notional),
                 )
                 continue
             tp_cloid = make_cloid(signal.id, level)

@@ -55,6 +55,21 @@ DEFAULT_POSITION_MANAGEMENT_SETTINGS: dict[str, Any] = {
         "lockProfitAtR": 2.0,
         "lockProfitStopR": 1.0,
     },
+    "preTpProfitLock": {
+        "enabled": True,
+        "activationR": 0.5,
+        "minProfitUsd": 1.5,
+        "lockFractionOfR": 0.35,
+        "minLockR": 0.15,
+        "maxLockR": 0.35,
+    },
+    "livePortfolioProfitLock": {
+        "enabled": True,
+        "activationUnrealizedPnlUsd": 10.0,
+        "givebackPct": 35.0,
+        "minPositionProfitUsd": 1.5,
+        "marketCloseEnabled": False,
+    },
     "takeProfit": {
         "enabled": True,
         "tp1R": 1.0,
@@ -370,6 +385,10 @@ def effective_live_execution_settings(db: Session, settings: Settings) -> dict:
         "min_order_notional_usd": _float(
             value.get("min_order_notional_usd"),
             settings.live_min_order_notional_usd,
+        ),
+        "min_reduce_only_notional_usd": _float(
+            value.get("min_reduce_only_notional_usd"),
+            10.0,
         ),
         "bump_to_min_notional": bool(
             value.get("bump_to_min_notional", settings.live_bump_to_min_notional)

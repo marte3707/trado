@@ -141,6 +141,16 @@ class L2BookSnapshot:
     asks: list[OrderBookLevel]  # ordinati per prezzo crescente
 
 
+@dataclass(frozen=True)
+class FillableDepthEstimate:
+    fillable_notional: Decimal
+    limit_px: Decimal | None = None
+    best_bid: Decimal | None = None
+    best_ask: Decimal | None = None
+    side_level_count: int = 0
+    fillable_level_count: int = 0
+
+
 def fetch_l2_book(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapshot | None:
     """Ritorna snapshot L2 dell'order book per `coin`. None in caso di errore.
 
@@ -488,6 +498,45 @@ class HyperliquidClient:
             payload["endTime"] = end_ms
         return await self._post_info(payload, breaker=hyperliquid_account_breaker)
 
+    async def user_fills(self, address: str) -> list[dict[str, Any]]:
+        return await self._post_info(
+            {"type": "userFills", "user": address},
+            breaker=hyperliquid_account_breaker,
+        )
+
+    async def user_fills_by_time(
+        self,
+        address: str,
+        start_ms: int,
+        end_ms: int | None = None,
+        *,
+        aggregate_by_time: bool = False,
+    ) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "type": "userFillsByTime",
+            "user": address,
+            "startTime": start_ms,
+            "aggregateByTime": aggregate_by_time,
+        }
+        if end_ms is not None:
+            payload["endTime"] = end_ms
+        return await self._post_info(payload, breaker=hyperliquid_account_breaker)
+
+    async def user_non_funding_ledger_updates(
+        self,
+        address: str,
+        start_ms: int,
+        end_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "type": "userNonFundingLedgerUpdates",
+            "user": address,
+            "startTime": start_ms,
+        }
+        if end_ms is not None:
+            payload["endTime"] = end_ms
+        return await self._post_info(payload, breaker=hyperliquid_account_breaker)
+
     @staticmethod
     def perp_markets(meta: dict[str, Any]) -> list[dict[str, Any]]:
         markets: list[dict[str, Any]] = []
@@ -746,13 +795,28 @@ class HyperliquidTradingClient:
         slippage_pct: float,
         mid_price: float,
     ) -> Decimal:
+        return self.available_fill_depth(
+            coin=coin,
+            is_buy=is_buy,
+            slippage_pct=slippage_pct,
+            mid_price=mid_price,
+        ).fillable_notional
+
+    def available_fill_depth(
+        self,
+        coin: str,
+        is_buy: bool,
+        slippage_pct: float,
+        mid_price: float,
+    ) -> FillableDepthEstimate:
         """Stima il notional USD fillabile al prezzo di slippage leggendo il book L2.
 
         Per un SHORT (is_buy=False): somma i bid con px >= limit_px.
         Per un LONG (is_buy=True): somma gli ask con px <= limit_px.
-        Restituisce il notional totale fillabile. Ritorna Decimal('Inf') in
-        caso di errore; il caller live tratta questo valore come depth non
-        verificabile e deve skippare l'ordine.
+        Ritorna anche best bid/ask e limit_px per distinguere un book sottile
+        da un prezzo di riferimento ormai fuori dallo slippage consentito.
+        In caso di errore fillable_notional resta Decimal('Inf'), che il caller
+        live tratta come depth non verificabile e quindi fail-closed.
         """
         try:
             info = self._info()
@@ -764,26 +828,39 @@ class HyperliquidTradingClient:
                 live_preflight=True,
             )
             levels = book.get("levels", [[], []])
-            slippage_factor = slippage_pct / 100.0
+            bids = levels[0] if isinstance(levels, list) and len(levels) > 0 else []
+            asks = levels[1] if isinstance(levels, list) and len(levels) > 1 else []
+            if not isinstance(bids, list):
+                bids = []
+            if not isinstance(asks, list):
+                asks = []
+            best_bid = Decimal(str(bids[0]["px"])) if bids else None
+            best_ask = Decimal(str(asks[0]["px"])) if asks else None
+            reference_price = Decimal(str(mid_price))
+            slippage_factor = Decimal(str(slippage_pct)) / Decimal("100")
             if is_buy:
-                limit_px = mid_price * (1 + slippage_factor)
-                side_levels = levels[1] if len(levels) > 1 else []
-                total_size = sum(
-                    float(lvl["sz"])
-                    for lvl in side_levels
-                    if float(lvl["px"]) <= limit_px
-                )
+                limit_px = reference_price * (Decimal("1") + slippage_factor)
+                side_levels = asks
+                fillable_levels = [
+                    lvl for lvl in side_levels if Decimal(str(lvl["px"])) <= limit_px
+                ]
             else:
-                limit_px = mid_price * (1 - slippage_factor)
-                side_levels = levels[0] if levels else []
-                total_size = sum(
-                    float(lvl["sz"])
-                    for lvl in side_levels
-                    if float(lvl["px"]) >= limit_px
-                )
-            return Decimal(str(total_size * mid_price))
+                limit_px = reference_price * (Decimal("1") - slippage_factor)
+                side_levels = bids
+                fillable_levels = [
+                    lvl for lvl in side_levels if Decimal(str(lvl["px"])) >= limit_px
+                ]
+            total_size = sum(Decimal(str(lvl["sz"])) for lvl in fillable_levels)
+            return FillableDepthEstimate(
+                fillable_notional=total_size * reference_price,
+                limit_px=limit_px,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                side_level_count=len(side_levels),
+                fillable_level_count=len(fillable_levels),
+            )
         except Exception:
-            return Decimal("Inf")
+            return FillableDepthEstimate(fillable_notional=Decimal("Inf"))
 
     def submit_market_order(
         self,

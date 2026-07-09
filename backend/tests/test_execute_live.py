@@ -10,6 +10,7 @@ from app.db.models import AppSetting, DecisionLog, Market, Order, Position, Sign
 from app.engine.execution import OrderExecutionEngine, _target_leverage
 from app.engine.order_validation import ValidationResult
 from app.services.hyperliquid import (
+    FillableDepthEstimate,
     HyperliquidError,
     HyperliquidOrderResult,
     HyperliquidTransientError,
@@ -46,6 +47,7 @@ class FakeDb:
     market: Market
     risk_settings: dict[str, Any] = field(default_factory=dict)
     live_execution_settings: dict[str, Any] = field(default_factory=dict)
+    position_management_settings: dict[str, Any] = field(default_factory=dict)
     operation_mode_setting: dict[str, Any] = field(default_factory=lambda: {"value": "AUTO_TRADE"})
     enable_live_setting: dict[str, Any] = field(default_factory=lambda: {"value": True})
     kill_switch: dict[str, Any] | None = None
@@ -67,6 +69,12 @@ class FakeDb:
                 return AppSetting(key="risk", value=self.risk_settings)
             if pk == "live_execution":
                 return AppSetting(key="live_execution", value=self.live_execution_settings)
+            if pk == "position_management":
+                return (
+                    AppSetting(key="position_management", value=self.position_management_settings)
+                    if self.position_management_settings
+                    else None
+                )
             if pk == "operation_mode":
                 return AppSetting(key="operation_mode", value=self.operation_mode_setting)
             if pk == "enable_live_trading":
@@ -128,6 +136,8 @@ class FakeTradingClient:
         user_state_positions: list[dict[str, Any]] | None = None,
         pre_existing_positions: list[dict[str, Any]] | None = None,
         fillable_notional: Decimal = Decimal("1000000"),
+        depth_best_bid: Decimal | None = None,
+        depth_best_ask: Decimal | None = None,
         depth_error: Exception | None = None,
         account_summary_error: Exception | None = None,
     ) -> None:
@@ -143,6 +153,8 @@ class FakeTradingClient:
         self.trigger_orders: list[dict[str, Any]] = []
         self.leverage_calls: list[dict[str, Any]] = []
         self.fillable_notional = fillable_notional
+        self.depth_best_bid = depth_best_bid
+        self.depth_best_ask = depth_best_ask
         self.depth_error = depth_error
         self.account_summary_error = account_summary_error
 
@@ -167,6 +179,37 @@ class FakeTradingClient:
         if self.depth_error is not None:
             raise self.depth_error
         return self.fillable_notional
+
+    def available_fill_depth(
+        self,
+        coin: str,  # noqa: ARG002
+        is_buy: bool,
+        slippage_pct: float,
+        mid_price: float,
+    ) -> FillableDepthEstimate:
+        if self.depth_error is not None:
+            raise self.depth_error
+        reference_price = Decimal(str(mid_price))
+        slippage_factor = Decimal(str(slippage_pct)) / Decimal("100")
+        limit_px = (
+            reference_price * (Decimal("1") + slippage_factor)
+            if is_buy
+            else reference_price * (Decimal("1") - slippage_factor)
+        )
+        side_level_count = 1 if (self.depth_best_ask if is_buy else self.depth_best_bid) else 0
+        fillable_level_count = (
+            1
+            if self.fillable_notional.is_finite() and self.fillable_notional > 0
+            else 0
+        )
+        return FillableDepthEstimate(
+            fillable_notional=self.fillable_notional,
+            limit_px=limit_px,
+            best_bid=self.depth_best_bid,
+            best_ask=self.depth_best_ask,
+            side_level_count=side_level_count,
+            fillable_level_count=fillable_level_count,
+        )
 
     def submit_market_order(
         self,
@@ -370,6 +413,49 @@ def test_execute_live_long_submits_market_plus_dynamic_triggers(monkeypatch: pyt
     orders = db.added_of(Order)
     # entry + SL + TP1/TP2
     assert len(orders) == 4
+
+
+def test_execute_live_rescales_small_tp2_into_tp1_for_reduce_only_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(
+        signal=signal,
+        market=_build_market(),
+        live_execution_settings={
+            "order_notional_cap_usd": 40.0,
+            "min_order_notional_usd": 40.0,
+            "min_reduce_only_notional_usd": 10.0,
+        },
+        position_management_settings={
+            "takeProfit": {
+                "enabled": True,
+                "tp1R": 1,
+                "tp1ClosePct": 30,
+                "tp2R": 2,
+                "tp2ClosePct": 20,
+                "runnerPct": 50,
+                "runnerMode": "trailing_stop",
+            }
+        },
+    )
+    trading = FakeTradingClient()
+
+    position = OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert position is not None
+    tp_orders = [order for order in trading.trigger_orders if order["tpsl"] == "tp"]
+    assert len(tp_orders) == 1
+    assert tp_orders[0]["size"] == Decimal("0.2000")
+    plan = position.metadata_json["take_profit_plan"]
+    assert [entry["level"] for entry in plan] == ["tp1", "runner"]
+    assert plan[0]["allocation"] == "0.5"
+    assert any(
+        row.event_type == "live_take_profit_plan_min_notional_rescaled"
+        for row in db.added_of(DecisionLog)
+    )
 
 
 def test_execute_live_short_uses_sell_market_and_buy_triggers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -942,6 +1028,61 @@ def test_execute_live_skips_when_depth_unavailable(monkeypatch: pytest.MonkeyPat
     events = [row.event_type for row in db.added_of(DecisionLog)]
     assert "live_order_skipped_depth_unavailable" in events
     assert "live_order_partial_fill_below_min_notional" not in events
+
+
+def test_execute_live_classifies_zero_depth_as_price_outside_slippage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient(
+        fillable_notional=Decimal("0"),
+        depth_best_bid=Decimal("100.9"),
+        depth_best_ask=Decimal("101"),
+    )
+
+    with pytest.raises(PermissionError, match="price outside slippage"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.market_orders == []
+    assert trading.leverage_calls == []
+    rows = db.added_of(DecisionLog)
+    event = next(
+        row for row in rows if row.event_type == "live_order_skipped_price_outside_slippage"
+    )
+    assert event.data["fillable_notional"] == "0"
+    assert event.data["best_ask"] == "101"
+    assert Decimal(event.data["limit_price"]) == Decimal("100.5")
+    assert event.data["reference_price"] == "100"
+    assert event.data["max_slippage_pct"] == "0.5"
+    assert "live_order_skipped_insufficient_depth" not in [row.event_type for row in rows]
+
+
+def test_execute_live_keeps_insufficient_depth_when_book_price_is_within_slippage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient(
+        fillable_notional=Decimal("20"),
+        depth_best_bid=Decimal("99.9"),
+        depth_best_ask=Decimal("100.1"),
+    )
+
+    with pytest.raises(PermissionError, match="insufficient book depth"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.market_orders == []
+    rows = db.added_of(DecisionLog)
+    event = next(row for row in rows if row.event_type == "live_order_skipped_insufficient_depth")
+    assert event.data["fillable_notional"] == "20"
+    assert event.data["best_ask"] == "100.1"
+    assert Decimal(event.data["limit_price"]) == Decimal("100.5")
+    assert "live_order_skipped_price_outside_slippage" not in [row.event_type for row in rows]
 
 
 def test_execute_live_aborts_before_submit_when_kill_switch_enabled(
