@@ -1787,7 +1787,8 @@ def _copy_live_dry_run_orders(
     account_value = _account_value(account_snapshot)
     available_margin = _available_margin(account_snapshot)
     max_leverage = Decimal(str(_risk_float(db, "max_leverage", app_settings.max_leverage)))
-    max_open_positions = _risk_int(db, "max_open_positions", app_settings.max_open_positions)
+    global_max_open_positions = _risk_int(db, "max_open_positions", app_settings.max_open_positions)
+    copy_live_max_open_positions = _int_setting(settings.get("copy_live_max_open_positions"), 3)
     max_exposure_pct = Decimal(str(_risk_float(db, "max_total_exposure_pct", app_settings.max_total_exposure_pct)))
     min_account_value = Decimal(str(live_settings["min_account_value_usd"]))
     min_notional = Decimal(str(live_settings["min_order_notional_usd"]))
@@ -1856,7 +1857,9 @@ def _copy_live_dry_run_orders(
         elif available_margin < required_margin:
             reasons.append("available_margin_insufficient")
 
-        if live_count + planned_count >= max_open_positions:
+        if planned_count >= copy_live_max_open_positions:
+            reasons.append("max_copy_live_open_positions_reached")
+        if live_count + planned_count >= global_max_open_positions:
             reasons.append("max_live_open_positions_reached")
 
         status = "blocked" if reasons else "would_submit"
@@ -1887,11 +1890,37 @@ def _copy_live_dry_run_orders(
                 "required_margin_usd": _short_decimal(required_margin),
                 "existing_live_positions": live_count,
                 "existing_live_notional_usd": _short_decimal(live_notional),
-                "max_live_open_positions": max_open_positions,
+                "max_copy_live_open_positions": copy_live_max_open_positions,
+                "max_live_open_positions": global_max_open_positions,
                 "max_total_exposure_pct": float(max_exposure_pct),
             }
         )
     return orders
+
+
+def _copy_live_readiness(settings: dict[str, Any], dry_run_orders: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    blockers: list[str] = []
+    if not settings.get("copy_live_enabled", False):
+        blockers.append("copy_live_disabled")
+    if str(settings.get("copy_live_mode") or "shadow") != "live":
+        blockers.append("copy_live_mode_shadow")
+    if not dry_run_orders:
+        blockers.append("no_dry_run_orders")
+    if not any(row.get("status") == "would_submit" for row in dry_run_orders):
+        blockers.append("no_dry_run_would_submit")
+    for row in dry_run_orders:
+        blockers.extend(str(reason) for reason in row.get("reasons") or [])
+    # Lo shadow planner non consuma budget L2. L'esecutore live deve comunque
+    # rifare depth/slippage preflight e fallire chiuso prima di inviare ordini.
+    blockers.append("live_depth_preflight_not_run")
+    blockers.append("live_order_dispatch_not_implemented")
+    unique_blockers = sorted(set(blockers))
+    return {
+        "ready": False,
+        "blockers": unique_blockers,
+        "would_submit": len([row for row in dry_run_orders if row.get("status") == "would_submit"]),
+        "blocked": len([row for row in dry_run_orders if row.get("status") != "would_submit"]),
+    }
 
 
 def build_copy_live_shadow_plan(
@@ -1970,6 +1999,7 @@ def build_copy_live_shadow_plan(
         "orders_enabled": False,
         "status": status,
         "reason": "shadow_only_no_live_order_dispatch",
+        "readiness": _copy_live_readiness(settings, dry_run_orders),
         "summary": {
             "evaluated_traders": len(evaluated),
             "selected_traders": len(selected),

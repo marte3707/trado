@@ -1309,6 +1309,7 @@ export type LeaderboardCopyLiveDryRunOrder = {
   required_margin_usd: string | null;
   existing_live_positions: number;
   existing_live_notional_usd: string | null;
+  max_copy_live_open_positions: number;
   max_live_open_positions: number;
   max_total_exposure_pct: number;
 };
@@ -1319,6 +1320,12 @@ export type LeaderboardCopyLive = {
   orders_enabled: boolean;
   status: "shadow_ready" | "no_live_candidates" | string;
   reason: string;
+  readiness: {
+    ready: boolean;
+    blockers: string[];
+    would_submit: number;
+    blocked: number;
+  };
   summary: {
     evaluated_traders: number;
     selected_traders: number;

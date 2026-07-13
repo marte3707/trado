@@ -413,6 +413,10 @@ def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() 
 
         assert plan["orders_enabled"] is False
         assert plan["status"] == "shadow_ready"
+        assert plan["readiness"]["ready"] is False
+        assert "copy_live_disabled" in plan["readiness"]["blockers"]
+        assert "copy_live_mode_shadow" in plan["readiness"]["blockers"]
+        assert "live_order_dispatch_not_implemented" in plan["readiness"]["blockers"]
         assert [row["trader_label"] for row in plan["selected_traders"]] == ["strong"]
         assert plan["selected_traders"][0]["promoted"] is True
         assert plan["selected_traders"][0]["promotion"]["shortlist_days"] == 1
@@ -421,6 +425,8 @@ def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() 
         assert plan["summary"]["estimated_open_notional_usd"] == "40"
         assert plan["summary"]["dry_run_would_submit"] == 1
         assert plan["dry_run_orders"][0]["status"] == "would_submit"
+        assert plan["dry_run_orders"][0]["max_copy_live_open_positions"] == 3
+        assert plan["dry_run_orders"][0]["max_live_open_positions"] >= 3
         assert plan["summary"]["skipped_open_positions"] == {"excluded_coin_prefix": 1}
         rejected = {row["trader_label"]: row["reasons"] for row in plan["rejected_traders"]}
         assert "quality_below_live_min" in rejected["weak quality"]

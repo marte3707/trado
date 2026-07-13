@@ -435,9 +435,16 @@ const LIVE_REASON_LABELS: Record<string, string> = {
   max_total_exposure_exceeded: "exposure cap superato",
   available_margin_unknown: "margine sconosciuto",
   available_margin_insufficient: "margine insufficiente",
+  max_copy_live_open_positions_reached: "max copy-live raggiunto",
   max_live_open_positions_reached: "max live raggiunto",
   depth_not_checked_shadow: "depth non verificata",
   order_not_submitted: "ordine non inviato",
+  copy_live_disabled: "copy-live disattivato",
+  copy_live_mode_shadow: "modalità shadow",
+  no_dry_run_orders: "nessun ordine dry-run",
+  no_dry_run_would_submit: "nessun ordine eseguibile",
+  live_depth_preflight_not_run: "preflight depth live non eseguito",
+  live_order_dispatch_not_implemented: "invio live non implementato",
 };
 
 function reasonLabel(reason: string): string {
@@ -453,6 +460,16 @@ function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
       <div className="mb-3 rounded-md border border-warn/30 bg-warn/10 p-3 text-xs text-warn">
         Modalità live preparatoria: seleziona i trader copiabili e stima le posizioni, ma
         `orders_enabled=false`, quindi non invia ordini Hyperliquid.
+      </div>
+      <div className="mb-3 rounded-md border border-border bg-bg p-3 text-xs">
+        <div className={plan.readiness.ready ? "font-semibold text-success" : "font-semibold text-warn"}>
+          {plan.readiness.ready ? "Live readiness: pronto" : "Live readiness: non pronto"}
+        </div>
+        <div className="mt-1 text-fg-3">
+          {plan.readiness.blockers.length
+            ? plan.readiness.blockers.map(reasonLabel).join(", ")
+            : "nessun blocker"}
+        </div>
       </div>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
         <Kpi
@@ -650,6 +667,7 @@ function CopyLiveDryRunOrders({ orders }: { orders: LeaderboardCopyLiveDryRunOrd
             <th className="pb-2">Dir</th>
             <th className="pb-2 text-right">Notional</th>
             <th className="pb-2 text-right">Margin</th>
+            <th className="pb-2 text-right">Cap</th>
             <th className="pb-2 text-right">Status</th>
           </tr>
         </thead>
@@ -660,6 +678,9 @@ function CopyLiveDryRunOrders({ orders }: { orders: LeaderboardCopyLiveDryRunOrd
               <td className={cn("py-1.5 font-mono text-xs", directionTone(order.direction))}>{order.direction}</td>
               <td className="py-1.5 text-right font-mono">{fmtUsd(order.effective_notional_usd)}</td>
               <td className="py-1.5 text-right font-mono">{fmtUsd(order.required_margin_usd)}</td>
+              <td className="py-1.5 text-right font-mono text-xs">
+                {order.existing_live_positions}/{order.max_live_open_positions} · copy {order.max_copy_live_open_positions}
+              </td>
               <td className="max-w-[260px] py-1.5 text-right text-xs">
                 <div className={order.status === "would_submit" ? "text-success" : "text-warn"}>
                   {order.status}
