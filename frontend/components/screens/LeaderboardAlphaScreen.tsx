@@ -83,6 +83,64 @@ function directionTone(direction: string | null | undefined): string {
   return direction === "long" ? "text-success" : direction === "short" ? "text-danger" : "text-fg-2";
 }
 
+function usePagination<T>(items: T[], pageSize = 8) {
+  const [page, setPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
+  const safePage = Math.min(page, pageCount - 1);
+  const start = safePage * pageSize;
+  const end = Math.min(start + pageSize, items.length);
+  return {
+    items: items.slice(start, end),
+    page: safePage,
+    pageCount,
+    start,
+    end,
+    total: items.length,
+    pageSize,
+    setPage,
+  };
+}
+
+function PaginationControls({
+  page,
+  pageCount,
+  start,
+  end,
+  total,
+  pageSize,
+  setPage,
+}: ReturnType<typeof usePagination>) {
+  if (total <= pageSize) return null;
+  return (
+    <div className="mt-2 flex items-center justify-between gap-3 text-xs text-fg-3">
+      <span>
+        {start + 1}-{end} di {total}
+      </span>
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() => setPage(Math.max(0, page - 1))}
+          disabled={page === 0}
+          className="rounded-md border border-border px-2 py-1 hover:bg-bg-hover disabled:opacity-50"
+        >
+          Prev
+        </button>
+        <span className="font-mono">
+          {page + 1}/{pageCount}
+        </span>
+        <button
+          type="button"
+          onClick={() => setPage(Math.min(pageCount - 1, page + 1))}
+          disabled={page >= pageCount - 1}
+          className="rounded-md border border-border px-2 py-1 hover:bg-bg-hover disabled:opacity-50"
+        >
+          Next
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function recordValue(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -118,6 +176,7 @@ export function LeaderboardAlphaScreen() {
       return Number(b.enabled) - Number(a.enabled) || sb - sa || a.address.localeCompare(b.address);
     });
   }, [data?.traders]);
+  const traderPage = usePagination(sortedTraders, 12);
 
   const onSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -293,7 +352,7 @@ export function LeaderboardAlphaScreen() {
               </tr>
             </thead>
             <tbody>
-              {sortedTraders.map((trader) => (
+              {traderPage.items.map((trader) => (
                 <TraderRow
                   key={trader.id}
                   trader={trader}
@@ -312,6 +371,7 @@ export function LeaderboardAlphaScreen() {
             </tbody>
           </table>
         </div>
+        <PaginationControls {...traderPage} />
       </Card>
 
       <Card title="Fill recenti">
@@ -348,6 +408,7 @@ function CopyPaperLab({
   recentClosed: LeaderboardCopyPaperPosition[];
 }) {
   const pnl = asNumber(summary.realized_pnl_usdc);
+  const rankingPage = usePagination(rankings, 8);
   return (
     <Card title="Copy-paper separato">
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
@@ -385,25 +446,26 @@ function CopyPaperLab({
                   </tr>
                 </thead>
                 <tbody>
-                  {rankings.slice(0, 8).map((row) => (
+                  {rankingPage.items.map((row) => (
                     <CopyRankingRow key={row.trader_id} row={row} />
                   ))}
                 </tbody>
               </table>
+              <PaginationControls {...rankingPage} />
             </div>
           )}
         </div>
 
         <div>
           <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-fg-3">Ultime posizioni chiuse</div>
-          <CopyPositionsTable positions={recentClosed.slice(0, 8)} empty="Nessuna posizione chiusa." />
+          <CopyPositionsTable positions={recentClosed} empty="Nessuna posizione chiusa." />
         </div>
       </div>
 
       {openPositions.length > 0 && (
         <div className="mt-4">
           <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-fg-3">Posizioni copy-paper aperte</div>
-          <CopyPositionsTable positions={openPositions.slice(0, 8)} empty="Nessuna posizione aperta." />
+          <CopyPositionsTable positions={openPositions} empty="Nessuna posizione aperta." />
         </div>
       )}
     </Card>
@@ -456,6 +518,7 @@ function reasonLabel(reason: string): string {
 
 function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
   const enableCopyLive = useEnableLeaderboardCopyLive();
+  const shadowPage = usePagination(plan.shadow_open_positions, 8);
   const hardBlockers = plan.readiness.blockers.filter((blocker) => !COPY_LIVE_CONFIG_BLOCKERS.has(blocker));
   const liveRequested = plan.enabled && plan.mode === "live";
   const canEnableLive = !liveRequested && hardBlockers.length === 0;
@@ -585,7 +648,7 @@ function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {plan.shadow_open_positions.map((position) => (
+                  {shadowPage.items.map((position) => (
                     <tr key={position.paper_position_id} className="border-t border-border">
                       <td className="py-1.5 font-mono text-xs">
                         {position.trader_label || shortAddress(position.trader_address)}
@@ -600,6 +663,7 @@ function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
                   ))}
                 </tbody>
               </table>
+              <PaginationControls {...shadowPage} />
             </div>
           )}
         </div>
@@ -610,7 +674,7 @@ function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
           <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-fg-3">
             Scartati principali
           </div>
-          <CopyLiveTraderTable rows={plan.rejected_traders.slice(0, 8)} />
+          <CopyLiveTraderTable rows={plan.rejected_traders} />
         </div>
       )}
 
@@ -619,7 +683,7 @@ function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
           <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-fg-3">
             Promotion table
           </div>
-          <CopyLiveTraderTable rows={plan.promotion_table.slice(0, 8)} showPromotion />
+          <CopyLiveTraderTable rows={plan.promotion_table} showPromotion />
         </div>
         <div>
           <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-fg-3">
@@ -641,6 +705,7 @@ function CopyLiveTraderTable({
   selected?: boolean;
   showPromotion?: boolean;
 }) {
+  const page = usePagination(rows, 8);
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-sm">
@@ -657,7 +722,7 @@ function CopyLiveTraderTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => (
+          {page.items.map((row) => (
             <tr key={row.trader_id} className="border-t border-border">
               <td className="py-2 pr-3">
                 <div className="font-medium">{row.trader_label || shortAddress(row.trader_address)}</div>
@@ -690,11 +755,13 @@ function CopyLiveTraderTable({
           ))}
         </tbody>
       </table>
+      <PaginationControls {...page} />
     </div>
   );
 }
 
 function CopyLiveDryRunOrders({ orders }: { orders: LeaderboardCopyLiveDryRunOrder[] }) {
+  const page = usePagination(orders, 8);
   if (orders.length === 0) {
     return (
       <div className="rounded-md border border-border bg-bg p-3 text-sm text-fg-3">
@@ -711,17 +778,23 @@ function CopyLiveDryRunOrders({ orders }: { orders: LeaderboardCopyLiveDryRunOrd
             <th className="pb-2">Dir</th>
             <th className="pb-2 text-right">Notional</th>
             <th className="pb-2 text-right">Margin</th>
-            <th className="pb-2 text-right">Cap</th>
+            <th className="pb-2 text-right">Risk cap</th>
+            <th className="pb-2 text-right">Pos cap</th>
             <th className="pb-2 text-right">Status</th>
           </tr>
         </thead>
         <tbody>
-          {orders.map((order) => (
+          {page.items.map((order) => (
             <tr key={`${order.paper_position_id}:${order.coin}`} className="border-t border-border">
               <td className="py-1.5 font-mono">{order.coin}</td>
               <td className={cn("py-1.5 font-mono text-xs", directionTone(order.direction))}>{order.direction}</td>
               <td className="py-1.5 text-right font-mono">{fmtUsd(order.effective_notional_usd)}</td>
-              <td className="py-1.5 text-right font-mono">{fmtUsd(order.required_margin_usd)}</td>
+              <td className="py-1.5 text-right font-mono text-xs">
+                {fmtUsd(order.required_margin_usd)} / {fmtUsd(order.available_margin_usd)}
+              </td>
+              <td className="py-1.5 text-right font-mono text-xs">
+                {fmtUsd(order.risk_after_order_usd)} / {fmtUsd(order.max_total_risk_usd)}
+              </td>
               <td className="py-1.5 text-right font-mono text-xs">
                 {order.existing_live_positions}/{order.max_live_open_positions} · copy {order.max_copy_live_open_positions}
               </td>
@@ -737,6 +810,7 @@ function CopyLiveDryRunOrders({ orders }: { orders: LeaderboardCopyLiveDryRunOrd
           ))}
         </tbody>
       </table>
+      <PaginationControls {...page} />
     </div>
   );
 }
@@ -769,6 +843,7 @@ function CopyPositionsTable({
   positions: LeaderboardCopyPaperPosition[];
   empty: string;
 }) {
+  const page = usePagination(positions, 8);
   if (positions.length === 0) {
     return <div className="rounded-md border border-border bg-bg p-3 text-sm text-fg-3">{empty}</div>;
   }
@@ -787,7 +862,7 @@ function CopyPositionsTable({
           </tr>
         </thead>
         <tbody>
-          {positions.map((position) => {
+          {page.items.map((position) => {
             const pnl = asNumber(position.net_pnl_usdc);
             return (
               <tr key={position.id} className="border-t border-border">
@@ -809,6 +884,7 @@ function CopyPositionsTable({
           })}
         </tbody>
       </table>
+      <PaginationControls {...page} />
     </div>
   );
 }
@@ -983,6 +1059,7 @@ function TraderRow({
 }
 
 function RecentFills({ fills }: { fills: LeaderboardAlphaFill[] }) {
+  const page = usePagination(fills, 8);
   if (fills.length === 0) {
     return <div className="py-3 text-sm text-fg-3">Nessun fill sincronizzato.</div>;
   }
@@ -1001,7 +1078,7 @@ function RecentFills({ fills }: { fills: LeaderboardAlphaFill[] }) {
           </tr>
         </thead>
         <tbody>
-          {fills.map((fill) => (
+          {page.items.map((fill) => (
             <tr key={fill.id} className="border-t border-border">
               <td className="py-1.5 font-mono text-xs">
                 {fill.trader_label || shortAddress(fill.trader_address)}
@@ -1020,6 +1097,7 @@ function RecentFills({ fills }: { fills: LeaderboardAlphaFill[] }) {
           ))}
         </tbody>
       </table>
+      <PaginationControls {...page} />
     </div>
   );
 }

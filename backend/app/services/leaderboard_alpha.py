@@ -27,6 +27,7 @@ from app.db.models import (
     Market,
     Position,
 )
+from app.engine.order_validation import live_open_risk
 from app.services.hyperliquid import HyperliquidClient, HyperliquidTransientError
 from app.services.hyperliquid_rate_limit import available_hyperliquid_info_request_capacity
 
@@ -1739,12 +1740,18 @@ def _account_value(snapshot: AccountSnapshot | None) -> Decimal | None:
 def _available_margin(snapshot: AccountSnapshot | None) -> Decimal | None:
     if snapshot is None:
         return None
+    account_value = _account_value(snapshot)
+    if account_value is not None and snapshot.margin_used is not None:
+        return max(Decimal("0"), account_value - snapshot.margin_used)
     if snapshot.available_balance is not None:
         return snapshot.available_balance
-    account_value = _account_value(snapshot)
-    if account_value is None or snapshot.margin_used is None:
+    return None
+
+
+def _margin_used(snapshot: AccountSnapshot | None) -> Decimal | None:
+    if snapshot is None:
         return None
-    return max(Decimal("0"), account_value - snapshot.margin_used)
+    return snapshot.margin_used
 
 
 def _risk_float(db: Session, key: str, default: float) -> float:
@@ -1787,6 +1794,7 @@ def _copy_live_dry_run_orders(
     account_snapshot = _latest_account_snapshot(db)
     account_value = _account_value(account_snapshot)
     available_margin = _available_margin(account_snapshot)
+    margin_used = _margin_used(account_snapshot)
     max_leverage = Decimal(str(_risk_float(db, "max_leverage", app_settings.max_leverage)))
     global_max_open_positions = _risk_int(db, "max_open_positions", app_settings.max_open_positions)
     copy_live_max_open_positions = _int_setting(settings.get("copy_live_max_open_positions"), 3)
@@ -1808,8 +1816,10 @@ def _copy_live_dry_run_orders(
     live_market_ids = {row.market_id for row in existing_live_positions}
     live_count = len(existing_live_positions)
     live_notional = _live_open_notional(db)
+    live_risk = live_open_risk(db)
     planned_count = 0
     planned_notional = Decimal("0")
+    planned_risk = Decimal("0")
     planned_market_ids: set[int] = set()
     orders: list[dict[str, Any]] = []
 
@@ -1843,16 +1853,19 @@ def _copy_live_dry_run_orders(
         if effective_notional > notional_cap:
             reasons.append("notional_above_live_cap")
 
+        required_margin = effective_notional / max_leverage if max_leverage > 0 else effective_notional
+        risk_amount = required_margin
+        risk_after_order = live_risk + planned_risk + risk_amount
+
         if account_value is None:
             reasons.append("account_snapshot_missing")
         else:
             if account_value < min_account_value:
                 reasons.append("account_value_below_live_min")
-            max_exposure = account_value * max_exposure_pct / Decimal("100")
-            if live_notional + planned_notional + effective_notional > max_exposure:
+            max_risk = account_value * max_exposure_pct / Decimal("100")
+            if risk_after_order > max_risk:
                 reasons.append("max_total_exposure_exceeded")
 
-        required_margin = effective_notional / max_leverage if max_leverage > 0 else effective_notional
         if available_margin is None:
             reasons.append("available_margin_unknown")
         elif available_margin < required_margin:
@@ -1867,6 +1880,7 @@ def _copy_live_dry_run_orders(
         if status == "would_submit":
             planned_count += 1
             planned_notional += effective_notional
+            planned_risk += risk_amount
             if market is not None:
                 planned_market_ids.add(market.id)
 
@@ -1887,8 +1901,15 @@ def _copy_live_dry_run_orders(
                 "min_order_notional_usd": _short_decimal(min_notional),
                 "order_notional_cap_usd": _short_decimal(notional_cap),
                 "account_value_usd": _short_decimal(account_value),
+                "account_margin_used_usd": _short_decimal(margin_used),
                 "available_margin_usd": _short_decimal(available_margin),
                 "required_margin_usd": _short_decimal(required_margin),
+                "planned_risk_usd": _short_decimal(risk_amount),
+                "existing_live_risk_usd": _short_decimal(live_risk),
+                "risk_after_order_usd": _short_decimal(risk_after_order),
+                "max_total_risk_usd": _short_decimal(
+                    account_value * max_exposure_pct / Decimal("100") if account_value is not None else None
+                ),
                 "existing_live_positions": live_count,
                 "existing_live_notional_usd": _short_decimal(live_notional),
                 "max_copy_live_open_positions": copy_live_max_open_positions,

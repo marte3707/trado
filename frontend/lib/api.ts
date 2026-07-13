@@ -1305,8 +1305,13 @@ export type LeaderboardCopyLiveDryRunOrder = {
   min_order_notional_usd: string | null;
   order_notional_cap_usd: string | null;
   account_value_usd: string | null;
+  account_margin_used_usd: string | null;
   available_margin_usd: string | null;
   required_margin_usd: string | null;
+  planned_risk_usd: string | null;
+  existing_live_risk_usd: string | null;
+  risk_after_order_usd: string | null;
+  max_total_risk_usd: string | null;
   existing_live_positions: number;
   existing_live_notional_usd: string | null;
   max_copy_live_open_positions: number;

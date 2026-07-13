@@ -16,6 +16,7 @@ from app.db.models import (
     LeaderboardTraderFill,
     LeaderboardTraderSnapshot,
     Market,
+    Position,
 )
 from app.services import leaderboard_alpha as alpha
 
@@ -432,6 +433,108 @@ def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() 
         rejected = {row["trader_label"]: row["reasons"] for row in plan["rejected_traders"]}
         assert "quality_below_live_min" in rejected["weak quality"]
         assert "classification_not_allowed" in rejected["watch"]
+    finally:
+        db.close()
+
+
+def test_copy_live_dry_run_uses_effective_margin_and_risk_based_exposure() -> None:
+    db = _sqlite_db()
+    now = datetime(2026, 7, 9, tzinfo=UTC)
+    try:
+        trader = LeaderboardTrader(
+            address="0x" + "1" * 40,
+            label="strong",
+            enabled=True,
+            metadata_json={"leaderboard": {"rank": 1}},
+        )
+        btc = Market(
+            exchange="hyperliquid",
+            symbol="BTC",
+            base="BTC",
+            quote="USDC",
+            market_type="perp",
+            active=True,
+            metadata_json={"hl_coin": "BTC"},
+        )
+        eth = Market(
+            exchange="hyperliquid",
+            symbol="ETH",
+            base="ETH",
+            quote="USDC",
+            market_type="perp",
+            active=True,
+            metadata_json={"hl_coin": "ETH"},
+        )
+        db.add_all([trader, btc, eth])
+        db.flush()
+        db.add(
+            AppSetting(
+                key="risk",
+                value={
+                    "max_leverage": 10,
+                    "max_total_exposure_pct": 90,
+                    "max_open_positions": 25,
+                },
+            )
+        )
+        db.add(
+            AccountSnapshot(
+                timestamp=now,
+                total_equity=Decimal("100"),
+                effective_account_value=Decimal("1000"),
+                available_balance=Decimal("0"),
+                margin_used=Decimal("900"),
+                unrealized_pnl=Decimal("0"),
+                raw_data={},
+            )
+        )
+        db.add(
+            Position(
+                market_id=eth.id,
+                mode="live",
+                side="long",
+                entry_price=Decimal("100"),
+                size=Decimal("9"),
+                stop_loss=Decimal("99"),
+                status="open",
+                opened_at=now,
+                metadata_json={},
+            )
+        )
+        _add_snapshot(db, trader, classification="candidate", quality_score=95)
+        for idx in range(22):
+            _add_copy_position(
+                db,
+                trader,
+                idx=idx,
+                now=now,
+                net_pnl=Decimal("1") if idx % 5 else Decimal("-0.25"),
+            )
+        _add_copy_position(db, trader, idx=500, now=now, status="open", coin="BTC")
+        db.commit()
+
+        settings = {
+            **alpha.DEFAULT_LEADERBOARD_ALPHA_SETTINGS,
+            "copy_live_promotion_min_shortlist_days": 1,
+        }
+        plan = alpha.build_copy_live_shadow_plan(
+            db,
+            settings=settings,
+            now=now,
+            state={},
+            update_promotion_state=True,
+        )
+
+        order = plan["dry_run_orders"][0]
+        assert order["status"] == "would_submit"
+        assert "available_margin_insufficient" not in order["reasons"]
+        assert "max_total_exposure_exceeded" not in order["reasons"]
+        assert order["available_margin_usd"] == "100"
+        assert order["required_margin_usd"] == "4"
+        assert order["existing_live_notional_usd"] == "900"
+        assert order["existing_live_risk_usd"] == "9"
+        assert order["risk_after_order_usd"] == "13"
+        assert order["max_total_risk_usd"] == "900"
     finally:
         db.close()
 
