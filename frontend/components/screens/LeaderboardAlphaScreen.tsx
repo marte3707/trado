@@ -5,6 +5,7 @@ import { AlertTriangle, Eye, RefreshCcw, ShieldCheck, TrendingUp } from "lucide-
 
 import {
   useCreateLeaderboardTrader,
+  useEnableLeaderboardCopyLive,
   useImportLeaderboardTopTraders,
   useRunLeaderboardCopyPaper,
   useSyncLeaderboardTrader,
@@ -447,29 +448,72 @@ const LIVE_REASON_LABELS: Record<string, string> = {
   live_order_dispatch_not_implemented: "invio live non implementato",
 };
 
+const COPY_LIVE_CONFIG_BLOCKERS = new Set(["copy_live_disabled", "copy_live_mode_shadow"]);
+
 function reasonLabel(reason: string): string {
   return LIVE_REASON_LABELS[reason] ?? reason.replaceAll("_", " ");
 }
 
 function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
+  const enableCopyLive = useEnableLeaderboardCopyLive();
+  const hardBlockers = plan.readiness.blockers.filter((blocker) => !COPY_LIVE_CONFIG_BLOCKERS.has(blocker));
+  const liveRequested = plan.enabled && plan.mode === "live";
+  const canEnableLive = !liveRequested && hardBlockers.length === 0;
+  const activationTitle = liveRequested
+    ? "Copy-live già impostato in modalità live"
+    : hardBlockers.length
+      ? `Bloccato: ${hardBlockers.map(reasonLabel).join(", ")}`
+      : "Attiva copy-live live";
   const skipped = Object.entries(plan.summary.skipped_open_positions ?? {})
     .map(([key, value]) => `${reasonLabel(key)}: ${value}`)
     .join(" · ");
+  const onEnableLive = () => {
+    if (!canEnableLive) return;
+    const confirmed = confirm(
+      [
+        "Attivare il copy-live della Leaderboard Alpha?",
+        "",
+        `Dry-run eseguibili: ${plan.readiness.would_submit}`,
+        `Posizioni shadow pianificate: ${plan.summary.planned_open_positions}`,
+        "",
+        "Il backend rifarà comunque i controlli di readiness prima di salvare la modalità live.",
+      ].join("\n"),
+    );
+    if (confirmed) {
+      enableCopyLive.mutate();
+    }
+  };
   return (
     <Card title="Live shadow shortlist">
       <div className="mb-3 rounded-md border border-warn/30 bg-warn/10 p-3 text-xs text-warn">
         Modalità live preparatoria: seleziona i trader copiabili e stima le posizioni, ma
         `orders_enabled=false`, quindi non invia ordini Hyperliquid.
       </div>
-      <div className="mb-3 rounded-md border border-border bg-bg p-3 text-xs">
-        <div className={plan.readiness.ready ? "font-semibold text-success" : "font-semibold text-warn"}>
-          {plan.readiness.ready ? "Live readiness: pronto" : "Live readiness: non pronto"}
+      <div className="mb-3 grid gap-3 rounded-md border border-border bg-bg p-3 text-xs md:grid-cols-[1fr_auto] md:items-center">
+        <div>
+          <div className={plan.readiness.ready ? "font-semibold text-success" : "font-semibold text-warn"}>
+            {plan.readiness.ready ? "Live readiness: pronto" : "Live readiness: non pronto"}
+          </div>
+          <div className="mt-1 text-fg-3">
+            {plan.readiness.blockers.length
+              ? plan.readiness.blockers.map(reasonLabel).join(", ")
+              : "nessun blocker"}
+          </div>
         </div>
-        <div className="mt-1 text-fg-3">
-          {plan.readiness.blockers.length
-            ? plan.readiness.blockers.map(reasonLabel).join(", ")
-            : "nessun blocker"}
-        </div>
+        <button
+          type="button"
+          onClick={onEnableLive}
+          disabled={!canEnableLive || enableCopyLive.isPending}
+          title={activationTitle}
+          className={cn(
+            "inline-flex h-9 items-center justify-center rounded-md border px-3 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50",
+            canEnableLive
+              ? "border-danger/50 bg-danger/10 text-danger hover:bg-danger/15"
+              : "border-border-strong bg-bg-2 text-fg-3",
+          )}
+        >
+          {liveRequested ? "Copy-live live attivo" : enableCopyLive.isPending ? "Attivazione…" : "Avvia live"}
+        </button>
       </div>
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
         <Kpi

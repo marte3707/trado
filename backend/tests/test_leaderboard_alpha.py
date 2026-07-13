@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.db.models import (
     AccountSnapshot,
+    AppSetting,
     Base,
     LeaderboardCopyPaperPosition,
     LeaderboardTrader,
@@ -431,6 +432,38 @@ def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() 
         rejected = {row["trader_label"]: row["reasons"] for row in plan["rejected_traders"]}
         assert "quality_below_live_min" in rejected["weak quality"]
         assert "classification_not_allowed" in rejected["watch"]
+    finally:
+        db.close()
+
+
+def test_copy_live_activation_blockers_ignore_configuration_flags() -> None:
+    plan = {
+        "readiness": {
+            "blockers": [
+                "copy_live_disabled",
+                "copy_live_mode_shadow",
+                "available_margin_insufficient",
+            ]
+        }
+    }
+
+    assert alpha.copy_live_activation_blockers(plan) == ["available_margin_insufficient"]
+    assert (
+        alpha.copy_live_activation_blockers(
+            {"readiness": {"blockers": ["copy_live_disabled", "copy_live_mode_shadow"]}}
+        )
+        == []
+    )
+
+
+def test_enable_copy_live_mode_blocks_when_readiness_has_hard_blockers() -> None:
+    db = _sqlite_db()
+    try:
+        result = alpha.enable_copy_live_mode(db)
+
+        assert result["status"] == "blocked"
+        assert "live_order_dispatch_not_implemented" in result["blockers"]
+        assert db.get(AppSetting, "leaderboard_alpha") is None
     finally:
         db.close()
 

@@ -1349,6 +1349,13 @@ export type LeaderboardCopyLive = {
   dry_run_orders: LeaderboardCopyLiveDryRunOrder[];
 };
 
+export type LeaderboardCopyLiveEnableResult = {
+  status: "enabled" | "blocked" | string;
+  blockers: string[];
+  settings?: Record<string, unknown>;
+  copy_live: LeaderboardCopyLive;
+};
+
 export type LeaderboardAlphaDashboard = {
   settings: {
     enabled: boolean;

@@ -12,6 +12,7 @@ import {
   type LeaderboardAlphaImportResult,
   type LeaderboardAlphaSyncResult,
   type LeaderboardAlphaTrader,
+  type LeaderboardCopyLiveEnableResult,
   type LeaderboardCopyPaperRunResult,
   type Strategy,
   type SystemService,
@@ -340,6 +341,21 @@ export function useRunLeaderboardCopyPaper() {
       qc.invalidateQueries({ queryKey: qk.leaderboardAlpha });
     },
     onError: (err) => toast.error(`Copy-paper fallito: ${errorMessage(err)}`),
+  });
+}
+
+export function useEnableLeaderboardCopyLive() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async () =>
+      apiPost<LeaderboardCopyLiveEnableResult>("/api/leaderboard-alpha/copy-live/enable"),
+    onSuccess: () => {
+      toast.success("Copy-live impostato in modalità live");
+      qc.invalidateQueries({ queryKey: qk.leaderboardAlpha });
+      qc.invalidateQueries({ queryKey: qk.settings });
+      qc.invalidateQueries({ queryKey: qk.health });
+    },
+    onError: (err) => toast.error(`Copy-live non attivato: ${errorMessage(err)}`),
   });
 }
 

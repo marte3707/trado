@@ -12,6 +12,7 @@ from app.db.models import LeaderboardTrader
 from app.db.session import get_db
 from app.services.leaderboard_alpha import (
     build_dashboard,
+    enable_copy_live_mode,
     import_top_leaderboard_traders,
     leaderboard_alpha_settings,
     normalize_address,
@@ -85,6 +86,26 @@ def run_leaderboard_copy_paper(db: Session = Depends(get_db)) -> dict[str, Any]:
         error_id = _log_and_redact("leaderboard_alpha_copy_paper_failed", exc)
         db.rollback()
         raise HTTPException(status_code=502, detail=f"Copy-paper fallito; error_id={error_id}") from exc
+    db.commit()
+    return result
+
+
+@router.post("/leaderboard-alpha/copy-live/enable")
+def enable_leaderboard_copy_live(db: Session = Depends(get_db)) -> dict[str, Any]:
+    try:
+        result = enable_copy_live_mode(db)
+    except Exception as exc:
+        error_id = _log_and_redact("leaderboard_alpha_copy_live_enable_failed", exc)
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"Attivazione copy-live fallita; error_id={error_id}") from exc
+    if result.get("status") == "blocked":
+        db.rollback()
+        blockers = [str(item) for item in result.get("blockers", [])]
+        reason = ", ".join(blockers) if blockers else "readiness non soddisfatta"
+        raise HTTPException(
+            status_code=409,
+            detail=f"Copy-live non attivabile: {reason}",
+        )
     db.commit()
     return result
 

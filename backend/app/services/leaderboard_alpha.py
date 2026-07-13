@@ -34,6 +34,7 @@ ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 LEADERBOARD_ALPHA_STATE_KEY = "leaderboard_alpha_state"
 LEADERBOARD_STATS_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 LEADERBOARD_AUTO_SOURCE = "hyperliquid_leaderboard_auto"
+COPY_LIVE_CONFIG_BLOCKERS = {"copy_live_disabled", "copy_live_mode_shadow"}
 
 DEFAULT_LEADERBOARD_ALPHA_SETTINGS: dict[str, Any] = {
     "enabled": True,
@@ -1920,6 +1921,49 @@ def _copy_live_readiness(settings: dict[str, Any], dry_run_orders: Sequence[dict
         "blockers": unique_blockers,
         "would_submit": len([row for row in dry_run_orders if row.get("status") == "would_submit"]),
         "blocked": len([row for row in dry_run_orders if row.get("status") != "would_submit"]),
+    }
+
+
+def copy_live_activation_blockers(plan: dict[str, Any]) -> list[str]:
+    readiness = plan.get("readiness") if isinstance(plan, dict) else None
+    raw_blockers = readiness.get("blockers") if isinstance(readiness, dict) else []
+    return sorted(
+        {
+            str(blocker)
+            for blocker in raw_blockers
+            if str(blocker) not in COPY_LIVE_CONFIG_BLOCKERS
+        }
+    )
+
+
+def enable_copy_live_mode(db: Session) -> dict[str, Any]:
+    settings = leaderboard_alpha_settings(db)
+    plan = build_copy_live_shadow_plan(db, settings=settings)
+    blockers = copy_live_activation_blockers(plan)
+    if blockers:
+        return {
+            "status": "blocked",
+            "blockers": blockers,
+            "copy_live": plan,
+        }
+
+    next_settings = {
+        **settings,
+        "copy_live_enabled": True,
+        "copy_live_mode": "live",
+    }
+    row = db.get(AppSetting, "leaderboard_alpha")
+    if row is None:
+        db.add(AppSetting(key="leaderboard_alpha", value=next_settings))
+    else:
+        row.value = next_settings
+        db.add(row)
+
+    return {
+        "status": "enabled",
+        "blockers": [],
+        "settings": next_settings,
+        "copy_live": build_copy_live_shadow_plan(db, settings=next_settings),
     }
 
 
