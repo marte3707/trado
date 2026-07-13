@@ -337,6 +337,161 @@ def _add_copy_position(
     db.add(position)
 
 
+def test_copy_paper_close_fill_can_close_multiple_positions() -> None:
+    db = _sqlite_db()
+    now = datetime(2026, 7, 8, tzinfo=UTC)
+    try:
+        trader = LeaderboardTrader(
+            address="0x" + "b" * 40,
+            label="copy candidate",
+            enabled=True,
+            metadata_json={"leaderboard": {"rank": 1}},
+        )
+        db.add(trader)
+        db.flush()
+        db.add_all(
+            [
+                LeaderboardTraderFill(
+                    trader_id=trader.id,
+                    fill_key="open-1",
+                    coin="BTC",
+                    side="buy",
+                    direction="long",
+                    intent="open",
+                    price=Decimal("100"),
+                    size=Decimal("1"),
+                    notional_usd=Decimal("100"),
+                    oid="open-1",
+                    raw_data={},
+                    filled_at=now,
+                ),
+                LeaderboardTraderFill(
+                    trader_id=trader.id,
+                    fill_key="open-2",
+                    coin="BTC",
+                    side="buy",
+                    direction="long",
+                    intent="open",
+                    price=Decimal("101"),
+                    size=Decimal("1"),
+                    notional_usd=Decimal("101"),
+                    oid="open-2",
+                    raw_data={},
+                    filled_at=now + timedelta(minutes=1),
+                ),
+                LeaderboardTraderFill(
+                    trader_id=trader.id,
+                    fill_key="close-large",
+                    coin="BTC",
+                    side="sell",
+                    direction="long",
+                    intent="close",
+                    price=Decimal("110"),
+                    size=Decimal("2.5"),
+                    notional_usd=Decimal("275"),
+                    oid="close-large",
+                    raw_data={},
+                    filled_at=now + timedelta(minutes=10),
+                ),
+            ]
+        )
+        db.commit()
+
+        result = alpha.run_copy_paper_replay(db)
+        db.commit()
+        positions = db.query(LeaderboardCopyPaperPosition).order_by(LeaderboardCopyPaperPosition.id).all()
+
+        assert result["opened"] == 2
+        assert result["closed"] == 2
+        assert [position.status for position in positions] == ["closed", "closed"]
+        assert {position.source_close_order_id for position in positions} == {"close-large"}
+    finally:
+        db.close()
+
+
+def test_copy_paper_reconciles_open_positions_past_cursor() -> None:
+    db = _sqlite_db()
+    now = datetime(2026, 7, 8, tzinfo=UTC)
+    try:
+        trader = LeaderboardTrader(
+            address="0x" + "c" * 40,
+            label="copy candidate",
+            enabled=True,
+            metadata_json={"leaderboard": {"rank": 1}},
+        )
+        db.add(trader)
+        db.flush()
+        open_fill = LeaderboardTraderFill(
+            trader_id=trader.id,
+            fill_key="open-1",
+            coin="ETH",
+            side="buy",
+            direction="long",
+            intent="open",
+            price=Decimal("100"),
+            size=Decimal("1"),
+            notional_usd=Decimal("100"),
+            oid="open-1",
+            raw_data={},
+            filled_at=now,
+        )
+        close_fill = LeaderboardTraderFill(
+            trader_id=trader.id,
+            fill_key="close-1",
+            coin="ETH",
+            side="sell",
+            direction="long",
+            intent="close",
+            price=Decimal("110"),
+            size=Decimal("1"),
+            notional_usd=Decimal("110"),
+            oid="close-1",
+            raw_data={},
+            filled_at=now + timedelta(minutes=5),
+        )
+        db.add_all([open_fill, close_fill])
+        db.flush()
+        db.add(
+            LeaderboardCopyPaperPosition(
+                trader_id=trader.id,
+                open_fill_id=open_fill.id,
+                coin="ETH",
+                direction="long",
+                status="open",
+                source_open_order_id=open_fill.oid,
+                entry_price=Decimal("100"),
+                copy_size=Decimal("1"),
+                copy_notional_usd=Decimal("100"),
+                original_notional_usd=Decimal("100"),
+                entry_fee_usdc=Decimal("0.045"),
+                opened_at=open_fill.filled_at,
+                metadata_json={},
+            )
+        )
+        db.add(
+            AppSetting(
+                key="leaderboard_alpha_state",
+                value={
+                    "last_copy_paper_fill_at": close_fill.filled_at.isoformat(),
+                    "last_copy_paper_fill_id": close_fill.id,
+                },
+            )
+        )
+        db.commit()
+
+        result = alpha.run_copy_paper_replay(db)
+        db.commit()
+        position = db.query(LeaderboardCopyPaperPosition).one()
+
+        assert result["fills_seen"] == 0
+        assert result["reconciled_closed"] == 1
+        assert position.status == "closed"
+        assert position.close_fill_id == close_fill.id
+        assert position.close_reason == "source_close_reconcile"
+    finally:
+        db.close()
+
+
 def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() -> None:
     db = _sqlite_db()
     now = datetime(2026, 7, 9, tzinfo=UTC)

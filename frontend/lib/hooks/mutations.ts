@@ -337,7 +337,11 @@ export function useRunLeaderboardCopyPaper() {
   return useMutation({
     mutationFn: async () => apiPost<LeaderboardCopyPaperRunResult>("/api/leaderboard-alpha/copy-paper/run"),
     onSuccess: (data) => {
-      toast.success(`Copy-paper aggiornato: ${data.opened ?? 0} aperte, ${data.closed ?? 0} chiuse`);
+      toast.success(
+        `Copy-paper aggiornato: ${data.opened ?? 0} aperte, ${data.closed ?? 0} chiuse, ${
+          data.reconciled_closed ?? 0
+        } riconciliate`,
+      );
       qc.invalidateQueries({ queryKey: qk.leaderboardAlpha });
     },
     onError: (err) => toast.error(`Copy-paper fallito: ${errorMessage(err)}`),

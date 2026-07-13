@@ -1467,6 +1467,9 @@ export type LeaderboardCopyPaperRunResult = {
   opened?: number;
   closed?: number;
   skipped?: number;
+  reconciled_closed?: number;
+  reconciled_scanned?: number;
+  reconciled_skipped?: number;
   summary?: LeaderboardCopyPaper;
 };
 

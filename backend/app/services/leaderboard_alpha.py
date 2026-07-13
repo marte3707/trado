@@ -915,24 +915,32 @@ def _copy_paper_open_order_exists(db: Session, fill: LeaderboardTraderFill) -> b
     return query.first() is not None
 
 
-def _copy_paper_close_order_used(db: Session, fill: LeaderboardTraderFill) -> bool:
-    if not fill.oid:
-        return (
-            db.query(LeaderboardCopyPaperPosition.id)
-            .filter(LeaderboardCopyPaperPosition.close_fill_id == fill.id)
-            .first()
-            is not None
-        )
-    return (
-        db.query(LeaderboardCopyPaperPosition.id)
-        .filter(
-            LeaderboardCopyPaperPosition.trader_id == fill.trader_id,
-            LeaderboardCopyPaperPosition.coin == fill.coin,
-            LeaderboardCopyPaperPosition.direction == fill.direction,
-            LeaderboardCopyPaperPosition.source_close_order_id == fill.oid,
-        )
-        .first()
-        is not None
+def _copy_paper_close_fill_capacity(fill: LeaderboardTraderFill, *, settings: dict[str, Any]) -> Decimal:
+    target_notional = _decimal_setting(settings.get("copy_paper_position_notional_usd"), Decimal("100"))
+    if fill.notional_usd is not None and fill.notional_usd > 0:
+        return max(target_notional, fill.notional_usd)
+    return target_notional
+
+
+def _copy_paper_close_fill_used_notional(db: Session, fill: LeaderboardTraderFill) -> Decimal:
+    used = (
+        db.query(func.coalesce(func.sum(LeaderboardCopyPaperPosition.copy_notional_usd), 0))
+        .filter(LeaderboardCopyPaperPosition.close_fill_id == fill.id)
+        .scalar()
+    )
+    return Decimal(str(used or 0))
+
+
+def _copy_paper_close_fill_remaining_notional(
+    db: Session,
+    fill: LeaderboardTraderFill,
+    *,
+    settings: dict[str, Any],
+) -> Decimal:
+    return max(
+        Decimal("0"),
+        _copy_paper_close_fill_capacity(fill, settings=settings)
+        - _copy_paper_close_fill_used_notional(db, fill),
     )
 
 
@@ -1060,6 +1068,96 @@ def _close_opposite_copy_positions(
     return len(rows)
 
 
+def _copy_paper_open_positions_for_close_fill(
+    db: Session,
+    fill: LeaderboardTraderFill,
+) -> list[LeaderboardCopyPaperPosition]:
+    return (
+        db.query(LeaderboardCopyPaperPosition)
+        .filter(
+            LeaderboardCopyPaperPosition.trader_id == fill.trader_id,
+            LeaderboardCopyPaperPosition.coin == fill.coin,
+            LeaderboardCopyPaperPosition.direction == fill.direction,
+            LeaderboardCopyPaperPosition.status == "open",
+            LeaderboardCopyPaperPosition.opened_at <= fill.filled_at,
+        )
+        .order_by(LeaderboardCopyPaperPosition.opened_at.asc(), LeaderboardCopyPaperPosition.id.asc())
+        .all()
+    )
+
+
+def _close_copy_paper_positions_for_fill(
+    db: Session,
+    fill: LeaderboardTraderFill,
+    *,
+    settings: dict[str, Any],
+    reason: str = "source_close",
+) -> int:
+    remaining = _copy_paper_close_fill_remaining_notional(db, fill, settings=settings)
+    closed = 0
+    for position in _copy_paper_open_positions_for_close_fill(db, fill):
+        required = position.copy_notional_usd
+        if remaining < required:
+            break
+        _close_copy_paper_position(position, fill, settings=settings, reason=reason)
+        remaining -= required
+        closed += 1
+    return closed
+
+
+def reconcile_copy_paper_open_positions(
+    db: Session,
+    *,
+    settings: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    settings = settings or leaderboard_alpha_settings(db)
+    min_source_notional = _decimal_setting(settings.get("copy_paper_min_source_notional_usd"), Decimal("25"))
+    result = {"closed": 0, "scanned": 0, "skipped": 0}
+    open_positions = (
+        db.query(LeaderboardCopyPaperPosition)
+        .filter(LeaderboardCopyPaperPosition.status == "open")
+        .order_by(LeaderboardCopyPaperPosition.opened_at.asc(), LeaderboardCopyPaperPosition.id.asc())
+        .all()
+    )
+    for position in open_positions:
+        if position.status != "open":
+            continue
+        result["scanned"] += 1
+        close_fills = (
+            db.query(LeaderboardTraderFill)
+            .filter(
+                LeaderboardTraderFill.trader_id == position.trader_id,
+                LeaderboardTraderFill.coin == position.coin,
+                LeaderboardTraderFill.direction == position.direction,
+                LeaderboardTraderFill.intent == "close",
+                LeaderboardTraderFill.filled_at >= position.opened_at,
+                LeaderboardTraderFill.price.isnot(None),
+                LeaderboardTraderFill.price > 0,
+            )
+            .order_by(LeaderboardTraderFill.filled_at.asc(), LeaderboardTraderFill.id.asc())
+            .all()
+        )
+        closed_before = result["closed"]
+        for fill in close_fills:
+            if fill.notional_usd is not None and fill.notional_usd < min_source_notional:
+                continue
+            if _copy_paper_close_fill_remaining_notional(db, fill, settings=settings) < position.copy_notional_usd:
+                continue
+            closed = _close_copy_paper_positions_for_fill(
+                db,
+                fill,
+                settings=settings,
+                reason="source_close_reconcile",
+            )
+            result["closed"] += closed
+            if closed:
+                db.flush()
+                break
+        if result["closed"] == closed_before and position.status == "open":
+            result["skipped"] += 1
+    return result
+
+
 def _copy_paper_process_fill(
     db: Session,
     fill: LeaderboardTraderFill,
@@ -1094,25 +1192,11 @@ def _copy_paper_process_fill(
         result["skipped"] += 0 if position is not None else 1
         return result
 
-    if _copy_paper_close_order_used(db, fill):
+    closed = _close_copy_paper_positions_for_fill(db, fill, settings=settings)
+    if closed <= 0:
         result["skipped"] += 1
         return result
-    position = (
-        db.query(LeaderboardCopyPaperPosition)
-        .filter(
-            LeaderboardCopyPaperPosition.trader_id == fill.trader_id,
-            LeaderboardCopyPaperPosition.coin == fill.coin,
-            LeaderboardCopyPaperPosition.direction == fill.direction,
-            LeaderboardCopyPaperPosition.status == "open",
-        )
-        .order_by(LeaderboardCopyPaperPosition.opened_at.asc(), LeaderboardCopyPaperPosition.id.asc())
-        .first()
-    )
-    if position is None:
-        result["skipped"] += 1
-        return result
-    _close_copy_paper_position(position, fill, settings=settings)
-    result["closed"] += 1
+    result["closed"] += closed
     return result
 
 
@@ -1234,6 +1318,11 @@ def run_copy_paper_replay(
         last_fill = fill
         if processed["opened"] or processed["closed"]:
             db.flush()
+
+    reconciled = reconcile_copy_paper_open_positions(db, settings=settings)
+    result["reconciled_closed"] = reconciled["closed"]
+    result["reconciled_scanned"] = reconciled["scanned"]
+    result["reconciled_skipped"] = reconciled["skipped"]
 
     state["last_copy_paper_run_at"] = now.isoformat()
     if last_fill is not None:
