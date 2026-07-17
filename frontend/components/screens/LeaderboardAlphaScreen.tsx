@@ -549,8 +549,9 @@ function CopyLiveShadowPanel({ plan }: { plan: LeaderboardCopyLive }) {
   return (
     <Card title="Live shadow shortlist">
       <div className="mb-3 rounded-md border border-warn/30 bg-warn/10 p-3 text-xs text-warn">
-        Modalità live preparatoria: seleziona i trader copiabili e stima le posizioni, ma
-        `orders_enabled=false`, quindi non invia ordini Hyperliquid.
+        {plan.orders_enabled
+          ? "Modalità live attiva: il backend può inviare ordini Hyperliquid solo per dry-run would_submit e dopo i guardrail live."
+          : "Modalità live preparatoria: seleziona i trader copiabili e stima le posizioni, ma `orders_enabled=false`, quindi non invia ordini Hyperliquid."}
       </div>
       <div className="mb-3 grid gap-3 rounded-md border border-border bg-bg p-3 text-xs md:grid-cols-[1fr_auto] md:items-center">
         <div>

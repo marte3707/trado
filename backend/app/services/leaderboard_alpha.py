@@ -5,6 +5,7 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -15,20 +16,27 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.enums import OrderMode
+from app.core.enums import Direction, OrderMode, SignalStatus
 from app.core.runtime_settings import effective_live_execution_settings
 from app.db.models import (
     AccountSnapshot,
     AppSetting,
+    DecisionLog,
     LeaderboardCopyPaperPosition,
     LeaderboardTrader,
     LeaderboardTraderFill,
     LeaderboardTraderSnapshot,
     Market,
     Position,
+    Signal,
 )
+from app.engine.execution import OrderExecutionEngine, coin_for_market
 from app.engine.order_validation import live_open_risk
-from app.services.hyperliquid import HyperliquidClient, HyperliquidTransientError
+from app.services.hyperliquid import (
+    HyperliquidClient,
+    HyperliquidTradingClient,
+    HyperliquidTransientError,
+)
 from app.services.hyperliquid_rate_limit import available_hyperliquid_info_request_capacity
 
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
@@ -36,6 +44,7 @@ LEADERBOARD_ALPHA_STATE_KEY = "leaderboard_alpha_state"
 LEADERBOARD_STATS_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 LEADERBOARD_AUTO_SOURCE = "hyperliquid_leaderboard_auto"
 COPY_LIVE_CONFIG_BLOCKERS = {"copy_live_disabled", "copy_live_mode_shadow"}
+COPY_LIVE_SIGNAL_TIMEFRAME = "copylive"
 
 DEFAULT_LEADERBOARD_ALPHA_SETTINGS: dict[str, Any] = {
     "enabled": True,
@@ -85,6 +94,7 @@ DEFAULT_LEADERBOARD_ALPHA_SETTINGS: dict[str, Any] = {
     "copy_live_excluded_coin_prefixes": ["xyz:"],
     "copy_live_promotion_min_shortlist_days": 3,
     "copy_live_dry_run_requires_promotion": True,
+    "copy_live_stop_loss_pct": "2",
 }
 
 
@@ -859,6 +869,8 @@ async def run_leaderboard_alpha_maintenance(
         state=state,
         update_promotion_state=True,
     )
+    if _copy_live_orders_enabled(settings):
+        result["copy_live_execution"] = run_copy_live_execution(db, settings=settings, now=now)
     _store_leaderboard_alpha_state(db, state)
     result["state"] = state
     return result
@@ -2009,6 +2021,552 @@ def _copy_live_dry_run_orders(
     return orders
 
 
+def _copy_live_orders_enabled(settings: dict[str, Any]) -> bool:
+    return bool(settings.get("copy_live_enabled", False)) and str(settings.get("copy_live_mode") or "shadow") == "live"
+
+
+def _copy_live_reference_price(
+    market: Market,
+    mids: dict[str, str],
+) -> Decimal | None:
+    keys: list[str] = []
+    with suppress(ValueError):
+        keys.append(coin_for_market(market))
+    metadata = market.metadata_json if isinstance(market.metadata_json, dict) else {}
+    for key in (metadata.get("hl_coin"), market.symbol, market.base):
+        if isinstance(key, str) and key and key not in keys:
+            keys.append(key)
+    for key in keys:
+        try:
+            price = Decimal(str(mids.get(key)))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if price > 0:
+            return price
+    return None
+
+
+def _copy_live_source_time(position: LeaderboardCopyPaperPosition) -> datetime:
+    opened_at = _as_utc(position.opened_at) or position.opened_at
+    return opened_at + timedelta(microseconds=int(position.id or 0) % 1_000_000)
+
+
+def _copy_live_existing_position_for_paper(
+    db: Session,
+    paper_position_id: int,
+) -> Position | None:
+    rows = (
+        db.query(Position)
+        .filter(Position.mode == OrderMode.LIVE.value)
+        .order_by(Position.opened_at.desc())
+        .all()
+    )
+    for row in rows:
+        metadata = row.metadata_json if isinstance(row.metadata_json, dict) else {}
+        copy_meta = metadata.get("leaderboard_copy_live")
+        if not isinstance(copy_meta, dict):
+            continue
+        try:
+            linked_id = int(copy_meta.get("paper_position_id"))
+        except (TypeError, ValueError):
+            continue
+        if linked_id == paper_position_id:
+            return row
+    return None
+
+
+def _copy_live_signal_levels(
+    db: Session,
+    *,
+    entry_price: Decimal,
+    direction: str,
+    settings: dict[str, Any],
+) -> dict[str, Decimal] | None:
+    stop_pct = _decimal_setting(settings.get("copy_live_stop_loss_pct"), Decimal("2"))
+    if stop_pct <= 0:
+        stop_pct = Decimal("2")
+    risk_settings = db.get(AppSetting, "risk")
+    app_settings = get_settings()
+    min_rr = Decimal(str(app_settings.min_risk_reward))
+    if risk_settings is not None and isinstance(risk_settings.value, dict):
+        min_rr = Decimal(str(risk_settings.value.get("min_risk_reward", min_rr)))
+    min_rr = max(Decimal("2"), min_rr)
+    risk = entry_price * stop_pct / Decimal("100")
+    if risk <= 0:
+        return None
+    if direction == "long":
+        stop_loss = entry_price - risk
+        if stop_loss <= 0:
+            return None
+        return {
+            "stop_loss": stop_loss,
+            "take_profit_1": entry_price + risk,
+            "take_profit_2": entry_price + (risk * min_rr),
+            "take_profit_3": entry_price + (risk * (min_rr + Decimal("1"))),
+            "risk_reward": min_rr,
+        }
+    if direction == "short":
+        return {
+            "stop_loss": entry_price + risk,
+            "take_profit_1": entry_price - risk,
+            "take_profit_2": entry_price - (risk * min_rr),
+            "take_profit_3": entry_price - (risk * (min_rr + Decimal("1"))),
+            "risk_reward": min_rr,
+        }
+    return None
+
+
+def _copy_live_signal_for_order(
+    db: Session,
+    *,
+    order: dict[str, Any],
+    paper_position: LeaderboardCopyPaperPosition,
+    market: Market,
+    entry_price: Decimal,
+    settings: dict[str, Any],
+) -> Signal | None:
+    source_time = _copy_live_source_time(paper_position)
+    existing = (
+        db.query(Signal)
+        .filter(
+            Signal.market_id == market.id,
+            Signal.timeframe == COPY_LIVE_SIGNAL_TIMEFRAME,
+            Signal.source_candle_open_time == source_time,
+        )
+        .first()
+    )
+    if existing is not None:
+        return existing
+    direction = str(order.get("direction") or paper_position.direction)
+    levels = _copy_live_signal_levels(db, entry_price=entry_price, direction=direction, settings=settings)
+    if levels is None:
+        return None
+    signal_direction = Direction.LONG.value if direction == "long" else Direction.SHORT.value
+    signal = Signal(
+        market_id=market.id,
+        timeframe=COPY_LIVE_SIGNAL_TIMEFRAME,
+        direction=signal_direction,
+        score=100,
+        confidence_label="copy_live",
+        entry_price=entry_price,
+        stop_loss=levels["stop_loss"],
+        take_profit_1=levels["take_profit_1"],
+        take_profit_2=levels["take_profit_2"],
+        take_profit_3=levels["take_profit_3"],
+        risk_reward=levels["risk_reward"],
+        reason=(
+            "Leaderboard Alpha copy-live "
+            f"{direction} {order.get('coin')} from trader {order.get('trader_label') or order.get('trader_id')}"
+        ),
+        strategy_breakdown={
+            "leaderboard_copy_live": {
+                "paper_position_id": paper_position.id,
+                "trader_id": paper_position.trader_id,
+                "trader_label": order.get("trader_label"),
+                "coin": order.get("coin"),
+                "direction": direction,
+                "requested_notional_usd": order.get("requested_notional_usd"),
+                "effective_notional_usd": order.get("effective_notional_usd"),
+                "source_open_order_id": paper_position.source_open_order_id,
+                "source_opened_at": paper_position.opened_at.isoformat(),
+                "copy_live_stop_loss_pct": str(settings.get("copy_live_stop_loss_pct") or "2"),
+            }
+        },
+        status=SignalStatus.NEW.value,
+        source_candle_open_time=source_time,
+    )
+    db.add(signal)
+    db.flush()
+    return signal
+
+
+def _copy_live_position_metadata(
+    position: Position,
+    *,
+    signal: Signal,
+    order: dict[str, Any],
+    paper_position: LeaderboardCopyPaperPosition,
+) -> dict[str, Any]:
+    metadata = dict(position.metadata_json or {})
+    metadata["leaderboard_copy_live"] = {
+        "paper_position_id": paper_position.id,
+        "trader_id": paper_position.trader_id,
+        "trader_label": order.get("trader_label"),
+        "coin": order.get("coin"),
+        "direction": order.get("direction"),
+        "source_open_order_id": paper_position.source_open_order_id,
+        "source_signal_id": signal.id,
+        "requested_notional_usd": order.get("requested_notional_usd"),
+        "effective_notional_usd": order.get("effective_notional_usd"),
+        "opened_from_copy_live_at": datetime.now(UTC).isoformat(),
+    }
+    return metadata
+
+
+def _copy_live_skip(
+    db: Session,
+    *,
+    order: dict[str, Any],
+    reason: str,
+    message: str,
+    signal: Signal | None = None,
+) -> dict[str, Any]:
+    market_id = order.get("market_id")
+    db.add(
+        DecisionLog(
+            event_type="leaderboard_copy_live_order_skipped",
+            market_id=int(market_id) if market_id is not None else None,
+            signal_id=signal.id if signal is not None else None,
+            message=message,
+            data={
+                "reason": reason,
+                "paper_position_id": order.get("paper_position_id"),
+                "trader_id": order.get("trader_id"),
+                "coin": order.get("coin"),
+                "direction": order.get("direction"),
+            },
+        )
+    )
+    return {
+        "status": "skipped",
+        "reason": reason,
+        "paper_position_id": order.get("paper_position_id"),
+        "coin": order.get("coin"),
+        "direction": order.get("direction"),
+    }
+
+
+def _close_copy_live_positions_for_closed_sources(
+    db: Session,
+    *,
+    executor: OrderExecutionEngine,
+    trading_client: HyperliquidTradingClient | None,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    live_positions = (
+        db.query(Position)
+        .filter(
+            Position.mode == OrderMode.LIVE.value,
+            Position.status == "open",
+        )
+        .all()
+    )
+    for position in live_positions:
+        metadata = position.metadata_json if isinstance(position.metadata_json, dict) else {}
+        copy_meta = metadata.get("leaderboard_copy_live")
+        if not isinstance(copy_meta, dict):
+            continue
+        try:
+            paper_position_id = int(copy_meta.get("paper_position_id"))
+        except (TypeError, ValueError):
+            continue
+        paper_position = db.get(LeaderboardCopyPaperPosition, paper_position_id)
+        if paper_position is None or paper_position.status != "closed":
+            continue
+        try:
+            executor.close_live_position(
+                db,
+                position,
+                "leaderboard_source_close",
+                trading_client=trading_client,
+            )
+        except Exception as exc:
+            db.rollback()
+            db.add(
+                DecisionLog(
+                    event_type="leaderboard_copy_live_close_failed",
+                    market_id=position.market_id,
+                    position_id=position.id,
+                    message="Copy-live source close failed",
+                    data={
+                        "paper_position_id": paper_position_id,
+                        "error": str(exc),
+                    },
+                )
+            )
+            db.commit()
+            results.append(
+                {
+                    "status": "failed",
+                    "position_id": position.id,
+                    "paper_position_id": paper_position_id,
+                    "error": str(exc),
+                }
+            )
+            continue
+        results.append(
+            {
+                "status": "closed",
+                "position_id": position.id,
+                "paper_position_id": paper_position_id,
+            }
+        )
+    return results
+
+
+def run_copy_live_execution(
+    db: Session,
+    *,
+    settings: dict[str, Any] | None = None,
+    now: datetime | None = None,
+    trading_client: HyperliquidTradingClient | None = None,
+    executor: OrderExecutionEngine | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(UTC)
+    settings = settings or leaderboard_alpha_settings(db)
+    result: dict[str, Any] = {
+        "status": "skipped",
+        "submitted": 0,
+        "blocked": 0,
+        "skipped": 0,
+        "closed": 0,
+        "orders": [],
+        "closed_sources": [],
+    }
+    if not _copy_live_orders_enabled(settings):
+        result["reason"] = "copy_live_not_enabled"
+        return result
+
+    client = trading_client or HyperliquidTradingClient(get_settings())
+    live_executor = executor or OrderExecutionEngine(get_settings())
+    closed_sources = _close_copy_live_positions_for_closed_sources(
+        db,
+        executor=live_executor,
+        trading_client=client,
+    )
+    result["closed_sources"] = closed_sources
+    result["closed"] = len([row for row in closed_sources if row.get("status") == "closed"])
+
+    plan = build_copy_live_shadow_plan(db, settings=settings, now=now)
+    dry_run_orders = [row for row in plan.get("dry_run_orders", []) if row.get("status") == "would_submit"]
+    if not dry_run_orders:
+        result["reason"] = "no_would_submit_orders"
+        result["plan_summary"] = plan.get("summary")
+        return result
+
+    try:
+        mids = client.all_mids(max_age_seconds=5)
+    except Exception as exc:
+        db.add(
+            DecisionLog(
+                event_type="leaderboard_copy_live_order_skipped",
+                message="Copy-live skipped: current Hyperliquid mids unavailable",
+                data={"reason": "mids_unavailable", "error": str(exc)},
+            )
+        )
+        db.commit()
+        result["reason"] = "mids_unavailable"
+        result["blocked"] = len(dry_run_orders)
+        return result
+
+    for order in dry_run_orders:
+        try:
+            paper_position_id = int(order.get("paper_position_id"))
+        except (TypeError, ValueError):
+            row = _copy_live_skip(
+                db,
+                order=order,
+                reason="invalid_paper_position_id",
+                message="Copy-live skipped: invalid paper position id",
+            )
+            result["orders"].append(row)
+            result["skipped"] += 1
+            continue
+
+        paper_position = db.get(LeaderboardCopyPaperPosition, paper_position_id)
+        if paper_position is None or paper_position.status != "open":
+            row = _copy_live_skip(
+                db,
+                order=order,
+                reason="source_position_not_open",
+                message="Copy-live skipped: source paper position is not open",
+            )
+            result["orders"].append(row)
+            result["skipped"] += 1
+            continue
+
+        existing_position = _copy_live_existing_position_for_paper(db, paper_position_id)
+        if existing_position is not None:
+            row = _copy_live_skip(
+                db,
+                order=order,
+                reason="source_position_already_copied",
+                message="Copy-live skipped: source paper position already copied",
+            )
+            row["position_id"] = existing_position.id
+            result["orders"].append(row)
+            result["skipped"] += 1
+            continue
+
+        market_id = order.get("market_id")
+        market = db.get(Market, int(market_id)) if market_id is not None else None
+        if market is None:
+            row = _copy_live_skip(
+                db,
+                order=order,
+                reason="market_not_found",
+                message="Copy-live skipped: market not found",
+            )
+            result["orders"].append(row)
+            result["skipped"] += 1
+            continue
+
+        entry_price = _copy_live_reference_price(market, mids)
+        if entry_price is None:
+            row = _copy_live_skip(
+                db,
+                order=order,
+                reason="current_price_unavailable",
+                message="Copy-live skipped: current price unavailable",
+            )
+            result["orders"].append(row)
+            result["blocked"] += 1
+            continue
+
+        signal = _copy_live_signal_for_order(
+            db,
+            order=order,
+            paper_position=paper_position,
+            market=market,
+            entry_price=entry_price,
+            settings=settings,
+        )
+        if signal is None:
+            row = _copy_live_skip(
+                db,
+                order=order,
+                reason="signal_build_failed",
+                message="Copy-live skipped: synthetic signal build failed",
+            )
+            result["orders"].append(row)
+            result["blocked"] += 1
+            continue
+        if signal.status != SignalStatus.NEW.value:
+            row = _copy_live_skip(
+                db,
+                order=order,
+                reason="signal_not_new",
+                message="Copy-live skipped: synthetic signal already processed",
+                signal=signal,
+            )
+            row["signal_id"] = signal.id
+            result["orders"].append(row)
+            result["skipped"] += 1
+            continue
+
+        db.commit()
+        try:
+            position = live_executor.execute_live(db, signal, trading_client=client)
+        except PermissionError as exc:
+            db.rollback()
+            signal = db.get(Signal, signal.id)
+            if signal is not None:
+                signal.status = SignalStatus.IGNORED.value
+                db.add(signal)
+            db.add(
+                DecisionLog(
+                    event_type="leaderboard_copy_live_order_blocked",
+                    market_id=market.id,
+                    signal_id=signal.id if signal is not None else None,
+                    message="Copy-live order blocked by live execution guardrails",
+                    data={
+                        "paper_position_id": paper_position.id,
+                        "coin": order.get("coin"),
+                        "direction": order.get("direction"),
+                        "error": str(exc),
+                    },
+                )
+            )
+            db.commit()
+            result["orders"].append(
+                {
+                    "status": "blocked",
+                    "reason": str(exc),
+                    "signal_id": signal.id if signal is not None else None,
+                    "paper_position_id": paper_position.id,
+                    "coin": order.get("coin"),
+                    "direction": order.get("direction"),
+                }
+            )
+            result["blocked"] += 1
+            continue
+        except Exception as exc:
+            db.rollback()
+            signal = db.get(Signal, signal.id)
+            if signal is not None:
+                signal.status = SignalStatus.IGNORED.value
+                db.add(signal)
+            db.add(
+                DecisionLog(
+                    event_type="leaderboard_copy_live_order_failed",
+                    market_id=market.id,
+                    signal_id=signal.id if signal is not None else None,
+                    message="Copy-live order failed before completion",
+                    data={
+                        "paper_position_id": paper_position.id,
+                        "coin": order.get("coin"),
+                        "direction": order.get("direction"),
+                        "error": str(exc),
+                    },
+                )
+            )
+            db.commit()
+            result["orders"].append(
+                {
+                    "status": "failed",
+                    "reason": str(exc),
+                    "signal_id": signal.id if signal is not None else None,
+                    "paper_position_id": paper_position.id,
+                    "coin": order.get("coin"),
+                    "direction": order.get("direction"),
+                }
+            )
+            result["blocked"] += 1
+            continue
+
+        position.metadata_json = _copy_live_position_metadata(
+            position,
+            signal=signal,
+            order=order,
+            paper_position=paper_position,
+        )
+        db.add(position)
+        db.add(
+            DecisionLog(
+                event_type="leaderboard_copy_live_order_submitted",
+                market_id=market.id,
+                signal_id=signal.id,
+                position_id=position.id,
+                message="Copy-live position opened from Leaderboard Alpha",
+                data={
+                    "paper_position_id": paper_position.id,
+                    "trader_id": paper_position.trader_id,
+                    "coin": order.get("coin"),
+                    "direction": order.get("direction"),
+                    "effective_notional_usd": order.get("effective_notional_usd"),
+                    "entry_price": str(entry_price),
+                },
+            )
+        )
+        db.commit()
+        result["orders"].append(
+            {
+                "status": "submitted",
+                "signal_id": signal.id,
+                "position_id": position.id,
+                "paper_position_id": paper_position.id,
+                "coin": order.get("coin"),
+                "direction": order.get("direction"),
+            }
+        )
+        result["submitted"] += 1
+
+    result["status"] = "ok" if result["submitted"] or result["closed"] else "skipped"
+    result["plan_summary"] = plan.get("summary")
+    db.commit()
+    return result
+
+
 def _copy_live_readiness(settings: dict[str, Any], dry_run_orders: Sequence[dict[str, Any]]) -> dict[str, Any]:
     blockers: list[str] = []
     if not settings.get("copy_live_enabled", False):
@@ -2021,13 +2579,9 @@ def _copy_live_readiness(settings: dict[str, Any], dry_run_orders: Sequence[dict
         blockers.append("no_dry_run_would_submit")
     for row in dry_run_orders:
         blockers.extend(str(reason) for reason in row.get("reasons") or [])
-    # Lo shadow planner non consuma budget L2. L'esecutore live deve comunque
-    # rifare depth/slippage preflight e fallire chiuso prima di inviare ordini.
-    blockers.append("live_depth_preflight_not_run")
-    blockers.append("live_order_dispatch_not_implemented")
     unique_blockers = sorted(set(blockers))
     return {
-        "ready": False,
+        "ready": len(unique_blockers) == 0,
         "blockers": unique_blockers,
         "would_submit": len([row for row in dry_run_orders if row.get("status") == "would_submit"]),
         "blocked": len([row for row in dry_run_orders if row.get("status") != "would_submit"]),
@@ -2150,9 +2704,9 @@ def build_copy_live_shadow_plan(
     return {
         "enabled": bool(settings.get("copy_live_enabled", False)),
         "mode": str(settings.get("copy_live_mode") or "shadow"),
-        "orders_enabled": False,
-        "status": status,
-        "reason": "shadow_only_no_live_order_dispatch",
+        "orders_enabled": _copy_live_orders_enabled(settings),
+        "status": "live_ready" if _copy_live_orders_enabled(settings) and selected else status,
+        "reason": "live_dispatch_available" if _copy_live_orders_enabled(settings) else "shadow_only_no_live_order_dispatch",
         "readiness": _copy_live_readiness(settings, dry_run_orders),
         "summary": {
             "evaluated_traders": len(evaluated),

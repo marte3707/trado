@@ -17,6 +17,7 @@ from app.db.models import (
     LeaderboardTraderSnapshot,
     Market,
     Position,
+    Signal,
 )
 from app.services import leaderboard_alpha as alpha
 
@@ -51,6 +52,41 @@ class _FakeDb:
 
     def add(self, row):  # noqa: ANN001
         self.added.append(row)
+
+
+class _FakeCopyLiveTradingClient:
+    def all_mids(self, max_age_seconds=None):  # noqa: ANN001, ARG002
+        return {"BTC": "100"}
+
+
+class _FakeCopyLiveExecutor:
+    def __init__(self) -> None:
+        self.executed_signals: list[int] = []
+        self.closed_positions: list[int] = []
+
+    def execute_live(self, db, signal: Signal, trading_client=None):  # noqa: ANN001, ARG002
+        self.executed_signals.append(signal.id)
+        position = Position(
+            market_id=signal.market_id,
+            mode="live",
+            side="long" if signal.direction == "LONG" else "short",
+            entry_price=signal.entry_price,
+            size=Decimal("0.4"),
+            stop_loss=signal.stop_loss,
+            status="open",
+            opened_at=datetime(2026, 7, 9, tzinfo=UTC),
+            metadata_json={"source_signal_id": str(signal.id)},
+        )
+        signal.status = "executed"
+        db.add(position)
+        db.flush()
+        return position
+
+    def close_live_position(self, db, position: Position, reason="manual", trading_client=None):  # noqa: ANN001, ARG002
+        self.closed_positions.append(position.id)
+        position.status = "closed"
+        db.add(position)
+        db.flush()
 
 
 def _fill(
@@ -573,7 +609,7 @@ def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() 
         assert plan["readiness"]["ready"] is False
         assert "copy_live_disabled" in plan["readiness"]["blockers"]
         assert "copy_live_mode_shadow" in plan["readiness"]["blockers"]
-        assert "live_order_dispatch_not_implemented" in plan["readiness"]["blockers"]
+        assert "live_order_dispatch_not_implemented" not in plan["readiness"]["blockers"]
         assert [row["trader_label"] for row in plan["selected_traders"]] == ["strong"]
         assert plan["selected_traders"][0]["promoted"] is True
         assert plan["selected_traders"][0]["promotion"]["shortlist_days"] == 1
@@ -585,6 +621,17 @@ def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() 
         assert plan["dry_run_orders"][0]["max_copy_live_open_positions"] == 3
         assert plan["dry_run_orders"][0]["max_live_open_positions"] >= 3
         assert plan["summary"]["skipped_open_positions"] == {"excluded_coin_prefix": 1}
+        live_plan = alpha.build_copy_live_shadow_plan(
+            db,
+            settings={**settings, "copy_live_enabled": True, "copy_live_mode": "live"},
+            now=now,
+            state=state,
+            update_promotion_state=False,
+        )
+        assert live_plan["orders_enabled"] is True
+        assert live_plan["status"] == "live_ready"
+        assert live_plan["readiness"]["ready"] is True
+        assert live_plan["readiness"]["blockers"] == []
         rejected = {row["trader_label"]: row["reasons"] for row in plan["rejected_traders"]}
         assert "quality_below_live_min" in rejected["weak quality"]
         assert "classification_not_allowed" in rejected["watch"]
@@ -720,8 +767,122 @@ def test_enable_copy_live_mode_blocks_when_readiness_has_hard_blockers() -> None
         result = alpha.enable_copy_live_mode(db)
 
         assert result["status"] == "blocked"
-        assert "live_order_dispatch_not_implemented" in result["blockers"]
+        assert "no_dry_run_orders" in result["blockers"]
+        assert "no_dry_run_would_submit" in result["blockers"]
         assert db.get(AppSetting, "leaderboard_alpha") is None
+    finally:
+        db.close()
+
+
+def test_run_copy_live_execution_submits_once_and_links_position() -> None:
+    db = _sqlite_db()
+    now = datetime(2026, 7, 9, tzinfo=UTC)
+    try:
+        trader = LeaderboardTrader(
+            address="0x" + "4" * 40,
+            label="strong",
+            enabled=True,
+            metadata_json={"leaderboard": {"rank": 1}},
+        )
+        market = Market(
+            exchange="hyperliquid",
+            symbol="BTC",
+            base="BTC",
+            quote="USDC",
+            market_type="perp",
+            active=True,
+            metadata_json={"hl_coin": "BTC"},
+        )
+        db.add_all([trader, market])
+        db.flush()
+        db.add(
+            AppSetting(
+                key="risk",
+                value={
+                    "min_signal_score": 70,
+                    "min_risk_reward": 2,
+                    "max_leverage": 10,
+                    "max_total_exposure_pct": 95,
+                    "max_open_positions": 25,
+                },
+            )
+        )
+        db.add(
+            AccountSnapshot(
+                timestamp=now,
+                total_equity=Decimal("1000"),
+                effective_account_value=Decimal("1000"),
+                available_balance=Decimal("500"),
+                margin_used=Decimal("0"),
+                unrealized_pnl=Decimal("0"),
+                raw_data={},
+            )
+        )
+        db.add(
+            AppSetting(
+                key=alpha.LEADERBOARD_ALPHA_STATE_KEY,
+                value={
+                    "copy_live_promotion": {
+                        "traders": {
+                            str(trader.id): {
+                                "shortlist_dates": [now.date().isoformat()],
+                                "first_seen_at": now.isoformat(),
+                                "last_seen_at": now.isoformat(),
+                            }
+                        }
+                    }
+                },
+            )
+        )
+        _add_snapshot(db, trader, classification="candidate", quality_score=95)
+        for idx in range(22):
+            _add_copy_position(
+                db,
+                trader,
+                idx=idx,
+                now=now,
+                net_pnl=Decimal("1") if idx % 5 else Decimal("-0.25"),
+            )
+        _add_copy_position(db, trader, idx=500, now=now, status="open", coin="BTC")
+        db.commit()
+
+        settings = {
+            **alpha.DEFAULT_LEADERBOARD_ALPHA_SETTINGS,
+            "copy_live_enabled": True,
+            "copy_live_mode": "live",
+            "copy_live_promotion_min_shortlist_days": 1,
+        }
+        executor = _FakeCopyLiveExecutor()
+
+        result = alpha.run_copy_live_execution(
+            db,
+            settings=settings,
+            now=now,
+            trading_client=_FakeCopyLiveTradingClient(),
+            executor=executor,
+        )
+        second = alpha.run_copy_live_execution(
+            db,
+            settings=settings,
+            now=now,
+            trading_client=_FakeCopyLiveTradingClient(),
+            executor=executor,
+        )
+
+        live_positions = db.query(Position).filter(Position.mode == "live").all()
+        signals = db.query(Signal).filter(Signal.timeframe == alpha.COPY_LIVE_SIGNAL_TIMEFRAME).all()
+        metadata = live_positions[0].metadata_json["leaderboard_copy_live"]
+
+        assert result["submitted"] == 1
+        assert result["blocked"] == 0
+        assert second["submitted"] == 0
+        assert second["reason"] == "no_would_submit_orders"
+        assert len(executor.executed_signals) == 1
+        assert len(live_positions) == 1
+        assert len(signals) == 1
+        assert metadata["paper_position_id"] is not None
+        assert metadata["trader_id"] == trader.id
+        assert metadata["coin"] == "BTC"
     finally:
         db.close()
 
