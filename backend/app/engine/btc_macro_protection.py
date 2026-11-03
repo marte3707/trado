@@ -160,10 +160,9 @@ class BtcMacroProtectionEngine:
         )
         db.commit()
 
-        # In reverse_mode l'engine deve poter agire anche sulle posizioni paper:
-        # l'auto-tuner valuta su `closed_paper_positions` e senza paper non avrebbe
-        # mai trade da analizzare. Quando reverse_mode è OFF rimane live-only
-        # (comportamento storico close/breakeven invariato).
+        # In reverse_mode l'engine agisce anche sulle posizioni paper, così la
+        # simulazione resta confrontabile con il percorso live. Quando reverse_mode
+        # è OFF rimane live-only (comportamento storico close/breakeven invariato).
         reverse_mode_enabled = bool(config.get("reverse_mode_enabled", False))
         if reverse_mode_enabled:
             allowed_modes = [OrderMode.LIVE.value, OrderMode.PAPER.value]

@@ -17,6 +17,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
+from app.core.runtime_settings import effective_telegram_notifications_enabled
 from app.db.models import BotUser
 
 logger = structlog.get_logger()
@@ -44,6 +45,8 @@ async def _send_admin(settings: Settings, text: str) -> bool:
 
 
 async def send_bot_online(settings: Settings, db: Session) -> None:
+    if not effective_telegram_notifications_enabled(db):
+        return
     now = datetime.now(UTC).strftime("%d/%m/%Y %H:%M UTC")
     total_users = db.query(func.count(BotUser.id)).scalar() or 0
     completed = (
@@ -72,6 +75,8 @@ async def send_bot_heartbeat(
     errors: int,
     uptime_seconds: float,
 ) -> None:
+    if not effective_telegram_notifications_enabled(db):
+        return
     total_users = db.query(func.count(BotUser.id)).scalar() or 0
     completed = (
         db.query(func.count(BotUser.id))
@@ -100,7 +105,14 @@ async def send_bot_heartbeat(
     )
 
 
-async def send_bot_fatal(settings: Settings, context: str, exc: Exception) -> None:
+async def send_bot_fatal(
+    settings: Settings,
+    db: Session,
+    context: str,
+    exc: Exception,
+) -> None:
+    if not effective_telegram_notifications_enabled(db):
+        return
     now = datetime.now(UTC).strftime("%H:%M UTC")
     error_type = type(exc).__name__
     error_msg = str(exc)[:300]

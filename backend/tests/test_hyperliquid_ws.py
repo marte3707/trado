@@ -5,8 +5,11 @@ from app.db.models import AppSetting, Market, Position
 from app.services.hyperliquid_ws import (
     CandleSubscription,
     ClosedCandleAccumulator,
+    L2BookSubscription,
     build_candle_subscription_plan,
+    build_l2_book_subscription_plan,
     candle_subscription_key_from_ack,
+    market_data_subscription_fingerprint,
 )
 
 
@@ -134,6 +137,47 @@ def test_candle_subscription_payload_matches_hyperliquid_protocol() -> None:
         "method": "subscribe",
         "subscription": {"type": "candle", "coin": "BTC", "interval": "15m"},
     }
+
+
+def test_l2_subscription_uses_remaining_websocket_capacity() -> None:
+    candles = [
+        CandleSubscription(1, "BTC", "15m"),
+        CandleSubscription(1, "BTC", "1h"),
+        CandleSubscription(2, "ETH", "15m"),
+    ]
+
+    assert build_l2_book_subscription_plan(candles, max_subscriptions=5) == [
+        L2BookSubscription(1, "BTC"),
+        L2BookSubscription(2, "ETH"),
+    ]
+    assert L2BookSubscription(1, "BTC").payload() == {
+        "method": "subscribe",
+        "subscription": {"type": "l2Book", "coin": "BTC"},
+    }
+
+
+def test_subscription_fingerprint_includes_l2_on_periodic_refresh() -> None:
+    candles = [
+        CandleSubscription(1, "BTC", "15m"),
+        CandleSubscription(2, "ETH", "15m"),
+    ]
+
+    initial = market_data_subscription_fingerprint(
+        candles,
+        max_subscriptions=4,
+    )
+    refreshed = market_data_subscription_fingerprint(
+        list(candles),
+        max_subscriptions=4,
+    )
+
+    assert initial == refreshed
+    assert initial == (
+        CandleSubscription(1, "BTC", "15m"),
+        CandleSubscription(2, "ETH", "15m"),
+        L2BookSubscription(1, "BTC"),
+        L2BookSubscription(2, "ETH"),
+    )
 
 
 def test_subscription_ack_matches_hyperliquid_protocol() -> None:

@@ -897,7 +897,7 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
         <Card className="border-warn/40 bg-warn/5 p-4 text-sm text-warn">
           <div className="flex items-start gap-3">
             <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-            <div className="space-y-1">
+            <div className="min-w-0 flex-1 space-y-2">
               <div className="font-medium">
                 {positionsNeedingIntervention.length} posizioni richiedono intervento sulle protezioni
               </div>
@@ -905,6 +905,27 @@ export function AccountMonitorScreen({ health }: { health: Health }) {
                 {positionsNeedingIntervention
                   .map((position) => `${position.coin}: ${position.protection?.summary ?? "repair richiesto"}`)
                   .join(" • ")}
+              </div>
+              <div className="flex flex-wrap gap-2 pt-1">
+                {positionsNeedingIntervention
+                  .filter((position) => position.coin && position.protection?.repairable)
+                  .map((position) => {
+                    const coin = String(position.coin);
+                    const running = action.key === `repair-protection-${coin}`;
+                    return (
+                      <button
+                        key={coin}
+                        className="btn ghost"
+                        disabled={running || action.key !== null}
+                        title={`Ricontrolla e ripristina le protezioni reduce-only di ${coin}`}
+                        onClick={() => repairProtection(coin)}
+                        style={{ minHeight: 28, padding: "0 10px" }}
+                      >
+                        <RotateCcw className={cn("h-3.5 w-3.5", running && "animate-spin")} />
+                        <span>{running ? `Riparazione ${coin}…` : `Ripara ${coin}`}</span>
+                      </button>
+                    );
+                  })}
               </div>
             </div>
           </div>

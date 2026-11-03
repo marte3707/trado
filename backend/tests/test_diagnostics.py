@@ -4,6 +4,7 @@ from decimal import Decimal
 from app.db.models import AppSetting, DecisionLog, Position, Signal
 from app.engine.diagnostics import (
     build_equity_slope_diagnostics,
+    consecutive_zero_signal_cycles,
     equity_slope,
     exit_reason_distribution,
     planned_stop_pct_summary,
@@ -77,29 +78,6 @@ class FakeDiagnosticsDb:
         self.positions = positions
         self.logs = logs
         self.settings = {
-            "auto_calibration": AppSetting(
-                key="auto_calibration",
-                value={
-                    "deep_defensive_slope_threshold": -0.1,
-                    "recent_slope_exit_cycles": 3,
-                    "starvation_hard_cycles": 15,
-                },
-            ),
-            "auto_calibration_state": AppSetting(
-                key="auto_calibration_state",
-                value={
-                    "deep_defensive_active": True,
-                    "last_reason": "deep defensive mode",
-                    "deep_defensive_positive_streak": 1,
-                    "deep_defensive_recent_positive_streak": 0,
-                    "consecutive_zero_signal_cycles": 2,
-                    "deep_defensive_cooldown_remaining": 0,
-                },
-            ),
-            "auto_calibration_baseline": AppSetting(
-                key="auto_calibration_baseline",
-                value={"risk": {"min_signal_score": 60}},
-            ),
             "risk": AppSetting(key="risk", value={"min_signal_score": 72}),
         }
 
@@ -194,6 +172,64 @@ def test_equity_slope_zero_when_insufficient_history() -> None:
     assert equity_slope(positions) == 0.0
 
 
+def test_consecutive_zero_signal_cycles_uses_live_worker_logs() -> None:
+    rows = [
+        DecisionLog(event_type="worker_cycle_failed", message="failed", data={}),
+        DecisionLog(
+            event_type="worker_cycle",
+            message="no-op",
+            data={"active_timeframes": [], "generated": 0},
+        ),
+        DecisionLog(
+            event_type="worker_cycle",
+            message="zero",
+            data={"active_timeframes": ["15m"], "generated": 0},
+        ),
+        DecisionLog(
+            event_type="worker_cycle",
+            message="zero",
+            data={"active_timeframes": ["15m"], "generated": 0},
+        ),
+        DecisionLog(
+            event_type="worker_cycle",
+            message="generated",
+            data={"active_timeframes": ["15m"], "generated": 1},
+        ),
+    ]
+    db = FakeDiagnosticsDb([], rows)
+
+    assert consecutive_zero_signal_cycles(db) == 3  # type: ignore[arg-type]
+
+
+def test_equity_slope_diagnostics_uses_live_zero_cycle_count(monkeypatch) -> None:
+    rows = [
+        DecisionLog(
+            event_type="worker_cycle",
+            message="zero",
+            data={"active_timeframes": ["15m"], "generated": 0},
+        ),
+        DecisionLog(
+            event_type="worker_cycle",
+            message="zero",
+            data={"active_timeframes": ["15m"], "generated": 0},
+        ),
+        DecisionLog(
+            event_type="worker_cycle",
+            message="generated",
+            data={"active_timeframes": ["15m"], "generated": 1},
+        ),
+    ]
+    db = FakeDiagnosticsDb([], rows)
+    monkeypatch.setattr(
+        "app.engine.diagnostics.SignalPerformanceAnalyzer.closed_paper_positions",
+        lambda self, db, limit=500, **kwargs: [],
+    )
+
+    diagnostics = build_equity_slope_diagnostics(db, lookback=500)  # type: ignore[arg-type]
+
+    assert diagnostics["consecutive_zero_signal_cycles"] == 2
+
+
 def test_build_equity_slope_diagnostics_exposes_status_and_time_stop_impact(monkeypatch) -> None:
     base = datetime(2026, 5, 1, tzinfo=UTC)
     positions = [
@@ -216,10 +252,7 @@ def test_build_equity_slope_diagnostics_exposes_status_and_time_stop_impact(monk
 
     assert diagnostics["status"] == "declining"
     assert diagnostics["threshold"] == -0.1
-    assert diagnostics["deep_defensive_active"] is True
     assert diagnostics["recent_time_stop_impact"]["closed_count"] == 1
     assert diagnostics["recent_time_stop_impact"]["realized_pnl"] == -12.5
-    assert diagnostics["baseline_vs_current"]["risk"]["min_signal_score"] == {
-        "baseline": 60,
-        "current": 72,
-    }
+    assert "deep_defensive_active" not in diagnostics
+    assert "baseline_vs_current" not in diagnostics

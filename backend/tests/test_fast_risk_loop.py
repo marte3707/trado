@@ -1,3 +1,5 @@
+import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -5,6 +7,8 @@ import pytest
 from app.core.config import Settings
 from app.core.enums import OperationMode
 from app.db.models import AppSetting, DecisionLog
+from app.services import hyperliquid_rate_limit as hl_rate_limit
+from app.services.hyperliquid import HyperliquidRateLimitError
 from app.worker import fast_risk as worker
 
 
@@ -321,3 +325,76 @@ async def test_fast_risk_one_action_failure_does_not_block_others(monkeypatch) -
     assert result["actions"]["unified_account_ratio"] == {"status": "ok"}
     assert calls == {"reconcile": 1, "uar": 1}
     assert db.rolled_back == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deferred_action", ["liquidation_guard", "live_reconciled", "unified_account_ratio"])
+async def test_budget_deferral_retries_only_affected_action_at_deadline(monkeypatch, deferred_action) -> None:
+    db = FastRiskDb(mode=OperationMode.AUTO_TRADE, live_enabled=True)
+    manager = FakePositionManager()
+    executor = FakeExecutor(Settings(fast_risk_loop_interval_seconds=15), manager)
+    calls = {"liquidation_guard": 0, "live_reconciled": 0, "unified_account_ratio": 0}
+    deadline = datetime.fromtimestamp(120, UTC).isoformat()
+
+    def action(name, result):
+        def run(*_args):
+            calls[name] += 1
+            if name == deferred_action and calls[name] == 1:
+                raise HyperliquidRateLimitError(
+                    "clearinghouseState",
+                    hl_rate_limit.HyperliquidRateLimitDecision(
+                        False, reason="ip_weight_budget", next_retry_after=deadline,
+                        rate_limit_class="info",
+                    ),
+                )
+            return result
+        return run
+
+    monkeypatch.setattr(worker, "SessionLocal", lambda: db)
+    monkeypatch.setattr(manager, "audit_live_positions_against_liquidation", action("liquidation_guard", {"checked": 1}))
+    monkeypatch.setattr(worker, "reconcile_live_positions", action("live_reconciled", 1))
+    monkeypatch.setattr(worker, "audit_unified_account_ratio_guard", action("unified_account_ratio", {"status": "ok"}))
+    state = worker._FastRiskState()
+
+    first = await worker.run_fast_risk_once(executor, state, now=100)
+    waiting = await worker.run_fast_risk_once(executor, state, now=119)
+    assert first["status"] == waiting["status"] == "warn"
+    assert first["deferred_actions"] == waiting["deferred_actions"] == {deferred_action: deadline}
+    assert first["actions"].keys() == calls.keys() - {deferred_action}
+    assert not waiting["actions"]
+    assert calls == dict.fromkeys(calls, 1)
+    assert state.hyperliquid_rate_limit_cooldown_until == 0
+
+    recovered = await worker.run_fast_risk_once(executor, state, now=120)
+    assert recovered["status"] == "ok"
+    assert set(recovered["actions"]) == {deferred_action}
+    assert calls[deferred_action] == 2
+    assert not state.retry_after
+    assert not any(
+        isinstance(row, DecisionLog) and row.event_type == "fast_risk_cycle_failed"
+        for row in db.added
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_risk_priority_propagates_to_thread_without_promoting_other_tasks(monkeypatch) -> None:
+    db = FastRiskDb(mode=OperationMode.AUTO_TRADE, live_enabled=True)
+    db.settings[hl_rate_limit.HYPERLIQUID_RATE_LIMIT_SETTING_KEY] = AppSetting(
+        key=hl_rate_limit.HYPERLIQUID_RATE_LIMIT_SETTING_KEY,
+        value={"ip_weight_budget_per_minute": 20, "live_preflight_reserve_weight": 20},
+    )
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(hl_rate_limit, "SessionLocal", lambda: db)
+    monkeypatch.setattr(hl_rate_limit, "_locked_state_setting", lambda _db: None)
+
+    def read_account():
+        return hl_rate_limit.check_hyperliquid_rate_limit(
+            request_type="clearinghouseState", rate_limit_class="info"
+        )
+
+    risk_read, other_read = await asyncio.gather(
+        worker._run_live_risk_action(read_account), asyncio.to_thread(read_account)
+    )
+    assert risk_read.allowed
+    assert not other_read.allowed
+    assert not read_account().allowed

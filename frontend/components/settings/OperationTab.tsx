@@ -157,7 +157,7 @@ export function OperationTab({ settings }: Props) {
       <Card className="p-6">
         <SectionTitle
           title="Monitoring-only timeframes"
-          hint="Sincronizzati per macro risk e BTC macro protection, senza generare segnali"
+          hint="Sincronizzati per correlazioni e BTC macro protection, senza generare segnali"
         />
         <div className="mt-3 flex flex-wrap gap-2">
           {TF_OPTIONS.map((tf) => {

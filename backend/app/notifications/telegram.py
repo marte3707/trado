@@ -1,7 +1,6 @@
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from html import escape
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -13,7 +12,6 @@ from sqlalchemy.orm import Session
 from app.core.config import Settings, get_settings
 from app.core.runtime_settings import DEFAULT_POSITION_MANAGEMENT_SETTINGS
 from app.db.models import Alert, AppSetting, Order, Position, Signal
-from app.engine.portfolio_guard import PortfolioGuard
 from app.notifications.card_renderer import render_close_card
 from app.services.trade_metrics import build_trade_metrics
 
@@ -44,6 +42,9 @@ _REASON_LABELS: dict[str, str] = {
     "btc_macro_protection_loss_exit": "BTC Macro Stop",
     "btc_macro_protection_breakeven": "BTC Macro Breakeven",
     "reconciliazione hl": "HL Reconciled",
+    "the_bull_profit_update": "The Bull Profit Update",
+    "the_bull_close_update": "The Bull Close Update",
+    "the_bull_stop_update": "The Bull Stop Update",
 }
 
 _REASON_ICONS: dict[str, str] = {
@@ -57,6 +58,9 @@ _REASON_ICONS: dict[str, str] = {
     "btc_macro_protection_loss_exit": "🟠",
     "btc_macro_protection_breakeven": "🟠",
     "reconciliazione hl": "🔄",
+    "the_bull_profit_update": "🐂",
+    "the_bull_close_update": "🐂",
+    "the_bull_stop_update": "🛑",
 }
 
 _TERM_ANCHORS: dict[str, str] = {
@@ -99,101 +103,11 @@ def _fmt_reason(reason: str) -> str:
     return _REASON_LABELS.get(reason.lower(), reason.upper())
 
 
-def _macro_risk_icon(level: str, active: bool) -> str:
-    if not active:
-        return "✅"
-    return {
-        "extreme": "🚨",
-        "high": "⚠️",
-        "watch": "🟡",
-        "manual": "🛡️",
-    }.get(level.lower(), "⚠️")
-
-
-def _humanize_macro_tokens(value: object) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return "n/a"
-    parts = [part.strip().replace("_", " ") for part in text.split(",") if part.strip()]
-    return ", ".join(parts) or "n/a"
-
-
-def _format_macro_sources(value: object) -> str:
-    if not isinstance(value, list):
-        return "n/a"
-    labels = [str(item).replace("_", " ").strip() for item in value if str(item).strip()]
-    return ", ".join(labels) or "n/a"
-
-
 def _short_text(value: str, max_len: int = 120) -> str:
     text = " ".join(value.split())
     if len(text) <= max_len:
         return text
     return f"{text[: max_len - 1].rstrip()}…"
-
-
-def _macro_risk_news_lines(value: object) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    lines: list[str] = []
-    for item in value[:2]:
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("title") or "").strip()
-        if not title:
-            continue
-        source = str(item.get("source") or "").strip()
-        url = str(item.get("url") or "").strip()
-        label = escape(_short_text(title))
-        source_suffix = f" <i>{escape(source)}</i>" if source else ""
-        if url.startswith(("https://", "http://")):
-            safe_url = escape(url, quote=True)
-            lines.append(f"• <a href=\"{safe_url}\">{label}</a>{source_suffix}")
-        else:
-            lines.append(f"• {label}{source_suffix}")
-    return lines
-
-
-def _macro_risk_calendar_lines(value: object) -> list[str]:
-    if not isinstance(value, dict):
-        return []
-    active_events = value.get("active_events")
-    if not isinstance(active_events, list):
-        return []
-    lines: list[str] = []
-    for item in active_events[:2]:
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("title") or "").strip()
-        if not title:
-            continue
-        source = str(item.get("source") or "").strip()
-        url = str(item.get("url") or "").strip()
-        label = escape(_short_text(title))
-        source_suffix = f" <i>{escape(source)}</i>" if source else ""
-        if url.startswith(("https://", "http://")):
-            lines.append(f"• <a href=\"{escape(url, quote=True)}\">{label}</a>{source_suffix}")
-        else:
-            lines.append(f"• {label}{source_suffix}")
-    return lines
-
-
-def _format_italian_datetime(value: object) -> str:
-    if value is None:
-        return "n/a"
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, str) and value:
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return value
-    else:
-        return str(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    local = parsed.astimezone(ZoneInfo("Europe/Rome"))
-    return local.strftime("%d/%m/%Y alle %H:%M")
 
 
 def _terms_guide_url(anchor: str | None = None) -> str:
@@ -531,8 +445,9 @@ def _build_message(signal: Signal) -> str:
 
 
 class TelegramNotifier:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, enabled: bool = True) -> None:
         self.settings = settings
+        self.enabled = enabled
 
     def _token_for(self, chat_id: str | None) -> str | None:
         """Pick the right bot token based on destination chat. Messages sent to
@@ -577,6 +492,8 @@ class TelegramNotifier:
         reply_to_message_id: int | None = None,
         disable_web_page_preview: bool = True,
     ) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
         target = chat_id or self.settings.telegram_chat_id
         payload: dict[str, object] = {
             "chat_id": target,
@@ -684,6 +601,8 @@ class TelegramNotifier:
         chat_id: str | None = None,
         reply_to_message_id: int | None = None,
     ) -> bool:
+        if not self.enabled:
+            return False
         target = chat_id or self.settings.telegram_chat_id
         token = self._token_for(target)
         if not token or not target:
@@ -892,7 +811,6 @@ class TelegramNotifier:
         now = datetime.now(UTC).strftime("%d/%m/%Y %H:%M UTC")
         mode = "—"
         score = "—"
-        defensive = False
         try:
             mode_setting = db.get(AppSetting, "operation_mode")
             if mode_setting:
@@ -900,17 +818,12 @@ class TelegramNotifier:
             risk_setting = db.get(AppSetting, "risk")
             if risk_setting:
                 score = risk_setting.value.get("min_signal_score", "—")
-            cal_state = db.get(AppSetting, "auto_calibration_state")
-            if cal_state:
-                defensive = bool(cal_state.value.get("deep_defensive_active", False))
         except Exception:
             pass
-        defensive_line = "\n⚠️ <b>Modalità difensiva attiva</b>" if defensive else ""
         await self._send_text(
             f"✅ <b>Trado Worker ONLINE</b>\n"
             f"<code>{now}</code>\n"
             f"\n⚙️ Config: modalità <b>{mode}</b> · score min <b>{score}</b>"
-            f"{defensive_line}"
         )
 
     async def send_worker_error(self, context: str, exc: Exception) -> None:
@@ -1008,14 +921,10 @@ class TelegramNotifier:
             pass
 
         mode = "—"
-        defensive = False
         try:
             mode_setting = db.get(AppSetting, "operation_mode")
             if mode_setting:
                 mode = mode_setting.value.get("mode", "—")
-            cal_state = db.get(AppSetting, "auto_calibration_state")
-            if cal_state:
-                defensive = bool(cal_state.value.get("deep_defensive_active", False))
         except Exception:
             pass
 
@@ -1029,8 +938,6 @@ class TelegramNotifier:
         raw_balance = stats.get("live_balance")
         balance_str = f"{float(raw_balance):,.2f} $" if raw_balance is not None else "n/d"
         live_total = live_long + live_short
-        defensive_line = "\n\n⚠️ <b>Modalità difensiva attiva</b>" if defensive else ""
-
         await self._send_text(
             f"📊 <b>Trado — Recap {period_min} min</b>\n"
             f"<code>{now_str}</code>\n\n"
@@ -1041,7 +948,6 @@ class TelegramNotifier:
             f"  ✅ Profitto: {live_profit}  |  🔴 Perdita: {live_loss}\n"
             f"  PnL: <code>{_pnl(live_pnl)}</code>\n\n"
             f"🆕 Aperte nel periodo: {new_positions}"
-            f"{defensive_line}"
         )
 
     async def send_daily_recap(
@@ -1301,62 +1207,6 @@ class TelegramNotifier:
         except Exception as exc:
             logger.warning("telegram_btc_macro_send_failed", error=str(exc))
 
-    async def send_macro_risk_state_changed(self, state: dict[str, Any]) -> bool:
-        if not self.settings.telegram_signal_chat_id:
-            return False
-        level_raw = str(state.get("level") or "off")
-        level = level_raw.upper()
-        is_active = bool(state.get("active"))
-        active = "ACTIVE · defensive rules enabled" if is_active else "OFF · normal rules restored"
-        icon = _macro_risk_icon(level_raw, is_active)
-        summary = escape(str(state.get("summary") or "Macro risk state changed"))
-        reason = escape(_humanize_macro_tokens(state.get("reason")))
-        sources = escape(_format_macro_sources(state.get("sources")))
-        active_until = escape(_format_italian_datetime(state.get("active_until")))
-        raw_policy = state.get("policy")
-        policy: dict[str, Any] = raw_policy if isinstance(raw_policy, dict) else {}
-        disabled_tfs = ", ".join(str(item) for item in policy.get("disable_timeframes", []) or []) or "none"
-        mtf = "required" if policy.get("require_mtf_confluence") else "not required"
-        expected_r_floor = policy.get("min_expected_r")
-        try:
-            expected_r_value = float(expected_r_floor) if expected_r_floor is not None else None
-            expected_r_label = f">={expected_r_value:.2f}R"
-        except (TypeError, ValueError):
-            expected_r_label = "not enforced"
-        lines = [
-            f"{icon} <b>Macro risk: {level}</b>",
-            f"Status: <b>{active}</b>",
-            summary,
-            "",
-            f"🧭 <b>Why:</b> {reason}",
-            f"📰 <b>Sources:</b> {sources}",
-            f"📊 <b>Risk score:</b> <code>{state.get('combined_score', 0)}/100</code> "
-            f"· news <code>{state.get('news_score', 0)}</code> "
-            f"· calendar <code>{state.get('calendar_score', 0)}</code> "
-            f"· market <code>{state.get('market_stress_score', 0)}</code>",
-            "",
-            "🛡️ <b>Trading impact</b>",
-            f"• Position size: <code>{policy.get('size_multiplier', 1)}x</code>",
-            f"• Calibrated expected R: <code>{expected_r_label}</code>",
-            f"• Paused timeframes: <code>{escape(disabled_tfs)}</code>",
-            f"• MTF confluence: <code>{mtf}</code>",
-            f"⏱️ <b>Active until:</b> {active_until}",
-        ]
-        news_lines = _macro_risk_news_lines(state.get("top_news"))
-        if news_lines:
-            lines.extend(["", "📰 <b>Top news</b>", *news_lines])
-        calendar_lines = _macro_risk_calendar_lines(state.get("calendar"))
-        if calendar_lines:
-            lines.extend(["", "📅 <b>Macro calendar</b>", *calendar_lines])
-        try:
-            return await self._send_text(
-                "\n".join(lines),
-                chat_id=self.settings.telegram_signal_chat_id,
-            )
-        except Exception as exc:
-            logger.warning("telegram_macro_risk_send_failed", error=str(exc))
-            return False
-
     async def send_signal(self, db: Session, signal: Signal) -> None:
         """Publish a new signal to the public channel only.
 
@@ -1378,18 +1228,13 @@ class TelegramNotifier:
             "take_profit_3": str(signal.take_profit_3) if signal.take_profit_3 is not None else None,
             "risk_reward": str(signal.risk_reward),
         }
-        macro_gate = PortfolioGuard(self.settings).evaluate_macro_risk_gate(db, signal)
-        if not macro_gate.allowed:
+        if not self.enabled:
             db.add(
                 Alert(
                     signal_id=signal.id,
                     channel="telegram",
                     status="skipped",
-                    payload={
-                        **payload,
-                        "skip_reason": macro_gate.reason,
-                        "skip_details": macro_gate.details,
-                    },
+                    payload={**payload, "skip_reason": "telegram_notifications_disabled"},
                 )
             )
             db.commit()

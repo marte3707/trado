@@ -17,16 +17,9 @@ interface Props {
   onRefresh: () => void | Promise<void>;
 }
 
-function toNum(value: unknown, fallback: number): number {
-  const n = Number(value);
-  return Number.isFinite(n) && value != null ? n : fallback;
-}
-
 export function StrategiesScreen({ strategies, settings, threshold }: Props) {
   const [localThreshold, setLocalThreshold] = useState(threshold);
   const { mutate: saveThreshold } = useUpdateScoreThreshold();
-
-  const maxWeight = toNum(settings.auto_calibration?.max_weight, 30);
 
   const enabledCount = useMemo(() => strategies.filter((s) => s.enabled).length, [strategies]);
   const totalCount = strategies.length;
@@ -65,7 +58,7 @@ export function StrategiesScreen({ strategies, settings, threshold }: Props) {
         <StatTile
           label="Peso totale attivo"
           value={String(totalActiveWeight)}
-          hint={`max per TF ${maxWeight}`}
+          hint="somma su tutti i timeframe"
         />
         <StatTile
           label="Score minimo globale"
@@ -116,7 +109,7 @@ export function StrategiesScreen({ strategies, settings, threshold }: Props) {
       </Card>
 
       {/* Accordion per timeframe */}
-      <StrategyTimeframeAccordion strategies={strategies} maxWeight={maxWeight} />
+      <StrategyTimeframeAccordion strategies={strategies} />
     </div>
   );
 }

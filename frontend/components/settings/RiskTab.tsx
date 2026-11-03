@@ -52,9 +52,6 @@ export function RiskTab({ settings }: Props) {
   const circuitBreaker = toRecord(risk.circuit_breaker);
   const directionalReversalBreaker = toRecord(risk.directional_reversal_breaker);
   const directionalReversalModes = toRecord(directionalReversalBreaker.modes);
-  const macroRiskMode = toRecord(risk.macro_risk_mode);
-  const macroRiskMonitor = toRecord(risk.macro_risk_monitor);
-  const macroRiskState = toRecord(settings.macro_risk_state);
 
   const persisted = {
     minScore: toNum(risk.min_signal_score, 60),
@@ -65,6 +62,13 @@ export function RiskTab({ settings }: Props) {
     maxPositions: toNum(risk.max_open_positions, 5),
     maxExposurePct: toNum(risk.max_total_exposure_pct, 25),
     maxLeverage: toNum(risk.max_leverage, 3),
+    signalGeneration: {
+      participationRatio: toNum(risk.participation_ratio, 0.35),
+      edgePenaltiesEnabled: toBool(risk.edge_penalties_enabled, true),
+      maxCombinedScoreAdjustment: toNum(risk.max_combined_score_adjustment, 15),
+      edgePenaltyMinMarketTrades: toNum(risk.edge_penalty_min_market_trades, 20),
+      minSignalExpectedR: toNum(risk.min_signal_expected_r, 0),
+    },
     portfolioGuard: {
       enabled: toBool(portfolioGuard.enabled, true),
       maxNewPerCycleLive: toNum(maxNewBySide.live, 3),
@@ -93,51 +97,6 @@ export function RiskTab({ settings }: Props) {
       windowMinutes: toNum(directionalReversalBreaker.window_minutes, 120),
       stopLossCount: toNum(directionalReversalBreaker.stop_loss_count, 4),
       cooldownMinutes: toNum(directionalReversalBreaker.cooldown_minutes, 180),
-    },
-    macroRiskMode: {
-      enabled: toBool(macroRiskMode.enabled, false),
-      sizeMultiplier: toNum(macroRiskMode.size_multiplier, 0.5),
-      minExpectedR: toNum(macroRiskMode.min_expected_r, 0),
-      disabledTimeframes: toCsv(macroRiskMode.disable_timeframes, ["5m"]),
-      requireMtfConfluence: toBool(macroRiskMode.require_mtf_confluence, true),
-    },
-    macroRiskMonitor: {
-      enabled: toBool(macroRiskMonitor.enabled, true),
-      actionsEnabled: toBool(macroRiskMonitor.actions_enabled, true),
-      telegramNotifyCooldownMinutes: toNum(
-        macroRiskMonitor.telegram_notify_cooldown_minutes,
-        180,
-      ),
-      telegramNotifyOnDowngrade: toBool(
-        macroRiskMonitor.telegram_notify_on_downgrade,
-        false,
-      ),
-      newsEnabled: toBool(macroRiskMonitor.news_enabled, true),
-      calendarEnabled: toBool(macroRiskMonitor.calendar_enabled, true),
-      marketStressEnabled: toBool(macroRiskMonitor.market_stress_enabled, true),
-      newsFeedUrls: toCsv(
-        macroRiskMonitor.news_feed_urls,
-        [
-          "https://feeds.bbci.co.uk/news/world/rss.xml",
-          "https://www.theguardian.com/world/rss",
-          "https://www.aljazeera.com/xml/rss/all.xml",
-          "https://www.coindesk.com/arc/outboundfeeds/rss/",
-        ],
-      ),
-      calendarFeedUrls: toCsv(
-        macroRiskMonitor.calendar_feed_urls,
-        [],
-      ),
-      newsFetchCooldownMinutes: toNum(macroRiskMonitor.news_fetch_cooldown_minutes, 15),
-      calendarFetchCooldownHours: toNum(macroRiskMonitor.calendar_fetch_cooldown_hours, 6),
-      newsLookbackHours: toNum(macroRiskMonitor.news_lookback_hours, 12),
-      calendarLookaheadHours: toNum(macroRiskMonitor.calendar_lookahead_hours, 48),
-      calendarPreEventMinutes: toNum(macroRiskMonitor.calendar_pre_event_minutes, 90),
-      calendarPostEventMinutes: toNum(macroRiskMonitor.calendar_post_event_minutes, 45),
-      marketLookbackMinutes: toNum(macroRiskMonitor.market_lookback_minutes, 120),
-      watchScore: toNum(macroRiskMonitor.watch_score, 40),
-      highScore: toNum(macroRiskMonitor.high_score, 60),
-      extremeScore: toNum(macroRiskMonitor.extreme_score, 80),
     },
   };
 
@@ -179,30 +138,6 @@ export function RiskTab({ settings }: Props) {
     persisted.directionalReversalBreaker.windowMinutes,
     persisted.directionalReversalBreaker.stopLossCount,
     persisted.directionalReversalBreaker.cooldownMinutes,
-    persisted.macroRiskMode.enabled,
-    persisted.macroRiskMode.sizeMultiplier,
-    persisted.macroRiskMode.minExpectedR,
-    persisted.macroRiskMode.disabledTimeframes,
-    persisted.macroRiskMode.requireMtfConfluence,
-    persisted.macroRiskMonitor.enabled,
-    persisted.macroRiskMonitor.actionsEnabled,
-    persisted.macroRiskMonitor.telegramNotifyCooldownMinutes,
-    persisted.macroRiskMonitor.telegramNotifyOnDowngrade,
-    persisted.macroRiskMonitor.newsEnabled,
-    persisted.macroRiskMonitor.calendarEnabled,
-    persisted.macroRiskMonitor.marketStressEnabled,
-    persisted.macroRiskMonitor.newsFeedUrls,
-    persisted.macroRiskMonitor.calendarFeedUrls,
-    persisted.macroRiskMonitor.newsFetchCooldownMinutes,
-    persisted.macroRiskMonitor.calendarFetchCooldownHours,
-    persisted.macroRiskMonitor.newsLookbackHours,
-    persisted.macroRiskMonitor.calendarLookaheadHours,
-    persisted.macroRiskMonitor.calendarPreEventMinutes,
-    persisted.macroRiskMonitor.calendarPostEventMinutes,
-    persisted.macroRiskMonitor.marketLookbackMinutes,
-    persisted.macroRiskMonitor.watchScore,
-    persisted.macroRiskMonitor.highScore,
-    persisted.macroRiskMonitor.extremeScore,
   ]);
 
   const dirty = JSON.stringify(local) !== JSON.stringify(persisted);
@@ -218,6 +153,11 @@ export function RiskTab({ settings }: Props) {
       max_open_positions: local.maxPositions,
       max_total_exposure_pct: local.maxExposurePct,
       max_leverage: local.maxLeverage,
+      participation_ratio: local.signalGeneration.participationRatio,
+      edge_penalties_enabled: local.signalGeneration.edgePenaltiesEnabled,
+      max_combined_score_adjustment: local.signalGeneration.maxCombinedScoreAdjustment,
+      edge_penalty_min_market_trades: local.signalGeneration.edgePenaltyMinMarketTrades,
+      min_signal_expected_r: local.signalGeneration.minSignalExpectedR,
       portfolio_guard: {
         ...portfolioGuard,
         enabled: local.portfolioGuard.enabled,
@@ -273,36 +213,6 @@ export function RiskTab({ settings }: Props) {
         stop_loss_count: local.directionalReversalBreaker.stopLossCount,
         cooldown_minutes: local.directionalReversalBreaker.cooldownMinutes,
       },
-      macro_risk_mode: {
-        enabled: local.macroRiskMode.enabled,
-        size_multiplier: local.macroRiskMode.sizeMultiplier,
-        min_score_add: 0,
-        min_expected_r: local.macroRiskMode.minExpectedR,
-        disable_timeframes: fromCsv(local.macroRiskMode.disabledTimeframes),
-        require_mtf_confluence: local.macroRiskMode.requireMtfConfluence,
-      },
-      macro_risk_monitor: {
-        ...macroRiskMonitor,
-        enabled: local.macroRiskMonitor.enabled,
-        actions_enabled: local.macroRiskMonitor.actionsEnabled,
-        telegram_notify_cooldown_minutes: local.macroRiskMonitor.telegramNotifyCooldownMinutes,
-        telegram_notify_on_downgrade: local.macroRiskMonitor.telegramNotifyOnDowngrade,
-        news_enabled: local.macroRiskMonitor.newsEnabled,
-        calendar_enabled: local.macroRiskMonitor.calendarEnabled,
-        market_stress_enabled: local.macroRiskMonitor.marketStressEnabled,
-        news_feed_urls: fromCsv(local.macroRiskMonitor.newsFeedUrls),
-        calendar_feed_urls: fromCsv(local.macroRiskMonitor.calendarFeedUrls),
-        news_fetch_cooldown_minutes: local.macroRiskMonitor.newsFetchCooldownMinutes,
-        calendar_fetch_cooldown_hours: local.macroRiskMonitor.calendarFetchCooldownHours,
-        news_lookback_hours: local.macroRiskMonitor.newsLookbackHours,
-        calendar_lookahead_hours: local.macroRiskMonitor.calendarLookaheadHours,
-        calendar_pre_event_minutes: local.macroRiskMonitor.calendarPreEventMinutes,
-        calendar_post_event_minutes: local.macroRiskMonitor.calendarPostEventMinutes,
-        market_lookback_minutes: local.macroRiskMonitor.marketLookbackMinutes,
-        watch_score: local.macroRiskMonitor.watchScore,
-        high_score: local.macroRiskMonitor.highScore,
-        extreme_score: local.macroRiskMonitor.extremeScore,
-      },
     };
     updateSettings({ risk: { value: nextRisk } } as Partial<AppSettings>);
   }
@@ -322,14 +232,6 @@ export function RiskTab({ settings }: Props) {
       ...s,
       directionalReversalBreaker: { ...s.directionalReversalBreaker, ...patch },
     }));
-  }
-
-  function setMacroRiskMode(patch: Partial<typeof persisted.macroRiskMode>) {
-    setLocal((s) => ({ ...s, macroRiskMode: { ...s.macroRiskMode, ...patch } }));
-  }
-
-  function setMacroRiskMonitor(patch: Partial<typeof persisted.macroRiskMonitor>) {
-    setLocal((s) => ({ ...s, macroRiskMonitor: { ...s.macroRiskMonitor, ...patch } }));
   }
 
   return (
@@ -353,6 +255,79 @@ export function RiskTab({ settings }: Props) {
         </div>
         <div className="mt-1.5 text-[11px] text-fg-3">
           Soglia globale: segnali con score &lt; {local.minScore} non passano il filtro.
+        </div>
+      </Card>
+
+      <Card className="p-6">
+        <SectionTitle
+          title="Signal generation"
+          hint="Leve del filtro score: cambiano quali candidati diventano segnali, non sizing o guardrail live."
+        />
+        <div className="mt-4 grid grid-cols-1 gap-5 md:grid-cols-2">
+          <div>
+            <Label className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+              Participation consensus
+            </Label>
+            <div className="mt-2 flex items-center gap-4">
+              <span className="w-12 font-mono text-2xl font-semibold tabular-nums text-fg">
+                {(local.signalGeneration.participationRatio * 100).toFixed(0)}%
+              </span>
+              <Slider
+                value={[local.signalGeneration.participationRatio]}
+                min={0.35}
+                max={0.8}
+                step={0.05}
+                onValueChange={(v: number[]) => setLocal((s) => ({
+                  ...s,
+                  signalGeneration: { ...s.signalGeneration, participationRatio: v[0] },
+                }))}
+              />
+            </div>
+            <div className="mt-1.5 text-[11px] text-fg-3">
+              Peso minimo delle strategie che deve votare nella stessa direzione. Il minimo UI 35% evita di allentare oltre il baseline conservativo.
+            </div>
+          </div>
+          <div className="space-y-3">
+            <ToggleBlock
+              label="Edge penalties"
+              hint="Applica le penalità direzione/bucket/mercato/timeframe già calcolate. Se sospese, i valori restano salvati ma non alzano la soglia score."
+              checked={local.signalGeneration.edgePenaltiesEnabled}
+              onChange={(edgePenaltiesEnabled) => setLocal((s) => ({
+                ...s,
+                signalGeneration: { ...s.signalGeneration, edgePenaltiesEnabled },
+              }))}
+            />
+            <Field
+              label="Max edge adjustment"
+              hint="Cap totale dei punti che le edge penalties possono aggiungere allo score minimo."
+              value={local.signalGeneration.maxCombinedScoreAdjustment}
+              step={1}
+              onChange={(maxCombinedScoreAdjustment) => setLocal((s) => ({
+                ...s,
+                signalGeneration: { ...s.signalGeneration, maxCombinedScoreAdjustment: Math.max(0, maxCombinedScoreAdjustment) },
+              }))}
+            />
+            <Field
+              label="Min trade per penalty mercato"
+              hint="Le penalty automatiche per singolo mercato restano visibili ma non si applicano sotto questa evidenza."
+              value={local.signalGeneration.edgePenaltyMinMarketTrades}
+              step={1}
+              onChange={(edgePenaltyMinMarketTrades) => setLocal((s) => ({
+                ...s,
+                signalGeneration: { ...s.signalGeneration, edgePenaltyMinMarketTrades: Math.max(1, edgePenaltyMinMarketTrades) },
+              }))}
+            />
+            <Field
+              label="Min Expected R"
+              hint="Gate empirico dopo score: consente solo bucket con Expected R almeno pari a questa soglia."
+              value={local.signalGeneration.minSignalExpectedR}
+              step={0.05}
+              onChange={(minSignalExpectedR) => setLocal((s) => ({
+                ...s,
+                signalGeneration: { ...s.signalGeneration, minSignalExpectedR: Math.max(-0.5, Math.min(1, minSignalExpectedR)) },
+              }))}
+            />
+          </div>
         </div>
       </Card>
 
@@ -628,227 +603,6 @@ export function RiskTab({ settings }: Props) {
         </div>
       </Card>
 
-      <Card className="p-6">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <SectionTitle
-            title="Macro risk mode"
-            hint="Override manuale difensivo per shock news-driven"
-          />
-          <ToggleInline
-            label={local.macroRiskMode.enabled ? "Enabled" : "Disabled"}
-            checked={local.macroRiskMode.enabled}
-            onChange={(enabled) => setMacroRiskMode({ enabled })}
-          />
-        </div>
-        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-          <Field
-            label="Size multiplier"
-            hint="Moltiplicatore rischio per trade"
-            value={local.macroRiskMode.sizeMultiplier}
-            step={0.05}
-            suffix="x"
-            onChange={(v) => setMacroRiskMode({ sizeMultiplier: v })}
-          />
-          <Field
-            label="Expected R floor"
-            hint="Blocca solo setup con expectancy empirica negativa quando la calibrazione è affidabile"
-            value={local.macroRiskMode.minExpectedR}
-            step={0.05}
-            suffix="R"
-            onChange={(v) => setMacroRiskMode({ minExpectedR: v })}
-          />
-          <TextField
-            label="Disabled TF"
-            hint="Timeframe separati da virgola"
-            value={local.macroRiskMode.disabledTimeframes}
-            onChange={(v) => setMacroRiskMode({ disabledTimeframes: v })}
-          />
-          <ToggleBlock
-            label="Require MTF"
-            hint="Richiede conferma multi-timeframe"
-            checked={local.macroRiskMode.requireMtfConfluence}
-            onChange={(requireMtfConfluence) => setMacroRiskMode({ requireMtfConfluence })}
-          />
-        </div>
-      </Card>
-
-      <Card className="p-6">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <SectionTitle
-            title="Auto macro risk monitor"
-            hint="News + stress BTC/ETH aggiornano automaticamente lo stato macro"
-          />
-          <ToggleInline
-            label={local.macroRiskMonitor.enabled ? "Enabled" : "Disabled"}
-            checked={local.macroRiskMonitor.enabled}
-            onChange={(enabled) => setMacroRiskMonitor({ enabled })}
-          />
-        </div>
-
-        <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-5">
-          <StatePill label="Level" value={String(macroRiskState.level ?? "off").toUpperCase()} />
-          <StatePill label="Score" value={`${macroRiskState.combined_score ?? 0}/100`} />
-          <StatePill label="News" value={`${macroRiskState.news_score ?? 0}/100`} />
-          <StatePill label="Calendar" value={`${macroRiskState.calendar_score ?? 0}/100`} />
-          <StatePill label="Market" value={`${macroRiskState.market_stress_score ?? 0}/100`} />
-        </div>
-        <div className="mt-3 rounded-lg border border-border bg-bg-2 px-3 py-2.5 text-xs text-fg-3">
-          <div className="text-fg-2">{String(macroRiskState.summary ?? "Macro risk normal")}</div>
-          <div className="mt-1 font-mono text-[11px]">
-            active_until: {String(macroRiskState.active_until ?? "n/a")}
-          </div>
-        </div>
-
-        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-          <ToggleBlock
-            label="Auto actions"
-            hint="Applica policy a nuove aperture"
-            checked={local.macroRiskMonitor.actionsEnabled}
-            onChange={(actionsEnabled) => setMacroRiskMonitor({ actionsEnabled })}
-          />
-          <Field
-            label="Telegram cooldown"
-            hint="Minuti minimi fra alert attivi ripetuti"
-            value={local.macroRiskMonitor.telegramNotifyCooldownMinutes}
-            step={15}
-            suffix="min"
-            onChange={(telegramNotifyCooldownMinutes) =>
-              setMacroRiskMonitor({ telegramNotifyCooldownMinutes })
-            }
-          />
-          <ToggleBlock
-            label="Notify downgrade"
-            hint="Invia alert anche quando il livello scende"
-            checked={local.macroRiskMonitor.telegramNotifyOnDowngrade}
-            onChange={(telegramNotifyOnDowngrade) =>
-              setMacroRiskMonitor({ telegramNotifyOnDowngrade })
-            }
-          />
-          <ToggleBlock
-            label="News feed"
-            hint="Usa headline RSS per scoring"
-            checked={local.macroRiskMonitor.newsEnabled}
-            onChange={(newsEnabled) => setMacroRiskMonitor({ newsEnabled })}
-          />
-          <ToggleBlock
-            label="Macro calendar"
-            hint="FOMC, CPI, NFP, PCE e altri eventi programmati"
-            checked={local.macroRiskMonitor.calendarEnabled}
-            onChange={(calendarEnabled) => setMacroRiskMonitor({ calendarEnabled })}
-          />
-          <ToggleBlock
-            label="Market stress"
-            hint="Usa stress BTC/ETH da candle locali"
-            checked={local.macroRiskMonitor.marketStressEnabled}
-            onChange={(marketStressEnabled) => setMacroRiskMonitor({ marketStressEnabled })}
-          />
-        </div>
-
-        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
-          <Field
-            label="News cooldown"
-            hint="Minuti fra fetch RSS"
-            value={local.macroRiskMonitor.newsFetchCooldownMinutes}
-            step={1}
-            suffix="min"
-            onChange={(v) => setMacroRiskMonitor({ newsFetchCooldownMinutes: v })}
-          />
-          <Field
-            label="Calendar cooldown"
-            hint="Ore fra fetch calendario"
-            value={local.macroRiskMonitor.calendarFetchCooldownHours}
-            step={1}
-            suffix="h"
-            onChange={(v) => setMacroRiskMonitor({ calendarFetchCooldownHours: v })}
-          />
-          <Field
-            label="Before event"
-            hint="Minuti difensivi prima evento"
-            value={local.macroRiskMonitor.calendarPreEventMinutes}
-            step={5}
-            suffix="min"
-            onChange={(v) => setMacroRiskMonitor({ calendarPreEventMinutes: v })}
-          />
-          <Field
-            label="After event"
-            hint="Minuti difensivi dopo evento"
-            value={local.macroRiskMonitor.calendarPostEventMinutes}
-            step={5}
-            suffix="min"
-            onChange={(v) => setMacroRiskMonitor({ calendarPostEventMinutes: v })}
-          />
-        </div>
-
-        <div className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-6">
-          <Field
-            label="Watch"
-            hint="Score stato watch"
-            value={local.macroRiskMonitor.watchScore}
-            step={1}
-            onChange={(v) => setMacroRiskMonitor({ watchScore: v })}
-          />
-          <Field
-            label="High"
-            hint="Score stato high"
-            value={local.macroRiskMonitor.highScore}
-            step={1}
-            onChange={(v) => setMacroRiskMonitor({ highScore: v })}
-          />
-          <Field
-            label="Extreme"
-            hint="Score stato extreme"
-            value={local.macroRiskMonitor.extremeScore}
-            step={1}
-            onChange={(v) => setMacroRiskMonitor({ extremeScore: v })}
-          />
-          <Field
-            label="News lookback"
-            hint="Ore headline rilevanti"
-            value={local.macroRiskMonitor.newsLookbackHours}
-            step={1}
-            suffix="h"
-            onChange={(v) => setMacroRiskMonitor({ newsLookbackHours: v })}
-          />
-          <Field
-            label="Calendar lookahead"
-            hint="Ore eventi monitorati"
-            value={local.macroRiskMonitor.calendarLookaheadHours}
-            step={1}
-            suffix="h"
-            onChange={(v) => setMacroRiskMonitor({ calendarLookaheadHours: v })}
-          />
-          <Field
-            label="Market lookback"
-            hint="Minuti candle stress"
-            value={local.macroRiskMonitor.marketLookbackMinutes}
-            step={5}
-            suffix="min"
-            onChange={(v) => setMacroRiskMonitor({ marketLookbackMinutes: v })}
-          />
-        </div>
-
-        <div className="mt-4">
-          <TextField
-            label="News feeds"
-            hint="URL RSS separati da virgola"
-            value={local.macroRiskMonitor.newsFeedUrls}
-            onChange={(newsFeedUrls) => setMacroRiskMonitor({ newsFeedUrls })}
-          />
-        </div>
-        <div className="mt-4">
-          <TextField
-            label="Calendar feeds"
-            hint="URL ICS opzionali separati da virgola"
-            value={local.macroRiskMonitor.calendarFeedUrls}
-            onChange={(calendarFeedUrls) => setMacroRiskMonitor({ calendarFeedUrls })}
-          />
-          <div className="mt-1.5 text-[11px] text-fg-3">
-            Vuoto = usiamo solo il calendario statico interno (FOMC, PCE, GDP, Treasury). I feed
-            ICS esterni sono opzionali.
-          </div>
-        </div>
-      </Card>
-
       {dirty && (
         <Card className="sticky bottom-4 z-10 flex items-center gap-3 border-warn/40 bg-warn/10 px-5 py-3">
           <span className="text-sm text-warn">Modifiche non salvate</span>
@@ -859,15 +613,6 @@ export function RiskTab({ settings }: Props) {
           </Button>
         </Card>
       )}
-    </div>
-  );
-}
-
-function StatePill({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-lg border border-border bg-bg-2 px-3 py-2.5">
-      <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">{label}</div>
-      <div className="mt-1 truncate font-mono text-sm font-semibold text-fg">{value}</div>
     </div>
   );
 }

@@ -1,6 +1,9 @@
+from datetime import UTC, datetime, timedelta
+
 from app.services.hyperliquid_account_ws import (
     account_channel_payload,
     account_subscription_payload,
+    websocket_snapshot_is_fresh,
 )
 
 
@@ -38,3 +41,26 @@ def test_account_channel_payload_ignores_ack_and_invalid_messages() -> None:
         }
     ) is None
     assert account_channel_payload({"channel": "openOrders", "data": {"orders": {}}}) is None
+
+
+def test_websocket_snapshot_freshness_requires_a_recent_ready_socket() -> None:
+    now = datetime(2026, 7, 14, 16, 0, tzinfo=UTC)
+
+    assert websocket_snapshot_is_fresh(
+        ready=True,
+        last_message_at=now - timedelta(seconds=89),
+        stale_seconds=90,
+        now=now,
+    )
+    assert not websocket_snapshot_is_fresh(
+        ready=False,
+        last_message_at=now,
+        stale_seconds=90,
+        now=now,
+    )
+    assert not websocket_snapshot_is_fresh(
+        ready=True,
+        last_message_at=now - timedelta(seconds=91),
+        stale_seconds=90,
+        now=now,
+    )

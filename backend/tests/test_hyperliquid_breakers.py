@@ -13,6 +13,7 @@ from app.services._circuit import (
 )
 from app.services.hyperliquid import (
     HyperliquidClient,
+    HyperliquidRateLimitError,
     HyperliquidTradingClient,
     HyperliquidTransientError,
     _call_trading_with_retry,
@@ -178,6 +179,87 @@ def test_available_info_capacity_excludes_live_reserve(monkeypatch) -> None:
     )
 
     assert capacity == 1
+
+
+def test_live_risk_reads_use_reserve_without_exceeding_total_budget(monkeypatch) -> None:
+    db = _RateLimitDb()
+    db.rows[hl_rate_limit.HYPERLIQUID_RATE_LIMIT_SETTING_KEY].value = {
+        "ip_weight_budget_per_minute": 64,
+        "live_preflight_reserve_weight": 24,
+    }
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(hl_rate_limit, "SessionLocal", lambda: db)
+    monkeypatch.setattr(hl_rate_limit, "_now", lambda: datetime(2026, 9, 3, tzinfo=UTC))
+
+    def request(kind):
+        return hl_rate_limit.check_hyperliquid_rate_limit(request_type=kind, rate_limit_class="info")
+
+    assert request("candleSnapshot").allowed
+    assert request("candleSnapshot").allowed
+    assert not request("clearinghouseState").allowed
+    with hl_rate_limit.live_risk_request_priority():
+        assert request("clearinghouseState").allowed
+        assert request("spotClearinghouseState").allowed
+        assert request("frontendOpenOrders").allowed
+        denied = request("clearinghouseState")
+    assert not denied.allowed
+    assert denied.reason == "ip_weight_budget"
+    assert db.rows[hl_rate_limit.HYPERLIQUID_RATE_LIMIT_STATE_KEY].value["window_weight"] == 64
+
+
+def test_live_risk_priority_preserves_cooldown_and_resets_after_exception(monkeypatch) -> None:
+    db = _RateLimitDb()
+    db.rows[hl_rate_limit.HYPERLIQUID_RATE_LIMIT_SETTING_KEY].value = {
+        "ip_weight_budget_per_minute": 24,
+        "live_preflight_reserve_weight": 24,
+    }
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr(hl_rate_limit, "SessionLocal", lambda: db)
+    monkeypatch.setattr(hl_rate_limit, "_now", lambda: datetime(2026, 9, 3, tzinfo=UTC))
+    hl_rate_limit.record_hyperliquid_rate_limit(
+        request_type="userFills", rate_limit_class="info", status_code=429
+    )
+    with (
+        pytest.raises(RuntimeError, match="failed guard"),
+        hl_rate_limit.live_risk_request_priority(),
+    ):
+        denied = hl_rate_limit.check_hyperliquid_rate_limit(
+            request_type="clearinghouseState", rate_limit_class="info"
+        )
+        assert denied.reason == "global_cooldown"
+        raise RuntimeError("failed guard")
+
+    # Once the external cooldown expires, ordinary reads still cannot use the reserve.
+    monkeypatch.setattr(hl_rate_limit, "_now", lambda: datetime(2026, 9, 3, 1, tzinfo=UTC))
+    denied = hl_rate_limit.check_hyperliquid_rate_limit(
+        request_type="clearinghouseState", rate_limit_class="info"
+    )
+    assert denied.reason == "ip_weight_budget"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_async_client", [False, True])
+async def test_governor_deferral_preserves_retry_deadline_without_network(
+    monkeypatch, use_async_client
+) -> None:
+    deadline = "2026-09-03T12:01:00+00:00"
+    decision = hl_rate_limit.HyperliquidRateLimitDecision(
+        False, reason="ip_weight_budget", next_retry_after=deadline, rate_limit_class="info"
+    )
+    monkeypatch.setattr("app.services.hyperliquid.check_hyperliquid_rate_limit", lambda **_: decision)
+
+    def unexpected_request():
+        pytest.fail("A deferred request must not reach Hyperliquid")
+
+    client = HyperliquidClient(Settings())
+    monkeypatch.setattr(client, "_post_info_raw", unexpected_request)
+    with pytest.raises(HyperliquidRateLimitError) as error:
+        if use_async_client:
+            await client.user_state("0xabc")
+        else:
+            _call_trading_with_retry(unexpected_request, request_type="clearinghouseState")
+    assert error.value.reason == "ip_weight_budget"
+    assert error.value.next_retry_after == deadline
 
 
 def test_available_fill_notional_uses_live_preflight_reserve(monkeypatch) -> None:

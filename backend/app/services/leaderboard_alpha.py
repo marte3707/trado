@@ -78,6 +78,7 @@ DEFAULT_LEADERBOARD_ALPHA_SETTINGS: dict[str, Any] = {
     "copy_live_mode": "shadow",
     "copy_live_max_traders": 3,
     "copy_live_allowed_rank_limit": 20,
+    "copy_live_max_rank_age_hours": 8,
     "copy_live_allowed_classes": ["candidate"],
     "copy_live_min_quality_score": 80,
     "copy_live_min_copy_closed_positions": 20,
@@ -87,6 +88,8 @@ DEFAULT_LEADERBOARD_ALPHA_SETTINGS: dict[str, Any] = {
     "copy_live_min_net_pnl_usdc": "0",
     "copy_live_recent_days": 7,
     "copy_live_min_recent_closed_positions": 2,
+    "copy_live_min_recent_net_pnl_usdc": "0",
+    "copy_live_mids_cache_seconds": 60,
     "copy_live_position_notional_usd": "40",
     "copy_live_max_open_positions": 3,
     "copy_live_max_open_positions_per_trader": 1,
@@ -891,6 +894,15 @@ def _leaderboard_rank(metadata: dict[str, Any] | None) -> int | None:
         return None
 
 
+def _leaderboard_imported_at(metadata: dict[str, Any] | None) -> datetime | None:
+    if not isinstance(metadata, dict):
+        return None
+    leaderboard = metadata.get("leaderboard")
+    if not isinstance(leaderboard, dict):
+        return None
+    return _parse_dt(leaderboard.get("imported_at"))
+
+
 def _eligible_copy_trader_ids(
     db: Session,
     *,
@@ -1596,11 +1608,14 @@ def _copy_live_candidate_row(
     snapshot: LeaderboardTraderSnapshot | None,
     stats: dict[str, Any],
     settings: dict[str, Any],
+    now: datetime | None = None,
 ) -> dict[str, Any]:
+    now = _as_utc(now or datetime.now(UTC)) or datetime.now(UTC)
     rank_limit = _int_setting(
         settings.get("copy_live_allowed_rank_limit", settings.get("copy_paper_allowed_rank_limit")),
         20,
     )
+    max_rank_age_hours = _int_setting(settings.get("copy_live_max_rank_age_hours"), 8)
     allowed_classes = set(_string_list_setting(settings.get("copy_live_allowed_classes"), ["candidate"]))
     min_quality = _int_setting(settings.get("copy_live_min_quality_score"), 80, minimum=0)
     min_closed = _int_setting(settings.get("copy_live_min_copy_closed_positions"), 20)
@@ -1609,13 +1624,23 @@ def _copy_live_candidate_row(
     min_avg_trade = _decimal_setting(settings.get("copy_live_min_avg_trade_pnl_usdc"), Decimal("0"))
     min_net_pnl = _decimal_setting(settings.get("copy_live_min_net_pnl_usdc"), Decimal("0"))
     min_recent_closed = _int_setting(settings.get("copy_live_min_recent_closed_positions"), 2, minimum=0)
+    min_recent_net_pnl = _decimal_setting(
+        settings.get("copy_live_min_recent_net_pnl_usdc"),
+        Decimal("0"),
+    )
     leaderboard_rank = _leaderboard_rank(trader.metadata_json)
+    leaderboard_imported_at = _as_utc(_leaderboard_imported_at(trader.metadata_json))
     reasons: list[str] = []
 
     if not trader.enabled:
         reasons.append("trader_disabled")
     if leaderboard_rank is None or leaderboard_rank > rank_limit:
         reasons.append("rank_outside_live_limit")
+    if (
+        leaderboard_imported_at is None
+        or leaderboard_imported_at < now - timedelta(hours=max_rank_age_hours)
+    ):
+        reasons.append("leaderboard_rank_stale")
     if snapshot is None:
         reasons.append("missing_snapshot")
     else:
@@ -1635,6 +1660,8 @@ def _copy_live_candidate_row(
         reasons.append("net_pnl_below_live_min")
     if stats["recent_closed_positions"] < min_recent_closed:
         reasons.append("recent_sample_too_small")
+    if not _copy_live_decimal_gte(stats.get("recent_net_pnl_usdc"), min_recent_net_pnl):
+        reasons.append("recent_net_pnl_below_live_min")
 
     score = (
         _copy_live_candidate_score(
@@ -1651,6 +1678,9 @@ def _copy_live_candidate_row(
         "trader_label": trader.label,
         "trader_address": trader.address,
         "leaderboard_rank": leaderboard_rank,
+        "leaderboard_rank_imported_at": (
+            leaderboard_imported_at.isoformat() if leaderboard_imported_at is not None else None
+        ),
         "classification": snapshot.classification if snapshot is not None else None,
         "quality_score": snapshot.quality_score if snapshot is not None else None,
         "live_candidate_score": score,
@@ -1934,6 +1964,19 @@ def _copy_live_dry_run_orders(
         elif require_promotion and not selected_row.get("promoted"):
             reasons.append("promotion_not_ready")
 
+        paper_position_id = item.get("paper_position_id")
+        if not isinstance(paper_position_id, (int, str)):
+            parsed_paper_position_id = None
+        else:
+            try:
+                parsed_paper_position_id = int(paper_position_id)
+            except ValueError:
+                parsed_paper_position_id = None
+        if parsed_paper_position_id is None:
+            reasons.append("invalid_paper_position_id")
+        elif _copy_live_existing_position_for_paper(db, parsed_paper_position_id) is not None:
+            reasons.append("source_position_already_copied")
+
         coin = str(item.get("coin") or "")
         market = _copy_live_market_for_coin(db, coin)
         if market is None:
@@ -2066,8 +2109,11 @@ def _copy_live_existing_position_for_paper(
         copy_meta = metadata.get("leaderboard_copy_live")
         if not isinstance(copy_meta, dict):
             continue
+        raw_paper_position_id = copy_meta.get("paper_position_id")
+        if raw_paper_position_id is None:
+            continue
         try:
-            linked_id = int(copy_meta.get("paper_position_id"))
+            linked_id = int(raw_paper_position_id)
         except (TypeError, ValueError):
             continue
         if linked_id == paper_position_id:
@@ -2256,8 +2302,11 @@ def _close_copy_live_positions_for_closed_sources(
         copy_meta = metadata.get("leaderboard_copy_live")
         if not isinstance(copy_meta, dict):
             continue
+        raw_paper_position_id = copy_meta.get("paper_position_id")
+        if raw_paper_position_id is None:
+            continue
         try:
-            paper_position_id = int(copy_meta.get("paper_position_id"))
+            paper_position_id = int(raw_paper_position_id)
         except (TypeError, ValueError):
             continue
         paper_position = db.get(LeaderboardCopyPaperPosition, paper_position_id)
@@ -2345,7 +2394,11 @@ def run_copy_live_execution(
         return result
 
     try:
-        mids = client.all_mids(max_age_seconds=5)
+        mids_cache_seconds = _int_setting(
+            settings.get("copy_live_mids_cache_seconds"),
+            60,
+        )
+        mids = client.all_mids(max_age_seconds=mids_cache_seconds)
     except Exception as exc:
         db.add(
             DecisionLog(
@@ -2591,10 +2644,11 @@ def _copy_live_readiness(settings: dict[str, Any], dry_run_orders: Sequence[dict
 def copy_live_activation_blockers(plan: dict[str, Any]) -> list[str]:
     readiness = plan.get("readiness") if isinstance(plan, dict) else None
     raw_blockers = readiness.get("blockers") if isinstance(readiness, dict) else []
+    blockers = raw_blockers if isinstance(raw_blockers, list) else []
     return sorted(
         {
             str(blocker)
-            for blocker in raw_blockers
+            for blocker in blockers
             if str(blocker) not in COPY_LIVE_CONFIG_BLOCKERS
         }
     )
@@ -2662,6 +2716,7 @@ def build_copy_live_shadow_plan(
             snapshot=snapshots.get(trader.id),
             stats=_copy_live_trader_stats(grouped.get(trader.id, []), now=now, recent_days=recent_days),
             settings=settings,
+            now=now,
         )
         for trader in traders.values()
     ]
@@ -2700,13 +2755,36 @@ def build_copy_live_shadow_plan(
     promoted = [row for row in selected if row.get("promoted")]
     would_submit = [row for row in dry_run_orders if row["status"] == "would_submit"]
 
-    status = "shadow_ready" if selected else "no_live_candidates"
+    already_copied_only = bool(dry_run_orders) and all(
+        "source_position_already_copied" in set(row.get("reasons") or [])
+        for row in dry_run_orders
+    )
+    status = (
+        "no_new_eligible_source"
+        if already_copied_only
+        else "shadow_ready"
+        if selected
+        else "no_live_candidates"
+    )
+    reason = (
+        "all_eligible_sources_already_copied"
+        if already_copied_only
+        else "no_eligible_live_traders"
+        if not selected
+        else "live_dispatch_available"
+        if _copy_live_orders_enabled(settings)
+        else "shadow_only_no_live_order_dispatch"
+    )
     return {
         "enabled": bool(settings.get("copy_live_enabled", False)),
         "mode": str(settings.get("copy_live_mode") or "shadow"),
         "orders_enabled": _copy_live_orders_enabled(settings),
-        "status": "live_ready" if _copy_live_orders_enabled(settings) and selected else status,
-        "reason": "live_dispatch_available" if _copy_live_orders_enabled(settings) else "shadow_only_no_live_order_dispatch",
+        "status": (
+            "live_ready"
+            if _copy_live_orders_enabled(settings) and selected and not already_copied_only
+            else status
+        ),
+        "reason": reason,
         "readiness": _copy_live_readiness(settings, dry_run_orders),
         "summary": {
             "evaluated_traders": len(evaluated),

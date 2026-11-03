@@ -475,6 +475,7 @@ function CopyPaperLab({
 const LIVE_REASON_LABELS: Record<string, string> = {
   trader_disabled: "trader off",
   rank_outside_live_limit: "rank fuori limite",
+  leaderboard_rank_stale: "ranking non aggiornato",
   missing_snapshot: "snapshot mancante",
   classification_not_allowed: "classe non live",
   quality_below_live_min: "quality bassa",
@@ -484,6 +485,7 @@ const LIVE_REASON_LABELS: Record<string, string> = {
   avg_trade_pnl_below_live_min: "avg PnL basso",
   net_pnl_below_live_min: "net PnL basso",
   recent_sample_too_small: "sample recente piccolo",
+  recent_net_pnl_below_live_min: "PnL recente negativo",
   outside_live_trader_cap: "fuori cap trader live",
   promotion_not_ready: "promozione non matura",
   trader_not_selected: "trader non selezionato",
@@ -491,6 +493,8 @@ const LIVE_REASON_LABELS: Record<string, string> = {
   market_inactive: "market inattivo",
   market_not_perp: "market non perp",
   live_position_already_open_for_market: "live già aperta",
+  invalid_paper_position_id: "sorgente paper non valida",
+  source_position_already_copied: "sorgente già copiata",
   notional_below_min_order: "notional sotto minimo",
   notional_above_live_cap: "notional sopra cap",
   account_snapshot_missing: "snapshot account mancante",
@@ -729,6 +733,7 @@ function CopyLiveTraderTable({
                 <div className="font-medium">{row.trader_label || shortAddress(row.trader_address)}</div>
                 <div className="text-xs text-fg-3">
                   {row.leaderboard_rank != null ? `HL #${row.leaderboard_rank}` : shortAddress(row.trader_address)}
+                  {row.leaderboard_rank_imported_at ? ` · rank ${fmtDate(row.leaderboard_rank_imported_at)}` : ""}
                   {row.classification ? ` · ${row.classification}` : ""}
                 </div>
               </td>

@@ -15,8 +15,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.enums import Direction
-from app.db.models import Position, Signal
+from app.db.models import ExperimentOutcome, Position, Signal
 from app.engine.edge_profile import direction_family, linked_position_signals, score_bucket
+from app.engine.experiment_outcomes import BARRIER_METHOD
 from app.engine.performance import SignalPerformanceAnalyzer
 from app.engine.score_calibration import _position_r_multiple
 
@@ -68,6 +69,10 @@ class PreTp1ValidationTable:
     computed_at: datetime
     lookback_positions: int
     excluded_count: int
+    sample_source: str = "legacy_closed_positions"
+    experiment_version: str | None = None
+    assignment: str | None = None
+    configuration_hash: str | None = None
 
     def get(self, cohort_type: str, key: str | None) -> PreTp1CohortMetrics | None:
         if not key:
@@ -264,6 +269,121 @@ def build_pre_tp1_validation_table(
     )
 
 
+def _experiment_cohort_metrics(
+    cohort_type: str,
+    key: str,
+    outcomes: list[ExperimentOutcome],
+    *,
+    min_samples_for_use: int,
+) -> PreTp1CohortMetrics:
+    r_values = [float(row.net_r) for row in outcomes if row.net_r is not None]
+    n_samples = len(outcomes)
+    wins = sum(1 for value in r_values if value > 0)
+    gross_profit = sum(value for value in r_values if value > 0)
+    gross_loss = abs(sum(value for value in r_values if value <= 0))
+    tp1_hits = sum(1 for row in outcomes if row.barrier_label == "tp_first")
+    no_tp1 = n_samples - tp1_hits
+    stop_before_tp1 = sum(1 for row in outcomes if row.barrier_label == "stop_first")
+    profit_factor = gross_profit / gross_loss if gross_loss else None
+    confidence = (
+        "low"
+        if n_samples < min_samples_for_use
+        else "medium"
+        if n_samples < min_samples_for_use * 3
+        else "high"
+    )
+    total_r = sum(r_values)
+    return PreTp1CohortMetrics(
+        key=key,
+        cohort_type=cohort_type,
+        n_samples=n_samples,
+        tp1_hits=tp1_hits,
+        no_tp1=no_tp1,
+        stop_before_tp1=stop_before_tp1,
+        wins=wins,
+        realized_pnl=total_r,
+        gross_profit=gross_profit,
+        gross_loss=gross_loss,
+        avg_pnl=(total_r / len(r_values)) if r_values else 0.0,
+        avg_r=(total_r / len(r_values)) if r_values else None,
+        median_r=median(r_values) if r_values else None,
+        tp1_rate=(tp1_hits / n_samples) if n_samples else 0.0,
+        no_tp1_rate=(no_tp1 / n_samples) if n_samples else 0.0,
+        stop_before_tp1_rate=(stop_before_tp1 / n_samples) if n_samples else 0.0,
+        win_rate=(wins / len(r_values)) if r_values else 0.0,
+        profit_factor=profit_factor,
+        confidence=confidence,
+    )
+
+
+def build_experiment_pre_tp1_validation_table(
+    outcomes: list[ExperimentOutcome],
+    signals_by_id: dict[int, Signal],
+    *,
+    experiment_version: str,
+    assignment: str,
+    configuration_hash: str | None = None,
+    min_samples_for_use: int = 30,
+    lookback_positions: int = DEFAULT_LOOKBACK,
+) -> PreTp1ValidationTable:
+    """Build pre-TP1 cohorts exclusively from active forward outcomes."""
+
+    grouped: dict[str, dict[str, list[ExperimentOutcome]]] = {
+        "direction_timeframe_score": {},
+        "direction_timeframe": {},
+        "market_direction_timeframe": {},
+        "strategy": {},
+    }
+    excluded = 0
+    for outcome in outcomes:
+        # Legacy first-touch labels can contain prices from the candle that
+        # opened at/just before exit. Never mix them into an entry gate.
+        metadata = outcome.metadata_json or {}
+        if metadata.get("method") != BARRIER_METHOD:
+            excluded += 1
+            continue
+        signal = signals_by_id.get(outcome.signal_id) if outcome.signal_id is not None else None
+        if signal is None or outcome.net_r is None:
+            excluded += 1
+            continue
+        family = direction_family(signal.direction)
+        if family is None:
+            excluded += 1
+            continue
+        score_key = f"{family}:{outcome.timeframe}:{score_bucket(signal.score)}"
+        tf_key = f"{family}:{outcome.timeframe}"
+        market_key = f"{outcome.market_id}:{family}:{outcome.timeframe}"
+        grouped["direction_timeframe_score"].setdefault(score_key, []).append(outcome)
+        grouped["direction_timeframe"].setdefault(tf_key, []).append(outcome)
+        grouped["market_direction_timeframe"].setdefault(market_key, []).append(outcome)
+        for strategy_name in _aligned_strategy_names(signal):
+            strategy_key = f"{outcome.timeframe}:{family}:{strategy_name}"
+            grouped["strategy"].setdefault(strategy_key, []).append(outcome)
+
+    cohorts = {
+        cohort_type: {
+            key: _experiment_cohort_metrics(
+                cohort_type,
+                key,
+                group_outcomes,
+                min_samples_for_use=min_samples_for_use,
+            )
+            for key, group_outcomes in groups.items()
+        }
+        for cohort_type, groups in grouped.items()
+    }
+    return PreTp1ValidationTable(
+        cohorts=cohorts,
+        computed_at=datetime.now(UTC),
+        lookback_positions=lookback_positions,
+        excluded_count=excluded,
+        sample_source="experiment_outcomes",
+        experiment_version=experiment_version,
+        assignment=assignment,
+        configuration_hash=configuration_hash,
+    )
+
+
 def linked_position_signals_from_map(
     positions: list[Position], signals_by_id: dict[int, Signal]
 ) -> list[tuple[Position, Signal | None]]:
@@ -298,6 +418,48 @@ def build_pre_tp1_validation_table_from_db(
     return build_pre_tp1_validation_table(
         filtered_positions,
         signals_by_id,
+        min_samples_for_use=min_samples_for_use,
+        lookback_positions=lookback,
+    )
+
+
+def build_experiment_pre_tp1_validation_table_from_db(
+    db: Session,
+    *,
+    experiment_version: str,
+    assignment: str,
+    configuration_hash: str | None = None,
+    lookback: int = DEFAULT_LOOKBACK,
+    min_samples_for_use: int = 30,
+) -> PreTp1ValidationTable:
+    query = db.query(ExperimentOutcome).filter(
+        ExperimentOutcome.experiment_version == experiment_version,
+        ExperimentOutcome.assignment == assignment,
+        ExperimentOutcome.net_r.is_not(None),
+    )
+    if configuration_hash:
+        query = query.filter(ExperimentOutcome.configuration_hash == configuration_hash)
+    outcomes = (
+        query
+        .order_by(ExperimentOutcome.closed_at.desc(), ExperimentOutcome.id.desc())
+        .limit(lookback)
+        .all()
+    )
+    signal_ids = {row.signal_id for row in outcomes if row.signal_id is not None}
+    signals_by_id = (
+        {
+            signal.id: signal
+            for signal in db.query(Signal).filter(Signal.id.in_(signal_ids)).all()
+        }
+        if signal_ids
+        else {}
+    )
+    return build_experiment_pre_tp1_validation_table(
+        outcomes,
+        signals_by_id,
+        experiment_version=experiment_version,
+        assignment=assignment,
+        configuration_hash=configuration_hash,
         min_samples_for_use=min_samples_for_use,
         lookback_positions=lookback,
     )
@@ -470,6 +632,9 @@ def serialize_table(table: PreTp1ValidationTable) -> dict[str, Any]:
         "computed_at": table.computed_at.isoformat(),
         "lookback_positions": table.lookback_positions,
         "excluded_count": table.excluded_count,
+        "sample_source": table.sample_source,
+        "experiment_version": table.experiment_version,
+        "assignment": table.assignment,
         "cohorts": {
             cohort_type: {
                 key: serialize_metrics(metrics)
@@ -481,6 +646,9 @@ def serialize_table(table: PreTp1ValidationTable) -> dict[str, Any]:
 
 
 _CACHE: dict[str, Any] = {"table": None, "computed_at": None, "min_samples_for_use": None}
+_EXPERIMENT_CACHE: dict[
+    tuple[str, str, str | None, int, int], tuple[PreTp1ValidationTable, datetime]
+] = {}
 
 
 def cached_pre_tp1_validation_table(
@@ -516,7 +684,40 @@ def cached_pre_tp1_validation_table(
     return table
 
 
+def cached_experiment_pre_tp1_validation_table(
+    db: Session,
+    *,
+    experiment_version: str,
+    assignment: str,
+    configuration_hash: str | None = None,
+    force_refresh: bool = False,
+    lookback: int = DEFAULT_LOOKBACK,
+    min_samples_for_use: int = 30,
+    cache_ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS,
+) -> PreTp1ValidationTable:
+    now = datetime.now(UTC)
+    key = (experiment_version, assignment, configuration_hash, lookback, min_samples_for_use)
+    cached = _EXPERIMENT_CACHE.get(key)
+    if (
+        not force_refresh
+        and cached is not None
+        and (now - cached[1]).total_seconds() <= cache_ttl_seconds
+    ):
+        return cached[0]
+    table = build_experiment_pre_tp1_validation_table_from_db(
+        db,
+        experiment_version=experiment_version,
+        assignment=assignment,
+        configuration_hash=configuration_hash,
+        lookback=lookback,
+        min_samples_for_use=min_samples_for_use,
+    )
+    _EXPERIMENT_CACHE[key] = (table, now)
+    return table
+
+
 def invalidate_pre_tp1_validation_cache() -> None:
     _CACHE["table"] = None
     _CACHE["computed_at"] = None
     _CACHE["min_samples_for_use"] = None
+    _EXPERIMENT_CACHE.clear()

@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import time
+from collections import deque
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -16,8 +18,13 @@ from app.core.runtime_settings import (
     effective_strategy_exclusions,
 )
 from app.db.models import AppSetting, Candle, DecisionLog, Indicator, Market, Signal, StrategyConfig
-from app.engine.auto_tuner import active_ab_overlay
-from app.engine.edge_profile import signal_threshold_adjustment
+from app.engine.edge_profile import direction_family, signal_threshold_adjustment
+from app.engine.experiment import (
+    experiment_snapshot,
+    forward_gate_policy,
+    neutralize_historical_overlays,
+    paper_candidate_allows_signal,
+)
 from app.engine.macro_direction import btc_macro_direction, suspended_penalty_family
 from app.engine.mtf import check_mtf_confluence, higher_timeframe
 from app.engine.orderbook import (
@@ -27,14 +34,19 @@ from app.engine.orderbook import (
     ob_imbalance_result,
     update_obi_stats,
 )
-from app.engine.performance import SignalPerformanceAnalyzer
+from app.engine.performance import SignalPerformanceAnalyzer, aligned_strategy_names
 from app.engine.pre_tp1_validation import (
+    cached_experiment_pre_tp1_validation_table,
     cached_pre_tp1_validation_table,
     evaluate_pre_tp1_entry,
 )
 from app.engine.regime import apply_regime_filter
 from app.engine.risk import RiskManager
-from app.engine.score_calibration import cached_calibration_table, serialize_metrics
+from app.engine.score_calibration import (
+    cached_calibration_table,
+    cached_experiment_calibration_table,
+    serialize_metrics,
+)
 from app.engine.scoring import ScoreResult, SignalScoringEngine
 from app.engine.volatility import evaluate_volatility
 from app.indicators.core import ema
@@ -45,7 +57,12 @@ from app.services.coinmarketcap import (
     FearGreedIndex,
     MarketQuote,
 )
-from app.services.hyperliquid import fetch_l2_book, fetch_l2_book_async, fetch_predicted_fundings
+from app.services.hyperliquid import (
+    fetch_l2_book,
+    fetch_l2_book_async,
+    fetch_predicted_fundings,
+    latest_ws_l2_book,
+)
 from app.services.kiotaka import KiotakaClient
 from app.services.whale_alert import WhaleAlertClient, WhaleFlow
 from app.strategies.base import CandleInput, StrategyContext, StrategyResult
@@ -68,6 +85,7 @@ _DEFAULT_MIN_STOP_BY_TF: dict[str, float] = {
     "1d": 0.030,   # 3.0%
 }
 
+
 # Minuti per timeframe: usato per scalare min_average_quote_volume_usd
 # proporzionalmente rispetto al riferimento 1h (60 min).
 _TF_MINUTES: dict[str, int] = {
@@ -75,7 +93,25 @@ _TF_MINUTES: dict[str, int] = {
     "1h": 60, "2h": 120, "4h": 240, "1d": 1440,
 }
 
+
+def source_candle_lag_minutes(
+    timeframe: str,
+    source_candle_open_time: datetime,
+    *,
+    now: datetime | None = None,
+) -> float:
+    """Return how late a closed source candle is beyond its expected close."""
+    opened_at = source_candle_open_time
+    if opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=UTC)
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    candle_close = opened_at + timedelta(minutes=_TF_MINUTES.get(timeframe, 60))
+    return max(0.0, (current - candle_close).total_seconds() / 60)
+
 _VOLATILITY_SHADOW_EVENT = "volatility_filter_shadow_sample"
+_SIGNAL_CANDIDATE_REJECTION_EVENT = "signal_candidate_rejected"
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -114,6 +150,37 @@ def apply_timeframe_min_score_override(
     return max(base_min_score, override)
 
 
+def effective_edge_adjustment(
+    risk_value: dict[str, Any],
+    *,
+    market_id: int,
+    timeframe: str,
+    direction: Direction,
+    score: int,
+    suspended_family: str | None,
+) -> tuple[bool, dict[str, Any]]:
+    """Return the runtime edge overlay without mutating its stored evidence."""
+    enabled = bool(risk_value.get("edge_penalties_enabled", True))
+    if enabled:
+        return enabled, signal_threshold_adjustment(
+            risk_value,
+            market_id=market_id,
+            timeframe=timeframe,
+            direction=direction,
+            score=score,
+            suspended_family=suspended_family,
+        )
+    return enabled, {
+        "total": 0,
+        "raw_total": 0,
+        "components": {},
+        "max_adjustment": _safe_int(risk_value.get("max_combined_score_adjustment"), 15),
+        "direction": direction_family(direction),
+        "score_bucket": None,
+        "suspended_family": None,
+    }
+
+
 class SignalEngine:
     def __init__(self) -> None:
         self.registry = strategy_registry()
@@ -133,6 +200,12 @@ class SignalEngine:
         # "signal_skipped_*" non si vedono in produzione; questo conta dove muoiono
         # i segnali per esporre un breakdown nel `worker_cycle` event.
         self._cycle_skip_counts: dict[str, int] = {}
+        # Diagnostic only: score distribution before the paper-candidate gate.
+        # Count a market/source candle once even if later worker ticks rescore it.
+        # This does not change eligibility or create additional signals.
+        self._cycle_candidate_funnel: dict[str, int] = {}
+        self._candidate_funnel_seen: set[tuple[int, str, datetime]] = set()
+        self._candidate_funnel_seen_order: deque[tuple[int, str, datetime]] = deque()
         # Cache del funding breadth per ciclo: frazione di mercati con funding
         # estremo nella direzione short/long. Calcolata una sola volta per tick.
         self._cycle_funding_breadth: dict[str, float] | None = None
@@ -143,21 +216,39 @@ class SignalEngine:
         # volta per ciclo (lista globale, non per market×timeframe).
         self._cycle_strategy_exclusions: set[str] | None = None
         self._cycle_volatility_shadow_samples = 0
+        self._cycle_candidate_rejection_samples = 0
+        self._cycle_forward_gate_policies: dict[str | None, dict[str, Any]] = {}
 
     def begin_cycle(self) -> None:
         """Invalidate per-cycle caches at the start of each worker tick."""
         self._cycle_fundings = None
         self._cycle_l2_cache = {}
         self._cycle_skip_counts = {}
+        self._cycle_candidate_funnel = {}
         self._cycle_funding_breadth = None
         self._cycle_btc_volume_profile_loaded = False
         self._cycle_btc_volume_profile_context = None
         self._cycle_macro_direction = None
         self._cycle_strategy_exclusions = None
         self._cycle_volatility_shadow_samples = 0
+        self._cycle_candidate_rejection_samples = 0
+        self._cycle_forward_gate_policies = {}
         # Abilita/invalida la cache per-cycle degli aggregati di performance
         # (global/timeframe stats + conteggi per market) usati da adjusted_weights.
         self.performance.begin_cycle()
+
+    def _get_cycle_forward_gate_policy(
+        self,
+        db: Session,
+        *,
+        configuration_hash: str | None = None,
+    ) -> dict[str, Any]:
+        if configuration_hash not in self._cycle_forward_gate_policies:
+            self._cycle_forward_gate_policies[configuration_hash] = forward_gate_policy(
+                db,
+                configuration_hash=configuration_hash,
+            )
+        return dict(self._cycle_forward_gate_policies[configuration_hash])
 
     async def prefetch_l2_books(self, markets: list, settings) -> None:
         """Pre-popola _cycle_l2_cache con fetch async paralleli (concorrenza=4) prima
@@ -183,8 +274,35 @@ class SignalEngine:
         """Snapshot dei contatori di skip aggregati per il tick in corso."""
         return dict(self._cycle_skip_counts)
 
+    def cycle_candidate_funnel(self) -> dict[str, int]:
+        """Aggregated pre-gate candidate scores for observational research."""
+        return dict(self._cycle_candidate_funnel)
+
     def _record_skip(self, reason: str) -> None:
         self._cycle_skip_counts[reason] = self._cycle_skip_counts.get(reason, 0) + 1
+
+    def _record_candidate_funnel(
+        self,
+        *,
+        market_id: int,
+        timeframe: str,
+        source_candle_open_time: datetime,
+        direction: str,
+        score: int,
+        allowed: bool,
+    ) -> bool:
+        opportunity = (market_id, timeframe, source_candle_open_time)
+        if opportunity in self._candidate_funnel_seen:
+            return False
+        if len(self._candidate_funnel_seen_order) >= 8192:
+            expired = self._candidate_funnel_seen_order.popleft()
+            self._candidate_funnel_seen.discard(expired)
+        self._candidate_funnel_seen_order.append(opportunity)
+        self._candidate_funnel_seen.add(opportunity)
+        score_decile = max(0, min(90, (score // 10) * 10))
+        key = f"{timeframe}:{direction}:{score_decile:02d}+:{'pass' if allowed else 'skip'}"
+        self._cycle_candidate_funnel[key] = self._cycle_candidate_funnel.get(key, 0) + 1
+        return True
 
     def _should_sample_volatility_skip(
         self,
@@ -254,6 +372,144 @@ class SignalEngine:
                         risk_value.get("volatility_filter_shadow_max_per_cycle"), 5
                     ),
                 },
+            )
+        )
+
+    def _should_sample_candidate_rejection(
+        self,
+        risk_value: dict[str, Any],
+        *,
+        market_id: int,
+        timeframe: str,
+        source_candle_open_time: Any,
+        score: int,
+        effective_min_score: int,
+    ) -> bool:
+        if not bool(risk_value.get("signal_candidate_diagnostics_enabled", True)):
+            return False
+        max_per_cycle = max(
+            0,
+            _safe_int(risk_value.get("signal_candidate_diagnostics_max_per_cycle"), 3),
+        )
+        if max_per_cycle == 0 or self._cycle_candidate_rejection_samples >= max_per_cycle:
+            return False
+        near_miss_delta = max(
+            0,
+            _safe_int(risk_value.get("signal_candidate_diagnostics_near_miss_delta"), 15),
+        )
+        if score >= max(1, effective_min_score - near_miss_delta):
+            return True
+        sample_rate = max(
+            0.0,
+            min(1.0, _safe_float(risk_value.get("signal_candidate_diagnostics_sample_rate"), 0.02)),
+        )
+        if sample_rate <= 0:
+            return False
+        if sample_rate >= 1:
+            return True
+        raw_key = f"candidate:{market_id}:{timeframe}:{source_candle_open_time}"
+        digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+        return int(digest[:8], 16) / 0xFFFFFFFF < sample_rate
+
+    def _record_candidate_rejection_sample(
+        self,
+        db: Session,
+        *,
+        market: Market,
+        timeframe: str,
+        source_candle_open_time: Any,
+        risk_value: dict[str, Any],
+        score: ScoreResult,
+        effective_min_score: int,
+        skip_reason: str,
+        participation_ratio: float,
+        regime_info: dict[str, Any] | None,
+        shadow_score: ScoreResult | None,
+        shadow_participation_ratio: float | None,
+        base_min_score: int,
+        edge_adjustment: dict[str, Any],
+        edge_penalties_enabled: bool,
+    ) -> None:
+        if not self._should_sample_candidate_rejection(
+            risk_value,
+            market_id=market.id,
+            timeframe=timeframe,
+            source_candle_open_time=source_candle_open_time,
+            score=score.score,
+            effective_min_score=effective_min_score,
+        ):
+            return
+        self._cycle_candidate_rejection_samples += 1
+        score_detail = score.breakdown.get("_score", {})
+        voting_weight = _safe_float(
+            score_detail.get("voting_weight") if isinstance(score_detail, dict) else None, 0.0
+        )
+        all_weight = _safe_float(
+            score_detail.get("all_weight") if isinstance(score_detail, dict) else None, 0.0
+        )
+        raw_edge_components = edge_adjustment.get("components")
+        edge_components = dict(raw_edge_components) if isinstance(raw_edge_components, dict) else {}
+        data: dict[str, Any] = {
+            "market": market.symbol,
+            "timeframe": timeframe,
+            "source_candle_open_time": (
+                source_candle_open_time.isoformat()
+                if hasattr(source_candle_open_time, "isoformat")
+                else str(source_candle_open_time)
+            ),
+            "reason": skip_reason,
+            "score": score.score,
+            "direction": score.direction.value,
+            "effective_min_score": effective_min_score,
+            "participation_ratio": participation_ratio,
+            "voting_weight": voting_weight,
+            "all_weight": all_weight,
+            "voting_ratio": round(voting_weight / all_weight, 4) if all_weight else 0.0,
+            "neutralized_strategies": (
+                list(regime_info.get("neutralized", [])) if isinstance(regime_info, dict) else []
+            ),
+            "regime": regime_info.get("regime") if isinstance(regime_info, dict) else None,
+            "threshold_pipeline": {
+                "base_min_score": base_min_score,
+                "edge_penalties_enabled": edge_penalties_enabled,
+                "edge_total": _safe_int(edge_adjustment.get("total"), 0),
+                "edge_raw_total": _safe_int(edge_adjustment.get("raw_total"), 0),
+                "edge_components": edge_components,
+                "final_min_score": effective_min_score,
+            },
+        }
+        if shadow_score is not None and shadow_participation_ratio is not None:
+            shadow_detail = shadow_score.breakdown.get("_score", {})
+            shadow_voting_weight = _safe_float(
+                shadow_detail.get("voting_weight") if isinstance(shadow_detail, dict) else None, 0.0
+            )
+            shadow_all_weight = _safe_float(
+                shadow_detail.get("all_weight") if isinstance(shadow_detail, dict) else None, 0.0
+            )
+            data["participation_shadow"] = {
+                "ratio": shadow_participation_ratio,
+                "score": shadow_score.score,
+                "direction": shadow_score.direction.value,
+                # This compares only the score gate. Downstream filters and the
+                # live path are deliberately not simulated or changed here.
+                "passes_score_gate": (
+                    shadow_score.direction != Direction.NEUTRAL
+                    and shadow_score.score >= effective_min_score
+                ),
+                "voting_weight": shadow_voting_weight,
+                "all_weight": shadow_all_weight,
+                "voting_ratio": (
+                    round(shadow_voting_weight / shadow_all_weight, 4)
+                    if shadow_all_weight
+                    else 0.0
+                ),
+            }
+        db.add(
+            DecisionLog(
+                event_type=_SIGNAL_CANDIDATE_REJECTION_EVENT,
+                market_id=market.id,
+                message="Sampled signal candidate rejection",
+                data=data,
             )
         )
 
@@ -896,23 +1152,33 @@ class SignalEngine:
         # eccessivo su 5m (= 4-6 ATR di noise) e penalizza il RR raggiungibile. Le
         # scale derivano dalla volatilità tipica per candela su BTC/ETH perpetual.
         min_stop_distance_pct = _DEFAULT_MIN_STOP_BY_TF.get(timeframe, 0.020)
-        # AB testing auto-tuner (§3.10): in mode="ab_test" l'auto-tuner non modifica
-        # `risk` globalmente — ogni segnale è assegnato a control o test e l'overlay
-        # del relativo arm viene mergiato in `risk_value` prima di derivare i filtri.
-        ab_overlay_payload = active_ab_overlay(
-            db,
-            market_id=market.id,
-            timeframe=timeframe,
-            source_candle_open_time=latest_candle_open_time,
-        )
-        ab_overlay: dict[str, Any] = (
-            dict(ab_overlay_payload.get("overlay", {})) if ab_overlay_payload else {}
-        )
         risk_value: dict[str, Any] = (
             dict(risk_settings.value) if risk_settings and isinstance(risk_settings.value, dict) else {}
         )
-        if ab_overlay:
-            risk_value.update(ab_overlay)
+        # The overlay policy itself is configuration-independent. Its outcome
+        # count is not: compute that only after the effective timeframe configs
+        # are known below, otherwise a frozen epoch can mix different hashes.
+        bootstrap_forward_policy = self._get_cycle_forward_gate_policy(db)
+        historical_overlay_info = neutralize_historical_overlays(
+            risk_value,
+            bootstrap_forward_policy,
+        )
+        if bool(risk_value.get("signal_freshness_filter_enabled", False)):
+            raw_limits = risk_value.get("signal_freshness_max_lag_minutes")
+            limits = raw_limits if isinstance(raw_limits, dict) else {}
+            max_lag = max(0.0, _safe_float(limits.get(timeframe), 10.0))
+            candle_lag = source_candle_lag_minutes(timeframe, latest_candle_open_time)
+            if candle_lag > max_lag:
+                logger.warning(
+                    "signal_skipped_stale_source_candle",
+                    market=market.symbol,
+                    timeframe=timeframe,
+                    candle_lag_minutes=round(candle_lag, 2),
+                    max_lag_minutes=max_lag,
+                    source_candle_open_time=latest_candle_open_time.isoformat(),
+                )
+                self._record_skip("stale_source_candle")
+                return None
         min_signal_score = int(risk_value.get("min_signal_score", min_signal_score))
         min_signal_score = apply_timeframe_min_score_override(
             risk_value, timeframe, min_signal_score
@@ -970,20 +1236,6 @@ class SignalEngine:
         # taglia effettivamente mercati morti (sotto p25) e panic moves (sopra p90).
         atr_pct_min = float(risk_value.get("atr_pct_min", 0.25))
         atr_pct_max = float(risk_value.get("atr_pct_max", 0.90))
-        # Durante starvation override la maggior parte dei mercati può trovarsi in una
-        # fase di compressione di volatilità relativa: il filtro ATR percentile blocca
-        # più candidati del previsto (>60% osservato) aggravando la starvation stessa.
-        # Il bypass è automatico e si disattiva non appena la starvation rientra.
-        if volatility_filter_enabled:
-            cal_state_setting = db.get(AppSetting, "auto_calibration_state")
-            if cal_state_setting and isinstance(cal_state_setting.value, dict):
-                if cal_state_setting.value.get("starvation_override_active"):
-                    volatility_filter_enabled = False
-                    logger.debug(
-                        "volatility_filter_bypassed_starvation",
-                        market=market.symbol,
-                        timeframe=timeframe,
-                    )
         mtf_confluence_enabled = bool(risk_value.get("mtf_confluence_enabled", False))
         mtf_ema_period = int(risk_value.get("mtf_ema_period", 50))
         volatility_passed, volatility_info = evaluate_volatility(
@@ -1072,6 +1324,15 @@ class SignalEngine:
                 for config in configs
                 if config.strategy_name not in skip_strategy_names
             ]
+        experiment_tag = experiment_snapshot(
+            db,
+            strategies=configs,
+            risk_value=risk_value,
+        )
+        forward_policy = self._get_cycle_forward_gate_policy(
+            db,
+            configuration_hash=str(experiment_tag["configuration_hash"]),
+        )
         context = StrategyContext(
             market="hyperliquid",
             symbol=market.symbol,
@@ -1081,10 +1342,8 @@ class SignalEngine:
         )
         results = []
         weights: dict[str, int] = {}
-        # Snapshot del peso "calibrated" (post-AutoCalibrationEngine, prima del
-        # performance adjustment e del regime filter). Serve per esporre la pipeline
-        # completa nel breakdown del segnale.
-        calibrated_weights: dict[str, int] = {}
+        # Snapshot del peso configurato, prima degli aggiustamenti runtime.
+        configured_weights: dict[str, int] = {}
         raw_direction_strategy_overrides = risk_value.get("direction_strategy_weight_overrides")
         direction_strategy_overrides: dict[str, Any] = (
             raw_direction_strategy_overrides
@@ -1127,7 +1386,7 @@ class SignalEngine:
                 except (TypeError, ValueError):
                     weight = config.weight
             weights[config.strategy_name] = weight
-            calibrated_weights[config.strategy_name] = weight
+            configured_weights[config.strategy_name] = weight
         disabled_sources = set(risk_value.get("disabled_signal_sources", []))
         fear_greed = self.market_data.latest_fear_greed()
         if "fear_greed" not in disabled_sources:
@@ -1174,9 +1433,11 @@ class SignalEngine:
             if ob_cache_key in self._cycle_l2_cache:
                 ob_snapshot = self._cycle_l2_cache[ob_cache_key]
             else:
-                ob_snapshot = fetch_l2_book(
-                    settings.info_url, str(coin), n_levels=settings.ob_imbalance_n_levels
-                )
+                ob_snapshot = latest_ws_l2_book(db, market.id)
+                if ob_snapshot is None:
+                    ob_snapshot = fetch_l2_book(
+                        settings.info_url, str(coin), n_levels=settings.ob_imbalance_n_levels
+                    )
                 self._cycle_l2_cache[ob_cache_key] = ob_snapshot
         if ob_snapshot is not None:
             ob_analysis = analyze_order_book(
@@ -1195,12 +1456,22 @@ class SignalEngine:
         # maggior parte viene scartata). L'endpoint /indicators ricade su un calcolo
         # on-demand quando non trova righe, quindi la UI resta coperta.
 
-        weights, performance_notes = self.performance.adjusted_weights(
+        legacy_adjusted_weights, performance_notes = self.performance.adjusted_weights(
             db,
             weights,
             timeframe=timeframe,
             market_id=market.id,
         )
+        performance_shadow_only = bool(
+            forward_policy.get("performance_adjustments_shadow_only", False)
+        )
+        if performance_shadow_only:
+            for name, note in performance_notes.items():
+                note["shadow_only"] = True
+                note["would_adjust_to"] = legacy_adjusted_weights.get(name)
+                note["adjusted_weight"] = weights.get(name)
+        else:
+            weights = legacy_adjusted_weights
         performance_adjusted_weights = dict(weights)
         weights, regime_info = apply_regime_filter(
             weights,
@@ -1221,19 +1492,73 @@ class SignalEngine:
                 neutralized=regime_info["neutralized"],
             )
         score = scoring_engine.score(results, weights, participation_ratio=participation_ratio)
+        aligned_for_candidate = aligned_strategy_names(score.direction, score.breakdown)
+        candidate_allowed, candidate_info = paper_candidate_allows_signal(
+            forward_policy,
+            timeframe=timeframe,
+            direction=score.direction,
+            score=score.score,
+            aligned_strategies=aligned_for_candidate,
+        )
+        if candidate_info.get("active"):
+            score.breakdown["_research_candidate"] = candidate_info
+            if candidate_info.get("timeframe") == timeframe:
+                new_opportunity = self._record_candidate_funnel(
+                    market_id=market.id,
+                    timeframe=timeframe,
+                    source_candle_open_time=latest_candle_open_time,
+                    direction=str(candidate_info.get("direction") or "UNKNOWN"),
+                    score=score.score,
+                    allowed=candidate_allowed,
+                )
+                if new_opportunity:
+                    # Shadow research only: no signal, position, or order is
+                    # created. The report deduplicates after worker restarts.
+                    db.add(DecisionLog(
+                        event_type="candidate_shadow_observation",
+                        market_id=market.id,
+                        message="Pre-gate paper candidate score observed",
+                        data={
+                            "source_candle_open_time": latest_candle_open_time.isoformat(),
+                            "timeframe": timeframe,
+                            "direction": candidate_info.get("direction"),
+                            "score": score.score,
+                            "aligned_strategies": sorted(aligned_for_candidate),
+                            "source_close": str(candles[-1].close),
+                            "configuration_hash": experiment_tag["configuration_hash"],
+                            "experiment_version": experiment_tag["version"],
+                            "candidate_allowed": candidate_allowed,
+                            "taker_fee_rate": str(settings.live_taker_fee_rate),
+                        },
+                    ))
+        if not candidate_allowed:
+            logger.debug(
+                "signal_skipped_research_candidate",
+                market=market.symbol,
+                timeframe=timeframe,
+                direction=score.direction.value,
+                candidate=candidate_info,
+            )
+            self._record_skip("research_candidate")
+            db.commit()
+            return None
+        score.breakdown["_forward_gate"] = {
+            **forward_policy,
+            "historical_overlays": historical_overlay_info,
+        }
         if performance_notes:
             score.breakdown["_performance_adjustments"] = performance_notes
         if regime_info is not None:
             score.breakdown["_regime"] = regime_info
         # Pipeline esplicita dei pesi: utile per debug quando un segnale "evapora"
-        # tra strategia, calibrazione, performance adjustment e regime filter.
+        # tra configurazione, performance adjustment e regime filter.
         score.breakdown["_weight_pipeline"] = {
             name: {
-                "calibrated": calibrated_weights.get(name),
+                "configured": configured_weights.get(name),
                 "performance_adjusted": performance_adjusted_weights.get(name),
                 "regime_filtered": weights.get(name),
             }
-            for name in calibrated_weights
+            for name in configured_weights
         }
         if volatility_info is not None:
             score.breakdown["_volatility"] = volatility_info
@@ -1344,7 +1669,7 @@ class SignalEngine:
             self._record_skip("whale_contra_flow")
             db.commit()
             return None
-        edge_adjustment = signal_threshold_adjustment(
+        edge_penalties_enabled, edge_adjustment = effective_edge_adjustment(
             risk_value,
             market_id=market.id,
             timeframe=timeframe,
@@ -1516,6 +1841,19 @@ class SignalEngine:
                 skip_reason = "edge_probation_filter"
             elif btc_volume_profile_penalty > 0:
                 skip_reason = "btc_volume_profile_filter"
+            shadow_participation_ratio = max(
+                0.0,
+                min(1.0, _safe_float(risk_value.get("participation_ratio_shadow"), 0.35)),
+            )
+            shadow_score = (
+                scoring_engine.score(
+                    results,
+                    weights,
+                    participation_ratio=shadow_participation_ratio,
+                )
+                if shadow_participation_ratio < participation_ratio
+                else None
+            )
             logger.debug(
                 "signal_skipped_low_score",
                 market=market.symbol,
@@ -1527,27 +1865,66 @@ class SignalEngine:
                 edge_calibration=edge_adjustment,
                 reason=score.reason,
             )
+            self._record_candidate_rejection_sample(
+                db,
+                market=market,
+                timeframe=timeframe,
+                source_candle_open_time=latest_candle_open_time,
+                risk_value=risk_value,
+                score=score,
+                effective_min_score=effective_min_signal_score,
+                skip_reason=skip_reason,
+                participation_ratio=participation_ratio,
+                regime_info=regime_info,
+                shadow_score=shadow_score,
+                shadow_participation_ratio=(
+                    shadow_participation_ratio if shadow_score is not None else None
+                ),
+                base_min_score=min_signal_score,
+                edge_adjustment=edge_adjustment,
+                edge_penalties_enabled=edge_penalties_enabled,
+            )
             self._record_skip(skip_reason)
             db.commit()
             return None
         min_expected_r = effective_min_signal_expected_r(db)
         if min_expected_r is not None:
-            calibration_table = cached_calibration_table(db)
+            if bool(forward_policy.get("forward_ready", False)):
+                calibration_table = cached_experiment_calibration_table(
+                    db,
+                    experiment_version=str(forward_policy["version"]),
+                    assignment=str(forward_policy["assignment"]),
+                    configuration_hash=str(forward_policy["configuration_hash"]),
+                )
+            else:
+                calibration_table = cached_calibration_table(db)
             calibrated = calibration_table.lookup(
                 direction=score.direction,
                 timeframe=timeframe,
                 score=score.score,
             )
             if calibrated is not None:
+                would_block = (
+                    calibrated.confidence != "low"
+                    and calibrated.expected_r < min_expected_r
+                )
+                shadow_only = bool(
+                    forward_policy.get("expected_r_shadow_only", False)
+                )
                 score.breakdown["_expected_r_calibration"] = {
                     **serialize_metrics(calibrated),
                     "min_required": min_expected_r,
                     "computed_at": calibration_table.computed_at.isoformat(),
+                    "sample_source": calibration_table.sample_source,
+                    "experiment_version": calibration_table.experiment_version,
+                    "assignment": calibration_table.assignment,
+                    "configuration_hash": calibration_table.configuration_hash,
+                    "shadow_only": shadow_only,
+                    "would_block": would_block,
+                    "forward_outcome_count": forward_policy.get("outcome_count", 0),
+                    "forward_min_outcomes": forward_policy.get("min_outcomes"),
                 }
-                if (
-                    calibrated.confidence != "low"
-                    and calibrated.expected_r < min_expected_r
-                ):
+                if would_block and not shadow_only:
                     logger.debug(
                         "signal_skipped_low_expected_r",
                         market=market.symbol,
@@ -1562,6 +1939,17 @@ class SignalEngine:
                     self._record_skip("low_expected_r")
                     db.commit()
                     return None
+                if would_block:
+                    logger.debug(
+                        "signal_shadow_low_expected_r",
+                        market=market.symbol,
+                        timeframe=timeframe,
+                        direction=score.direction.value,
+                        score=score.score,
+                        expected_r=calibrated.expected_r,
+                        min_expected_r=min_expected_r,
+                        experiment_version=forward_policy.get("version"),
+                    )
         if (
             not bool(risk_value.get("allow_ob_imbalance_only_signals", False))
             and self._is_ob_imbalance_only_signal(score.breakdown, score.direction)
@@ -1590,11 +1978,24 @@ class SignalEngine:
                 50,
                 min(2000, _safe_int(risk_value.get("pre_tp1_validation_lookback"), 500)),
             )
-            pre_tp1_table = cached_pre_tp1_validation_table(
-                db,
-                lookback=pre_tp1_lookback,
-                min_samples_for_use=pre_tp1_min_samples,
-            )
+            if bool(forward_policy.get("forward_ready", False)):
+                pre_tp1_table = cached_experiment_pre_tp1_validation_table(
+                    db,
+                    experiment_version=str(forward_policy["version"]),
+                    assignment=str(forward_policy["assignment"]),
+                    configuration_hash=str(forward_policy["configuration_hash"]),
+                    lookback=pre_tp1_lookback,
+                    min_samples_for_use=pre_tp1_min_samples,
+                )
+            else:
+                pre_tp1_table = cached_pre_tp1_validation_table(
+                    db,
+                    lookback=pre_tp1_lookback,
+                    min_samples_for_use=pre_tp1_min_samples,
+                )
+            pre_tp1_risk_value = dict(risk_value)
+            if bool(forward_policy.get("pre_tp1_shadow_only", False)):
+                pre_tp1_risk_value["pre_tp1_validation_shadow_only"] = True
             pre_tp1_passed, pre_tp1_info = evaluate_pre_tp1_entry(
                 pre_tp1_table,
                 direction=score.direction,
@@ -1602,7 +2003,17 @@ class SignalEngine:
                 score=score.score,
                 market_id=market.id,
                 strategy_breakdown=score.breakdown,
-                risk_value=risk_value,
+                risk_value=pre_tp1_risk_value,
+            )
+            pre_tp1_info.update(
+                {
+                    "sample_source": pre_tp1_table.sample_source,
+                    "experiment_version": pre_tp1_table.experiment_version,
+                    "assignment": pre_tp1_table.assignment,
+                    "configuration_hash": pre_tp1_table.configuration_hash,
+                    "forward_outcome_count": forward_policy.get("outcome_count", 0),
+                    "forward_min_outcomes": forward_policy.get("min_outcomes"),
+                }
             )
             score.breakdown["_pre_tp1_validation"] = pre_tp1_info
             if not pre_tp1_passed:
@@ -1698,12 +2109,7 @@ class SignalEngine:
             self._record_skip("risk_reward")
             db.commit()
             return None
-        if ab_overlay_payload is not None:
-            score.breakdown["_auto_tuner"] = {
-                "step_key": ab_overlay_payload["step_key"],
-                "arm": ab_overlay_payload["arm"],
-                "assignment_method": ab_overlay_payload.get("assignment_method"),
-            }
+        score.breakdown["_experiment"] = experiment_tag
         # Segnale confermato: ora persistiamo lo snapshot degli indicatori delle
         # strategie (un'unica riga per la candela sorgente), committato insieme al
         # Signal nello stesso commit sottostante.

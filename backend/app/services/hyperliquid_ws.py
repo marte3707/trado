@@ -21,7 +21,15 @@ from app.core.runtime_settings import (
     effective_enabled_timeframes,
     effective_monitoring_only_timeframes,
 )
-from app.db.models import AppSetting, Candle, Market, MarketDataEvent, Position, Signal
+from app.db.models import (
+    AppSetting,
+    Candle,
+    Market,
+    MarketDataEvent,
+    MarketL2Snapshot,
+    Position,
+    Signal,
+)
 from app.db.session import SessionLocal
 from app.services.candle_sync import TIMEFRAME_MS
 from app.services.hyperliquid import parse_hl_candle
@@ -38,6 +46,7 @@ DEFAULT_MARKET_DATA_WS_SETTINGS: dict[str, int | bool] = {
     "reconnect_max_seconds": 60,
     "writer_flush_seconds": 1,
     "writer_batch_size": 500,
+    "l2_snapshot_flush_seconds": 2,
 }
 
 
@@ -59,6 +68,22 @@ class CandleSubscription:
                 "coin": self.coin,
                 "interval": self.timeframe,
             },
+        }
+
+
+@dataclass(frozen=True, order=True)
+class L2BookSubscription:
+    market_id: int
+    coin: str
+
+    @property
+    def key(self) -> str:
+        return self.coin
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "method": "subscribe",
+            "subscription": {"type": "l2Book", "coin": self.coin},
         }
 
 
@@ -166,6 +191,33 @@ def build_candle_subscription_plan(
     return plan
 
 
+def build_l2_book_subscription_plan(
+    candle_plan: list[CandleSubscription], *, max_subscriptions: int
+) -> list[L2BookSubscription]:
+    """Use remaining websocket capacity for one L2 stream per subscribed market."""
+    remaining = max(0, max_subscriptions - len(candle_plan))
+    by_market: dict[int, L2BookSubscription] = {}
+    for subscription in candle_plan:
+        by_market.setdefault(
+            subscription.market_id,
+            L2BookSubscription(market_id=subscription.market_id, coin=subscription.coin),
+        )
+    return list(by_market.values())[:remaining]
+
+
+def market_data_subscription_fingerprint(
+    candle_plan: list[CandleSubscription],
+    *,
+    max_subscriptions: int,
+) -> tuple[CandleSubscription | L2BookSubscription, ...]:
+    """Build the complete subscription identity used across periodic refreshes."""
+    l2_plan = build_l2_book_subscription_plan(
+        candle_plan,
+        max_subscriptions=max_subscriptions,
+    )
+    return (*candle_plan, *l2_plan)
+
+
 class ClosedCandleAccumulator:
     def __init__(self) -> None:
         self._current: dict[tuple[str, str], dict[str, Any]] = {}
@@ -262,6 +314,38 @@ def persist_closed_candles(
     return len(deduped)
 
 
+def persist_l2_snapshots(
+    db: Session,
+    batch: list[tuple[L2BookSubscription, dict[str, Any]]],
+) -> int:
+    latest_by_market = {subscription.market_id: (subscription, row) for subscription, row in batch}
+    updated_at = datetime.now(UTC)
+    persisted = 0
+    for subscription, row in latest_by_market.values():
+        levels = row.get("levels")
+        if not isinstance(levels, list) or len(levels) < 2:
+            continue
+        bids = levels[0] if isinstance(levels[0], list) else []
+        asks = levels[1] if isinstance(levels[1], list) else []
+        if not bids or not asks:
+            continue
+        stmt = insert(MarketL2Snapshot).values(
+            market_id=subscription.market_id,
+            bids=bids[:20],
+            asks=asks[:20],
+            updated_at=updated_at,
+        )
+        db.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[MarketL2Snapshot.market_id],
+                set_={"bids": bids[:20], "asks": asks[:20], "updated_at": updated_at},
+            )
+        )
+        persisted += 1
+    db.commit()
+    return persisted
+
+
 class HyperliquidMarketDataService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -269,6 +353,8 @@ class HyperliquidMarketDataService:
         self.queue: asyncio.Queue[tuple[CandleSubscription, dict[str, Any]]] = asyncio.Queue(
             maxsize=20_000
         )
+        self._l2_latest: dict[int, tuple[L2BookSubscription, dict[str, Any]]] = {}
+        self._l2_dirty = asyncio.Event()
         self.reconnect_count = 0
         self.last_message_at: datetime | None = None
         self.last_persisted_at: datetime | None = None
@@ -279,11 +365,13 @@ class HyperliquidMarketDataService:
         self.expected_subscriptions = 0
         self.active_subscriptions = 0
         self.writer_flush_seconds = 1.0
+        self.l2_snapshot_flush_seconds = 2.0
         self.writer_batch_size = 500
         self.reconnect_max_seconds = 60.0
 
     async def run_forever(self) -> None:
         writer = asyncio.create_task(self._writer_loop())
+        l2_writer = asyncio.create_task(self._l2_writer_loop())
         delay = 1.0
         try:
             while True:
@@ -301,27 +389,41 @@ class HyperliquidMarketDataService:
                     delay = min(delay * 2, self.reconnect_max_seconds)
         finally:
             writer.cancel()
-            await asyncio.gather(writer, return_exceptions=True)
+            l2_writer.cancel()
+            await asyncio.gather(writer, l2_writer, return_exceptions=True)
             self.connected = False
             self.ready = False
             with contextlib.suppress(Exception):
                 await self._write_state(connected=False, ready=False, active=0)
 
     async def _run_connection(self) -> str:
-        plan, config = await asyncio.to_thread(self._load_plan)
+        candle_plan, config = await asyncio.to_thread(self._load_plan)
         if not bool(config["enabled"]):
             await self._write_state(connected=False, ready=False, expected=0, active=0)
             await asyncio.sleep(30)
             return "disabled"
-        by_key = {subscription.key: subscription for subscription in plan}
-        fingerprint = tuple(plan)
+        fingerprint = market_data_subscription_fingerprint(
+            candle_plan,
+            max_subscriptions=int(config["max_subscriptions"]),
+        )
+        plan = list(fingerprint)
+        l2_plan = [
+            subscription
+            for subscription in plan
+            if isinstance(subscription, L2BookSubscription)
+        ]
+        subscription_payloads = [subscription.payload() for subscription in candle_plan]
+        subscription_payloads.extend(subscription.payload() for subscription in l2_plan)
+        candle_by_key = {subscription.key: subscription for subscription in candle_plan}
+        l2_by_coin = {subscription.coin: subscription for subscription in l2_plan}
         config_fingerprint = tuple(sorted(config.items()))
         refresh_seconds = int(config["subscription_refresh_seconds"])
         heartbeat_seconds = int(config["heartbeat_seconds"])
         self.writer_flush_seconds = float(config["writer_flush_seconds"])
+        self.l2_snapshot_flush_seconds = float(config["l2_snapshot_flush_seconds"])
         self.writer_batch_size = int(config["writer_batch_size"])
         self.reconnect_max_seconds = float(config["reconnect_max_seconds"])
-        acked: set[tuple[str, str]] = set()
+        acked: set[tuple[str, ...]] = set()
         self.connected = True
         self.ready = not plan
         self.expected_subscriptions = len(plan)
@@ -335,8 +437,8 @@ class HyperliquidMarketDataService:
                 close_timeout=10,
                 max_queue=4096,
             ) as websocket:
-                for index, subscription in enumerate(plan, start=1):
-                    await websocket.send(json.dumps(subscription.payload()))
+                for index, payload in enumerate(subscription_payloads, start=1):
+                    await websocket.send(json.dumps(payload))
                     if index % 100 == 0:
                         await asyncio.sleep(0.05)
                 await self._write_state(
@@ -361,12 +463,32 @@ class HyperliquidMarketDataService:
                         state_at = now + heartbeat_seconds
                     if now < refresh_at:
                         return False
-                    new_plan, new_config = await asyncio.to_thread(self._load_plan)
+                    new_candle_plan, new_config = await asyncio.to_thread(self._load_plan)
                     refresh_at = now + refresh_seconds
                     return (
-                        tuple(new_plan) != fingerprint
+                        market_data_subscription_fingerprint(
+                            new_candle_plan,
+                            max_subscriptions=int(new_config["max_subscriptions"]),
+                        )
+                        != fingerprint
                         or tuple(sorted(new_config.items())) != config_fingerprint
                     )
+
+                async def mark_subscription_active(key: tuple[str, ...]) -> None:
+                    if key in acked:
+                        return
+                    acked.add(key)
+                    self.active_subscriptions = len(acked)
+                    became_ready = len(acked) == len(plan)
+                    if became_ready and not self.ready:
+                        self.ready = True
+                        self.last_error = None
+                        await self._write_state(
+                            connected=True,
+                            ready=True,
+                            expected=len(plan),
+                            active=len(acked),
+                        )
 
                 while True:
                     timeout = min(heartbeat_seconds, max(0.1, refresh_at - time.monotonic()))
@@ -381,18 +503,7 @@ class HyperliquidMarketDataService:
                     message = json.loads(raw)
                     ack_key = candle_subscription_key_from_ack(message)
                     if ack_key is not None:
-                        acked.add(ack_key)
-                        self.active_subscriptions = len(acked)
-                        became_ready = len(acked) == len(plan)
-                        if became_ready and not self.ready:
-                            self.ready = True
-                            self.last_error = None
-                            await self._write_state(
-                                connected=True,
-                                ready=True,
-                                expected=len(plan),
-                                active=len(acked),
-                            )
+                        await mark_subscription_active(("candle", *ack_key))
                         if await maintenance():
                             return "plan_changed"
                         continue
@@ -404,7 +515,7 @@ class HyperliquidMarketDataService:
                             if not isinstance(row, dict):
                                 continue
                             key = (str(row.get("s")), str(row.get("i")))
-                            candle_subscription = by_key.get(key)
+                            candle_subscription = candle_by_key.get(key)
                             if candle_subscription is None:
                                 continue
                             closed = self.accumulator.ingest(
@@ -414,6 +525,15 @@ class HyperliquidMarketDataService:
                             )
                             for closed_row in closed:
                                 await self.queue.put((candle_subscription, closed_row))
+                    elif channel == "l2Book" and isinstance(data, dict):
+                        coin = data.get("coin")
+                        l2_subscription = l2_by_coin.get(str(coin)) if coin is not None else None
+                        if l2_subscription is not None:
+                            # Hyperliquid may stream l2Book data before emitting a
+                            # subscriptionResponse, so the first book is a valid ack.
+                            await mark_subscription_active(("l2Book", l2_subscription.coin))
+                            self._l2_latest[l2_subscription.market_id] = (l2_subscription, data)
+                            self._l2_dirty.set()
                     if await maintenance():
                         return "plan_changed"
         finally:
@@ -485,11 +605,41 @@ class HyperliquidMarketDataService:
                 for _ in batch:
                     self.queue.task_done()
 
+    async def _l2_writer_loop(self) -> None:
+        while True:
+            await self._l2_dirty.wait()
+            await asyncio.sleep(self.l2_snapshot_flush_seconds)
+            batch = list(self._l2_latest.values())
+            self._l2_dirty.clear()
+            if not batch:
+                continue
+            try:
+                persisted = await asyncio.to_thread(self._persist_l2_batch, batch)
+                if persisted:
+                    self.last_error = None
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = f"l2 writer: {str(exc)[:480]}"
+                logger.exception("market_data_ws_l2_writer_failed", error=self.last_error)
+                self._l2_dirty.set()
+
     @staticmethod
     def _persist_batch(batch: list[tuple[CandleSubscription, dict[str, Any]]]) -> int:
         db = SessionLocal()
         try:
             return persist_closed_candles(db, batch)
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    @staticmethod
+    def _persist_l2_batch(batch: list[tuple[L2BookSubscription, dict[str, Any]]]) -> int:
+        db = SessionLocal()
+        try:
+            return persist_l2_snapshots(db, batch)
         except Exception:
             db.rollback()
             raise

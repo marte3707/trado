@@ -21,12 +21,9 @@ import { TopSignalsList } from "@/components/widgets/TopSignalsList";
 import { OpenPositionsLive } from "@/components/widgets/OpenPositionsLive";
 import { MarketIntelligenceStrip } from "@/components/widgets/MarketIntelligenceStrip";
 import { MacroCorrelationCard } from "@/components/widgets/MacroCorrelationCard";
-import { MacroRiskStateCard } from "@/components/widgets/MacroRiskStateCard";
-import { BitcoinNewsCard } from "@/components/widgets/BitcoinNewsCard";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
   useAccountMonitor,
-  useMarketDashboardSnapshot,
   usePositionHistory,
   useSignalRejections,
 } from "@/lib/hooks/queries";
@@ -218,7 +215,6 @@ export function DashboardScreen({
   );
 
   const { data: rejections } = useSignalRejections(50);
-  const { data: marketDashboard } = useMarketDashboardSnapshot();
   const { data: accountSnapshot } = useAccountMonitor();
   const paperEquity = asNumber(settings.paper?.equity) ?? 10_000;
 
@@ -426,19 +422,21 @@ export function DashboardScreen({
         />
       </div>
 
-      {/* Row 4 — Market intelligence + latest news */}
-      <MarketIntelligenceStrip
-        data={marketIntelligence}
-        settings={settings}
-        snapshot={marketDashboard}
-      />
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-4">
-        <MacroCorrelationCard />
-        <MacroRiskStateCard settings={settings} />
-        <div className="lg:col-span-2">
-          <BitcoinNewsCard snapshot={marketDashboard} />
+      <details className="rounded-lg border border-border bg-bg-1">
+        <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-fg-2 transition-colors hover:text-fg">
+          Contesto mercato e segnali macro
+          <span className="ml-2 text-xs font-normal text-fg-4">
+            correlazioni e rischio
+          </span>
+        </summary>
+        <div className="space-y-4 border-t border-border p-4">
+          <MarketIntelligenceStrip
+            data={marketIntelligence}
+            settings={settings}
+          />
+          <MacroCorrelationCard />
         </div>
-      </div>
+      </details>
     </div>
   );
 }

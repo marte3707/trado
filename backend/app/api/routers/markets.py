@@ -26,7 +26,6 @@ from app.services.hyperliquid import (
     HyperliquidClient,
     parse_hl_candle,
 )
-from app.services.market_dashboard import MarketDashboardService
 from app.services.market_sync import MarketSyncService
 
 _logger = structlog.get_logger()
@@ -35,19 +34,14 @@ router = APIRouter()
 
 
 _market_data_client: CoinMarketCapClient | None = None
-_market_dashboard_service: MarketDashboardService | None = None
+
+
 def market_data_client() -> CoinMarketCapClient:
     global _market_data_client
     if _market_data_client is None:
         _market_data_client = CoinMarketCapClient(get_settings())
     return _market_data_client
 
-
-def market_dashboard_service() -> MarketDashboardService:
-    global _market_dashboard_service
-    if _market_dashboard_service is None:
-        _market_dashboard_service = MarketDashboardService(get_settings())
-    return _market_dashboard_service
 
 @router.get("/market-intelligence")
 def market_intelligence() -> dict:
@@ -91,11 +85,6 @@ def market_intelligence() -> dict:
         if global_market
         else None,
     }
-
-
-@router.get("/market-intelligence/dashboard")
-def market_dashboard_snapshot() -> dict:
-    return market_dashboard_service().snapshot()
 
 
 @router.get("/market-intelligence/coinmarketcap-usage")
@@ -219,5 +208,4 @@ def indicators(
         )
         for name, vals in sorted(row.values.items())
     ]
-
 

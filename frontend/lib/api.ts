@@ -5,11 +5,14 @@ export type Health = {
   mode: string;
   network: string;
   enable_live_trading: boolean;
+  new_live_entries_enabled: boolean;
+  readiness_gate_enabled: boolean;
   live_trading_allowed: boolean;
   live_readiness?: {
     account_address_configured: boolean;
     private_key_configured: boolean;
     mainnet_live_enabled: boolean;
+    profitability_gate_enabled: boolean;
     checks: string[];
   };
   worker?: {
@@ -28,7 +31,6 @@ export type Health = {
       closed?: number;
       pnl_updated?: number;
       live_reconciled?: number;
-      calibrated?: number;
     } | null;
     last_error_at: string | null;
     last_error_message: string | null;
@@ -89,60 +91,6 @@ export type MarketIntelligence = {
     last_updated: string | null;
     source: string;
   } | null;
-};
-
-export type MarketDashboardMover = {
-  symbol: string;
-  name: string;
-  price_usd: number | null;
-  price_change_24h_pct: number;
-};
-
-export type MarketDashboardNewsItem = {
-  title: string;
-  url: string;
-  source: string | null;
-  published_at: string | null;
-  excerpt: string | null;
-};
-
-export type MarketDashboardSnapshot = {
-  generated_at: string;
-  source_url: string;
-  cache: {
-    hit: boolean;
-    age_seconds: number;
-    max_age_seconds: number;
-    expires_at: string;
-  };
-  metrics: {
-    btc_price_usd: number | null;
-    btc_price_change_1h_pct: number | null;
-    btc_price_change_24h_pct: number | null;
-    btc_price_change_7d_pct: number | null;
-    total_market_cap_usd: number | null;
-    total_market_cap_ex_top10_usd: number | null;
-    total_volume_24h_usd: number | null;
-    btc_dominance_pct: number | null;
-    market_cap_change_24h_pct: number | null;
-    last_updated: string | null;
-    source: string;
-    top_gainers_24h: MarketDashboardMover[];
-    top_losers_24h: MarketDashboardMover[];
-  } | null;
-  fear_greed: {
-    value: number;
-    classification: string | null;
-    timestamp: string | null;
-    source: string;
-  } | null;
-  altcoin_season: {
-    altcoin_index: number;
-    snapshot_time: string | null;
-    source: string;
-  } | null;
-  news: MarketDashboardNewsItem[];
-  errors: string[];
 };
 
 export type CoinMarketCapUsage = {
@@ -518,26 +466,6 @@ export type CalibrationStats = {
   profit_factor: number | null;
 };
 
-export type CalibrationChange = {
-  target: string;
-  key: string;
-  before: number | Record<string, unknown> | null;
-  after: number | Record<string, unknown>;
-  reason: string;
-};
-
-export type Calibration = {
-  applied: boolean;
-  eligible: boolean;
-  reason: string;
-  overall: CalibrationStats;
-  changes: CalibrationChange[];
-  strategy_adjustments: Record<string, Record<string, unknown>>;
-  settings: Record<string, unknown>;
-  state?: Record<string, unknown>;
-  baseline?: Record<string, unknown>;
-};
-
 export type OutcomeProfile = {
   filters: { lookback: number; mode?: string | null };
   overall: CalibrationStats;
@@ -550,143 +478,38 @@ export type OutcomeProfile = {
   by_tp_state: Record<string, CalibrationStats>;
 };
 
-export type CalibrationHistoryEntry = {
-  id: number;
-  timestamp: string;
-  event_type: string;
-  message: string;
-  status: string | null;
-  reason: string | null;
-  overall: CalibrationStats | null;
-  changes: CalibrationChange[];
-  error: string | null;
-  force: boolean | null;
-};
-
-export type TunerStepMetrics = {
+export type ExperimentOutcomeSummary = {
   trades: number;
-  win_rate: number;
-  realized_pnl?: number;
-  mean_pnl?: number;
-  profit_factor?: number;
-  equity_slope: number;
+  usable_net_r: number;
+  net_r: number;
+  average_net_r: number | null;
+  profit_factor_net_r: number | null;
+  max_drawdown_r: number;
+  average_mae_r: number | null;
+  average_mfe_r: number | null;
+  barriers: Record<string, number>;
 };
 
-export type TunerStepHistory = {
-  key: string;
-  label: string;
-  status: "success" | "reverted" | "skipped" | "promoted" | "rejected";
-  mode?: string;
-  ab_test?: Record<string, unknown>;
-  metrics_before: TunerStepMetrics | null;
-  metrics_after: TunerStepMetrics | null;
-  trades_evaluated?: number;
-  evaluated_at: string;
-  manual?: boolean;
+export type ActivePaperSummary = {
+  positions: number;
+  marked_to_market: number;
+  unrealized_pnl: number | null;
+  oldest_opened_at: string | null;
+  latest_opened_at: string | null;
+  by_configuration: Record<string, Pick<ActivePaperSummary, "positions" | "marked_to_market" | "unrealized_pnl">>;
+  by_source: Record<string, Pick<ActivePaperSummary, "positions" | "marked_to_market" | "unrealized_pnl">>;
 };
 
-export type TunerProgress = {
-  trades_done: number;
-  trades_required: number;
-};
-
-export type AutoTunerAbProgress = {
-  trades_control: number;
-  trades_test: number;
-  trades_required_per_arm: number;
-  sample_balance?: number;
-  mean_control?: number;
-  mean_test?: number;
-  mean_delta?: number;
-  alpha?: number;
-  assignment_method?: string;
-  control_overlay?: Record<string, unknown>;
-  test_overlay?: Record<string, unknown>;
-  active_overlay?: Record<string, unknown>;
-};
-
-export type AutoTunerSourceTest = {
-  source: string;
-  key: string;
-  label: string;
-  control_overlay: Record<string, unknown>;
-  test_overlay: Record<string, unknown>;
-  currently_disabled: boolean;
-  active: boolean;
-  available: boolean;
-};
-
-export type AutoTunerStrategyTest = {
-  timeframe: string;
-  strategy: string;
-  key: string;
-  label: string;
-  control_overlay: Record<string, unknown>;
-  test_overlay: Record<string, unknown>;
-  active: boolean;
-  available: boolean;
-  queued?: boolean;
-  last_recommendation?: string | null;
-};
-
-export type AutoTunerSourceTests = {
-  enabled: boolean;
-  mode: string;
-  active_step_key: string | null;
-  active_mode?: string | null;
-  blocked: boolean;
-  tests: AutoTunerSourceTest[];
-};
-
-export type AutoTunerStrategyTests = {
-  enabled: boolean;
-  mode: string;
-  active_step_key: string | null;
-  active_mode?: string | null;
-  blocked: boolean;
-  queued_strategy_test?: {
-    timeframe: string;
-    strategy: string;
-    step_key: string;
-    queued_at?: string;
-  } | null;
-  tests: AutoTunerStrategyTest[];
-};
-
-export type AutoTunerStatus = {
-  enabled: boolean;
-  mode?: string;
-  current_step_key: string | null;
-  current_step_index: number | null;
-  current_step_mode?: string | null;
-  activated_at: string | null;
-  metrics_before: TunerStepMetrics | null;
-  metrics_now?: TunerStepMetrics | null;
-  ab_test_state?: Record<string, unknown> | null;
-  target_timeframe?: string | null;
-  target_strategy?: string | null;
-  recommendation?: string | null;
-  queued_strategy_test?: {
-    timeframe: string;
-    strategy: string;
-    step_key: string;
-    queued_at?: string;
-  } | null;
-  next_step_key: string | null;
-  trades_now: number;
-  progress: TunerProgress | null;
-  ab_progress?: AutoTunerAbProgress | null;
-  step_history: TunerStepHistory[];
-  config: {
-    min_trades_per_step: number;
-    improvement_threshold: number;
-    mode?: string;
-    ab_test_min_trades_per_arm?: number;
-    ab_test_significance_level?: number;
-    ab_test_allocation?: number;
-    ab_test_assignment_salt?: string;
-  };
-  available_source_ab_sequence?: Array<Record<string, unknown>>;
+export type ExperimentOutcomesReport = {
+  filters: { version: string | null; recent: number };
+  overall: ExperimentOutcomeSummary;
+  recent: ExperimentOutcomeSummary;
+  by_version: Record<string, ExperimentOutcomeSummary>;
+  by_configuration: Record<string, ExperimentOutcomeSummary>;
+  by_source: Record<string, ExperimentOutcomeSummary>;
+  active_paper: ActivePaperSummary;
+  configuration_count: number;
+  latest_closed_at: string | null;
 };
 
 export type EquitySlopeDiagnostics = {
@@ -705,25 +528,12 @@ export type EquitySlopeDiagnostics = {
     normalized_slope: number;
     median_abs_pnl: number;
   }>;
-  deep_defensive_active: boolean;
-  starvation_override_active: boolean;
-  last_reason?: string | null;
-  last_exit_reason?: string | null;
-  positive_streak: number;
-  recent_positive_streak: number;
-  cooldown_remaining: number;
   consecutive_zero_signal_cycles: number;
-  exit_conditions: {
-    full_slope_non_negative_cycles: number;
-    recent_slope_non_negative_cycles: number;
-    starvation_hard_cycles: number;
-  };
   recent_time_stop_impact: {
     hours: number;
     closed_count: number;
     realized_pnl: number;
   };
-  baseline_vs_current: Record<string, unknown>;
 };
 
 export type WorkerCycle = {
@@ -736,7 +546,6 @@ export type WorkerCycle = {
     skipped?: number;
     generated?: number;
     closed?: number;
-    calibrated?: boolean;
     active_timeframes?: string[];
     skip_reasons?: Record<string, number>;
     error?: string;
@@ -774,46 +583,56 @@ export type SignalRejections = {
   recent: { id: number; timestamp: string; reasons: string[] }[];
 };
 
-export type CalibrationStabilityEntry = {
-  key: string;
+export type SignalCandidateRejectionSample = {
+  id: number;
+  timestamp: string;
+  market: string;
   timeframe: string;
-  strategy: string;
-  enabled: boolean;
-  weight: number;
-  trades: number;
-  factor_history: number[];
-  factor_stddev: number;
-  holdout: {
-    train: CalibrationStats;
-    test: CalibrationStats;
-    wr_delta: number;
-  } | null;
-};
-
-export type CalibrationStability = {
-  settings: {
-    walk_forward_train_ratio: number;
-    walk_forward_min_per_side: number;
-    factor_history_window: number;
-    factor_history_std_threshold: number;
+  reason: string;
+  score: number;
+  direction: string;
+  effective_min_score: number;
+  participation_ratio: number;
+  voting_weight: number;
+  all_weight: number;
+  voting_ratio: number;
+  neutralized_strategies: string[];
+  regime: string | null;
+  threshold_pipeline?: {
+    base_min_score: number;
+    edge_penalties_enabled: boolean;
+    edge_total: number;
+    edge_raw_total: number;
+    edge_components: Record<string, number>;
+    final_min_score: number;
   };
-  by_strategy: CalibrationStabilityEntry[];
+  participation_shadow?: {
+    ratio: number;
+    score: number;
+    direction: string;
+    passes_score_gate: boolean;
+    voting_weight: number;
+    all_weight: number;
+    voting_ratio: number;
+  };
 };
 
-export type DiagnosticReport = {
-  lookback: number;
-  trade_count: number;
-  generated_at: string;
-  overall: CalibrationStats;
-  equity_slope: number;
-  by_direction: Record<string, CalibrationStats>;
-  by_strategy: Record<string, CalibrationStats>;
-  by_timeframe: Record<string, CalibrationStats>;
-  anomalies: string[];
-  top_strategies: Array<CalibrationStats & { name: string }>;
-  bottom_strategies: Array<CalibrationStats & { name: string }>;
-  calibration_state: Record<string, unknown>;
-  baseline_vs_current: Record<string, unknown>;
+export type SignalCandidateRejections = {
+  total: number;
+  by_reason: Record<string, number>;
+  recent: SignalCandidateRejectionSample[];
+};
+
+export type MacroDirectionStatus = {
+  direction: "bullish" | "bearish" | "neutral";
+  timeframe: string;
+  fast_ema_period: number;
+  slow_ema_period: number;
+  close?: number;
+  fast_ema?: number;
+  slow_ema?: number;
+  reason?: string;
+  suspended_family: "LONG" | "SHORT" | null;
 };
 
 export class ApiError extends Error {
@@ -1251,6 +1070,7 @@ export type LeaderboardCopyLiveTrader = {
   trader_label: string | null;
   trader_address: string | null;
   leaderboard_rank: number | null;
+  leaderboard_rank_imported_at: string | null;
   classification: LeaderboardAlphaClassification | null;
   quality_score: number | null;
   live_candidate_score: number;
@@ -1394,6 +1214,7 @@ export type LeaderboardAlphaDashboard = {
     copy_live_mode: string;
     copy_live_max_traders: number;
     copy_live_allowed_rank_limit: number;
+    copy_live_max_rank_age_hours: number;
     copy_live_allowed_classes: string[];
     copy_live_min_quality_score: number;
     copy_live_min_copy_closed_positions: number;
@@ -1403,6 +1224,8 @@ export type LeaderboardAlphaDashboard = {
     copy_live_min_net_pnl_usdc: string;
     copy_live_recent_days: number;
     copy_live_min_recent_closed_positions: number;
+    copy_live_min_recent_net_pnl_usdc: string;
+    copy_live_mids_cache_seconds: number;
     copy_live_position_notional_usd: string;
     copy_live_max_open_positions: number;
     copy_live_max_open_positions_per_trader: number;

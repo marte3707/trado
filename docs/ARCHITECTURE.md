@@ -39,12 +39,17 @@ Regole asset:
 - Per aggiornare uno stop live il sistema invia prima il nuovo trigger reduce-only, poi prova a cancellare il vecchio ordine. Se la submit fallisce, il vecchio stop resta invariato; se la cancel fallisce, il nuovo stop rimane registrato e l'evento viene loggato.
 - I TP dinamici chiudono TP1/TP2 e lasciano la quota runner senza TP fisso, gestita dal trailing stop. Le posizioni legacy continuano a usare il piano TP salvato in metadata.
 
-## Macro Risk
+## Protezione macro
 
-- Il monitor macro/news produce uno stato difensivo a livelli `watch`, `high`, `extreme` con policy runtime in `risk.macro_risk_monitor`.
-- `watch` e `high` restano filtri soft: possono ridurre la size, alzare la soglia score o disattivare timeframe, ma non devono riattivare il filtro globale `risk.mtf_confluence_enabled`.
-- `extreme` puo' richiedere una MTF confluence hard per i low timeframe (`5m`, `15m`, `30m`, `1h`), valutata on-demand dal `PortfolioGuard` sul timeframe superiore reale.
-- La MTF macro hard non usa piu' la sola presenza del breakdown `_mtf_confluence` come proxy: se mancano abbastanza candele sul timeframe superiore il guard fail-open, coerente con `check_mtf_confluence()`.
+La protezione macro operativa è market-based:
+
+- `BtcMacroProtectionEngine` osserva trend, volume e flow BTC;
+- circuit breaker e directional reversal breaker bloccano nuove entry dopo
+  sequenze di perdita;
+- `PortfolioGuard` applica cap di concentrazione e rischio direzionale.
+
+Il precedente monitor RSS/news/calendar è stato rimosso: era disabilitato e non
+faceva parte dei guardrail live effettivi.
 
 ## Estensioni previste
 

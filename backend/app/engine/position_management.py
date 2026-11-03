@@ -120,11 +120,13 @@ class PositionManagementEngine:
         size: Decimal,
         planned_notional: Decimal,
         base: dict[str, Any],
+        entry_price: Decimal | None = None,
     ) -> dict[str, Any]:
         metadata = dict(base)
         config = effective_position_management_settings(db)
         initial_stop = signal.stop_loss
-        risk_per_unit = abs(signal.entry_price - initial_stop) if initial_stop is not None else None
+        actual_entry = entry_price if entry_price is not None else signal.entry_price
+        risk_per_unit = abs(actual_entry - initial_stop) if initial_stop is not None else None
         metadata.update(
             {
                 "initial_stop_loss": str(initial_stop) if initial_stop is not None else None,
@@ -132,8 +134,8 @@ class PositionManagementEngine:
                 "initial_position_risk": str(risk_per_unit * size)
                 if risk_per_unit is not None
                 else None,
-                "highest_high_since_entry": str(signal.entry_price),
-                "lowest_low_since_entry": str(signal.entry_price),
+                "highest_high_since_entry": str(actual_entry),
+                "lowest_low_since_entry": str(actual_entry),
                 "current_r_multiple": "0",
                 "breakeven_triggered": False,
                 "tp1_hit": False,
@@ -243,6 +245,11 @@ class PositionManagementEngine:
         trading_client: HyperliquidTradingClient | None = None,
     ) -> int:
         if not self._live_updates_allowed(db):
+            return 0
+        # The Bull spot fallback keeps one static full-size stop.  Perp-style
+        # trailing replacements and partial TP management are not safe for a
+        # wallet balance that may be reserved by that trigger.
+        if market.market_type == "spot":
             return 0
         positions = (
             db.query(Position)
@@ -909,6 +916,8 @@ class PositionManagementEngine:
     ) -> bool:
         if not self._live_updates_allowed(db) or position.mode != OrderMode.LIVE.value:
             return False
+        if market.market_type == "spot":
+            return False
         safety_critical = self._is_safety_critical_stop(position, candidate)
         old_order = self._active_stop_order(db, position)
         live_settings = effective_live_execution_settings(db, self.settings)
@@ -1286,6 +1295,9 @@ class PositionManagementEngine:
         recovered = 0
         for position in positions:
             market = position.market or db.get(Market, position.market_id)
+            if market is not None and market.market_type == "spot":
+                skipped += 1
+                continue
             if market is None:
                 result = self._persist_liquidation_guard_result(
                     db,

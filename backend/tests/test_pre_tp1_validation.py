@@ -1,10 +1,12 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 
 from app.core.enums import Direction
-from app.db.models import Position, Signal
+from app.db.models import ExperimentOutcome, Position, Signal
 from app.engine.pre_tp1_validation import (
+    build_experiment_pre_tp1_validation_table,
     build_pre_tp1_validation_table,
     evaluate_pre_tp1_entry,
 )
@@ -88,6 +90,77 @@ def _weak_table():
         min_samples_for_use=30,
         lookback_positions=len(positions),
     )
+
+
+def test_forward_pre_tp1_table_uses_first_touch_outcomes() -> None:
+    signal = _signal(8, direction="LONG", timeframe="1h", score=68)
+    labels = ["stop_first"] * 4 + ["tp_first"]
+    outcomes = [
+        ExperimentOutcome(
+            position_id=index,
+            signal_id=8,
+            market_id=1,
+            experiment_version="baseline-frozen-v2",
+            configuration_hash="hash",
+            assignment="champion",
+            timeframe="1h",
+            side="buy",
+            barrier_label=label,
+            opened_at=datetime(2026, 7, 20, tzinfo=UTC),
+            closed_at=datetime(2026, 7, 21, tzinfo=UTC),
+            entry_price=Decimal("100"),
+            net_r=Decimal("1") if label == "tp_first" else Decimal("-1"),
+            metadata_json={"method": "first_touch_complete_candles_v2"},
+        )
+        for index, label in enumerate(labels, start=1)
+    ]
+
+    table = build_experiment_pre_tp1_validation_table(
+        outcomes,
+        {8: signal},
+        experiment_version="baseline-frozen-v2",
+        assignment="champion",
+        min_samples_for_use=5,
+        lookback_positions=5,
+    )
+
+    metrics = table.cohorts["direction_timeframe_score"]["LONG:1h:60-69"]
+    assert metrics.tp1_hits == 1
+    assert metrics.stop_before_tp1 == 4
+    assert metrics.avg_r == pytest.approx(-0.6)
+    assert table.sample_source == "experiment_outcomes"
+
+
+def test_forward_pre_tp1_excludes_legacy_barrier_method() -> None:
+    signal = _signal(8, direction="LONG", timeframe="1h", score=68)
+    legacy = ExperimentOutcome(
+        position_id=1,
+        signal_id=8,
+        market_id=1,
+        experiment_version="baseline-frozen-v2",
+        configuration_hash="hash",
+        assignment="champion",
+        timeframe="1h",
+        side="buy",
+        barrier_label="tp_first",
+        opened_at=datetime(2026, 7, 20, tzinfo=UTC),
+        closed_at=datetime(2026, 7, 21, tzinfo=UTC),
+        entry_price=Decimal("100"),
+        net_r=Decimal("1"),
+        metadata_json={"method": "first_touch_closed_candles_v1"},
+    )
+
+    table = build_experiment_pre_tp1_validation_table(
+        [legacy],
+        {8: signal},
+        experiment_version="baseline-frozen-v2",
+        assignment="champion",
+        min_samples_for_use=1,
+        lookback_positions=1,
+    )
+
+    assert table.excluded_count == 1
+    assert table.cohorts["direction_timeframe_score"] == {}
 
 
 def test_pre_tp1_validation_blocks_weak_direction_timeframe_score_bucket() -> None:

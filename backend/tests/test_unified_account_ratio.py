@@ -319,7 +319,12 @@ def test_account_snapshot_prefers_fresh_websocket_state(monkeypatch) -> None:
                 "updated_at": datetime.now(UTC).isoformat(),
                 "user_state": _state("5"),
                 "spot_state": {"balances": [{"coin": "USDC", "total": "25", "hold": "5"}]},
-                "open_orders": [{"coin": "BTC", "oid": 123}],
+                "open_orders": [
+                    {"coin": "BTC", "oid": 123},
+                    {"coin": "ETH", "oid": 456, "isTrigger": True},
+                ],
+                # This is an older REST-recovery snapshot.  It must not hide a
+                # newer order reported by the healthy account WebSocket.
                 "frontend_open_orders": [{"coin": "BTC", "oid": 123, "isTrigger": False}],
                 "predicted_fundings": [],
                 "user_funding": [],
@@ -351,8 +356,8 @@ def test_account_snapshot_prefers_fresh_websocket_state(monkeypatch) -> None:
     assert payload["api"]["source"] == "websocket"
     assert payload["api"]["latency_ms"] == 0.0
     assert payload["account"]["effective_account_value"] == "1020.000000"
-    assert payload["account"]["open_orders"] == 1
-    assert payload["open_orders"][0]["oid"] == 123
+    assert payload["account"]["open_orders"] == 2
+    assert [order["oid"] for order in payload["open_orders"]] == [123, 456]
     account_router._ACCOUNT_SNAPSHOT_CACHE.clear()
 
 

@@ -180,9 +180,12 @@ if __name__ == "__main__":
         # Last-resort: notify the admin chat before the process dies so the
         # silent-failure window between launchd restarts is visible.
         logger.exception("bot_run_crashed", error=str(exc))
+        db = SessionLocal()
         try:
             settings = get_settings()
-            asyncio.run(send_bot_fatal(settings, "bot.main.run", exc))
+            asyncio.run(send_bot_fatal(settings, db, "bot.main.run", exc))
         except Exception:
             pass
+        finally:
+            db.close()
         raise

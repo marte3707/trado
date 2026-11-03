@@ -29,6 +29,14 @@ def test_market_data_registered_in_system_services() -> None:
     assert str(config["error_log"]).endswith("trado-marketdata.err.log")
 
 
+def test_watchdog_registered_in_system_services() -> None:
+    config = routes.SYSTEM_SERVICES["watchdog"]
+
+    assert config["label"] == "com.trado.watchdog"
+    assert str(config["plist"]).endswith("com.trado.watchdog.plist")
+    assert str(config["error_log"]).endswith("trado-watchdog.err.log")
+
+
 def test_market_data_status_requires_ready_recent_stream(monkeypatch) -> None:  # noqa: ANN001
     db = StatusDb(
         {

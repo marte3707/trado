@@ -1,9 +1,9 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from app.core.enums import OperationMode, SignalStatus
 from app.db.models import AppSetting, DecisionLog, Market, Position, Signal
-from app.worker import calibration_runner, live_close_notifications, timeframe_schedule
+from app.worker import live_close_notifications, timeframe_schedule
 from app.worker import main as worker
 
 
@@ -43,87 +43,6 @@ class FakeQuery:
 
     def all(self) -> list[Position]:
         return list(self.rows)
-
-
-class CalibrationFakeDb:
-    def __init__(
-        self,
-        *,
-        total_closed: int = 500,
-        settings: dict | None = None,
-        state: dict | None = None,
-        logs: list[DecisionLog] | None = None,
-    ) -> None:
-        self.total_closed = total_closed
-        self.rows = {
-            "auto_calibration": AppSetting(
-                key="auto_calibration",
-                value={
-                    "min_closed_trades": 20,
-                    "starvation_soft_cycles": 10,
-                    "starvation_hard_cycles": 15,
-                    **(settings or {}),
-                },
-            ),
-            "auto_calibration_state": AppSetting(
-                key="auto_calibration_state",
-                value={
-                    "last_trade_count": total_closed,
-                    **(state or {}),
-                },
-            ),
-        }
-        self.logs = logs or []
-        self.committed = 0
-
-    def get(self, model: object, key: str) -> AppSetting | None:
-        if model is AppSetting:
-            return self.rows.get(key)
-        raise AssertionError(f"unexpected get model: {model}")
-
-    def add(self, row: object) -> None:
-        if isinstance(row, AppSetting):
-            self.rows[row.key] = row
-
-    def commit(self) -> None:
-        self.committed += 1
-
-    def query(self, model: object) -> "CalibrationCountQuery | CalibrationLogQuery":
-        if model is Position:
-            return CalibrationCountQuery(self.total_closed)
-        if model is DecisionLog:
-            return CalibrationLogQuery(self.logs)
-        raise AssertionError(f"unexpected query model: {model}")
-
-
-class CalibrationCountQuery:
-    def __init__(self, count_value: int) -> None:
-        self.count_value = count_value
-
-    def filter(self, *args: object, **kwargs: object) -> "CalibrationCountQuery":
-        return self
-
-    def count(self) -> int:
-        return self.count_value
-
-
-class CalibrationLogQuery:
-    def __init__(self, rows: list[DecisionLog]) -> None:
-        self.rows = rows
-        self.limit_value: int | None = None
-
-    def filter(self, *args: object, **kwargs: object) -> "CalibrationLogQuery":
-        return self
-
-    def order_by(self, *args: object, **kwargs: object) -> "CalibrationLogQuery":
-        return self
-
-    def limit(self, value: int) -> "CalibrationLogQuery":
-        self.limit_value = value
-        return self
-
-    def all(self) -> list[DecisionLog]:
-        return list(self.rows[: self.limit_value])
 
 
 class FakeExecutor:
@@ -201,23 +120,6 @@ class SyncCursorFakeDb:
     def add(self, row: object) -> None:
         if isinstance(row, AppSetting):
             self.settings[row.key] = row
-
-
-def _worker_cycle(
-    *,
-    generated: int,
-    active_timeframes: list[str] | None = None,
-    timestamp: datetime | None = None,
-) -> DecisionLog:
-    return DecisionLog(
-        event_type="worker_cycle",
-        message="Worker cycle completed",
-        timestamp=timestamp or datetime(2026, 6, 11, tzinfo=UTC),
-        data={
-            "generated": generated,
-            "active_timeframes": active_timeframes if active_timeframes is not None else ["5m"],
-        },
-    )
 
 
 def test_active_timeframes_use_boundary_window_without_history() -> None:
@@ -596,130 +498,6 @@ def test_display_live_close_reason_uses_trailing_stop_for_profitable_close_witho
         exit_price=Decimal("108"),
         pnl_usd=Decimal("8"),
     ) == "trailing_stop"
-
-
-def test_calibration_starvation_does_not_retrigger_without_defensive_state() -> None:
-    db = CalibrationFakeDb(
-        state={
-            "consecutive_zero_signal_cycles": 12,
-            "deep_defensive_active": False,
-            "starvation_override_active": False,
-        },
-        logs=[_worker_cycle(generated=0) for _ in range(12)],
-    )
-
-    assert worker.should_run_calibration(db, closed_this_cycle=0) is False
-
-
-def test_calibration_uses_unbounded_total_closed_trade_count_after_lookback_cap() -> None:
-    db = CalibrationFakeDb(
-        total_closed=819,
-        state={
-            "last_trade_count": 500,
-            "last_total_closed_trade_count": 819,
-            "deep_defensive_active": False,
-            "starvation_override_active": False,
-        },
-        logs=[_worker_cycle(generated=1)],
-    )
-
-    assert worker.should_run_calibration(db, closed_this_cycle=0) is False
-
-
-def test_calibration_legacy_lookback_count_runs_once_when_total_exceeds_cap() -> None:
-    db = CalibrationFakeDb(
-        total_closed=819,
-        state={
-            "last_trade_count": 500,
-            "deep_defensive_active": False,
-            "starvation_override_active": False,
-        },
-        logs=[_worker_cycle(generated=1)],
-    )
-
-    assert worker.should_run_calibration(db, closed_this_cycle=0) is True
-
-
-def test_record_calibration_total_closed_trade_count_persists_unbounded_total() -> None:
-    db = CalibrationFakeDb(total_closed=819, state={"last_trade_count": 500})
-
-    calibration_runner._record_calibration_total_closed_trade_count(db, 819)
-
-    assert db.rows["auto_calibration_state"].value["last_total_closed_trade_count"] == 819
-    assert db.committed == 1
-
-
-def test_calibration_starvation_runs_when_deep_defensive_crosses_soft_threshold() -> None:
-    db = CalibrationFakeDb(
-        state={
-            "consecutive_zero_signal_cycles": 9,
-            "deep_defensive_active": True,
-            "starvation_override_active": False,
-        },
-        logs=[_worker_cycle(generated=0) for _ in range(10)],
-    )
-
-    assert worker.should_run_calibration(db, closed_this_cycle=0) is True
-
-
-def test_calibration_starvation_does_not_rerun_after_same_threshold() -> None:
-    db = CalibrationFakeDb(
-        state={
-            "consecutive_zero_signal_cycles": 12,
-            "deep_defensive_active": True,
-            "starvation_override_active": False,
-        },
-        logs=[_worker_cycle(generated=0) for _ in range(12)],
-    )
-
-    assert worker.should_run_calibration(db, closed_this_cycle=0) is False
-
-
-def test_calibration_starvation_runs_when_deep_defensive_crosses_hard_threshold() -> None:
-    db = CalibrationFakeDb(
-        state={
-            "consecutive_zero_signal_cycles": 14,
-            "deep_defensive_active": True,
-            "starvation_override_active": False,
-        },
-        logs=[_worker_cycle(generated=0) for _ in range(15)],
-    )
-
-    assert worker.should_run_calibration(db, closed_this_cycle=0) is True
-
-
-def test_calibration_starvation_override_processes_new_generated_active_cycle_once() -> None:
-    cycle_at = datetime(2026, 6, 11, 7, 0, tzinfo=UTC)
-    base_state = {
-        "consecutive_zero_signal_cycles": 0,
-        "deep_defensive_active": False,
-        "starvation_override_active": True,
-    }
-
-    due_db = CalibrationFakeDb(
-        state={
-            **base_state,
-            "last_run_at": (cycle_at - timedelta(minutes=1)).isoformat(),
-        },
-        logs=[_worker_cycle(generated=1, timestamp=cycle_at)],
-    )
-    already_processed_db = CalibrationFakeDb(
-        state={
-            **base_state,
-            "last_run_at": (cycle_at + timedelta(seconds=1)).isoformat(),
-        },
-        logs=[
-            _worker_cycle(
-                generated=0,
-                active_timeframes=[],
-                timestamp=cycle_at + timedelta(seconds=30),
-            ),
-            _worker_cycle(generated=1, timestamp=cycle_at),
-        ],
-    )
-
-    assert worker.should_run_calibration(due_db, closed_this_cycle=0) is True
-    assert worker.should_run_calibration(already_processed_db, closed_this_cycle=0) is False
 
 
 def test_auto_trade_executes_paper_before_live() -> None:

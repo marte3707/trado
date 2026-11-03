@@ -1,7 +1,8 @@
 "use client";
 
 import Image from "next/image";
-import { ChevronLeft } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ChevronDown, ChevronLeft } from "lucide-react";
 
 import { useHealth } from "@/lib/hooks/queries";
 import { ROUTE_GROUPS, ROUTES, type Route } from "@/components/shell/routes";
@@ -20,6 +21,12 @@ export interface SidebarProps {
 export function Sidebar({ route, setRoute, counts, collapsed, onToggleCollapsed }: SidebarProps) {
   const { data: health } = useHealth();
   const wsLive = health?.status === "ok";
+  const advancedActive = ROUTES.some((item) => item.group === "advanced" && item.id === route);
+  const [advancedOpen, setAdvancedOpen] = useState(advancedActive);
+
+  useEffect(() => {
+    if (advancedActive) setAdvancedOpen(true);
+  }, [advancedActive]);
 
   return (
     <aside
@@ -48,7 +55,7 @@ export function Sidebar({ route, setRoute, counts, collapsed, onToggleCollapsed 
               />
             </div>
             <div className="flex min-w-0 flex-col leading-tight">
-              <span className="text-xs font-semibold text-fg">Trade smarter</span>
+              <span className="text-xs font-semibold text-fg">Trading control</span>
               <span className="font-mono text-[10px] uppercase tracking-wide text-fg-3">
                 {health?.network ?? "—"}
               </span>
@@ -87,15 +94,29 @@ export function Sidebar({ route, setRoute, counts, collapsed, onToggleCollapsed 
           const items = ROUTES.filter((r) => r.group === group.id);
           return (
             <div key={group.id} className="flex flex-col gap-0.5">
-              {!collapsed && (
+              {!collapsed && group.id !== "advanced" && (
                 <div className="px-2 pb-1 pt-3 text-[10px] font-medium uppercase tracking-wider text-fg-4">
                   {group.label}
                 </div>
               )}
-              {collapsed && group.id !== "workspace" && (
+              {!collapsed && group.id === "advanced" && (
+                <button
+                  type="button"
+                  onClick={() => setAdvancedOpen((value) => !value)}
+                  className="mt-3 flex h-8 items-center gap-2 rounded-md px-2 text-[10px] font-medium uppercase tracking-wider text-fg-4 transition-colors hover:bg-bg-2 hover:text-fg-2"
+                  aria-expanded={advancedOpen}
+                >
+                  <ChevronDown
+                    className={cn("h-3.5 w-3.5 transition-transform", !advancedOpen && "-rotate-90")}
+                  />
+                  {group.label}
+                  <span className="ml-auto font-mono text-[9px]">{items.length}</span>
+                </button>
+              )}
+              {collapsed && group.id !== "operations" && (
                 <div className="my-1 h-px bg-border" />
               )}
-              {items.map((item) => {
+              {(group.id !== "advanced" || advancedOpen || collapsed) && items.map((item) => {
                 const Icon = item.icon;
                 const active = route === item.id;
                 const badge =

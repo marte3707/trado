@@ -3,13 +3,9 @@ import { dehydrate, HydrationBoundary } from "@tanstack/react-query";
 import { AppShell } from "@/components/AppShell";
 import {
   AppSettings,
-  AutoTunerStatus,
-  Calibration,
-  CalibrationHistoryEntry,
   DecisionLog,
   Health,
   Market,
-  MarketDashboardSnapshot,
   MarketIntelligence,
   Order,
   Position,
@@ -45,13 +41,9 @@ async function loadDashboard() {
     settings,
     strategies,
     logs,
-    calibration,
-    calibrationHistory,
-    tunerStatus,
     workerCycles,
     signalRejections,
     marketIntelligence,
-    marketDashboard,
   ] = await Promise.all([
     apiGet<Health>("/api/health"),
     apiGet<Market[]>("/api/markets"),
@@ -62,9 +54,6 @@ async function loadDashboard() {
     apiGet<AppSettings>("/api/settings"),
     apiGet<Strategy[]>("/api/strategies"),
     apiGet<DecisionLog[]>("/api/logs").catch(() => []),
-    apiGet<Calibration>("/api/analytics/calibration"),
-    apiGet<CalibrationHistoryEntry[]>("/api/analytics/calibration/history"),
-    apiGet<AutoTunerStatus>("/api/auto-tuner/status").catch(() => null),
     apiGet<WorkerCycle[]>("/api/analytics/worker-cycles?limit=20").catch(() => []),
     apiGet<SignalRejections>("/api/analytics/signal-rejections?limit=50").catch(() => ({ total: 0, by_reason: {}, recent: [] })),
     apiGet<MarketIntelligence>("/api/market-intelligence").catch(() => ({
@@ -72,7 +61,6 @@ async function loadDashboard() {
       altcoin_season: null,
       global_metrics: null,
     } as MarketIntelligence)),
-    apiGet<MarketDashboardSnapshot>("/api/market-intelligence/dashboard").catch(() => null),
   ]);
   const hydratedSignals = await hydrateOpenPositionSourceSignals(signals, positions);
   const latestSignal = hydratedSignals[0];
@@ -102,13 +90,9 @@ async function loadDashboard() {
     settings,
     strategies,
     logs,
-    calibration,
-    calibrationHistory,
-    tunerStatus,
     workerCycles,
     signalRejections,
     marketIntelligence,
-    marketDashboard,
   };
 }
 
@@ -125,13 +109,9 @@ export default async function Home() {
   queryClient.setQueryData(qk.settings, data.settings);
   queryClient.setQueryData(qk.strategies, data.strategies);
   queryClient.setQueryData(qk.logs, data.logs);
-  queryClient.setQueryData(qk.calibration, data.calibration);
-  queryClient.setQueryData(qk.calibrationHistory, data.calibrationHistory);
-  queryClient.setQueryData(qk.tunerStatus, data.tunerStatus);
   queryClient.setQueryData(qk.workerCycles(20), data.workerCycles);
   queryClient.setQueryData(qk.signalRejections(50), data.signalRejections);
   queryClient.setQueryData(qk.marketIntelligence, data.marketIntelligence);
-  queryClient.setQueryData(qk.marketDashboard, data.marketDashboard);
 
   return (
     <HydrationBoundary state={dehydrate(queryClient)}>

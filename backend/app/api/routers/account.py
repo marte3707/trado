@@ -712,8 +712,12 @@ async def account_snapshot(db: Session = Depends(get_db)) -> dict:
         user_state = ws_state["user_state"]
         spot_state = ws_state["spot_state"]
         basic_open_orders = ws_state["open_orders"]
-        enriched_open_orders = ws_state.get("frontend_open_orders")
-        open_orders = enriched_open_orders if isinstance(enriched_open_orders, list) else basic_open_orders
+        # ``frontend_open_orders`` is only refreshed by the REST recovery path
+        # when the account socket is stale.  Once the socket is healthy again,
+        # that older snapshot can coexist with newer ``openOrders`` messages.
+        # Prefer the fresh subscription here: the protection matcher only needs
+        # fields supplied by it (oid/cloid, triggerPx, reduceOnly and isTrigger).
+        open_orders = basic_open_orders
         raw_fundings = ws_state.get("predicted_fundings")
         predicted_fundings = [
             item

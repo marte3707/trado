@@ -8,18 +8,14 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.enums import Direction
 from app.core.runtime_settings import (
     DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE,
     effective_directional_reversal_breaker_settings,
-    effective_macro_risk_mode_settings,
     effective_portfolio_circuit_breaker_settings,
     effective_portfolio_guard_settings,
     setting_value,
 )
-from app.db.models import AppSetting, Candle, DecisionLog, Position, Signal
-from app.engine.mtf import check_mtf_confluence, higher_timeframe
-from app.strategies.base import CandleInput
+from app.db.models import AppSetting, DecisionLog, Position, Signal
 
 
 @dataclass(frozen=True)
@@ -40,13 +36,26 @@ class PortfolioGuard:
         self.settings = settings
 
     def position_size_multiplier(self, db: Session, signal: Signal) -> float:
-        multiplier = 1.0
-        macro = _effective_macro_policy(db)
-        if macro["active"]:
-            macro_multiplier = _float(macro["policy"].get("size_multiplier"), 1.0)
-            multiplier *= max(0.0, min(1.0, macro_multiplier))
-        multiplier *= self._new_market_probation_multiplier(db, signal)
-        return multiplier
+        return self._new_market_probation_multiplier(db, signal)
+
+    def evaluate_addition(
+        self,
+        db: Session,
+        signal: Signal,
+        position: Position,
+        *,
+        now: datetime | None = None,
+    ) -> PortfolioGuardDecision:
+        """Apply active portfolio breakers without counting a scale-in as a new position."""
+        if position.status != "open" or position.mode != "live" or position.market_id != signal.market_id:
+            return PortfolioGuardDecision(allowed=False, reason="addition target is not an open live position")
+        checked_at = now or datetime.now(UTC)
+        circuit = self._circuit_breaker_decision(db, checked_at)
+        if not circuit.allowed:
+            return circuit
+        return self._directional_reversal_decision(
+            db, signal, position.mode, position.side, checked_at
+        )
 
     def _new_market_probation_multiplier(self, db: Session, signal: Signal) -> float:
         """Rischio ridotto sui mercati senza storico di trade chiusi.
@@ -97,10 +106,6 @@ class PortfolioGuard:
         reversal_decision = self._directional_reversal_decision(db, signal, mode, side, now)
         if not reversal_decision.allowed:
             return reversal_decision
-
-        macro_decision = self._macro_risk_mode_decision(db, signal)
-        if not macro_decision.allowed:
-            return macro_decision
 
         config = effective_portfolio_guard_settings(db)
         if not bool(config.get("enabled", True)):
@@ -383,14 +388,6 @@ class PortfolioGuard:
             "active": active_directional_state,
         }
 
-    def evaluate_macro_risk_gate(
-        self,
-        db: Session,
-        signal: Signal,
-    ) -> PortfolioGuardDecision:
-        """Macro-only gate shared by execution and public signal publishing."""
-        return self._macro_risk_mode_decision(db, signal)
-
     def _circuit_breaker_decision(
         self,
         db: Session,
@@ -456,195 +453,9 @@ class PortfolioGuard:
             },
         )
 
-    def _macro_risk_mode_decision(
-        self,
-        db: Session,
-        signal: Signal,
-    ) -> PortfolioGuardDecision:
-        macro = _effective_macro_policy(db)
-        if not macro["active"]:
-            return PortfolioGuardDecision(allowed=True)
-        policy = macro["policy"]
-        disabled_timeframes = _string_set(policy.get("disable_timeframes"))
-        details = {
-            "signal_id": signal.id,
-            "timeframe": signal.timeframe,
-            "score": signal.score,
-            "macro_level": macro.get("level"),
-            "macro_sources": macro.get("sources"),
-            "macro_reason": macro.get("reason"),
-        }
-        if signal.timeframe in disabled_timeframes:
-            return PortfolioGuardDecision(
-                allowed=False,
-                reason="macro risk mode disabled this timeframe",
-                details={**details, "disabled_timeframes": sorted(disabled_timeframes)},
-            )
-
-        if bool(policy.get("require_mtf_confluence", False)):
-            mtf_passed, mtf_details = _evaluate_macro_mtf_confluence(db, signal)
-            if not mtf_passed:
-                return PortfolioGuardDecision(
-                    allowed=False,
-                    reason="macro risk mode requires MTF confluence",
-                    details={**details, **mtf_details},
-                )
-
-        expected_r_floor = _optional_float(policy.get("min_expected_r"))
-        if expected_r_floor is not None:
-            breakdown = signal.strategy_breakdown if isinstance(signal.strategy_breakdown, dict) else {}
-            raw_calibration = breakdown.get("_expected_r_calibration")
-            calibration: dict[str, Any] = raw_calibration if isinstance(raw_calibration, dict) else {}
-            confidence = str(calibration.get("confidence") or "").lower()
-            expected_r = _optional_float(calibration.get("expected_r"))
-            if confidence in {"medium", "high"} and expected_r is not None and expected_r < expected_r_floor:
-                return PortfolioGuardDecision(
-                    allowed=False,
-                    reason="macro risk mode expected R threshold not met",
-                    details={
-                        **details,
-                        "required_expected_r": expected_r_floor,
-                        "calibrated_expected_r": expected_r,
-                        "calibration_confidence": confidence,
-                        "calibration_samples": calibration.get("n_samples"),
-                    },
-                )
-
-        return PortfolioGuardDecision(allowed=True, details=details)
-
-
 def _mode_key(mode: str) -> str:
     raw = getattr(mode, "value", mode)
     return str(raw).lower()
-
-
-def _effective_macro_policy(db: Session) -> dict[str, Any]:
-    manual = effective_macro_risk_mode_settings(db)
-    state = setting_value(db, "macro_risk_state")
-    policies: list[dict[str, Any]] = []
-    sources: list[str] = []
-    level = "off"
-    reason = None
-
-    if bool(manual.get("enabled", False)):
-        policies.append(manual)
-        sources.append("manual")
-        level = "manual"
-        reason = "manual_macro_risk_mode"
-
-    if _macro_state_active(state):
-        policy = state.get("policy") if isinstance(state.get("policy"), dict) else {}
-        if policy:
-            policies.append(policy)
-            sources.extend(str(item) for item in state.get("sources", []) if item)
-            level = str(state.get("level") or level)
-            reason = state.get("reason") or reason
-
-    if not policies:
-        return {"active": False, "policy": {}, "level": "off", "sources": [], "reason": None}
-
-    merged = {
-        "size_multiplier": min((_float(policy.get("size_multiplier"), 1.0) for policy in policies), default=1.0),
-        "disable_timeframes": sorted(
-            {
-                timeframe
-                for policy in policies
-                for timeframe in _string_set(policy.get("disable_timeframes"))
-            }
-        ),
-        "require_mtf_confluence": _macro_mtf_required(
-            manual=manual,
-            state=state,
-        ),
-    }
-    expected_r_floors = [
-        floor
-        for floor in (_optional_float(policy.get("min_expected_r")) for policy in policies)
-        if floor is not None
-    ]
-    merged["min_expected_r"] = max(expected_r_floors) if expected_r_floors else None
-    return {
-        "active": True,
-        "policy": merged,
-        "level": level,
-        "sources": sorted(set(sources)),
-        "reason": reason,
-    }
-
-
-def _macro_state_active(state: dict[str, Any]) -> bool:
-    if not bool(state.get("active", False)):
-        return False
-    active_until = _parse_dt(state.get("active_until"))
-    return not (active_until is not None and active_until <= datetime.now(UTC))
-
-
-def _macro_mtf_required(*, manual: dict[str, Any], state: dict[str, Any]) -> bool:
-    manual_required = bool(
-        manual.get("enabled", False) and manual.get("require_mtf_confluence", False)
-    )
-    if manual_required:
-        return True
-    if not _macro_state_active(state):
-        return False
-    raw_policy = state.get("policy")
-    policy: dict[str, Any] = raw_policy if isinstance(raw_policy, dict) else {}
-    return bool(
-        str(state.get("level") or "").lower() == "extreme"
-        and policy.get("require_mtf_confluence", False)
-    )
-
-
-def _evaluate_macro_mtf_confluence(
-    db: Session,
-    signal: Signal,
-) -> tuple[bool, dict[str, Any]]:
-    if signal.timeframe not in {"5m", "15m", "30m", "1h"}:
-        return True, {}
-    higher_tf = higher_timeframe(signal.timeframe)
-    if higher_tf is None:
-        return True, {}
-    direction = _signal_direction(signal.direction)
-    risk_value = setting_value(db, "risk")
-    mtf_ema_period = int(risk_value.get("mtf_ema_period", 50))
-    higher_rows = (
-        db.query(Candle)
-        .filter(Candle.market_id == signal.market_id, Candle.timeframe == higher_tf)
-        .order_by(Candle.open_time.desc())
-        .limit(max(mtf_ema_period * 3, 100))
-        .all()
-    )
-    higher_candles = [
-        CandleInput(
-            open_time=row.open_time,
-            open=float(row.open),
-            high=float(row.high),
-            low=float(row.low),
-            close=float(row.close),
-            volume=float(row.volume),
-            open_interest=float(row.open_interest) if row.open_interest is not None else None,
-        )
-        for row in reversed(higher_rows)
-    ]
-    mtf_passed, mtf_info = check_mtf_confluence(
-        higher_candles,
-        direction,
-        enabled=True,
-        ema_period=mtf_ema_period,
-    )
-    if mtf_passed or mtf_info is None:
-        return True, {}
-    return False, {
-        "higher_timeframe": higher_tf,
-        "mtf": mtf_info,
-    }
-
-
-def _signal_direction(value: Any) -> Direction:
-    try:
-        return Direction(str(value))
-    except ValueError:
-        return Direction.NEUTRAL
 
 
 def _open_positions(db: Session, mode: str) -> list[Position]:
@@ -835,13 +646,6 @@ def _float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-def _optional_float(value: Any) -> float | None:
-    try:
-        return None if value is None else float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _decimal(value: Any) -> Decimal | None:

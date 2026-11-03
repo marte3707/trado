@@ -22,22 +22,30 @@ export function SettingsScreen({ settings, health }: Props) {
     <div className="space-y-6 px-7 py-7">
       <div className="flex items-end justify-between gap-4">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight text-fg">Settings</h1>
+          <h1 className="text-xl font-semibold tracking-tight text-fg">Impostazioni</h1>
           <p className="mt-1 text-xs text-fg-3">
-            Operation · Risk · Paper · Position mgmt · Live · Services &amp; Integrations
+            Controlli operativi, rischio e accesso live
           </p>
         </div>
       </div>
 
       <Tabs defaultValue="operation" className="w-full">
-        <TabsList className="flex-wrap h-auto">
-          <TabsTrigger value="operation">Operation</TabsTrigger>
-          <TabsTrigger value="risk">Risk</TabsTrigger>
-          <TabsTrigger value="paper">Paper</TabsTrigger>
-          <TabsTrigger value="position">Position</TabsTrigger>
+        <TabsList className="h-auto flex-wrap">
+          <TabsTrigger value="operation">Operatività</TabsTrigger>
+          <TabsTrigger value="risk">Rischio</TabsTrigger>
           <TabsTrigger value="live">Live</TabsTrigger>
-          <TabsTrigger value="services">Services</TabsTrigger>
         </TabsList>
+
+        <details className="mt-3 rounded-md border border-border bg-bg-1 px-3 py-2">
+          <summary className="cursor-pointer text-xs font-medium text-fg-3">
+            Configurazione avanzata
+          </summary>
+          <TabsList className="mt-3 h-auto flex-wrap">
+            <TabsTrigger value="paper">Paper</TabsTrigger>
+            <TabsTrigger value="position">Gestione posizioni</TabsTrigger>
+            <TabsTrigger value="services">Servizi e integrazioni</TabsTrigger>
+          </TabsList>
+        </details>
 
         <TabsContent value="operation" className="mt-5">
           <OperationTab settings={settings} />
@@ -57,7 +65,7 @@ export function SettingsScreen({ settings, health }: Props) {
         <TabsContent value="services" className="mt-5 space-y-6">
           <ServicesTab health={health} />
           <Separator />
-          <IntegrationsTab />
+          <IntegrationsTab settings={settings} />
         </TabsContent>
       </Tabs>
     </div>

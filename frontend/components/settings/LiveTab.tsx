@@ -40,6 +40,8 @@ export function LiveTab({ health, settings }: Props) {
 
   const persisted = {
     enableLive: toBool(operation.enable_live_trading, health.enable_live_trading),
+    enableNewEntries: toBool(execution.new_live_entries_enabled, health.new_live_entries_enabled),
+    readinessGate: toBool(execution.readiness_gate_enabled, health.readiness_gate_enabled),
     enableMainnet: toBool(execution.enable_mainnet_live_trading, false),
     killEnabled: toBool(killSwitch.enabled, false),
     minAccount: toNum(execution.min_account_value_usd, 100),
@@ -58,6 +60,8 @@ export function LiveTab({ health, settings }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     persisted.enableLive,
+    persisted.enableNewEntries,
+    persisted.readinessGate,
     persisted.enableMainnet,
     persisted.killEnabled,
     persisted.minAccount,
@@ -80,6 +84,8 @@ export function LiveTab({ health, settings }: Props) {
       live_execution: {
         value: {
           ...execution,
+          new_live_entries_enabled: local.enableNewEntries,
+          readiness_gate_enabled: local.readinessGate,
           enable_mainnet_live_trading: local.enableMainnet,
           min_account_value_usd: local.minAccount,
           order_notional_cap_usd: local.notionalCap,
@@ -149,6 +155,19 @@ export function LiveTab({ health, settings }: Props) {
             hint="Master flag per consentire live trading. Persistito in DB e prevale su .env"
             checked={local.enableLive}
             onChange={(v) => setLocal((s) => ({ ...s, enableLive: v }))}
+          />
+          <ToggleRow
+            label="new_live_entries_enabled"
+            hint="Blocca solo nuove entry live; gestione, stop, TP e reconciliation restano attivi"
+            checked={local.enableNewEntries}
+            onChange={(v) => setLocal((s) => ({ ...s, enableNewEntries: v }))}
+            danger={!local.enableNewEntries}
+          />
+          <ToggleRow
+            label="readiness_gate_enabled"
+            hint="Richiede edge paper netto dopo fee prima di ogni nuova entry live"
+            checked={local.readinessGate}
+            onChange={(v) => setLocal((s) => ({ ...s, readinessGate: v }))}
           />
           <ToggleRow
             label="enable_mainnet_live_trading"

@@ -18,7 +18,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.core.enums import Direction
-from app.db.models import Position, Signal
+from app.db.models import ExperimentOutcome, Position, Signal
 from app.engine.edge_profile import direction_family, linked_position_signals, score_bucket
 from app.engine.performance import SignalPerformanceAnalyzer
 
@@ -55,6 +55,10 @@ class CalibrationTable:
     excluded_count: int
     prior_strength: float
     min_samples_for_use: int
+    sample_source: str = "legacy_closed_positions"
+    experiment_version: str | None = None
+    assignment: str | None = None
+    configuration_hash: str | None = None
 
     def lookup(
         self, *, direction: Direction | str, timeframe: str, score: int
@@ -159,6 +163,74 @@ def _confidence_label(n_samples: int, min_samples_for_use: int) -> str:
     return "high"
 
 
+def _build_table_from_grouped(
+    grouped: dict[tuple[str, str, str], list[float]],
+    *,
+    excluded: int,
+    prior_strength: float,
+    min_samples_for_use: int,
+    enforce_monotonic: bool,
+    lookback_positions: int,
+    sample_source: str = "legacy_closed_positions",
+    experiment_version: str | None = None,
+    assignment: str | None = None,
+    configuration_hash: str | None = None,
+) -> CalibrationTable:
+    if prior_strength < 0:
+        prior_strength = 0.0
+    alpha_prior = prior_strength / 2.0
+
+    buckets: dict[str, CalibratedMetrics] = {}
+    for (family, timeframe, bucket), r_values in grouped.items():
+        n = len(r_values)
+        wins_r = [r for r in r_values if r > 0]
+        losses_r = [r for r in r_values if r <= 0]
+        wins = len(wins_r)
+        raw_win_rate = wins / n if n > 0 else 0.0
+        shrunk_win_rate = (
+            (alpha_prior + wins) / (prior_strength + n)
+            if (prior_strength + n) > 0
+            else 0.5
+        )
+        mean_r_win = sum(wins_r) / len(wins_r) if wins_r else 0.0
+        mean_r_loss = sum(losses_r) / len(losses_r) if losses_r else 0.0
+        expected_r = (
+            shrunk_win_rate * mean_r_win
+            + (1.0 - shrunk_win_rate) * mean_r_loss
+        )
+        key = f"{family}:{timeframe}:{bucket}"
+        buckets[key] = CalibratedMetrics(
+            key=key,
+            direction=family,
+            timeframe=timeframe,
+            score_bucket=bucket,
+            n_samples=n,
+            wins=wins,
+            raw_win_rate=raw_win_rate,
+            shrunk_win_rate=shrunk_win_rate,
+            mean_r_win=mean_r_win,
+            mean_r_loss=mean_r_loss,
+            expected_r=expected_r,
+            confidence=_confidence_label(n, min_samples_for_use),
+        )
+
+    if enforce_monotonic:
+        buckets = _enforce_monotonic(buckets)
+
+    return CalibrationTable(
+        buckets=buckets,
+        computed_at=datetime.now(UTC),
+        lookback_positions=lookback_positions,
+        excluded_count=excluded,
+        prior_strength=prior_strength,
+        min_samples_for_use=min_samples_for_use,
+        sample_source=sample_source,
+        experiment_version=experiment_version,
+        assignment=assignment,
+        configuration_hash=configuration_hash,
+    )
+
+
 def compute_calibration_table(
     positions: list[Position],
     signals_by_id: dict[int, Signal],
@@ -174,10 +246,6 @@ def compute_calibration_table(
     calcola win rate con Bayesian shrinkage (prior Beta(α₀, β₀) centrato su 0.5),
     mean R-multiple di vittorie e perdite separatamente, e l'expected R.
     """
-    if prior_strength < 0:
-        prior_strength = 0.0
-    alpha_prior = prior_strength / 2.0
-
     grouped: dict[tuple[str, str, str], list[float]] = {}
     excluded = 0
     for position in positions:
@@ -206,43 +274,60 @@ def compute_calibration_table(
         bucket = score_bucket(signal.score)
         grouped.setdefault((family, signal.timeframe, bucket), []).append(r)
 
-    buckets: dict[str, CalibratedMetrics] = {}
-    for (family, timeframe, bucket), r_values in grouped.items():
-        n = len(r_values)
-        wins_r = [r for r in r_values if r > 0]
-        losses_r = [r for r in r_values if r <= 0]
-        wins = len(wins_r)
-        raw_win_rate = wins / n if n > 0 else 0.0
-        shrunk_win_rate = (alpha_prior + wins) / (prior_strength + n) if (prior_strength + n) > 0 else 0.5
-        mean_r_win = sum(wins_r) / len(wins_r) if wins_r else 0.0
-        mean_r_loss = sum(losses_r) / len(losses_r) if losses_r else 0.0
-        expected_r = shrunk_win_rate * mean_r_win + (1.0 - shrunk_win_rate) * mean_r_loss
-        key = f"{family}:{timeframe}:{bucket}"
-        buckets[key] = CalibratedMetrics(
-            key=key,
-            direction=family,
-            timeframe=timeframe,
-            score_bucket=bucket,
-            n_samples=n,
-            wins=wins,
-            raw_win_rate=raw_win_rate,
-            shrunk_win_rate=shrunk_win_rate,
-            mean_r_win=mean_r_win,
-            mean_r_loss=mean_r_loss,
-            expected_r=expected_r,
-            confidence=_confidence_label(n, min_samples_for_use),
-        )
-
-    if enforce_monotonic:
-        buckets = _enforce_monotonic(buckets)
-
-    return CalibrationTable(
-        buckets=buckets,
-        computed_at=datetime.now(UTC),
-        lookback_positions=lookback_positions,
-        excluded_count=excluded,
+    return _build_table_from_grouped(
+        grouped,
+        excluded=excluded,
         prior_strength=prior_strength,
         min_samples_for_use=min_samples_for_use,
+        enforce_monotonic=enforce_monotonic,
+        lookback_positions=lookback_positions,
+    )
+
+
+def compute_experiment_calibration_table(
+    outcomes: list[ExperimentOutcome],
+    signals_by_id: dict[int, Signal],
+    *,
+    prior_strength: float = DEFAULT_PRIOR_STRENGTH,
+    min_samples_for_use: int = DEFAULT_MIN_SAMPLES_FOR_USE,
+    enforce_monotonic: bool = False,
+    lookback_positions: int = DEFAULT_LOOKBACK,
+    experiment_version: str,
+    assignment: str,
+    configuration_hash: str | None = None,
+) -> CalibrationTable:
+    """Build Expected R exclusively from immutable forward outcomes."""
+
+    grouped: dict[tuple[str, str, str], list[float]] = {}
+    excluded = 0
+    for outcome in outcomes:
+        signal = signals_by_id.get(outcome.signal_id) if outcome.signal_id is not None else None
+        if signal is None or outcome.net_r is None:
+            excluded += 1
+            continue
+        family = direction_family(signal.direction)
+        if family is None:
+            excluded += 1
+            continue
+        try:
+            r_value = float(outcome.net_r)
+        except (TypeError, ValueError):
+            excluded += 1
+            continue
+        grouped.setdefault(
+            (family, outcome.timeframe, score_bucket(signal.score)), []
+        ).append(r_value)
+    return _build_table_from_grouped(
+        grouped,
+        excluded=excluded,
+        prior_strength=prior_strength,
+        min_samples_for_use=min_samples_for_use,
+        enforce_monotonic=enforce_monotonic,
+        lookback_positions=lookback_positions,
+        sample_source="experiment_outcomes",
+        experiment_version=experiment_version,
+        assignment=assignment,
+        configuration_hash=configuration_hash,
     )
 
 
@@ -346,6 +431,10 @@ def serialize_table(table: CalibrationTable) -> dict[str, Any]:
         "excluded_count": table.excluded_count,
         "prior_strength": table.prior_strength,
         "min_samples_for_use": table.min_samples_for_use,
+        "sample_source": table.sample_source,
+        "experiment_version": table.experiment_version,
+        "assignment": table.assignment,
+        "configuration_hash": table.configuration_hash,
     }
 
 
@@ -379,11 +468,56 @@ def build_calibration_table_from_db(
     )
 
 
+def build_experiment_calibration_table_from_db(
+    db: Session,
+    *,
+    experiment_version: str,
+    assignment: str,
+    configuration_hash: str | None = None,
+    lookback: int = DEFAULT_LOOKBACK,
+    prior_strength: float = DEFAULT_PRIOR_STRENGTH,
+    min_samples_for_use: int = DEFAULT_MIN_SAMPLES_FOR_USE,
+) -> CalibrationTable:
+    query = db.query(ExperimentOutcome).filter(
+        ExperimentOutcome.experiment_version == experiment_version,
+        ExperimentOutcome.assignment == assignment,
+        ExperimentOutcome.net_r.is_not(None),
+    )
+    if configuration_hash:
+        query = query.filter(ExperimentOutcome.configuration_hash == configuration_hash)
+    outcomes = (
+        query
+        .order_by(ExperimentOutcome.closed_at.desc(), ExperimentOutcome.id.desc())
+        .limit(lookback)
+        .all()
+    )
+    signal_ids = {row.signal_id for row in outcomes if row.signal_id is not None}
+    signals_by_id = (
+        {
+            signal.id: signal
+            for signal in db.query(Signal).filter(Signal.id.in_(signal_ids)).all()
+        }
+        if signal_ids
+        else {}
+    )
+    return compute_experiment_calibration_table(
+        outcomes,
+        signals_by_id,
+        prior_strength=prior_strength,
+        min_samples_for_use=min_samples_for_use,
+        lookback_positions=lookback,
+        experiment_version=experiment_version,
+        assignment=assignment,
+        configuration_hash=configuration_hash,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cache in-memory
 # ---------------------------------------------------------------------------
 
 _CACHE: dict[str, Any] = {"table": None, "computed_at": None}
+_EXPERIMENT_CACHE: dict[tuple[str, str, str | None, int, float, int], tuple[CalibrationTable, datetime]] = {}
 _CACHE_TTL_SECONDS = 30 * 60  # 30 minuti
 
 
@@ -418,6 +552,47 @@ def cached_calibration_table(
     return table
 
 
+def cached_experiment_calibration_table(
+    db: Session,
+    *,
+    experiment_version: str,
+    assignment: str,
+    configuration_hash: str | None = None,
+    force_refresh: bool = False,
+    lookback: int = DEFAULT_LOOKBACK,
+    prior_strength: float = DEFAULT_PRIOR_STRENGTH,
+    min_samples_for_use: int = DEFAULT_MIN_SAMPLES_FOR_USE,
+) -> CalibrationTable:
+    now = datetime.now(UTC)
+    key = (
+        experiment_version,
+        assignment,
+        configuration_hash,
+        lookback,
+        prior_strength,
+        min_samples_for_use,
+    )
+    cached = _EXPERIMENT_CACHE.get(key)
+    if (
+        not force_refresh
+        and cached is not None
+        and (now - cached[1]).total_seconds() <= _CACHE_TTL_SECONDS
+    ):
+        return cached[0]
+    table = build_experiment_calibration_table_from_db(
+        db,
+        experiment_version=experiment_version,
+        assignment=assignment,
+        configuration_hash=configuration_hash,
+        lookback=lookback,
+        prior_strength=prior_strength,
+        min_samples_for_use=min_samples_for_use,
+    )
+    _EXPERIMENT_CACHE[key] = (table, now)
+    return table
+
+
 def invalidate_calibration_cache() -> None:
     _CACHE["table"] = None
     _CACHE["computed_at"] = None
+    _EXPERIMENT_CACHE.clear()

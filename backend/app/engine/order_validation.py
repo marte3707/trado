@@ -6,7 +6,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings
-from app.core.enums import Direction, OperationMode, OrderMode
+from app.core.enums import Direction, MarketType, OperationMode, OrderMode
 from app.core.runtime_settings import (
     effective_live_execution_settings,
     effective_live_trading_enabled,
@@ -40,6 +40,7 @@ class OrderValidator:
         signal: Signal,
         settings: Settings,
         plan: LiveOrderPlan | None = None,
+        existing_position: Position | None = None,
     ) -> ValidationResult:
         reasons: list[str] = []
         operation_mode = effective_operation_mode(db, settings)
@@ -82,10 +83,29 @@ class OrderValidator:
         if signal.stop_loss is None:
             reasons.append("signal has no stop loss")
         market = db.get(Market, signal.market_id)
+        market_is_spot = market is not None and market.market_type == MarketType.SPOT.value
         if market is None:
             reasons.append("market not found")
-        elif market.market_type != "perp":
-            reasons.append("live execution currently supports perp markets only")
+        elif market.market_type == MarketType.SPOT.value:
+            source = (signal.strategy_breakdown or {}).get("_external_source")
+            the_bull = db.get(AppSetting, "the_bull")
+            spot_fallback_enabled = bool(
+                the_bull is not None
+                and isinstance(the_bull.value, dict)
+                and the_bull.value.get("spot_fallback_enabled")
+            )
+            if not (
+                isinstance(source, dict)
+                and source.get("provider") == "the_bull"
+                and spot_fallback_enabled
+            ):
+                reasons.append("live spot execution is limited to enabled The Bull fallback")
+            if signal.direction not in {Direction.LONG.value, Direction.STRONG_LONG.value}:
+                reasons.append("live spot execution supports long buys only")
+            if str(market.quote or "").upper() != "USDC":
+                reasons.append("live spot execution requires a USDC-quoted market")
+        elif market.market_type != MarketType.PERP.value:
+            reasons.append("live execution market type is unsupported")
         duplicate = (
             db.query(Position)
             .filter(
@@ -95,13 +115,13 @@ class OrderValidator:
             )
             .first()
         )
-        if duplicate is not None:
+        if duplicate is not None and duplicate is not existing_position:
             reasons.append("live position already open for this market")
         open_positions = db.query(Position).filter(
             Position.status == "open",
             Position.mode == OrderMode.LIVE.value,
         ).count()
-        if open_positions >= max_open_positions:
+        if existing_position is None and open_positions >= max_open_positions:
             reasons.append("max open positions reached")
         if signal.risk_reward is not None and float(signal.risk_reward) < min_risk_reward:
             reasons.append("risk/reward below configured threshold")
@@ -123,12 +143,22 @@ class OrderValidator:
         # Soglia: serve almeno min_notional / max_leverage di margine libero.
         # Check attivo solo se available_margin è stato passato esplicitamente.
         if plan.available_margin is not None:
-            required_margin = min_notional / Decimal(str(max_leverage))
+            required_margin = (
+                min_notional
+                if market_is_spot
+                else min_notional / Decimal(str(max_leverage))
+            )
             if plan.available_margin < required_margin:
                 reasons.append(
-                    f"available margin insufficient "
-                    f"(${plan.available_margin:.2f} < ${required_margin:.2f} required for min position)"
+                    (
+                        "available spot USDC insufficient "
+                        if market_is_spot
+                        else "available margin insufficient "
+                    )
+                    + f"(${plan.available_margin:.2f} < ${required_margin:.2f} required for min position)"
                 )
+            if market_is_spot and plan.notional > plan.available_margin:
+                reasons.append("live spot order exceeds available USDC")
         if plan.leverage > Decimal(str(max_leverage)):
             reasons.append("max leverage exceeded")
         current_risk = live_open_risk(db)

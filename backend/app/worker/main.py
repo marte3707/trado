@@ -4,6 +4,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import structlog
+from sqlalchemy import func
 
 from app.core.config import get_settings
 from app.core.enums import MarketType, OperationMode, OrderMode, SignalStatus
@@ -13,15 +14,15 @@ from app.core.runtime_settings import (
     effective_enabled_timeframes,
     effective_monitoring_only_timeframes,
     effective_operation_mode,
+    effective_telegram_notifications_enabled,
 )
 from app.db.init_db import create_schema, seed_defaults
 from app.db.migrations import apply_migrations
-from app.db.models import AppSetting, DecisionLog, Market, MarketDataEvent, Position, Signal
+from app.db.models import AppSetting, Candle, DecisionLog, Market, MarketDataEvent, Position, Signal
 from app.db.session import SessionLocal
 from app.engine.btc_macro_protection import BtcMacroProtectionEngine
-from app.engine.calibration import AutoCalibrationEngine
 from app.engine.execution import OrderExecutionEngine
-from app.engine.macro_risk_monitor import MacroRiskMonitor
+from app.engine.experiment_outcomes import materialize_experiment_outcomes
 from app.engine.signal_engine import SignalEngine
 from app.notifications.diagnostic_report import DiagnosticReporter
 from app.notifications.telegram import TelegramNotifier
@@ -42,11 +43,7 @@ from app.services.leaderboard_alpha import run_leaderboard_alpha_maintenance
 from app.services.live_reconciliation import reconcile_live_positions
 from app.services.market_sync import MarketSyncService
 from app.services.position_pnl import refresh_open_position_pnls
-from app.worker.calibration_runner import (
-    run_auto_tuner,
-    run_calibration,
-    should_run_calibration,
-)
+from app.services.the_bull_signals import poll_the_bull_signals
 from app.worker.cycle_status import (
     _record_heartbeat,
     _record_worker_failure,
@@ -56,7 +53,6 @@ from app.worker.fast_risk import _FastRiskState, _last_cycle_ok_at, run_fast_ris
 from app.worker.live_close_notifications import (
     _notify_btc_macro_reversals,
     _notify_live_position_closes,
-    _notify_macro_risk_state_change,
     _notify_stop_update_failures,
 )
 from app.worker.scheduler import (
@@ -126,6 +122,48 @@ def _int_setting(value: object, default: int, *, minimum: int = 1) -> int:
     except ValueError:
         return default
     return max(minimum, parsed)
+
+
+def signal_universe_market_ids(
+    db,
+    markets: list[Market],
+    *,
+    now: datetime,
+) -> set[int]:
+    """Choose liquid markets for new signals, never for position management."""
+    risk = db.get(AppSetting, "risk")
+    value = risk.value if risk is not None and isinstance(risk.value, dict) else {}
+    try:
+        max_markets = max(0, int(value.get("signal_universe_max_markets", 0)))
+    except (TypeError, ValueError):
+        max_markets = 0
+    all_ids = {market.id for market in markets}
+    if max_markets == 0 or len(all_ids) <= max_markets:
+        return all_ids
+    try:
+        lookback_hours = max(
+            1,
+            int(value.get("signal_universe_liquidity_lookback_hours", 24)),
+        )
+    except (TypeError, ValueError):
+        lookback_hours = 24
+    quote_volume = func.sum(Candle.close * Candle.volume).label("quote_volume")
+    rows = (
+        db.query(Candle.market_id, quote_volume)
+        .filter(
+            Candle.market_id.in_(all_ids),
+            Candle.timeframe == "1h",
+            Candle.open_time >= now - timedelta(hours=lookback_hours),
+        )
+        .group_by(Candle.market_id)
+        .order_by(quote_volume.desc())
+        .limit(max_markets)
+        .all()
+    )
+    selected = {int(row[0]) for row in rows if row[0] in all_ids}
+    # No local volume evidence: retain legacy scope rather than choosing symbols
+    # alphabetically and presenting that as a liquidity decision.
+    return selected or all_ids
 
 
 def effective_hyperliquid_rate_limit_settings(db) -> dict[str, int]:
@@ -555,15 +593,14 @@ def should_publish_public_signal(signal, alert_min_score: int) -> bool:
 async def run_once(
     signal_engine: SignalEngine,
     candle_sync: CandleSyncService,
-    calibration_engine: AutoCalibrationEngine,
     notifier: TelegramNotifier,
     executor: OrderExecutionEngine,
-    macro_risk_monitor: MacroRiskMonitor,
     btc_protection: BtcMacroProtectionEngine | None = None,
 ) -> tuple[int, int]:
     tick_start = datetime.now(UTC)
     settings = get_settings()
     db = SessionLocal()
+    notifier.enabled = effective_telegram_notifications_enabled(db)
     # Invalida le cache per-cycle del signal_engine (fundings, L2 book): evitano
     # di rieseguire chiamate HTTP per ogni (market × timeframe) nello stesso tick.
     signal_engine.begin_cycle()
@@ -613,21 +650,69 @@ async def run_once(
     except Exception as exc:
         logger.exception("position_pnl_refresh_failed", error=str(exc))
         db.rollback()
-    closed = await asyncio.to_thread(
+    stale_market_data_result = await asyncio.to_thread(
+        executor.apply_stale_market_data_guard,
+        db,
+    )
+    closed = int(stale_market_data_result.get("paper_closed", 0))
+    closed += await asyncio.to_thread(
         reconcile_open_paper_positions, db, executor, managed_sync_timeframes
     )
     time_stop_result = await asyncio.to_thread(executor.apply_time_stops, db)
     closed += int(time_stop_result.get("paper_closed", 0))
     portfolio_breaker_result = executor.portfolio_guard.update_circuit_breaker(db)
-    macro_risk_result = macro_risk_monitor.run(db)
     db.commit()
-    calibrated = False
-    calibration_attempted = False
-    if should_run_calibration(db, closed):
-        calibrated = run_calibration(db, calibration_engine)
-        calibration_attempted = True
-    run_auto_tuner(db)
+    experiment_outcomes = {"candidates": 0, "created": 0, "skipped": 0}
+    try:
+        experiment_outcomes = await asyncio.to_thread(
+            materialize_experiment_outcomes,
+            db,
+            taker_fee_rate=settings.live_taker_fee_rate,
+        )
+    except Exception as exc:
+        logger.exception("experiment_outcome_materialization_failed", error=str(exc))
+        db.rollback()
     btc_protection_updates = 0
+    the_bull_result: dict = {
+        "status": "not_run",
+        "processed": 0,
+        "opened": 0,
+        "closed": 0,
+    }
+    try:
+        the_bull_result = await poll_the_bull_signals(db, settings, executor)
+        closed += int(the_bull_result.get("closed", 0))
+        if int(the_bull_result.get("opened", 0)) > 0:
+            recent_external_live = (
+                db.query(Position)
+                .filter(
+                    Position.mode == OrderMode.LIVE.value,
+                    Position.status == "open",
+                    Position.opened_at >= tick_start,
+                )
+                .all()
+            )
+            for position in recent_external_live:
+                source = (position.metadata_json or {}).get("external_source")
+                if not isinstance(source, dict) or source.get("provider") != "the_bull":
+                    continue
+                try:
+                    await notifier.send_live_position_opened(position)
+                except Exception:
+                    logger.exception(
+                        "telegram_the_bull_live_open_notify_failed",
+                        position_id=position.id,
+                    )
+    except Exception as exc:
+        logger.exception("the_bull_cycle_failed", error=str(exc))
+        db.rollback()
+        the_bull_result = {
+            "status": "error",
+            "processed": 0,
+            "opened": 0,
+            "closed": 0,
+            "error": str(exc)[:500],
+        }
     # Nota: btc_protection.run() viene invocato DOPO il loop di generazione segnali
     # (più sotto) — non qui — perché in reverse_mode deve poter agire sui signal flip
     # generati nello stesso ciclo. La protezione legacy live-only era idempotente
@@ -647,17 +732,23 @@ async def run_once(
                     "skipped": 0,
                     "generated": 0,
                     "closed": closed,
+                    "experiment_outcomes": experiment_outcomes,
                     "pnl_updated": pnl_updated,
                     "live_reconciled": live_reconciled,
                     "live_reconcile_skipped_reason": live_reconcile_skipped_reason,
                     "portfolio_profit_lock": portfolio_profit_lock_result,
                     "live_stop_updates": 0,
                     "btc_protection_updates": btc_protection_updates,
+                    "the_bull": the_bull_result,
+                    "stale_market_data_paper_closed": stale_market_data_result.get(
+                        "paper_closed", 0
+                    ),
+                    "stale_market_data_paper_alerted": stale_market_data_result.get(
+                        "paper_alerted", 0
+                    ),
                     "time_stop_paper_closed": time_stop_result.get("paper_closed", 0),
                     "time_stop_live_alerted": time_stop_result.get("live_alerted", 0),
                     "portfolio_circuit_breaker": portfolio_breaker_result,
-                    "macro_risk": macro_risk_result,
-                    "calibrated": calibrated,
                     "active_timeframes": [],
                     "sync_active_timeframes": [],
                     "market_scope": MarketType.PERP.value,
@@ -668,7 +759,6 @@ async def run_once(
                 },
             ))
             db.commit()
-            await _notify_macro_risk_state_change(db, notifier, macro_risk_result)
             await _notify_live_position_closes(db, notifier, tick_start)
             await _notify_stop_update_failures(db, notifier, tick_start)
             await _notify_btc_macro_reversals(db, notifier, tick_start)
@@ -690,6 +780,12 @@ async def run_once(
         )
         if settings.external_quote_enrichment_enabled:
             signal_engine.market_data.prefetch_quotes([m.base for m in markets])
+        signal_market_ids = await asyncio.to_thread(
+            signal_universe_market_ids,
+            db,
+            markets,
+            now=tick_start,
+        )
         perp_oi_map = await asyncio.to_thread(fetch_perp_open_interests, settings.info_url)
         # Prefetch parallelo dei fetch HTTP candele per i soli perp del budget tick.
         # La latenza di rete è il costo dominante del ciclo: scaricare in parallelo (con
@@ -739,7 +835,7 @@ async def run_once(
         event_l2_markets = {
             market.id
             for market, timeframe in event_pairs
-            if timeframe in signal_timeframes
+            if timeframe in signal_timeframes and market.id in signal_market_ids
         }
         available_candle_requests = max(
             0,
@@ -752,6 +848,11 @@ async def run_once(
             rate_limit_settings["candle_prefetch_budget_per_tick"],
             available_candle_requests,
         )
+        signal_priority_pair_keys = {
+            (market_id, timeframe)
+            for market_id in signal_market_ids
+            for timeframe in signal_timeframes
+        }
         rest_pairs, sync_pair_stats = select_worker_sync_pairs(
             db,
             markets,
@@ -760,7 +861,7 @@ async def run_once(
             now=tick_start,
             latest_open_by_pair=latest_open_by_pair,
             restricted_market_ids_by_timeframe=restricted_market_ids_by_timeframe,
-            priority_pair_keys=monitoring_priority_pair_keys,
+            priority_pair_keys=monitoring_priority_pair_keys | signal_priority_pair_keys,
         )
         event_pair_keys = {(market.id, timeframe) for market, timeframe in event_pairs}
         rest_pairs = [
@@ -778,17 +879,9 @@ async def run_once(
             if isinstance(result, Exception) and _is_market_data_breaker_error(result)
         )
         market_data_breaker_skip_logged = False
-        selected_markets_by_id = {
-            market.id: market
-            for market, timeframe in sync_pairs
-            if timeframe in signal_timeframes
-        }
-        selected_markets = list(selected_markets_by_id.values())
-        # Prefetch L2 books per i market selezionati prima del loop segnali: evita
-        # le ~N fetch sequenziali (una per coin) dentro generate(), sostituendole con
-        # un batch async a concorrenza limitata che pre-popola _cycle_l2_cache.
-        if active_timeframes and selected_markets:
-            await signal_engine.prefetch_l2_books(selected_markets, settings)
+        # L2 is loaded lazily in SignalEngine.generate(), after its duplicate
+        # check. Prefetching here also queried books for candles that already
+        # had a stored signal, consuming shared /info capacity for no decision.
         synced = 0
         skipped = 0
         generated = 0
@@ -879,6 +972,11 @@ async def run_once(
                     _mark_market_data_event_processed(db, market_data_event)
                     db.commit()
                 continue
+            if market.id not in signal_market_ids:
+                if market_data_event is not None:
+                    _mark_market_data_event_processed(db, market_data_event)
+                    db.commit()
+                continue
             signal = await asyncio.to_thread(signal_engine.generate, db, market, timeframe)
             if market_data_event is not None:
                 _mark_market_data_event_processed(db, market_data_event)
@@ -905,9 +1003,6 @@ async def run_once(
                     await notifier.send_live_position_opened(live_position)
                 except Exception:
                     logger.exception("telegram_live_open_notify_failed")
-        if not calibration_attempted and should_run_calibration(db, closed):
-            calibrated = run_calibration(db, calibration_engine)
-            calibration_attempted = True
         if btc_protection is not None and operation_mode in {
             OperationMode.AUTO_TRADE,
             OperationMode.PAPER_TRADING,
@@ -919,6 +1014,17 @@ async def run_once(
             except Exception as exc:
                 logger.exception("btc_macro_protection_failed", error=str(exc))
                 db.rollback()
+        try:
+            latest_outcomes = await asyncio.to_thread(
+                materialize_experiment_outcomes,
+                db,
+                taker_fee_rate=settings.live_taker_fee_rate,
+            )
+            for key in experiment_outcomes:
+                experiment_outcomes[key] += latest_outcomes[key]
+        except Exception as exc:
+            logger.exception("experiment_outcome_materialization_failed", error=str(exc))
+            db.rollback()
         completed_sync_backlog = (
             skipped == 0
             and sync_pair_stats["selected_pairs"] >= sync_pair_stats["total_pairs"]
@@ -931,6 +1037,7 @@ async def run_once(
                 message="Worker cycle completed",
                 data={
                     "markets": len(markets),
+                    "signal_universe_markets": len(signal_market_ids),
                     "timeframes": enabled_timeframes,
                     "monitoring_only_timeframes": monitoring_only_timeframes,
                     "sync_timeframes": sync_timeframes,
@@ -941,17 +1048,23 @@ async def run_once(
                     "skipped": skipped,
                     "generated": generated,
                     "closed": closed,
+                    "experiment_outcomes": experiment_outcomes,
                     "pnl_updated": pnl_updated,
                     "live_reconciled": live_reconciled,
                     "live_reconcile_skipped_reason": live_reconcile_skipped_reason,
                     "portfolio_profit_lock": portfolio_profit_lock_result,
                     "live_stop_updates": live_stop_updates,
                     "btc_protection_updates": btc_protection_updates,
+                    "the_bull": the_bull_result,
+                    "stale_market_data_paper_closed": stale_market_data_result.get(
+                        "paper_closed", 0
+                    ),
+                    "stale_market_data_paper_alerted": stale_market_data_result.get(
+                        "paper_alerted", 0
+                    ),
                     "time_stop_paper_closed": time_stop_result.get("paper_closed", 0),
                     "time_stop_live_alerted": time_stop_result.get("live_alerted", 0),
                     "portfolio_circuit_breaker": portfolio_breaker_result,
-                    "macro_risk": macro_risk_result,
-                    "calibrated": calibrated,
                     "market_scope": MarketType.PERP.value,
                     "rate_limit_settings": rate_limit_settings,
                     "sync_pairs_total": sync_pair_stats["total_pairs"],
@@ -967,11 +1080,13 @@ async def run_once(
                     # in produzione gli eventi debug per skip sono filtrati, qui
                     # restano visibili per debug "perché non genero?".
                     "skip_reasons": signal_engine.cycle_skip_counts(),
+                    # Each market/source candle is counted once per worker
+                    # process; persisted outcomes remain the trade evidence.
+                    "candidate_funnel": signal_engine.cycle_candidate_funnel(),
                 },
             )
         )
         db.commit()
-        await _notify_macro_risk_state_change(db, notifier, macro_risk_result)
         await _notify_live_position_closes(db, notifier, tick_start)
         await _notify_stop_update_failures(db, notifier, tick_start)
         await _notify_btc_macro_reversals(db, notifier, tick_start)
@@ -1004,10 +1119,8 @@ async def main() -> None:
         db.close()
     signal_engine = SignalEngine()
     candle_sync = CandleSyncService()
-    calibration_engine = AutoCalibrationEngine()
     notifier = TelegramNotifier(settings)
     executor = OrderExecutionEngine(settings)
-    macro_risk_monitor = MacroRiskMonitor(settings)
     btc_protection = BtcMacroProtectionEngine(settings)
     _record_heartbeat("starting")
 
@@ -1028,6 +1141,7 @@ async def main() -> None:
 
     startup_db = SessionLocal()
     try:
+        notifier.enabled = effective_telegram_notifications_enabled(startup_db)
         await notifier.send_worker_online(startup_db)
     except Exception:
         logger.exception("telegram_worker_online_failed")
@@ -1050,10 +1164,8 @@ async def main() -> None:
                     generated, candle_errors = await run_once(
                         signal_engine,
                         candle_sync,
-                        calibration_engine,
                         notifier,
                         executor,
-                        macro_risk_monitor,
                         btc_protection,
                     )
                     stats.cycles += 1

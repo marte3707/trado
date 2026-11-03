@@ -1,13 +1,11 @@
-"""Notifiche Telegram per chiusure live, reversal BTC e stato macro risk."""
-from datetime import UTC, datetime, timedelta
+"""Notifiche Telegram per chiusure live e reversal BTC."""
+from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
 
 import structlog
 from sqlalchemy.orm import Session
 
-from app.core.runtime_settings import effective_macro_risk_monitor_settings
-from app.db.models import AppSetting, DecisionLog, Position
+from app.db.models import DecisionLog, Position
 from app.notifications.telegram import TelegramNotifier
 
 logger = structlog.get_logger()
@@ -19,9 +17,6 @@ _FILL_EVENT_TYPES = frozenset(
         "live_reconciliation_stop_loss_filled",
     }
 )
-_MACRO_RISK_LEVEL_ORDER = {"off": 0, "watch": 1, "high": 2, "extreme": 3, "manual": 4}
-
-
 def _is_profitable_close(
     position: "Position",
     exit_price: Decimal | None,
@@ -338,170 +333,3 @@ async def _notify_btc_macro_reversals(
                 "telegram_btc_macro_notify_failed",
                 event_id=event.id,
             )
-
-
-async def _notify_macro_risk_state_change(
-    db: Session,
-    notifier: TelegramNotifier,
-    result: dict[str, Any],
-) -> None:
-    if not result.get("changed"):
-        return
-    state = result.get("state")
-    if not isinstance(state, dict):
-        return
-    previous = result.get("previous_state")
-    previous_state = previous if isinstance(previous, dict) else {}
-    config = effective_macro_risk_monitor_settings(db)
-    notify, transition = _should_notify_macro_risk_state(previous_state, state, config)
-    if not notify:
-        return
-    if not getattr(notifier.settings, "telegram_signal_chat_id", None):
-        return
-    try:
-        sent = await notifier.send_macro_risk_state_changed(state)
-        if not sent:
-            _record_macro_risk_notification(
-                db,
-                previous=previous_state,
-                state=state,
-                transition=transition,
-                status="failed",
-            )
-            db.commit()
-            return
-        _persist_macro_risk_notification_state(db, state, transition)
-        _record_macro_risk_notification(
-            db,
-            previous=previous_state,
-            state=state,
-            transition=transition,
-            status="sent",
-        )
-        db.commit()
-    except Exception as exc:
-        logger.warning("telegram_macro_risk_notify_failed", error=str(exc))
-        _record_macro_risk_notification(
-            db,
-            previous=previous_state,
-            state=state,
-            transition=transition,
-            status="failed",
-        )
-        db.commit()
-
-
-def _macro_risk_transition(previous: dict[str, Any], state: dict[str, Any]) -> str:
-    previous_active = bool(previous.get("active"))
-    current_active = bool(state.get("active"))
-    previous_level = str(previous.get("level") or "off").lower()
-    current_level = str(state.get("level") or "off").lower()
-
-    if not previous_active and current_active:
-        return "activation"
-    if previous_active and not current_active:
-        return "recovery"
-    if not previous_active and not current_active:
-        return "noop"
-
-    previous_order = _MACRO_RISK_LEVEL_ORDER.get(previous_level, 0)
-    current_order = _MACRO_RISK_LEVEL_ORDER.get(current_level, 0)
-    if current_order > previous_order:
-        return "escalation"
-    if current_order < previous_order:
-        return "downgrade"
-    return "refresh"
-
-
-def _should_notify_macro_risk_state(
-    previous: dict[str, Any],
-    state: dict[str, Any],
-    config: dict[str, Any],
-) -> tuple[bool, str]:
-    transition = _macro_risk_transition(previous, state)
-    if transition in {"noop", "refresh"}:
-        return False, transition
-    if transition == "downgrade" and not bool(config.get("telegram_notify_on_downgrade", False)):
-        return False, transition
-    if transition == "recovery":
-        return True, transition
-
-    cooldown_minutes = max(0, int(config.get("telegram_notify_cooldown_minutes", 180) or 0))
-    if cooldown_minutes <= 0:
-        return True, transition
-
-    last_sent_at = _parse_dt(state.get("last_telegram_risk_notification_at"))
-    if last_sent_at is None:
-        return True, transition
-    current_at = _parse_dt(state.get("last_checked_at")) or datetime.now(UTC)
-    if current_at - last_sent_at >= timedelta(minutes=cooldown_minutes):
-        return True, transition
-
-    last_level = str(state.get("last_telegram_risk_notification_level") or "off").lower()
-    current_level = str(state.get("level") or "off").lower()
-    if _MACRO_RISK_LEVEL_ORDER.get(current_level, 0) > _MACRO_RISK_LEVEL_ORDER.get(last_level, 0):
-        return True, transition
-    return False, transition
-
-
-def _persist_macro_risk_notification_state(
-    db: Session,
-    state: dict[str, Any],
-    transition: str,
-) -> None:
-    if transition == "recovery":
-        return
-    row = db.get(AppSetting, "macro_risk_state")
-    if row is None or not isinstance(row.value, dict):
-        return
-    next_state = dict(row.value)
-    next_state["last_telegram_risk_notification_at"] = (
-        _parse_dt(state.get("last_checked_at")) or datetime.now(UTC)
-    ).isoformat()
-    next_state["last_telegram_risk_notification_level"] = state.get("level")
-    row.value = next_state
-    state.update(
-        {
-            "last_telegram_risk_notification_at": next_state["last_telegram_risk_notification_at"],
-            "last_telegram_risk_notification_level": next_state["last_telegram_risk_notification_level"],
-        }
-    )
-
-
-def _record_macro_risk_notification(
-    db: Session,
-    *,
-    previous: dict[str, Any],
-    state: dict[str, Any],
-    transition: str,
-    status: str,
-) -> None:
-    db.add(
-        DecisionLog(
-            event_type="macro_risk_telegram_notification",
-            message=f"Macro risk Telegram notification {status}",
-            data={
-                "status": status,
-                "transition": transition,
-                "previous_level": previous.get("level", "off"),
-                "level": state.get("level"),
-                "active": state.get("active"),
-                "last_checked_at": state.get("last_checked_at"),
-            },
-        )
-    )
-
-
-def _parse_dt(value: object) -> datetime | None:
-    if isinstance(value, datetime):
-        parsed = value
-    elif isinstance(value, str) and value:
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    else:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)

@@ -10,7 +10,12 @@ DEFAULT_POSITION_MANAGEMENT_SETTINGS: dict[str, Any] = {
     "timeStop": {
         "enabled": True,
         "paperEnabled": True,
-        "closeLosingPaperPositions": False,
+        # Una posizione che supera la durata massima senza aver raggiunto TP1
+        # non deve restare aperta indefinitamente solo perche' e' in perdita.
+        # I trade profittevoli e i runner restano invece affidati al trailing.
+        "closeLosingPaperPositions": True,
+        "closeProfitablePaperPositions": False,
+        "preserveTakeProfitRunners": True,
         "liveMode": "alert",
         "maxAgeHoursByTimeframe": {
             "5m": 12,
@@ -19,6 +24,24 @@ DEFAULT_POSITION_MANAGEMENT_SETTINGS: dict[str, Any] = {
             "1h": 96,
             "4h": 192,
             "1d": 336,
+        },
+    },
+    "staleMarketData": {
+        "enabled": True,
+        # Solo paper: il live non viene mai chiuso usando un mark locale.
+        "paperMode": "close",
+        "freshMarkMaxAgeMinutes": 5,
+        "alertCooldownMinutes": 360,
+        # Margine ampio rispetto alla durata della candela: evita chiusure per
+        # un singolo ciclo perso, ma impedisce posizioni non piu' gestibili.
+        "maxCandleAgeHoursByTimeframe": {
+            "1m": 0.5,
+            "5m": 1,
+            "15m": 2,
+            "30m": 4,
+            "1h": 8,
+            "4h": 24,
+            "1d": 72,
         },
     },
     "trailingStop": {
@@ -81,6 +104,49 @@ DEFAULT_POSITION_MANAGEMENT_SETTINGS: dict[str, Any] = {
     },
 }
 
+
+DEFAULT_THE_BULL_SETTINGS: dict[str, Any] = {
+    "enabled": False,
+    "channel_username": "thebull_crypto",
+    # The public Telegram preview is paged. Keep enough posts to cover the
+    # expected worker interval without treating an old backlog as a new call.
+    "feed_history_limit": 25,
+    # Source-specific opt-in. Global operation mode and all live guardrails
+    # remain mandatory when this is switched to ``live``.
+    "execution_mode": "paper",
+    "timeframe": "4h",
+    "max_signal_age_minutes": 60,
+    "signal_score": 60,
+    "risk_multiplier": 0.5,
+    "max_open_positions": 3,
+    # The Bull scale-ins are bounded against the original filled asset size.
+    # Never bump an undersized addition up to the exchange minimum.
+    "max_additions_per_ticker": 2,
+    "max_addition_fraction": 0.30,
+    "min_stop_distance_pct": 0.03,
+    "close_on_profit_update": True,
+    "close_companion_paper_on_source_exit": True,
+    # Broader source language is retained as evidence and the explicitly
+    # supported subset can be routed through the normal execution path.
+    "semantic_audit_enabled": True,
+    # Supported source calls enter the normal guarded execution path.
+    "expanded_entry_execution": True,
+    # Chart review uses the macOS Vision framework locally. A zone is eligible
+    # only when the current market midpoint is inside the OCR-derived range;
+    # the normal risk plan and all global execution guardrails still apply.
+    "chart_analysis_enabled": True,
+    "chart_zone_execution": True,
+    # A chart whose range cannot be read must not discard an otherwise
+    # identifiable The Bull call. This remains an explicit runtime opt-in and
+    # never overrides a successfully read zone that says the current price is
+    # outside the intended range.
+    "chart_ocr_fallback_execution": False,
+    "chart_analysis_max_per_cycle": 2,
+    # A separate opt-in for The Bull-only spot routing.  It never enables spot
+    # execution for native strategies and all normal live guards still apply.
+    "spot_fallback_enabled": False,
+}
+
 DEFAULT_PORTFOLIO_GUARD_SETTINGS: dict[str, Any] = {
     "enabled": True,
     "max_new_positions_per_cycle_by_side": {
@@ -126,178 +192,6 @@ DEFAULT_DIRECTIONAL_REVERSAL_BREAKER_SETTINGS: dict[str, Any] = {
     "window_minutes": 120,
     "stop_loss_count": 4,
     "cooldown_minutes": 180,
-}
-
-DEFAULT_MACRO_RISK_MODE_SETTINGS: dict[str, Any] = {
-    "enabled": False,
-    "size_multiplier": 0.5,
-    "min_score_add": 0,
-    "min_expected_r": 0.0,
-    "disable_timeframes": ["5m"],
-    "require_mtf_confluence": True,
-}
-
-DEFAULT_MACRO_RISK_MONITOR_SETTINGS: dict[str, Any] = {
-    "enabled": True,
-    "actions_enabled": True,
-    "telegram_notify_cooldown_minutes": 180,
-    "telegram_notify_on_downgrade": False,
-    "news_enabled": True,
-    "calendar_enabled": True,
-    "market_stress_enabled": True,
-    "news_feed_urls": [
-        "https://feeds.bbci.co.uk/news/world/rss.xml",
-        "https://www.theguardian.com/world/rss",
-        "https://www.aljazeera.com/xml/rss/all.xml",
-        "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    ],
-    "calendar_feed_urls": [],
-    "news_fetch_cooldown_minutes": 15,
-    "calendar_fetch_cooldown_hours": 6,
-    "news_lookback_hours": 12,
-    "calendar_lookahead_hours": 48,
-    "calendar_pre_event_minutes": 90,
-    "calendar_post_event_minutes": 45,
-    "market_lookback_minutes": 120,
-    # Thresholds raised after the monitor sat in high/extreme ~73% of its first
-    # days live: the band was too low for the real BTC/ETH market-stress scale.
-    "watch_score": 45,
-    "high_score": 70,
-    "extreme_score": 88,
-    # Anti-flapping: wider downgrade hysteresis, level-aware minimum hold and a
-    # smoother market-stress EMA so the state stops oscillating every ~20 minutes.
-    "level_hysteresis_points": 10,
-    "min_level_hold_minutes": {"watch": 30, "high": 60, "extreme": 90, "default": 30},
-    "market_stress_ema_alpha": 0.3,
-    "calendar_static_events": [
-        {
-            "key": "fomc_2026_06",
-            "title": "FOMC rate decision and projections",
-            "category": "macro_calendar",
-            "source": "Federal Reserve",
-            "starts_at": "2026-06-17T14:00:00-04:00",
-            "score": 72,
-            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
-        },
-        {
-            "key": "fomc_2026_07",
-            "title": "FOMC rate decision",
-            "category": "macro_calendar",
-            "source": "Federal Reserve",
-            "starts_at": "2026-07-29T14:00:00-04:00",
-            "score": 70,
-            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
-        },
-        {
-            "key": "fomc_2026_09",
-            "title": "FOMC rate decision and projections",
-            "category": "macro_calendar",
-            "source": "Federal Reserve",
-            "starts_at": "2026-09-16T14:00:00-04:00",
-            "score": 72,
-            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
-        },
-        {
-            "key": "fomc_2026_10",
-            "title": "FOMC rate decision",
-            "category": "macro_calendar",
-            "source": "Federal Reserve",
-            "starts_at": "2026-10-28T14:00:00-04:00",
-            "score": 70,
-            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
-        },
-        {
-            "key": "fomc_2026_12",
-            "title": "FOMC rate decision and projections",
-            "category": "macro_calendar",
-            "source": "Federal Reserve",
-            "starts_at": "2026-12-09T14:00:00-05:00",
-            "score": 72,
-            "url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
-        },
-        {
-            "key": "bea_pce_2026_06",
-            "title": "Personal Income and Outlays / PCE inflation",
-            "category": "macro_calendar",
-            "source": "BEA",
-            "starts_at": "2026-06-25T08:30:00-04:00",
-            "score": 66,
-            "url": "https://www.bea.gov/news/schedule",
-        },
-        {
-            "key": "bea_gdp_2026_q2_advance",
-            "title": "GDP advance estimate",
-            "category": "macro_calendar",
-            "source": "BEA",
-            "starts_at": "2026-07-30T08:30:00-04:00",
-            "score": 62,
-            "url": "https://www.bea.gov/news/schedule",
-        },
-        {
-            "key": "treasury_quarterly_refunding",
-            "title": "Treasury quarterly refunding window",
-            "category": "liquidity",
-            "source": "U.S. Treasury",
-            "starts_at": "2026-07-29T08:30:00-04:00",
-            "score": 55,
-            "url": "https://home.treasury.gov/policy-issues/financing-the-government/quarterly-refunding",
-        },
-    ],
-    "ttl_minutes_by_level": {
-        "watch": 120,
-        "high": 360,
-        "extreme": 720,
-    },
-    "policies": {
-        "watch": {
-            "size_multiplier": 1.0,
-            "min_score_add": 0,
-            "min_expected_r": None,
-            "disable_timeframes": [],
-            "require_mtf_confluence": False,
-        },
-        "high": {
-            "size_multiplier": 0.5,
-            "min_score_add": 0,
-            "min_expected_r": 0.0,
-            "disable_timeframes": ["5m"],
-            "require_mtf_confluence": False,
-        },
-        "extreme": {
-            "size_multiplier": 0.25,
-            "min_score_add": 0,
-            "min_expected_r": 0.0,
-            "disable_timeframes": ["5m"],
-            "require_mtf_confluence": True,
-        },
-    },
-}
-
-DEFAULT_MACRO_RISK_STATE: dict[str, Any] = {
-    "active": False,
-    "level": "off",
-    "reason": None,
-    "confidence": 0,
-    "combined_score": 0,
-    "news_score": 0,
-    "calendar_score": 0,
-    "market_stress_score": 0,
-    "triggered_at": None,
-    "active_until": None,
-    "last_checked_at": None,
-    "summary": None,
-    "sources": [],
-    "policy": {},
-    "top_news": [],
-    "calendar": {},
-    "market_stress": {},
-    "last_news_fetch_at": None,
-    "last_calendar_fetch_at": None,
-    "cached_news_items": [],
-    "cached_calendar_events": [],
-    "last_telegram_risk_notification_at": None,
-    "last_telegram_risk_notification_level": None,
-    "market_stress_ema": None,
 }
 
 DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE: dict[str, Any] = {
@@ -374,6 +268,21 @@ def effective_paper_equity(db: Session, settings: Settings) -> float:
 def effective_live_execution_settings(db: Session, settings: Settings) -> dict:
     value = setting_value(db, "live_execution")
     return {
+        "new_live_entries_enabled": bool(value.get("new_live_entries_enabled", True)),
+        "readiness_gate_enabled": bool(value.get("readiness_gate_enabled", False)),
+        "readiness_lookback_trades": int(_float(value.get("readiness_lookback_trades"), 200.0)),
+        "readiness_recent_trades": int(_float(value.get("readiness_recent_trades"), 50.0)),
+        "readiness_min_closed_trades": int(_float(value.get("readiness_min_closed_trades"), 100.0)),
+        "readiness_min_recent_trades": int(_float(value.get("readiness_min_recent_trades"), 30.0)),
+        "readiness_min_profit_factor": _float(value.get("readiness_min_profit_factor"), 1.2),
+        "readiness_min_recent_profit_factor": _float(
+            value.get("readiness_min_recent_profit_factor"), 1.1
+        ),
+        "readiness_min_avg_net_r": _float(value.get("readiness_min_avg_net_r"), 0.05),
+        "readiness_min_recent_avg_net_r": _float(
+            value.get("readiness_min_recent_avg_net_r"), 0.02
+        ),
+        "readiness_max_drawdown_r": _float(value.get("readiness_max_drawdown_r"), 10.0),
         "min_account_value_usd": _float(
             value.get("min_account_value_usd"),
             settings.live_min_account_value_usd,
@@ -409,6 +318,16 @@ def effective_live_execution_settings(db: Session, settings: Settings) -> dict:
     }
 
 
+def effective_new_live_entries_enabled(db: Session, settings: Settings) -> bool:
+    """Entry-only live guard.
+
+    This is intentionally separate from ``enable_live_trading``: turning it off
+    must not disable reconciliation, protective orders, stops, take profits, or
+    operator-initiated reduce-only closes for positions already open.
+    """
+    return bool(effective_live_execution_settings(db, settings)["new_live_entries_enabled"])
+
+
 def effective_position_management_settings(db: Session) -> dict[str, Any]:
     value = setting_value(db, "position_management")
     return _deep_merge(DEFAULT_POSITION_MANAGEMENT_SETTINGS, value)
@@ -432,18 +351,6 @@ def effective_directional_reversal_breaker_settings(db: Session) -> dict[str, An
     return _deep_merge(DEFAULT_DIRECTIONAL_REVERSAL_BREAKER_SETTINGS, overrides)
 
 
-def effective_macro_risk_mode_settings(db: Session) -> dict[str, Any]:
-    value = setting_value(db, "risk").get("macro_risk_mode")
-    overrides = value if isinstance(value, dict) else {}
-    return _deep_merge(DEFAULT_MACRO_RISK_MODE_SETTINGS, overrides)
-
-
-def effective_macro_risk_monitor_settings(db: Session) -> dict[str, Any]:
-    value = setting_value(db, "risk").get("macro_risk_monitor")
-    overrides = value if isinstance(value, dict) else {}
-    return _deep_merge(DEFAULT_MACRO_RISK_MONITOR_SETTINGS, overrides)
-
-
 def effective_alert_min_score(db: Session, settings: Settings) -> int:
     value = setting_value(db, "alerts").get("min_score")
     if value is None:
@@ -452,6 +359,20 @@ def effective_alert_min_score(db: Session, settings: Settings) -> int:
         return int(value)
     except (TypeError, ValueError):
         return settings.min_signal_score
+
+
+def effective_telegram_notifications_enabled(db: Session) -> bool:
+    """Return the runtime kill switch for outbound Telegram notifications.
+
+    Missing settings preserve the legacy enabled behaviour; an explicit false
+    value is fail-closed and must be honoured by every worker notification path.
+    """
+    value = setting_value(db, "alerts").get("telegram_enabled")
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
 
 
 MIN_SIGNAL_EXPECTED_R_BOUNDS = (-0.5, 1.0)

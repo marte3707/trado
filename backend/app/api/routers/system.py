@@ -69,6 +69,8 @@ def health(db: Session = Depends(get_db)) -> dict:
     mode = effective_operation_mode(db, settings)
     enable_live_trading = effective_live_trading_enabled(db, settings)
     live_settings = effective_live_execution_settings(db, settings)
+    new_live_entries_enabled = bool(live_settings["new_live_entries_enabled"])
+    readiness_gate_enabled = bool(live_settings["readiness_gate_enabled"])
     checks = []
     if not settings.hyperliquid_account_address:
         checks.append("HYPERLIQUID_ACCOUNT_ADDRESS missing")
@@ -81,16 +83,25 @@ def health(db: Session = Depends(get_db)) -> dict:
         "mode": mode.value,
         "network": settings.hyperliquid_network,
         "enable_live_trading": enable_live_trading,
-        "live_trading_allowed": mode.value == "AUTO_TRADE" and enable_live_trading and not checks,
+        "new_live_entries_enabled": new_live_entries_enabled,
+        "readiness_gate_enabled": readiness_gate_enabled,
+        "live_trading_allowed": (
+            mode.value == "AUTO_TRADE"
+            and enable_live_trading
+            and new_live_entries_enabled
+            and not checks
+        ),
         "live_readiness": {
             "account_address_configured": bool(settings.hyperliquid_account_address),
             "private_key_configured": bool(settings.hyperliquid_private_key),
             "mainnet_live_enabled": bool(live_settings["enable_mainnet_live_trading"]),
+            "profitability_gate_enabled": readiness_gate_enabled,
             "checks": checks,
         },
         "worker": _worker_status(db),
         "market_data": _market_data_status(db),
         "bot": _bot_status(),
+        "watchdog": _launchd_status("watchdog"),
     }
 
 
@@ -117,6 +128,11 @@ SYSTEM_SERVICES = {
         "label": "com.trado.bot",
         "plist": FilePath.home() / "Library/LaunchAgents/com.trado.bot.plist",
         "error_log": FilePath.home() / "Library/Logs/trado-bot.err.log",
+    },
+    "watchdog": {
+        "label": "com.trado.watchdog",
+        "plist": FilePath.home() / "Library/LaunchAgents/com.trado.watchdog.plist",
+        "error_log": FilePath.home() / "Library/Logs/trado-watchdog.err.log",
     },
 }
 SYSTEM_ACTIONS = {"start", "stop", "reboot"}
@@ -357,7 +373,7 @@ def _service_cycle_diagnostic(
     elif stored_status in {"skipped", "disabled"}:
         status = "skipped"
         state = "skipped"
-    elif (
+    elif stored_status == "warn" or (
         last_failure_at is not None
         and (last_ok_at is None or last_failure_at > last_ok_at)
     ):
@@ -377,7 +393,12 @@ def _service_cycle_diagnostic(
     data = status_entry.get("data") if isinstance(status_entry.get("data"), dict) else {}
     if not data and latest_success is not None and isinstance(latest_success.data, dict):
         data = latest_success.data
-    if status in {"failed", "warn"} and latest_failure is not None and isinstance(latest_failure.data, dict):
+    if (
+        status in {"failed", "warn"}
+        and latest_failure is not None
+        and isinstance(latest_failure.data, dict)
+        and not (stored_status == "warn" and data)
+    ):
         data = latest_failure.data
 
     return {
@@ -512,7 +533,7 @@ def system_cycles(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 @router.post("/system/services/{service}/{action}")
 def system_service_action(
-    service: str = Path(..., pattern=r"^(backend|worker|marketdata|bot)$"),
+    service: str = Path(..., pattern=r"^(backend|worker|marketdata|bot|watchdog)$"),
     action: str = Path(..., pattern=r"^(start|stop|reboot)$"),
 ) -> dict:
     if service not in SYSTEM_SERVICES or action not in SYSTEM_ACTIONS:

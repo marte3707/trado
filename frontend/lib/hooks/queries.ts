@@ -7,25 +7,19 @@ import {
   type AccountEquityHistory,
   type AccountMonitor,
   type AppSettings,
-  type AutoTunerStrategyTests,
-  type AutoTunerSourceTests,
-  type AutoTunerStatus,
   type BotFunnelStats,
-  type Calibration,
-  type CalibrationHistoryEntry,
-  type CalibrationStability,
   type CoinGeckoUsage,
   type CoinMarketCapUsage,
   type DecisionLog,
-  type DiagnosticReport,
   type EquitySlopeDiagnostics,
   type ExpectedRCalibration,
+  type ExperimentOutcomesReport,
   type Health,
   type LeaderboardAlphaDashboard,
   type LiveEligibilityReport,
   type MacroCorrelation,
   type Market,
-  type MarketDashboardSnapshot,
+  type MacroDirectionStatus,
   type MarketIntelligence,
   type Order,
   type OutcomeProfile,
@@ -34,6 +28,7 @@ import {
   type PositionHistoryResponse,
   type ScoreCalibration,
   type Signal,
+  type SignalCandidateRejections,
   type SignalRejections,
   type SignalSnapshot,
   type Strategy,
@@ -172,34 +167,6 @@ export function useDecisionLogsFiltered(filters: DecisionLogFilters, opts?: Quer
   });
 }
 
-export function useCalibration(opts?: QueryOpts<Calibration>) {
-  return useQuery({
-    queryKey: qk.calibration,
-    queryFn: () => apiGet<Calibration>("/api/analytics/calibration"),
-    refetchInterval: 30_000,
-    ...opts,
-  });
-}
-
-export function useCalibrationHistory(opts?: QueryOpts<CalibrationHistoryEntry[]>) {
-  return useQuery({
-    queryKey: qk.calibrationHistory,
-    queryFn: () => apiGet<CalibrationHistoryEntry[]>("/api/analytics/calibration/history"),
-    refetchInterval: 60_000,
-    ...opts,
-  });
-}
-
-export function useCalibrationStability(opts?: QueryOpts<CalibrationStability | null>) {
-  return useQuery({
-    queryKey: qk.calibrationStability,
-    queryFn: () =>
-      apiGet<CalibrationStability>("/api/analytics/calibration/stability").catch(() => null),
-    refetchInterval: 60_000,
-    ...opts,
-  });
-}
-
 export function useOutcomeProfile(
   lookback = 500,
   mode: "paper" | "live" | null = null,
@@ -217,29 +184,18 @@ export function useOutcomeProfile(
   });
 }
 
-export function useTunerStatus(opts?: QueryOpts<AutoTunerStatus | null>) {
+export function useExperimentOutcomes(
+  version: string | null = null,
+  opts?: QueryOpts<ExperimentOutcomesReport | null>,
+) {
+  const versionParam = version ? `&version=${encodeURIComponent(version)}` : "";
   return useQuery({
-    queryKey: qk.tunerStatus,
-    queryFn: () => apiGet<AutoTunerStatus>("/api/auto-tuner/status").catch(() => null),
-    refetchInterval: 10_000,
-    ...opts,
-  });
-}
-
-export function useTunerSourceTests(opts?: QueryOpts<AutoTunerSourceTests | null>) {
-  return useQuery({
-    queryKey: qk.tunerSourceTests,
-    queryFn: () => apiGet<AutoTunerSourceTests>("/api/auto-tuner/source-tests").catch(() => null),
-    refetchInterval: 15_000,
-    ...opts,
-  });
-}
-
-export function useTunerStrategyTests(opts?: QueryOpts<AutoTunerStrategyTests | null>) {
-  return useQuery({
-    queryKey: qk.tunerStrategyTests,
-    queryFn: () => apiGet<AutoTunerStrategyTests>("/api/auto-tuner/strategy-tests").catch(() => null),
-    refetchInterval: 15_000,
+    queryKey: qk.experimentOutcomes(version),
+    queryFn: () =>
+      apiGet<ExperimentOutcomesReport>(
+        `/api/analytics/experiments?recent=50${versionParam}`,
+      ).catch(() => null),
+    refetchInterval: 30_000,
     ...opts,
   });
 }
@@ -275,6 +231,30 @@ export function useSignalRejections(limit = 50, opts?: QueryOpts<SignalRejection
   });
 }
 
+export function useSignalCandidateRejections(
+  limit = 30,
+  opts?: QueryOpts<SignalCandidateRejections>,
+) {
+  return useQuery({
+    queryKey: qk.signalCandidateRejections(limit),
+    queryFn: () =>
+      apiGet<SignalCandidateRejections>(
+        `/api/analytics/signal-candidate-rejections?limit=${limit}`,
+      ).catch(() => ({ total: 0, by_reason: {}, recent: [] }) as SignalCandidateRejections),
+    refetchInterval: 30_000,
+    ...opts,
+  });
+}
+
+export function useMacroDirection(opts?: QueryOpts<MacroDirectionStatus | null>) {
+  return useQuery({
+    queryKey: qk.macroDirection,
+    queryFn: () => apiGet<MacroDirectionStatus>("/api/analytics/macro-direction").catch(() => null),
+    refetchInterval: 30_000,
+    ...opts,
+  });
+}
+
 export function useMarketIntelligence(opts?: QueryOpts<MarketIntelligence>) {
   return useQuery({
     queryKey: qk.marketIntelligence,
@@ -283,16 +263,6 @@ export function useMarketIntelligence(opts?: QueryOpts<MarketIntelligence>) {
         () => ({ fear_greed: null, altcoin_season: null, global_metrics: null }) as MarketIntelligence,
       ),
     refetchInterval: 60_000,
-    ...opts,
-  });
-}
-
-export function useMarketDashboardSnapshot(opts?: QueryOpts<MarketDashboardSnapshot | null>) {
-  return useQuery({
-    queryKey: qk.marketDashboard,
-    queryFn: () =>
-      apiGet<MarketDashboardSnapshot>("/api/market-intelligence/dashboard").catch(() => null),
-    refetchInterval: 5 * 60_000,
     ...opts,
   });
 }
@@ -357,15 +327,6 @@ export function useLiveEligibility(opts?: QueryOpts<LiveEligibilityReport | null
     queryKey: qk.liveEligibility,
     queryFn: () => apiGet<LiveEligibilityReport>("/api/analytics/live-eligibility").catch(() => null),
     refetchInterval: 5 * 60_000,
-    ...opts,
-  });
-}
-
-export function useDiagnostics(opts?: QueryOpts<DiagnosticReport | null>) {
-  return useQuery({
-    queryKey: qk.diagnostics,
-    queryFn: () => apiGet<DiagnosticReport>("/api/analytics/diagnostics").catch(() => null),
-    refetchInterval: 60_000,
     ...opts,
   });
 }

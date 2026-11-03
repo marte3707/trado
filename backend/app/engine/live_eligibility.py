@@ -1,8 +1,8 @@
 """Paper-first live eligibility report.
 
-This module is read-only: it does not gate live execution. It summarizes paper
-trades in R-multiple after simulated round-trip taker fees, so live promotion can
-be evaluated from the larger paper sample instead of the smaller live sample.
+It summarizes paper trades in R-multiple after simulated round-trip taker fees.
+The report is read-only; ``evaluate_live_readiness_gate`` reuses the same metrics
+as an explicit, opt-in live-entry guard.
 """
 from __future__ import annotations
 
@@ -16,11 +16,89 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.enums import OrderMode
 from app.core.runtime_settings import setting_value
-from app.db.models import Position, Signal
+from app.db.models import ExperimentOutcome, Position, Signal
 from app.engine.edge_profile import direction_family, score_bucket
 from app.engine.macro_direction import btc_macro_direction, suspended_penalty_family
 
 ELIGIBILITY_CLASSES = ("eligible", "watch", "quarantine", "insufficient")
+
+
+def evaluate_live_readiness_gate(
+    db: Session,
+    *,
+    taker_fee_rate: float,
+) -> dict[str, Any]:
+    live = setting_value(db, "live_execution")
+    enabled = bool(live.get("readiness_gate_enabled", False))
+    if not enabled:
+        return {"enabled": False, "ready": True, "checks": [], "metrics": {}}
+
+    def number(key: str, default: float) -> float:
+        try:
+            return float(live.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    lookback = max(20, int(number("readiness_lookback_trades", 200)))
+    recent_window = max(10, int(number("readiness_recent_trades", 50)))
+    min_closed = max(10, int(number("readiness_min_closed_trades", 100)))
+    min_recent = max(5, int(number("readiness_min_recent_trades", 30)))
+    min_pf = number("readiness_min_profit_factor", 1.2)
+    min_recent_pf = number("readiness_min_recent_profit_factor", 1.1)
+    min_avg_r = number("readiness_min_avg_net_r", 0.05)
+    min_recent_avg_r = number("readiness_min_recent_avg_net_r", 0.02)
+    max_drawdown_r = max(0.0, number("readiness_max_drawdown_r", 10.0))
+    report = build_live_eligibility_report(
+        db,
+        lookback=lookback,
+        recent_window=recent_window,
+        taker_fee_rate=taker_fee_rate,
+        min_trades=min_closed,
+        min_recent_trades=min_recent,
+        min_net_profit_factor=min_pf,
+        min_recent_net_profit_factor=min_recent_pf,
+        min_avg_net_r=min_avg_r,
+        min_recent_avg_net_r=min_recent_avg_r,
+    )
+    full = report["overall"]["full"]
+    recent = report["overall"]["recent"]
+    train = report["overall"].get("train")
+    test = report["overall"].get("test")
+    checks: list[str] = []
+    summary = report.get("summary", {})
+    if isinstance(summary, dict) and summary.get("mixed_configurations"):
+        checks.append("paper outcomes mix different configuration hashes")
+    if isinstance(summary, dict) and summary.get("mixed_forward_gate_phases"):
+        checks.append("paper outcomes mix different forward gate phases")
+    if int(full["trades"]) < min_closed:
+        checks.append(f"paper sample {full['trades']} < {min_closed}")
+    if int(recent["trades"]) < min_recent:
+        checks.append(f"recent paper sample {recent['trades']} < {min_recent}")
+    if _pf_for_decision(full) < min_pf:
+        checks.append(f"net PF {_pf_for_decision(full):.3f} < {min_pf:.3f}")
+    if _pf_for_decision(recent) < min_recent_pf:
+        checks.append(f"recent net PF {_pf_for_decision(recent):.3f} < {min_recent_pf:.3f}")
+    if _avg_for_decision(full) < min_avg_r:
+        checks.append(f"avg net R {_avg_for_decision(full):.3f} < {min_avg_r:.3f}")
+    if _avg_for_decision(recent) < min_recent_avg_r:
+        checks.append(
+            f"recent avg net R {_avg_for_decision(recent):.3f} < {min_recent_avg_r:.3f}"
+        )
+    if isinstance(train, dict) and isinstance(test, dict):
+        if _pf_for_decision(train) < min_pf or _avg_for_decision(train) < min_avg_r:
+            checks.append("train holdout does not confirm net edge")
+        if _pf_for_decision(test) < min_recent_pf or _avg_for_decision(test) < min_recent_avg_r:
+            checks.append("recent holdout does not confirm net edge")
+    if float(full["max_drawdown_r"]) > max_drawdown_r:
+        checks.append(
+            f"max drawdown {float(full['max_drawdown_r']):.3f}R > {max_drawdown_r:.3f}R"
+        )
+    return {
+        "enabled": True,
+        "ready": not checks,
+        "checks": checks,
+        "metrics": {"full": full, "recent": recent},
+    }
 
 
 @dataclass(frozen=True)
@@ -47,15 +125,31 @@ def build_live_eligibility_report(
     min_recent_net_profit_factor: float = 1.0,
     min_avg_net_r: float = 0.02,
     min_recent_avg_net_r: float = 0.0,
+    configuration_hash: str | None = None,
+    experiment_version: str | None = None,
 ) -> dict[str, Any]:
-    positions = (
+    experiment = setting_value(db, "research_experiment")
+    active_experiment_version = str(
+        experiment.get("active_version") or "baseline-frozen-v1"
+    )
+    selected_experiment_version = experiment_version or active_experiment_version
+    experiment_assignment = str(experiment.get("assignment") or "champion")
+    query = (
         db.query(Position)
+        .join(ExperimentOutcome, ExperimentOutcome.position_id == Position.id)
         .options(joinedload(Position.market))
         .filter(
             Position.mode == OrderMode.PAPER.value,
             Position.status == "closed",
             Position.realized_pnl.is_not(None),
+            ExperimentOutcome.experiment_version == selected_experiment_version,
+            ExperimentOutcome.assignment == experiment_assignment,
         )
+    )
+    if configuration_hash:
+        query = query.filter(ExperimentOutcome.configuration_hash == configuration_hash)
+    positions = (
+        query
         .order_by(Position.closed_at.desc())
         .limit(lookback)
         .all()
@@ -76,7 +170,7 @@ def build_live_eligibility_report(
         **macro,
         "suspended_penalty_family": suspended_penalty_family(macro, risk_settings),
     }
-    return compute_live_eligibility_report(
+    report = compute_live_eligibility_report(
         positions,
         signals_by_id,
         lookback=lookback,
@@ -91,6 +185,93 @@ def build_live_eligibility_report(
         macro_context=macro_context,
         risk_settings=risk_settings,
     )
+    report["filters"].update(
+        {
+            "sample_source": "experiment_outcomes",
+            "experiment_version": selected_experiment_version,
+            "active_experiment_version": active_experiment_version,
+            "experiment_assignment": experiment_assignment,
+            "configuration_hash": configuration_hash,
+        }
+    )
+    configuration_query = db.query(ExperimentOutcome.configuration_hash).filter(
+        ExperimentOutcome.experiment_version == selected_experiment_version,
+        ExperimentOutcome.assignment == experiment_assignment,
+        ExperimentOutcome.net_r.is_not(None),
+    )
+    if configuration_hash:
+        configuration_query = configuration_query.filter(
+            ExperimentOutcome.configuration_hash == configuration_hash
+        )
+    hashes = sorted({str(row[0]) for row in configuration_query.distinct().all() if row[0]})
+    phases = _forward_gate_phase_keys(positions, signals_by_id)
+    report["summary"].update(
+        {
+            "configuration_hashes": hashes,
+            "mixed_configurations": len(hashes) > 1,
+            "forward_gate_phases": sorted(phases),
+            "mixed_forward_gate_phases": len(phases) > 1,
+        }
+    )
+    if len(hashes) > 1:
+        _mark_mixed_configuration_cohorts(report)
+    if len(phases) > 1:
+        _mark_mixed_configuration_cohorts(
+            report,
+            reason="risultati con gate forward in fasi diverse: separare le coorti prima di promuovere",
+        )
+    report["note"] = (
+        "Il readiness gate usa esclusivamente trade paper attribuiti alla versione "
+        "sperimentale attiva. Lo storico precedente resta disponibile per audit, "
+        "ma non puo' promuovere nuove entry live."
+    )
+    return report
+
+
+def _forward_gate_phase_keys(
+    positions: list[Position],
+    signals_by_id: dict[int, Signal],
+) -> set[str]:
+    """Identify changes to effective gate behavior within one forward version."""
+    phases: set[str] = set()
+    for position in positions:
+        signal_id = _source_signal_id(position)
+        signal = signals_by_id.get(signal_id) if signal_id is not None else None
+        breakdown = signal.strategy_breakdown if signal is not None else None
+        gate = breakdown.get("_forward_gate") if isinstance(breakdown, dict) else None
+        if not isinstance(gate, dict):
+            phases.add("unknown")
+            continue
+        expected = "shadow" if bool(gate.get("expected_r_shadow_only")) else "active"
+        pre_tp1 = "shadow" if bool(gate.get("pre_tp1_shadow_only")) else "active"
+        phases.add(f"expected_r:{expected}|pre_tp1:{pre_tp1}")
+    return phases
+
+
+def _mark_mixed_configuration_cohorts(
+    report: dict[str, Any],
+    *,
+    reason: str = "risultati di configurazioni diverse: selezionare un hash singolo prima di promuovere",
+) -> None:
+    """Never make an eligibility claim from outcomes of different configs."""
+
+    demoted = 0
+    for cohort_group in ("direction_timeframes", "strategies", "score_buckets"):
+        cohorts = report.get(cohort_group)
+        if not isinstance(cohorts, list):
+            continue
+        for cohort in cohorts:
+            if not isinstance(cohort, dict) or cohort.get("classification") != "eligible":
+                continue
+            cohort["classification"] = "watch"
+            cohort["recommended_action"] = _recommended_action("watch")
+            cohort["reasons"] = [reason]
+            demoted += 1
+    if demoted:
+        summary = report.get("summary")
+        if isinstance(summary, dict):
+            summary["eligible"] = max(0, int(summary.get("eligible", 0)) - demoted)
+            summary["watch"] = int(summary.get("watch", 0)) + demoted
 
 
 def compute_live_eligibility_report(
@@ -210,6 +391,7 @@ def compute_live_eligibility_report(
         )
     ]
     all_cohorts = direction_timeframes + strategies + score_buckets
+    overall_split = _split_train_test(trades, min_recent_trades)
     setting_conflicts = _setting_conflicts(all_cohorts)
     summary = dict.fromkeys(ELIGIBILITY_CLASSES, 0)
     for cohort in all_cohorts:
@@ -235,6 +417,8 @@ def compute_live_eligibility_report(
         "overall": {
             "full": _stats_payload(trades),
             "recent": _stats_payload(trades[:recent_window]),
+            "train": _stats_payload(overall_split[0]) if overall_split else None,
+            "test": _stats_payload(overall_split[1]) if overall_split else None,
         },
         "direction_timeframes": direction_timeframes,
         "strategies": strategies,
@@ -371,6 +555,13 @@ def _stats_payload(trades: list[EligibilityTrade]) -> dict[str, Any]:
     fee_r = sum(trade.fee_r for trade in trades)
     net_r = sum(values)
     trade_count = len(trades)
+    equity = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for value in reversed(values):
+        equity += value
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
     return {
         "trades": trade_count,
         "wins": len(wins),
@@ -385,6 +576,7 @@ def _stats_payload(trades: list[EligibilityTrade]) -> dict[str, Any]:
         "avg_net_r": (net_r / trade_count) if trade_count else None,
         "median_net_r": median(values) if values else None,
         "avg_fee_r": (fee_r / trade_count) if trade_count else None,
+        "max_drawdown_r": max_drawdown,
     }
 
 
@@ -428,6 +620,7 @@ def _cohort_payload(
     classification, reasons = _classify(
         full_stats,
         recent_stats,
+        train_stats,
         test_stats,
         thresholds=thresholds,
     )
@@ -597,6 +790,7 @@ def _positive_recent_or_full(cohort: dict[str, Any]) -> bool:
 def _classify(
     full: dict[str, Any],
     recent: dict[str, Any],
+    train: dict[str, Any] | None,
     test: dict[str, Any] | None,
     *,
     thresholds: dict[str, Any],
@@ -623,9 +817,21 @@ def _classify(
         and full_avg >= float(thresholds["min_avg_net_r"])
         and recent_avg >= float(thresholds["min_recent_avg_net_r"])
     ):
-        if test is not None and int(test["trades"]) >= min_recent_trades:
+        if (
+            train is not None
+            and test is not None
+            and int(train["trades"]) >= min_recent_trades
+            and int(test["trades"]) >= min_recent_trades
+        ):
+            train_pf = _pf_for_decision(train)
+            train_avg = _avg_for_decision(train)
             test_pf = _pf_for_decision(test)
             test_avg = _avg_for_decision(test)
+            if (
+                train_pf < float(thresholds["min_net_profit_factor"])
+                or train_avg < float(thresholds["min_avg_net_r"])
+            ):
+                return "watch", ["holdout train non conferma ancora l'edge"]
             if test_pf < float(thresholds["min_recent_net_profit_factor"]) or test_avg < 0:
                 return "watch", ["holdout recente non conferma ancora l'edge"]
         return "eligible", ["edge netto positivo full + recente"]

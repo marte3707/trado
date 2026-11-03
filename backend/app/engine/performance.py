@@ -6,8 +6,45 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session, joinedload
 
-from app.core.enums import OrderMode
+from app.core.enums import Direction, OrderMode
 from app.db.models import Position, Signal
+
+
+def aligned_strategy_names(
+    direction: Direction | str | None,
+    breakdown: object,
+) -> set[str]:
+    """Return strategy votes that helped the signal's final direction only."""
+    signal_direction = str(getattr(direction, "value", direction) or "")
+    if signal_direction in {"LONG", "STRONG_LONG"}:
+        family = "LONG"
+    elif signal_direction in {"SHORT", "STRONG_SHORT"}:
+        family = "SHORT"
+    else:
+        return set()
+    if not isinstance(breakdown, dict):
+        return set()
+
+    names: set[str] = set()
+    for name, payload in breakdown.items():
+        if str(name).startswith("_") or not isinstance(payload, dict):
+            continue
+        vote_direction = str(
+            getattr(payload.get("direction"), "value", payload.get("direction")) or ""
+        )
+        if vote_direction in {"LONG", "STRONG_LONG"}:
+            vote_family = "LONG"
+        elif vote_direction in {"SHORT", "STRONG_SHORT"}:
+            vote_family = "SHORT"
+        else:
+            continue
+        try:
+            contribution = float(payload.get("contribution", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if vote_family == family and contribution > 0:
+            names.add(str(name))
+    return names
 
 
 def _wilson_bounds(wins: int, trades: int, z: float = 1.96) -> tuple[float, float]:
@@ -39,7 +76,7 @@ class SignalPerformanceAnalyzer:
         # SignalEngine all'inizio di ogni worker tick). Gli aggregati *global* e
         # *per-timeframe* sono identici per tutti i market dello stesso timeframe
         # nello stesso tick: senza cache venivano ricalcolati (3 query da 500
-        # posizioni) per ogni candidato. Le istanze usa-e-getta (API, calibration)
+        # posizioni) per ogni candidato. Le istanze usa-e-getta delle API
         # non chiamano begin_cycle → `_cycle_active=False` → comportamento invariato.
         self._cycle_active: bool = False
         self._cycle_global_stats: dict[str, PerformanceStats] | None = None
@@ -156,9 +193,9 @@ class SignalPerformanceAnalyzer:
     ) -> dict[str, list[Position]]:
         """Posizioni chiuse raggruppate per strategia che ha contribuito al segnale.
 
-        Why expose this: la holdout validation in `AutoCalibrationEngine` ha bisogno
-        delle posizioni *individuali* per fare lo split train/test temporale. Ricavare
-        gli stats da `summarize_positions(...)` mantiene la composizione semplice.
+        La diagnostica holdout ha bisogno delle posizioni *individuali* per fare
+        lo split train/test temporale. Ricavare gli stats da
+        `summarize_positions(...)` mantiene la composizione semplice.
         Ritorna le posizioni nello stesso ordine di `closed_paper_positions` (closed_at desc).
         """
         positions = self.closed_paper_positions(db, timeframe, market_id, limit)
@@ -185,11 +222,10 @@ class SignalPerformanceAnalyzer:
                 signal = None
             if signal is None:
                 continue
-            for strategy_name, breakdown in (signal.strategy_breakdown or {}).items():
-                if strategy_name.startswith("_") or not isinstance(breakdown, dict):
-                    continue
-                if breakdown.get("direction") == "NEUTRAL" or breakdown.get("contribution", 0) <= 0:
-                    continue
+            for strategy_name in aligned_strategy_names(
+                signal.direction,
+                signal.strategy_breakdown,
+            ):
                 by_strategy.setdefault(strategy_name, []).append(position)
         return by_strategy
 
@@ -385,11 +421,9 @@ class SignalPerformanceAnalyzer:
     ) -> tuple[PerformanceStats, PerformanceStats] | None:
         """Split temporale train/test per holdout validation.
 
-        Why: la calibration usa le stesse posizioni che ha contribuito a generare per
-        decidere i factor futuri (look-ahead bias). Lo split temporale crea un naive
-        out-of-sample check: la più vecchia frazione `train_ratio` è il "training",
-        la più recente è il "test". Se la decisione regge su entrambi → segnale è robusto.
-        Se diverge → probabile overfitting al rumore.
+        Lo split temporale crea un semplice controllo out-of-sample: la più
+        vecchia frazione `train_ratio` è il training, la più recente è il test.
+        La divergenza resta osservativa e segnala possibile overfitting.
 
         Le posizioni in input sono attese in ordine *desc* per closed_at (come ritorna
         `closed_paper_positions`). Ritorna `None` se non ci sono abbastanza campioni
@@ -501,9 +535,7 @@ class SignalPerformanceAnalyzer:
                 strategy_stats = global_stats.get(strategy_name)
             if strategy_stats is None or strategy_stats.trades < min_trades:
                 continue
-            # Wilson bounds del WR per ridurre il rumore campionario; le stesse soglie
-            # sono usate in AutoCalibrationEngine._strategy_factor → coerenza tra i due
-            # adjuster (era una fonte di inconsistenza segnalata in audit).
+            # Wilson bounds del WR per ridurre il rumore campionario.
             wr_lb, wr_ub = _wilson_bounds(strategy_stats.wins, strategy_stats.trades)
             factor = 1.0
             if wr_ub < 0.40:

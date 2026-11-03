@@ -2,8 +2,8 @@
 
 Questo folder contiene gli `.plist` di macOS `launchd` che fanno partire
 automaticamente backend (`uvicorn`), market-data WebSocket
-(`python -m app.market_data.main`) e worker (`python -m app.worker.main`) al
-login dell'utente, e li rilanciano in caso di crash.
+(`python -m app.market_data.main`), worker (`python -m app.worker.main`) e un
+watchdog di health al login dell'utente.
 
 L'avvio e' mediato da uno script wrapper che:
 
@@ -26,6 +26,12 @@ L'avvio e' mediato da uno script wrapper che:
   `ThrottleInterval` minimo fra tentativi).
 - **Crash**: rilancio automatico. `SuccessfulExit=false` evita di rilanciare se
   il processo termina con `exit(0)` (es. graceful shutdown via SIGTERM).
+- **Processo vivo ma unhealthy**: il watchdog interroga `/api/health` ogni 30
+  secondi. Dopo tre failure consecutive riavvia solo il servizio interessato;
+  rileva anche quattro stati unhealthy in una finestra di 10 minuti, anche
+  alternati a recuperi brevi. Un cooldown di 5 minuti impedisce restart loop.
+- **Backend irraggiungibile**: viene riavviato solo il backend; worker e
+  market-data restano in stato sconosciuto per evitare restart a cascata.
 
 ## Installazione
 
@@ -45,6 +51,7 @@ I servizi partono immediatamente. Verifica:
 launchctl print gui/$(id -u)/com.trado.backend | head -20
 launchctl print gui/$(id -u)/com.trado.marketdata | head -20
 launchctl print gui/$(id -u)/com.trado.worker | head -20
+launchctl print gui/$(id -u)/com.trado.watchdog | head -20
 ```
 
 Cerca le righe `state = running` e `last exit code = 0`.
@@ -75,6 +82,7 @@ I servizi scrivono su:
 - `~/Library/Logs/trado-backend.out.log` / `.err.log`
 - `~/Library/Logs/trado-marketdata.out.log` / `.err.log`
 - `~/Library/Logs/trado-worker.out.log`  / `.err.log`
+- `~/Library/Logs/trado-watchdog.out.log` / `.err.log`
 
 Per seguire in real time:
 
@@ -82,6 +90,7 @@ Per seguire in real time:
 tail -f ~/Library/Logs/trado-backend.err.log
 tail -f ~/Library/Logs/trado-marketdata.err.log
 tail -f ~/Library/Logs/trado-worker.err.log
+tail -f ~/Library/Logs/trado-watchdog.err.log
 ```
 
 (L'app usa `structlog`; molti messaggi finiscono su stderr, da lì
@@ -93,8 +102,11 @@ Quando vuoi sviluppare con `uvicorn --reload`:
 
 ```bash
 launchctl bootout gui/$(id -u)/com.trado.backend
+# sospende l'auto-recovery finche' il file esiste
+touch .local/watchdog.pause
 # ora lancia uvicorn a mano con --reload
 # quando hai finito:
+rm .local/watchdog.pause
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.trado.backend.plist
 ```
 
@@ -103,14 +115,14 @@ il backend.
 
 ## Caratteristiche delle plist
 
-| Chiave             | Backend           | Market data           | Worker            |
-|--------------------|-------------------|-----------------------|-------------------|
-| Label              | com.trado.backend | com.trado.marketdata  | com.trado.worker  |
-| RunAtLoad          | true              | true                  | true              |
-| KeepAlive.Crashed  | true              | true                  | true              |
-| ThrottleInterval   | 10 s              | 15 s                  | 15 s              |
-| ProcessType        | Interactive       | Background            | Background        |
-| WorkingDirectory   | `backend/`        | `backend/`            | `backend/`        |
+| Chiave             | Backend           | Market data           | Worker            | Watchdog           |
+|--------------------|-------------------|-----------------------|-------------------|--------------------|
+| Label              | com.trado.backend | com.trado.marketdata  | com.trado.worker  | com.trado.watchdog |
+| RunAtLoad          | true              | true                  | true              | true               |
+| KeepAlive.Crashed  | true              | true                  | true              | true               |
+| ThrottleInterval   | 10 s              | 15 s                  | 15 s              | 15 s               |
+| ProcessType        | Interactive       | Background            | Background        | Background         |
+| WorkingDirectory   | `backend/`        | `backend/`            | `backend/`        | `backend/`         |
 
 `Interactive` per il backend evita aggressivo throttling I/O che macOS
 applicherebbe ai `Background`; il worker invece è giustamente Background

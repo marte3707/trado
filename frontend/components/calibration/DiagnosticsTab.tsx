@@ -15,13 +15,15 @@ import {
   useEquitySlope,
   useExpectedRCalibration,
   useLiveEligibility,
+  useMacroDirection,
+  useSignalCandidateRejections,
+  useStrategies,
   useSystemCycles,
   useStrategyEdge,
 } from "@/lib/hooks/queries";
 import type {
-  Calibration,
-  CalibrationHistoryEntry,
   CalibrationStats,
+  AppSettings,
   ExpectedRBucket,
   ExpectedRCalibration,
   LiveEligibilityClass,
@@ -29,64 +31,26 @@ import type {
   LiveEligibilityReport,
   OutcomeProfile,
   Signal,
+  SignalCandidateRejectionSample,
   SignalRejections,
   StrategyEdgeCell,
   StrategyEdgeReport,
   StrategyEdgeStrategy,
   SystemCycleService,
+  MacroDirectionStatus,
   WorkerCycle,
 } from "@/lib/api";
 
 interface Props {
-  calibration: Calibration;
-  history: CalibrationHistoryEntry[];
   signals: Signal[];
   rejections: SignalRejections;
   workerCycles: WorkerCycle[];
+  settings: AppSettings;
 }
 
 function pct(value: number | null | undefined) {
   if (value == null || !Number.isFinite(value)) return "—";
   return `${(value * 100).toFixed(1)}%`;
-}
-
-function eventTone(eventType: string): "success" | "danger" | "warn" | "info" {
-  if (eventType.includes("applied")) return "success";
-  if (eventType.includes("failed")) return "danger";
-  if (eventType.includes("skipped")) return "warn";
-  return "info";
-}
-
-const TONE_BG: Record<string, string> = {
-  success: "border-success/40 bg-success/10 text-success",
-  danger: "border-danger/40 bg-danger/10 text-danger",
-  warn: "border-warn/40 bg-warn/10 text-warn",
-  info: "border-info/40 bg-info/10 text-info",
-};
-
-const EDGE_CHANGE_KEYS = new Set([
-  "directional_score_adjustments",
-  "score_bucket_adjustments",
-  "market_score_adjustments",
-  "timeframe_score_adjustments",
-]);
-
-function computeLiveZeroCycles(cycles: WorkerCycle[]): number {
-  let streak = 0;
-  for (const c of cycles) {
-    if (c.event_type === "worker_cycle_failed") {
-      streak++;
-      continue;
-    }
-    const activeTf = c.data.active_timeframes;
-    if (Array.isArray(activeTf) && activeTf.length === 0) continue;
-    if ((c.data.generated ?? 0) === 0) {
-      streak++;
-    } else {
-      break;
-    }
-  }
-  return streak;
 }
 
 function weakestRows(groups: Record<string, CalibrationStats> | undefined, limit = 5) {
@@ -101,11 +65,10 @@ function weakestRows(groups: Record<string, CalibrationStats> | undefined, limit
 }
 
 export function DiagnosticsTab({
-  calibration,
-  history,
   signals,
   rejections,
   workerCycles,
+  settings,
 }: Props) {
   const [outcomeMode, setOutcomeMode] = useState<"paper" | "live" | null>("paper");
   const { data: outcomeProfile } = useOutcomeProfile(500, outcomeMode);
@@ -113,25 +76,22 @@ export function DiagnosticsTab({
   const { data: strategyEdge } = useStrategyEdge();
   const { data: liveEligibility } = useLiveEligibility();
   const { data: systemCycles } = useSystemCycles();
-  const overall = calibration.overall;
+  const { data: macroDirection } = useMacroDirection();
+  const { data: strategies = [] } = useStrategies();
+  const overall = outcomeProfile?.overall;
   const winRate = overall?.win_rate ?? null;
   const profitFactor = overall?.profit_factor ?? null;
   const realizedPnl = overall?.realized_pnl ?? null;
 
-  const recentHistory = useMemo(() => history.slice(0, 8), [history]);
   const recentCycles = useMemo(() => workerCycles.slice(0, 5), [workerCycles]);
   const lastSignal = signals[0] ?? null;
-  const edgeChanges = useMemo(
-    () => calibration.changes.filter((change) => EDGE_CHANGE_KEYS.has(change.key)),
-    [calibration.changes],
-  );
 
   return (
     <div className="space-y-4">
       {/* Top metrics */}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <MetricCard
-          label="Calibration win rate"
+          label="Outcome win rate"
           value={pct(winRate)}
           tone={winRate == null ? "muted" : winRate >= 0.55 ? "success" : winRate >= 0.45 ? "muted" : "danger"}
           hint={`${overall?.trades ?? 0} trade considerati`}
@@ -166,9 +126,10 @@ export function DiagnosticsTab({
         <RejectionReasonsList rejections={rejections} />
       </div>
 
+      <SignalGenerationPanel settings={settings} macroDirection={macroDirection} enabledStrategies={strategies.filter((strategy) => strategy.enabled).length} totalStrategies={strategies.length} />
+
       <OutcomeProfilePanel
         profile={outcomeProfile}
-        edgeChanges={edgeChanges}
         mode={outcomeMode}
         onModeChange={setOutcomeMode}
       />
@@ -183,61 +144,9 @@ export function DiagnosticsTab({
 
       <SkipReasonsPanel workerCycles={workerCycles} />
 
-      {/* Calibration history + worker cycles */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        {/* Calibration history */}
-        <Card className="flex flex-col p-0 overflow-hidden">
-          <div className="border-b border-border px-6 py-4">
-            <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
-              Calibration history
-            </div>
-            <div className="mt-0.5 text-xs text-fg-3">
-              Ultimi cicli auto-calibration (applied / skipped / failed)
-            </div>
-          </div>
-          <ScrollArea className="flex-1">
-            {recentHistory.length === 0 ? (
-              <div className="grid h-24 place-items-center text-xs text-fg-3">
-                Nessuna calibrazione registrata.
-              </div>
-            ) : (
-              <ul className="divide-y divide-border">
-                {recentHistory.map((entry) => {
-                  const tone = eventTone(entry.event_type);
-                  const label = entry.event_type
-                    .replace("auto_calibration_", "")
-                    .replace(/_/g, " ");
-                  return (
-                    <li key={entry.id} className="flex flex-col gap-1 px-6 py-3">
-                      <div className="flex items-center justify-between gap-2">
-                        <Badge
-                          variant="outline"
-                          className={cn("font-mono uppercase", TONE_BG[tone])}
-                        >
-                          {label}
-                        </Badge>
-                        <span className="font-mono text-[10px] text-fg-3">
-                          {fmt.relTime(entry.timestamp)}
-                        </span>
-                      </div>
-                      {entry.reason && (
-                        <div className="text-xs text-fg-2">{entry.reason}</div>
-                      )}
-                      {entry.changes.length > 0 && (
-                        <div className="text-[11px] text-fg-3">
-                          {entry.changes.length} change applicat{entry.changes.length === 1 ? "o" : "i"}
-                        </div>
-                      )}
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-          </ScrollArea>
-        </Card>
+      <CandidateRejectionSamplesPanel />
 
-        {/* Worker cycles */}
-        <Card className="flex flex-col p-0 overflow-hidden">
+      <Card className="flex flex-col overflow-hidden p-0">
           <div className="flex items-center justify-between border-b border-border px-6 py-4">
             <div>
               <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
@@ -308,10 +217,174 @@ export function DiagnosticsTab({
               </ul>
             )}
           </ScrollArea>
-        </Card>
-      </div>
+      </Card>
     </div>
   );
+}
+
+function CandidateRejectionSamplesPanel() {
+  const { data } = useSignalCandidateRejections(30);
+  const samples = data?.recent ?? [];
+
+  return (
+    <Card className="p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">
+            Candidate score samples
+          </div>
+          <div className="mt-0.5 text-xs text-fg-3">
+            Campione dei candidati respinti: consenso reale e confronto shadow, senza modificare i gate.
+          </div>
+        </div>
+        <Badge variant="outline" className="font-mono">
+          {data?.total ?? 0} sample
+        </Badge>
+      </div>
+      {samples.length === 0 ? (
+        <div className="mt-4 rounded border border-border px-3 py-2 text-xs text-fg-3">
+          I campioni compariranno ai prossimi rifiuti per score. Il shadow è solo diagnostico.
+        </div>
+      ) : (
+        <div className="mt-4 space-y-2">
+          {samples.map((sample) => <CandidateRejectionRow key={sample.id} sample={sample} />)}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function CandidateRejectionRow({ sample }: { sample: SignalCandidateRejectionSample }) {
+  const shadow = sample.participation_shadow;
+  const pipeline = sample.threshold_pipeline;
+  const components = pipeline
+    ? Object.entries(pipeline.edge_components).filter(([, value]) => value > 0)
+    : [];
+  return (
+    <div className="grid gap-2 rounded border border-border px-3 py-2.5 sm:grid-cols-[1fr_auto] sm:items-center">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-mono text-xs text-fg">{sample.market} · {sample.timeframe}</span>
+          <Badge variant="outline" className="font-mono text-[10px]">{sample.reason}</Badge>
+          <span className="font-mono text-[10px] text-fg-3">{fmt.relTime(sample.timestamp)}</span>
+        </div>
+        <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-fg-3">
+          <span>score {sample.score}/{sample.effective_min_score}</span>
+          {pipeline && <span>base {pipeline.base_min_score} + edge {pipeline.edge_total} → {pipeline.final_min_score}</span>}
+          <span>vote {(sample.voting_ratio * 100).toFixed(0)}% ({sample.voting_weight}/{sample.all_weight})</span>
+          {sample.neutralized_strategies.length > 0 && <span>neutralizzate: {sample.neutralized_strategies.join(", ")}</span>}
+          {components.length > 0 && <span>componenti: {components.map(([key, value]) => `${key} +${value}`).join(", ")}</span>}
+        </div>
+      </div>
+      {shadow && (
+        <Badge
+          variant="outline"
+          className={cn(
+            "justify-self-start font-mono text-[10px] sm:justify-self-end",
+            shadow.passes_score_gate ? "border-warn/40 bg-warn/10 text-warn" : "border-border text-fg-3",
+          )}
+        >
+          shadow {(shadow.ratio * 100).toFixed(0)}%: {shadow.score}/{sample.effective_min_score}
+          {shadow.passes_score_gate ? " score-pass" : " score-block"}
+        </Badge>
+      )}
+    </div>
+  );
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function asNum(value: unknown, fallback = 0): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function penaltyRows(value: unknown, source: string) {
+  return Object.entries(asRecord(value)).flatMap(([key, raw]) => {
+    const payload = asRecord(raw);
+    const adjustment = asNum(payload.adjustment ?? raw);
+    return adjustment > 0 ? [{ key, source, adjustment, stats: asRecord(payload.stats) }] : [];
+  });
+}
+
+function SignalGenerationPanel({
+  settings,
+  macroDirection,
+  enabledStrategies,
+  totalStrategies,
+}: {
+  settings: AppSettings;
+  macroDirection: MacroDirectionStatus | null | undefined;
+  enabledStrategies: number;
+  totalStrategies: number;
+}) {
+  const risk = asRecord(settings.risk);
+  const penalties = [
+    ...penaltyRows(risk.directional_score_adjustments, "direction"),
+    ...penaltyRows(risk.score_bucket_adjustments, "score bucket"),
+    ...penaltyRows(risk.market_score_adjustments, "market"),
+    ...penaltyRows(risk.timeframe_score_adjustments, "timeframe"),
+  ].sort((left, right) => right.adjustment - left.adjustment || left.key.localeCompare(right.key));
+  const enabled = risk.edge_penalties_enabled !== false;
+  const baseScore = asNum(risk.min_signal_score, 60);
+  const participation = asNum(risk.participation_ratio, 0.35);
+  const cap = asNum(risk.max_combined_score_adjustment, 15);
+  const minMarketTrades = asNum(risk.edge_penalty_min_market_trades, 20);
+  const minExpectedR = risk.min_signal_expected_r == null ? null : asNum(risk.min_signal_expected_r);
+
+  return (
+    <Card className="p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-[10px] font-medium uppercase tracking-wider text-fg-3">Signal generation control tower</div>
+          <div className="mt-0.5 text-xs text-fg-3">Configurazione runtime che trasforma un candidato in segnale. Non include i guardrail di esecuzione live.</div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Badge variant="outline" className={cn("font-mono", enabled ? "border-warn/40 bg-warn/10 text-warn" : "border-border text-fg-3")}>
+            edge penalties {enabled ? "on" : "suspended"}
+          </Badge>
+          {macroDirection && <Badge variant="outline" className={cn("font-mono", macroDirection.direction === "bullish" ? "border-success/40 bg-success/10 text-success" : "border-border text-fg-3")}>
+            BTC {macroDirection.direction} · {macroDirection.timeframe} · {macroDirection.suspended_family ? `${macroDirection.suspended_family} penalties suspended` : "no suspension"}
+          </Badge>}
+        </div>
+      </div>
+      <div className="mt-4 grid grid-cols-2 gap-2 lg:grid-cols-7">
+        <ControlMetric label="Base score" value={String(baseScore)} />
+        <ControlMetric label="Consensus" value={`${(participation * 100).toFixed(0)}%`} />
+        <ControlMetric label="Edge cap" value={`+${cap}`} />
+        <ControlMetric label="Penalty rules" value={String(penalties.length)} />
+        <ControlMetric label="Market evidence" value={`${minMarketTrades}t`} />
+        <ControlMetric label="Min Expected R" value={minExpectedR == null ? "off" : minExpectedR.toFixed(2)} />
+        <ControlMetric label="Strategies" value={`${enabledStrategies}/${totalStrategies}`} />
+      </div>
+      <div className="mt-4 rounded border border-border bg-bg-2 px-3 py-2 font-mono text-[11px] text-fg-2">
+        pipeline: consensus → score → base {baseScore} + edge adjustment (max +{cap}) → altri filtri → signal
+      </div>
+      <div className="mt-4 space-y-1.5">
+        {penalties.length === 0 ? (
+          <div className="rounded border border-border px-3 py-2 text-xs text-fg-3">Nessuna edge penalty attiva in configurazione.</div>
+        ) : penalties.map((penalty) => {
+          const trades = asNum(penalty.stats.trades);
+          const pf = penalty.stats.profit_factor == null ? null : asNum(penalty.stats.profit_factor);
+          const insufficientMarketEvidence = penalty.source === "market" && trades < minMarketTrades;
+          return (
+            <div key={`${penalty.source}:${penalty.key}`} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded border border-border px-3 py-2 text-[11px]">
+              <div className="min-w-0"><span className="font-mono text-fg">{penalty.key}</span><span className="ml-2 text-fg-3">{penalty.source}</span></div>
+              <div className="flex gap-3 font-mono text-fg-3"><span className={insufficientMarketEvidence ? "text-fg-3 line-through" : "text-warn"}>+{penalty.adjustment}</span><span>{trades > 0 ? `${trades} trade` : "manual"}</span><span>PF {pf == null ? "—" : pf.toFixed(2)}</span>{insufficientMarketEvidence && <span className="text-info">observe only</span>}</div>
+            </div>
+          );
+        })}
+      </div>
+    </Card>
+  );
+}
+
+function ControlMetric({ label, value }: { label: string; value: string }) {
+  return <div className="rounded border border-border bg-bg-2 px-3 py-2"><div className="text-[9px] uppercase tracking-wider text-fg-3">{label}</div><div className="mt-1 font-mono text-sm font-semibold text-fg">{value}</div></div>;
 }
 
 function statsHealth(stats: CalibrationStats): "success" | "warn" | "danger" | "muted" {
@@ -668,12 +741,10 @@ function SystemCyclesPanel({
 
 function OutcomeProfilePanel({
   profile,
-  edgeChanges,
   mode,
   onModeChange,
 }: {
   profile: OutcomeProfile | null | undefined;
-  edgeChanges: Calibration["changes"];
   mode: "paper" | "live" | null;
   onModeChange: (mode: "paper" | "live" | null) => void;
 }) {
@@ -681,13 +752,6 @@ function OutcomeProfilePanel({
   const weakBuckets = weakestRows(profile?.by_score_bucket, 4);
   const weakMarkets = weakestRows(profile?.by_market, 4);
   const tpRows = Object.entries(profile?.by_tp_state ?? {}).filter(([, s]) => s.trades > 0);
-  const activePenaltyCount = edgeChanges.reduce((total, change) => {
-    if (change.after && typeof change.after === "object") {
-      return total + Object.keys(change.after).length;
-    }
-    return total;
-  }, 0);
-
   return (
     <Card className="p-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -696,7 +760,7 @@ function OutcomeProfilePanel({
             Outcome profile
           </div>
           <div className="mt-0.5 text-xs text-fg-3">
-            Profilo ultimi {profile?.filters.lookback ?? 500} trade chiusi per edge calibration
+            Profilo degli ultimi {profile?.filters.lookback ?? 500} trade chiusi
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -719,12 +783,6 @@ function OutcomeProfilePanel({
               </button>
             ))}
           </div>
-          <Badge
-            variant="outline"
-            className={cn("font-mono", activePenaltyCount > 0 && "border-warn/40 bg-warn/10 text-warn")}
-          >
-            {activePenaltyCount} penalty preview
-          </Badge>
         </div>
       </div>
       <div className="mt-5 grid grid-cols-1 gap-6 lg:grid-cols-4">
@@ -773,15 +831,9 @@ function SkipReasonsPanel({ workerCycles }: { workerCycles: WorkerCycle[] }) {
     };
   }, [workerCycles]);
 
-  const liveZeroCycles = useMemo(() => computeLiveZeroCycles(workerCycles), [workerCycles]);
-
   if (aggregated.rows.length === 0) return null;
 
-  const storedZeroCycles = slope?.consecutive_zero_signal_cycles ?? null;
-  const hardCycles = slope?.exit_conditions?.starvation_hard_cycles ?? 15;
-  const isStale = storedZeroCycles != null && storedZeroCycles !== liveZeroCycles;
-  const displayCycles = liveZeroCycles;
-  const starvationRatio = displayCycles / hardCycles;
+  const displayCycles = slope?.consecutive_zero_signal_cycles ?? 0;
 
   return (
     <Card className="p-5">
@@ -798,20 +850,13 @@ function SkipReasonsPanel({ workerCycles }: { workerCycles: WorkerCycle[] }) {
             variant="outline"
             className={cn(
               "font-mono",
-              starvationRatio >= 1
-                ? "border-danger/40 bg-danger/10 text-danger"
-                : starvationRatio >= 0.7
-                  ? "border-warn/40 bg-warn/10 text-warn"
-                  : "border-border text-fg-3",
+              displayCycles > 0
+                ? "border-warn/40 bg-warn/10 text-warn"
+                : "border-border text-fg-3",
             )}
           >
-            {displayCycles}/{hardCycles} zero cycles
+            {displayCycles} zero cycles
           </Badge>
-          {isStale && (
-            <Badge variant="outline" className="font-mono text-[10px] border-border text-fg-3" title={`Valore DB: ${storedZeroCycles} (da ultima calibrazione)`}>
-              DB: {storedZeroCycles}
-            </Badge>
-          )}
         </div>
       </div>
       <div className="mt-4 space-y-2.5">

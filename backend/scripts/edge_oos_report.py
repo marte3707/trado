@@ -14,6 +14,11 @@ Riporta tre livelli:
   3. Per strategia aggregata cross-timeframe
 Piu' una vista PF time-weighted (half-life 50) per cogliere il regime recente.
 
+Questo e' uno screening storico esplorativo: esamina molte celle e puo'
+mescolare configurazioni passate. Anche una cella con train/test concordi e'
+soltanto un candidato da pre-registrare in paper; non dimostra un edge e non
+puo' autorizzare il live.
+
 Uso:
     cd backend && ../venv/bin/python -m scripts.edge_oos_report
 """
@@ -45,13 +50,21 @@ def _fmt(stats: PerformanceStats) -> str:
     )
 
 
-def _verdict(test: PerformanceStats | None) -> str:
+def _concordant(train: PerformanceStats | None, test: PerformanceStats | None) -> bool:
+    if train is None or test is None or train.profit_factor is None or test.profit_factor is None:
+        return False
+    return train.profit_factor >= 0.95 and test.profit_factor >= 1.0
+
+
+def _verdict(train: PerformanceStats | None, test: PerformanceStats | None) -> str:
     if test is None:
         return "INSUFF"
     if test.profit_factor is None:
         return "no-loss"
+    if _concordant(train, test) and test.profit_factor >= 1.2:
+        return "CANDIDATO"
     if test.profit_factor >= 1.2:
-        return "EDGE+"
+        return "TEST+"
     if test.profit_factor >= 1.0:
         return "marg+"
     if test.profit_factor >= 0.9:
@@ -114,7 +127,7 @@ def main() -> None:
             on = "Y" if enabled.get(key) else "."
             n_te = te.trades if te else 0
             print(
-                f"    {key:<34} {on:<3} {_pf(full)} {_pf(tr)} {_pf(te)} {n_te:>5}  {_verdict(te)}"
+                f"    {key:<34} {on:<3} {_pf(full)} {_pf(tr)} {_pf(te)} {n_te:>5}  {_verdict(tr, te)}"
             )
 
         # ---- 3. Per strategia aggregata cross-timeframe -----------------------
@@ -133,33 +146,25 @@ def main() -> None:
         print("    " + "-" * 66)
         for name, full, tr, te in agg_rows:
             n_te = te.trades if te else 0
-            print(f"    {name:<28} {_pf(full)} {_pf(tr)} {_pf(te)} {n_te:>5}  {_verdict(te)}")
+            print(f"    {name:<28} {_pf(full)} {_pf(tr)} {_pf(te)} {n_te:>5}  {_verdict(tr, te)}")
 
         # ---- Riepilogo decisionale --------------------------------------------
-        # Un edge conta come ROBUSTO solo se train e test sono concordi: un train
-        # pessimo (PF<<1) con test ottimo (PF>>1) e' divergenza di regime / rumore
-        # campionario, NON edge — ed e' proprio cio' che il gate walk-forward della
-        # calibrazione (`_strategy_factor_holdout_validated`) scarta. Filtriamo qui
-        # con lo stesso criterio per non sovrastimare.
-        def _concordant(tr: PerformanceStats | None, te: PerformanceStats | None) -> bool:
-            if tr is None or te is None or tr.profit_factor is None or te.profit_factor is None:
-                return False
-            return tr.profit_factor >= 0.95 and te.profit_factor >= 1.0
-
         scored = [r for r in cells if r[3] is not None]
         edge_cells = [r for r in scored if r[3].profit_factor is not None and r[3].profit_factor >= 1.2]
-        robust = [r for r in scored if _concordant(r[2], r[3]) and r[3].profit_factor >= 1.2]
+        candidates = [r for r in scored if _concordant(r[2], r[3]) and r[3].profit_factor >= 1.2]
         print("\n" + "=" * 78)
         print("RIEPILOGO DECISIONALE")
         print("=" * 78)
         print(f"  Celle con campione test sufficiente (n_test>={MIN_PER_SIDE}): {len(scored)}/{len(cells)}")
         print(f"  Celle con PF_test >= 1.20 (grezzo, include rumore): {len(edge_cells)}")
-        print(f"  Celle con edge OOS ROBUSTO (train concorde + PF_test >= 1.20): {len(robust)}")
-        if robust:
-            print("  -> Edge OOS robusti su:", ", ".join(r[0] for r in robust[:10]))
+        print(f"  Candidati storici train/test concordi (PF_test >= 1.20): {len(candidates)}")
+        print("  -> Lo screening non e' evidenza: costi, selezione multipla e configurazioni passate")
+        print("     richiedono un esperimento paper forward separato prima di qualsiasi conclusione.")
+        if candidates:
+            print("  -> Candidati da pre-registrare in paper:", ", ".join(r[0] for r in candidates[:10]))
         else:
             print(
-                "  -> NESSUN edge OOS robusto: i 'PF_test alti' sono train/test discordi"
+                "  -> Nessun candidato storico train/test concorde: i 'PF_test alti' sono discordi"
                 " su campioni minimi.\n"
                 "     Priorita' = revisione/cull strategie + difesa recency-aware,"
                 " NON tuning fine dei pesi."

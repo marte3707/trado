@@ -3,6 +3,15 @@ from app.db.models import StrategyConfig
 from app.engine.performance import PerformanceStats
 
 
+def test_oos_verdict_requires_train_test_concordance() -> None:
+    weak_train = {"trades": 20, "profit_factor": 0.6}
+    strong_test = {"trades": 10, "profit_factor": 1.5}
+    solid_train = {"trades": 20, "profit_factor": 1.1}
+
+    assert routes._oos_verdict(weak_train, strong_test) == "TEST+"
+    assert routes._oos_verdict(solid_train, strong_test) == "ROBUSTO"
+
+
 def test_analytics_outcome_profile_delegates_to_builder(monkeypatch) -> None:  # noqa: ANN001
     seen: dict[str, object] = {}
 

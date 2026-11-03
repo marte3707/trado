@@ -26,7 +26,7 @@ export type Route =
   | "alerts"
   | "settings";
 
-export type RouteGroup = "workspace" | "analytics" | "config";
+export type RouteGroup = "operations" | "research" | "system" | "advanced";
 
 export interface RouteMeta {
   id: Route;
@@ -38,25 +38,25 @@ export interface RouteMeta {
 }
 
 export const ROUTES: RouteMeta[] = [
-  { id: "dash",        label: "Dashboard",  group: "workspace", icon: LayoutDashboard,   description: "Panoramica operativa" },
-  { id: "signals",     label: "Segnali",    group: "workspace", icon: Activity,          description: "Feed segnali live" },
-  { id: "coin",        label: "Dettaglio",    group: "workspace", icon: LineChart,         description: "Chart e indicatori per mercato" },
-  { id: "account",     label: "Account",    group: "workspace", icon: Wallet,            description: "Posizioni live e storico, ordini Hyperliquid" },
+  { id: "dash",        label: "Panoramica",   group: "operations", icon: LayoutDashboard,   description: "Stato operativo e posizioni" },
+  { id: "signals",     label: "Segnali",      group: "operations", icon: Activity,          description: "Candidati e decisioni recenti" },
+  { id: "account",     label: "Portafoglio",  group: "operations", icon: Wallet,            description: "Posizioni, ordini e storico" },
+  { id: "calibration", label: "Ricerca",      group: "research",   icon: RefreshCcw,        description: "Diagnostica e validazione forward" },
+  { id: "alerts",      label: "Eventi",       group: "system",     icon: Bell,              description: "Errori, warning e notifiche" },
+  { id: "settings",    label: "Impostazioni", group: "system",     icon: Settings,          description: "Trading, rischio e servizi" },
 
-  { id: "calibration", label: "Calibration",group: "analytics", icon: RefreshCcw,        description: "Auto-tuner e stability" },
-  { id: "performance", label: "Performance",group: "analytics", icon: TrendingUp,        description: "Equity, drawdown e distribuzione P&L" },
-  { id: "leaderboard", label: "Alpha",      group: "analytics", icon: Radar,             description: "Watchlist leaderboard Hyperliquid" },
-  { id: "funnel",      label: "Funnel",     group: "analytics", icon: Users,             description: "Bot Telegram: iscritti, conversione, source" },
-
-  { id: "strategies",  label: "Strategie",  group: "config",    icon: SlidersHorizontal, description: "Pesi, parametri e analisi (strategy lab)" },
-  { id: "alerts",      label: "Alert",      group: "config",    icon: Bell,              description: "Feed alert, push, telegram" },
-  { id: "settings",    label: "Settings",   group: "config",    icon: Settings,          description: "Operation, risk, services" },
+  { id: "coin",        label: "Mercati",      group: "advanced",   icon: LineChart,         description: "Chart e indicatori per mercato" },
+  { id: "performance", label: "Performance",  group: "advanced",   icon: TrendingUp,        description: "Equity, drawdown e distribuzione P&L" },
+  { id: "strategies",  label: "Strategie",    group: "advanced",   icon: SlidersHorizontal, description: "Pesi, parametri e strategy lab" },
+  { id: "leaderboard", label: "Alpha",        group: "advanced",   icon: Radar,             description: "Watchlist leaderboard Hyperliquid" },
+  { id: "funnel",      label: "Bot funnel",   group: "advanced",   icon: Users,             description: "Iscritti e conversione Telegram" },
 ];
 
 export const ROUTE_GROUPS: { id: RouteGroup; label: string }[] = [
-  { id: "workspace", label: "Workspace" },
-  { id: "analytics", label: "Analytics" },
-  { id: "config",    label: "Config" },
+  { id: "operations", label: "Operatività" },
+  { id: "research", label: "Evidenza" },
+  { id: "system", label: "Sistema" },
+  { id: "advanced", label: "Strumenti avanzati" },
 ];
 
 export const ROUTE_MAP: Record<Route, RouteMeta> = Object.fromEntries(

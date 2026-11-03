@@ -1,17 +1,15 @@
-from typing import Any
+from copy import deepcopy
 
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.runtime_settings import (
     DEFAULT_DIRECTIONAL_REVERSAL_BREAKER_SETTINGS,
-    DEFAULT_MACRO_RISK_MODE_SETTINGS,
-    DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
-    DEFAULT_MACRO_RISK_STATE,
     DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
     DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE,
     DEFAULT_PORTFOLIO_GUARD_SETTINGS,
     DEFAULT_POSITION_MANAGEMENT_SETTINGS,
+    DEFAULT_THE_BULL_SETTINGS,
 )
 from app.db.models import AppSetting, Base, Market, StrategyConfig
 from app.db.session import engine
@@ -100,6 +98,26 @@ LEGACY_DEFAULT_STRATEGY_WEIGHTS = {
 }
 
 DEFAULT_EDGE_RISK_SETTINGS = {
+    "signal_freshness_filter_enabled": False,
+    "signal_freshness_max_lag_minutes": {
+        "5m": 2,
+        "15m": 5,
+        "30m": 8,
+        "1h": 10,
+        "4h": 30,
+        "1d": 120,
+    },
+    # 0 preserves the full universe. A positive production cap prioritizes
+    # liquid markets without affecting management of already-open positions.
+    "signal_universe_max_markets": 0,
+    "signal_universe_liquidity_lookback_hours": 24,
+    # Master switch operativo: conserva gli adjustment calcolati ma ne sospende
+    # l'applicazione al gate score quando l'operatore deve osservarne l'impatto.
+    "edge_penalties_enabled": True,
+    # Gli adjustment per singolo mercato sono rumorosi con pochi trade: il
+    # motore li ignora fino a questa evidenza minima, pur mantenendoli visibili
+    # in diagnostica e nel setting runtime.
+    "edge_penalty_min_market_trades": 20,
     "directional_score_adjustments": {},
     "score_bucket_adjustments": {},
     "market_score_adjustments": {},
@@ -139,28 +157,16 @@ DEFAULT_EDGE_RISK_SETTINGS = {
     "btc_volume_profile_poc_chop_penalty": 0,
 }
 
-
-def _normalize_macro_risk_monitor_policies(value: Any) -> tuple[Any, bool]:
-    if not isinstance(value, dict):
-        return value, False
-    raw_policies = value.get("policies")
-    if not isinstance(raw_policies, dict):
-        return value, False
-    policies = dict(raw_policies)
-    mutated = False
-    for level in ("watch", "high"):
-        raw_policy = raw_policies.get(level)
-        if not isinstance(raw_policy, dict):
-            continue
-        if raw_policy.get("require_mtf_confluence") is True:
-            policies[level] = {
-                **raw_policy,
-                "require_mtf_confluence": False,
-            }
-            mutated = True
-    if not mutated:
-        return value, False
-    return {**value, "policies": policies}, True
+# Telemetria diagnostica, senza alcun effetto sui gate di generazione o live.
+# Il participation ratio shadow viene calcolato soltanto sui candidati campionati
+# e serve a verificare se un consenso meno rigido meriti una futura analisi.
+DEFAULT_SIGNAL_CANDIDATE_DIAGNOSTICS_SETTINGS = {
+    "signal_candidate_diagnostics_enabled": True,
+    "signal_candidate_diagnostics_sample_rate": 0.02,
+    "signal_candidate_diagnostics_max_per_cycle": 3,
+    "signal_candidate_diagnostics_near_miss_delta": 15,
+    "participation_ratio_shadow": 0.35,
+}
 
 
 # Market osservati solo a scopo macro: sincronizzano candele ma NON generano
@@ -204,6 +210,17 @@ def seed_defaults(db: Session) -> None:
             AppSetting(
                 key="live_execution",
                 value={
+                    "new_live_entries_enabled": True,
+                    "readiness_gate_enabled": False,
+                    "readiness_lookback_trades": 200,
+                    "readiness_recent_trades": 50,
+                    "readiness_min_closed_trades": 100,
+                    "readiness_min_recent_trades": 30,
+                    "readiness_min_profit_factor": 1.2,
+                    "readiness_min_recent_profit_factor": 1.1,
+                    "readiness_min_avg_net_r": 0.05,
+                    "readiness_min_recent_avg_net_r": 0.02,
+                    "readiness_max_drawdown_r": 10.0,
                     "min_account_value_usd": settings.live_min_account_value_usd,
                     "order_notional_cap_usd": settings.live_order_notional_cap_usd,
                     "min_order_notional_usd": settings.live_min_order_notional_usd,
@@ -219,6 +236,23 @@ def seed_defaults(db: Session) -> None:
         live_execution = db.get(AppSetting, "live_execution")
         if live_execution is not None and isinstance(live_execution.value, dict):
             value = dict(live_execution.value)
+            if "new_live_entries_enabled" not in value:
+                value["new_live_entries_enabled"] = True
+            readiness_defaults = {
+                "readiness_gate_enabled": False,
+                "readiness_lookback_trades": 200,
+                "readiness_recent_trades": 50,
+                "readiness_min_closed_trades": 100,
+                "readiness_min_recent_trades": 30,
+                "readiness_min_profit_factor": 1.2,
+                "readiness_min_recent_profit_factor": 1.1,
+                "readiness_min_avg_net_r": 0.05,
+                "readiness_min_recent_avg_net_r": 0.02,
+                "readiness_max_drawdown_r": 10.0,
+            }
+            for readiness_key, readiness_default in readiness_defaults.items():
+                if readiness_key not in value:
+                    value[readiness_key] = readiness_default
             if "close_companion_paper_on_live_reconcile" not in value:
                 value["close_companion_paper_on_live_reconcile"] = False
             if "min_reduce_only_notional_usd" not in value:
@@ -243,9 +277,8 @@ def seed_defaults(db: Session) -> None:
                     "portfolio_guard": DEFAULT_PORTFOLIO_GUARD_SETTINGS,
                     "circuit_breaker": DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
                     "directional_reversal_breaker": DEFAULT_DIRECTIONAL_REVERSAL_BREAKER_SETTINGS,
-                    "macro_risk_mode": DEFAULT_MACRO_RISK_MODE_SETTINGS,
-                    "macro_risk_monitor": DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
                     **DEFAULT_EDGE_RISK_SETTINGS,
+                    **DEFAULT_SIGNAL_CANDIDATE_DIAGNOSTICS_SETTINGS,
                     **DEFAULT_UAR_RISK_SETTINGS,
                 },
             )
@@ -263,23 +296,19 @@ def seed_defaults(db: Session) -> None:
                 if key not in value:
                     value[key] = default
                     mutated = True
+            for key, default in DEFAULT_SIGNAL_CANDIDATE_DIAGNOSTICS_SETTINGS.items():
+                if key not in value:
+                    value[key] = default
+                    mutated = True
             portfolio_defaults = {
                 "portfolio_guard": DEFAULT_PORTFOLIO_GUARD_SETTINGS,
                 "circuit_breaker": DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_SETTINGS,
                 "directional_reversal_breaker": DEFAULT_DIRECTIONAL_REVERSAL_BREAKER_SETTINGS,
-                "macro_risk_mode": DEFAULT_MACRO_RISK_MODE_SETTINGS,
-                "macro_risk_monitor": DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
             }
             for key, default in portfolio_defaults.items():
                 if key not in value:
                     value[key] = default
                     mutated = True
-            normalized_monitor, normalized = _normalize_macro_risk_monitor_policies(
-                value.get("macro_risk_monitor")
-            )
-            if normalized:
-                value["macro_risk_monitor"] = normalized_monitor
-                mutated = True
             if mutated:
                 risk_setting.value = value
     if db.get(AppSetting, "portfolio_circuit_breaker_state") is None:
@@ -287,13 +316,6 @@ def seed_defaults(db: Session) -> None:
             AppSetting(
                 key="portfolio_circuit_breaker_state",
                 value=DEFAULT_PORTFOLIO_CIRCUIT_BREAKER_STATE,
-            )
-        )
-    if db.get(AppSetting, "macro_risk_state") is None:
-        db.add(
-            AppSetting(
-                key="macro_risk_state",
-                value=DEFAULT_MACRO_RISK_STATE,
             )
         )
     if db.get(AppSetting, "position_management") is None:
@@ -307,9 +329,40 @@ def seed_defaults(db: Session) -> None:
         existing_pm = db.get(AppSetting, "position_management")
         if existing_pm is not None and isinstance(existing_pm.value, dict):
             value = dict(existing_pm.value)
-            if "timeStop" not in value:
-                value["timeStop"] = DEFAULT_POSITION_MANAGEMENT_SETTINGS["timeStop"]
+            mutated = False
+            for section in ("timeStop", "staleMarketData"):
+                defaults = DEFAULT_POSITION_MANAGEMENT_SETTINGS[section]
+                current = value.get(section)
+                if not isinstance(current, dict):
+                    value[section] = deepcopy(defaults)
+                    mutated = True
+                    continue
+                merged = dict(current)
+                for key, default in defaults.items():
+                    if key not in merged:
+                        merged[key] = deepcopy(default)
+                        mutated = True
+                value[section] = merged
+            if mutated:
                 existing_pm.value = value
+    if db.get(AppSetting, "the_bull") is None:
+        db.add(
+            AppSetting(
+                key="the_bull",
+                value=deepcopy(DEFAULT_THE_BULL_SETTINGS),
+            )
+        )
+    else:
+        existing_the_bull = db.get(AppSetting, "the_bull")
+        if existing_the_bull is not None and isinstance(existing_the_bull.value, dict):
+            value = dict(existing_the_bull.value)
+            mutated = False
+            for key, default in DEFAULT_THE_BULL_SETTINGS.items():
+                if key not in value:
+                    value[key] = deepcopy(default)
+                    mutated = True
+            if mutated:
+                existing_the_bull.value = value
     if db.get(AppSetting, "timeframes") is None:
         db.add(
             AppSetting(
@@ -336,6 +389,7 @@ def seed_defaults(db: Session) -> None:
                     "reconnect_max_seconds": 60,
                     "writer_flush_seconds": 1,
                     "writer_batch_size": 500,
+                    "l2_snapshot_flush_seconds": 2,
                 },
             )
         )
@@ -411,6 +465,7 @@ def seed_defaults(db: Session) -> None:
         "copy_live_mode": "shadow",
         "copy_live_max_traders": 3,
         "copy_live_allowed_rank_limit": 20,
+        "copy_live_max_rank_age_hours": 8,
         "copy_live_allowed_classes": ["candidate"],
         "copy_live_min_quality_score": 80,
         "copy_live_min_copy_closed_positions": 20,
@@ -420,6 +475,8 @@ def seed_defaults(db: Session) -> None:
         "copy_live_min_net_pnl_usdc": "0",
         "copy_live_recent_days": 7,
         "copy_live_min_recent_closed_positions": 2,
+        "copy_live_min_recent_net_pnl_usdc": "0",
+        "copy_live_mids_cache_seconds": 60,
         "copy_live_position_notional_usd": "40",
         "copy_live_max_open_positions": 3,
         "copy_live_max_open_positions_per_trader": 1,
@@ -467,56 +524,45 @@ def seed_defaults(db: Session) -> None:
                 },
             )
         )
-    if db.get(AppSetting, "auto_calibration") is None:
+    if db.get(AppSetting, "research_experiment") is None:
         db.add(
             AppSetting(
-                key="auto_calibration",
+                key="research_experiment",
                 value={
                     "enabled": True,
-                    "lookback_trades": 500,
-                    "min_closed_trades": 20,
-                    "min_strategy_trades": 20,
-                    "min_weight": 1,
-                    "max_weight": 30,
-                    "min_signal_score_floor": 55,
-                    "min_signal_score_ceiling": 80,
-                    "min_risk_reward_floor": 2.0,
-                    "min_risk_reward_ceiling": 3.0,
-                    "min_risk_per_trade_pct": 0.25,
-                    "deep_defensive_slope_threshold": -0.1,
-                    "directional_penalty_lookback_trades": 200,
-                    "auto_disable_retest_after_trades": 200,
+                    "active_version": "baseline-frozen-v1",
+                    "mode": "frozen_observation",
+                    "assignment": "champion",
+                    "hypothesis": (
+                        "Misurare l'edge forward senza mutazioni automatiche dei parametri"
+                    ),
+                    "promotion_policy": "manual",
+                    "forward_gate_min_outcomes": 30,
+                    "expected_r_shadow_until_ready": True,
+                    "pre_tp1_shadow_until_ready": True,
+                    "historical_overlays_shadow_only": True,
+                    "performance_adjustments_shadow_only": True,
                 },
             )
         )
     else:
-        # Idempotent upgrade: il default della slope threshold è cambiato da -2.0
-        # (USD/trade-index, dipendente dalla scala) a -0.1 (unit-less, normalizzato
-        # per |PnL| mediano). Aggiorna SOLO se il valore in DB è il vecchio default.
-        existing = db.get(AppSetting, "auto_calibration")
-        if existing is not None and isinstance(existing.value, dict):
-            updated = dict(existing.value)
+        research_experiment = db.get(AppSetting, "research_experiment")
+        if research_experiment is not None and isinstance(research_experiment.value, dict):
+            value = dict(research_experiment.value)
+            defaults = {
+                "forward_gate_min_outcomes": 30,
+                "expected_r_shadow_until_ready": True,
+                "pre_tp1_shadow_until_ready": True,
+                "historical_overlays_shadow_only": True,
+                "performance_adjustments_shadow_only": True,
+            }
             mutated = False
-            if updated.get("deep_defensive_slope_threshold") == -2.0:
-                updated["deep_defensive_slope_threshold"] = -0.1
-                mutated = True
-            if updated.get("min_strategy_trades") == 8:
-                updated["min_strategy_trades"] = 20
-                mutated = True
-            if "auto_disable_retest_after_trades" not in updated:
-                updated["auto_disable_retest_after_trades"] = 200
-                mutated = True
-            if "directional_penalty_lookback_trades" not in updated:
-                updated["directional_penalty_lookback_trades"] = 200
-                mutated = True
-            if "deep_defensive_cooldown_runs" not in updated:
-                updated["deep_defensive_cooldown_runs"] = 6
-                mutated = True
-            if "deep_defensive_cooldown_min_new_trades" not in updated:
-                updated["deep_defensive_cooldown_min_new_trades"] = 3
-                mutated = True
+            for key, default in defaults.items():
+                if key not in value:
+                    value[key] = default
+                    mutated = True
             if mutated:
-                existing.value = updated
+                research_experiment.value = value
     if db.get(AppSetting, "strategy_exclusions") is None:
         # Cull permanente delle strategie senza edge out-of-sample (Fase 0, giu 2026):
         # negative su PnL reale e profit factor sia in-sample sia OOS. `macd` escluso

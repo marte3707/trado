@@ -1,14 +1,16 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 
-from app.db.models import Position, Signal
+from app.db.models import ExperimentOutcome, Position, Signal
 from app.engine.score_calibration import (
     DEFAULT_MIN_SAMPLES_FOR_USE,
     CalibrationTable,
     _pool_adjacent_violators,
     _position_r_multiple,
     compute_calibration_table,
+    compute_experiment_calibration_table,
     serialize_table,
 )
 
@@ -266,3 +268,41 @@ def test_serialize_table_is_json_friendly() -> None:
     bucket = payload["buckets"]["LONG:1h:70-79"]
     assert isinstance(bucket["expected_r"], float)
     assert bucket["confidence"] in {"low", "medium", "high"}
+
+
+def test_experiment_calibration_uses_only_forward_net_r() -> None:
+    signal = _signal(7, direction="SHORT", timeframe="15m", score=72)
+    outcomes = [
+        ExperimentOutcome(
+            position_id=index,
+            signal_id=7,
+            market_id=1,
+            experiment_version="baseline-frozen-v2",
+            configuration_hash="hash",
+            assignment="champion",
+            timeframe="15m",
+            side="sell",
+            barrier_label="tp_first" if net_r > 0 else "stop_first",
+            opened_at=datetime(2026, 7, 20, tzinfo=UTC),
+            closed_at=datetime(2026, 7, 21, tzinfo=UTC),
+            entry_price=Decimal("100"),
+            net_r=Decimal(str(net_r)),
+        )
+        for index, net_r in enumerate((1.5, -1.0, 0.5), start=1)
+    ]
+
+    table = compute_experiment_calibration_table(
+        outcomes,
+        {7: signal},
+        prior_strength=0,
+        min_samples_for_use=2,
+        lookback_positions=3,
+        experiment_version="baseline-frozen-v2",
+        assignment="champion",
+    )
+
+    bucket = table.buckets["SHORT:15m:70-79"]
+    assert bucket.n_samples == 3
+    assert bucket.expected_r == pytest.approx((1.5 - 1.0 + 0.5) / 3)
+    assert table.sample_source == "experiment_outcomes"
+    assert table.experiment_version == "baseline-frozen-v2"

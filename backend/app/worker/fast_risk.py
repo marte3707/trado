@@ -1,6 +1,8 @@
 """Fast risk loop: reconcile live, liquidation guard e UAR su cadenza rapida."""
 import asyncio
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -14,9 +16,11 @@ from app.core.runtime_settings import (
 from app.db.models import AppSetting, DecisionLog
 from app.db.session import SessionLocal
 from app.engine.execution import OrderExecutionEngine
+from app.services.hyperliquid import HyperliquidRateLimitError
 from app.services.hyperliquid_rate_limit import (
     effective_hyperliquid_rate_limit_settings,
     hyperliquid_rate_limit_cooldown_until,
+    live_risk_request_priority,
 )
 from app.services.live_reconciliation import reconcile_live_positions
 from app.worker.cycle_status import (
@@ -29,6 +33,7 @@ logger = structlog.get_logger()
 _FAST_RISK_LOCK = asyncio.Lock()
 
 
+@dataclass
 class _FastRiskState:
     last_liquidation_at: float = 0.0
     last_reconcile_at: float = 0.0
@@ -36,6 +41,41 @@ class _FastRiskState:
     consecutive_failures: int = 0
     hyperliquid_rate_limit_cooldown_until: float = 0.0
     last_rate_limit_log_at: float = 0.0
+    retry_after: dict[str, float] = field(default_factory=dict)
+
+
+async def _run_live_risk_action(action: Callable[..., Any], *args: Any) -> Any:
+    with live_risk_request_priority():
+        return await asyncio.to_thread(action, *args)
+
+
+def _action_due(
+    state: _FastRiskState, action: str, last_attempt: float, interval: int, now: float
+) -> bool:
+    if action in state.retry_after:
+        return now >= state.retry_after[action]
+    return last_attempt == 0.0 or now - last_attempt >= interval
+
+
+def _defer_budget_limited_action(
+    state: _FastRiskState, action: str, exc: Exception, now: float, loop_interval: int
+) -> bool:
+    if not isinstance(exc, HyperliquidRateLimitError) or exc.reason != "ip_weight_budget":
+        return False
+    retry_at = now + max(1, loop_interval)
+    if exc.next_retry_after:
+        try:
+            deadline = datetime.fromisoformat(exc.next_retry_after)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=UTC)
+            retry_at = max(now, deadline.timestamp())
+        except ValueError:
+            pass
+    state.retry_after[action] = retry_at
+    logger.warning(
+        "fast_risk_action_deferred", action=action, reason=exc.reason, retry_after=retry_at
+    )
+    return True
 
 
 def _record_guard_subcycle(
@@ -187,19 +227,19 @@ async def run_fast_risk_once(
             # fast_risk_cycle_failed). Le 3 funzioni-azione si auto-committano
             # internamente in caso di successo, quindi il rollback locale qui
             # annulla solo il lavoro non committato della azione fallita.
-            liquidation_due = (
-                state.last_liquidation_at == 0.0
-                or current_time - state.last_liquidation_at
-                >= rate_limit_settings["liquidation_interval_seconds"]
+            liquidation_due = _action_due(
+                state, "liquidation_guard", state.last_liquidation_at,
+                rate_limit_settings["liquidation_interval_seconds"], current_time,
             )
             if liquidation_due:
                 try:
-                    liquidation = await asyncio.to_thread(
+                    liquidation = await _run_live_risk_action(
                         executor.position_manager.audit_live_positions_against_liquidation,
                         db,
                     )
                     actions["liquidation_guard"] = liquidation
                     state.last_liquidation_at = current_time
+                    state.retry_after.pop("liquidation_guard", None)
                     _record_guard_subcycle(
                         db,
                         "live_liquidation_guard_cycle",
@@ -212,41 +252,52 @@ async def run_fast_risk_once(
                     db.rollback()
                     state.last_liquidation_at = current_time
                     error = _compact_error(exc)
-                    errors["liquidation_guard"] = error
-                    logger.exception("fast_risk_liquidation_guard_failed", error=error)
+                    if not _defer_budget_limited_action(
+                        state, "liquidation_guard", exc, current_time,
+                        settings.fast_risk_loop_interval_seconds,
+                    ):
+                        state.retry_after.pop("liquidation_guard", None)
+                        errors["liquidation_guard"] = error
+                        logger.exception("fast_risk_liquidation_guard_failed", error=error)
 
-            reconcile_due = (
-                state.last_reconcile_at == 0.0
-                or current_time - state.last_reconcile_at
-                >= rate_limit_settings["reconcile_interval_seconds"]
+            reconcile_due = _action_due(
+                state, "live_reconciled", state.last_reconcile_at,
+                rate_limit_settings["reconcile_interval_seconds"], current_time,
             )
             if reconcile_due:
                 try:
-                    actions["live_reconciled"] = await asyncio.to_thread(
+                    actions["live_reconciled"] = await _run_live_risk_action(
                         reconcile_live_positions,
                         db,
                     )
                     state.last_reconcile_at = current_time
+                    state.retry_after.pop("live_reconciled", None)
                 except Exception as exc:
                     db.rollback()
                     state.last_reconcile_at = current_time
                     error = _compact_error(exc)
-                    errors["live_reconciled"] = error
-                    logger.exception("fast_risk_reconcile_failed", error=error)
+                    if not _defer_budget_limited_action(
+                        state, "live_reconciled", exc, current_time,
+                        settings.fast_risk_loop_interval_seconds,
+                    ):
+                        state.retry_after.pop("live_reconciled", None)
+                        errors["live_reconciled"] = error
+                        logger.exception("fast_risk_reconcile_failed", error=error)
 
-            uar_due = (
-                state.last_uar_at == 0.0
-                or current_time - state.last_uar_at >= rate_limit_settings["uar_interval_seconds"]
+            uar_due = _action_due(
+                state, "unified_account_ratio", state.last_uar_at,
+                rate_limit_settings["uar_interval_seconds"], current_time,
             )
             if uar_due:
                 try:
-                    uar_result = await asyncio.to_thread(
+                    uar_result = await _run_live_risk_action(
                         audit_unified_account_ratio_guard,
                         db,
                         executor,
                     )
                     actions["unified_account_ratio"] = uar_result
                     state.last_uar_at = current_time
+                    state.retry_after.pop("unified_account_ratio", None)
                     _record_guard_subcycle(
                         db,
                         "unified_account_ratio_guard_cycle",
@@ -259,17 +310,27 @@ async def run_fast_risk_once(
                     db.rollback()
                     state.last_uar_at = current_time
                     error = _compact_error(exc)
-                    errors["unified_account_ratio"] = error
-                    logger.exception("fast_risk_uar_guard_failed", error=error)
+                    if not _defer_budget_limited_action(
+                        state, "unified_account_ratio", exc, current_time,
+                        settings.fast_risk_loop_interval_seconds,
+                    ):
+                        state.retry_after.pop("unified_account_ratio", None)
+                        errors["unified_account_ratio"] = error
+                        logger.exception("fast_risk_uar_guard_failed", error=error)
 
             duration_seconds = time.monotonic() - started
-            status = "failed" if errors else "ok"
+            status = "failed" if errors else "warn" if state.retry_after else "ok"
             result: dict[str, Any] = {
                 "status": status,
                 "duration_seconds": round(duration_seconds, 4),
                 "warn": duration_seconds > settings.fast_risk_warn_after_seconds,
                 "actions": actions,
             }
+            if state.retry_after:
+                result["deferred_actions"] = {
+                    action: datetime.fromtimestamp(retry_at, UTC).isoformat()
+                    for action, retry_at in state.retry_after.items()
+                }
             if errors:
                 result["errors"] = errors
                 if any(_is_hyperliquid_rate_limit_error(error) for error in errors.values()):
@@ -285,7 +346,11 @@ async def run_fast_risk_once(
                 "fast_risk_cycle",
                 "Fast Risk Cycle",
                 status,
-                message="Fast risk cycle completed" if not errors else "Fast risk cycle completed with errors",
+                message=(
+                    "Fast risk cycle completed with errors" if errors else
+                    "Fast risk actions awaiting request budget" if state.retry_after else
+                    "Fast risk cycle completed"
+                ),
                 data=result,
                 expected_interval_seconds=settings.fast_risk_loop_interval_seconds,
             )

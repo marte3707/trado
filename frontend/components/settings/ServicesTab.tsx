@@ -43,7 +43,7 @@ function workerMeta(health: Health): ServiceMeta {
   return {
     id: "worker",
     label: "Worker",
-    description: "Loop async che genera segnali, gestisce posizioni e calibration",
+    description: "Loop async che genera segnali e gestisce posizioni",
     status,
     statusLabel,
     detail: `Phase: ${phase} · ultimo ciclo ${sec != null ? Math.round(sec) + "s fa" : "—"}`,

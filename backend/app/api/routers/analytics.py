@@ -22,6 +22,8 @@ from app.db.models import (
 from app.db.session import get_db
 from app.engine.diagnostics import build_diagnostics_report, build_equity_slope_diagnostics
 from app.engine.edge_profile import build_outcome_profile
+from app.engine.experiment import forward_gate_policy
+from app.engine.experiment_outcomes import experiment_outcomes_report
 from app.engine.live_eligibility import build_live_eligibility_report
 from app.engine.macro_direction import btc_macro_direction, suspended_penalty_family
 from app.engine.performance import SignalPerformanceAnalyzer, serialize_stats
@@ -29,6 +31,7 @@ from app.engine.pre_tp1_validation import (
     DEFAULT_LOOKBACK as PRE_TP1_DEFAULT_LOOKBACK,
 )
 from app.engine.pre_tp1_validation import (
+    build_experiment_pre_tp1_validation_table_from_db,
     build_pre_tp1_validation_table_from_db,
 )
 from app.engine.pre_tp1_validation import (
@@ -39,6 +42,7 @@ from app.engine.score_calibration import (
 )
 from app.engine.score_calibration import (
     build_calibration_table_from_db,
+    build_experiment_calibration_table_from_db,
     serialize_table,
 )
 from app.engine.strategy_attribution import build_strategy_attribution
@@ -47,6 +51,15 @@ from app.services.trade_cost import aggregate_live_costs, serialize_live_cost_re
 _logger = structlog.get_logger()
 
 router = APIRouter()
+
+
+@router.get("/analytics/experiments")
+def experiment_analytics(
+    version: str | None = None,
+    recent: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return experiment_outcomes_report(db, version=version, recent=recent)
 
 
 @router.get("/analytics/signals")
@@ -109,10 +122,9 @@ def signal_analytics(
 @router.get("/analytics/diagnostics")
 def analytics_diagnostics(
     lookback: int = Query(200, ge=10, le=2000),
-    history_limit: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
 ) -> dict:
-    return build_diagnostics_report(db, lookback=lookback, history_limit=history_limit)
+    return build_diagnostics_report(db, lookback=lookback)
 
 
 @router.get("/analytics/equity-slope")
@@ -167,14 +179,19 @@ def _pf_value(payload: dict[str, Any] | None) -> float | None:
         return None
 
 
-def _oos_verdict(test_payload: dict[str, Any] | None) -> str:
+def _oos_verdict(
+    train_payload: dict[str, Any] | None,
+    test_payload: dict[str, Any] | None,
+) -> str:
     pf = _pf_value(test_payload)
     if test_payload is None or int(test_payload.get("trades", 0)) <= 0:
         return "INSUFF"
     if pf is None:
         return "no-loss"
+    if pf >= 1.2 and _oos_concordant(train_payload, test_payload):
+        return "ROBUSTO"
     if pf >= 1.2:
-        return "EDGE+"
+        return "TEST+"
     if pf >= 1.0:
         return "marg+"
     if pf >= 0.9:
@@ -292,7 +309,7 @@ def analytics_strategy_edge(
                     "strategy": strategy_name,
                     "enabled": enabled_by_cell.get(key, False),
                     "classification": classification,
-                    "verdict": _oos_verdict(cell_test),
+                    "verdict": _oos_verdict(cell_train, cell_test),
                     "full": full_payload,
                     "train": cell_train,
                     "test": cell_test,
@@ -339,7 +356,10 @@ def analytics_strategy_edge(
             "train": serialize_stats(train_stats) if train_stats else None,
             "test": serialize_stats(test_stats) if test_stats else None,
             "time_weighted": serialize_stats(time_weighted),
-            "verdict": _oos_verdict(serialize_stats(test_stats) if test_stats else None),
+            "verdict": _oos_verdict(
+                serialize_stats(train_stats) if train_stats else None,
+                serialize_stats(test_stats) if test_stats else None,
+            ),
             "classification": _cell_classification(
                 full=serialize_stats(overall),
                 train=serialize_stats(train_stats) if train_stats else None,
@@ -371,6 +391,8 @@ def analytics_live_eligibility(
     min_recent_net_profit_factor: float = Query(1.0, ge=0.0, le=10.0),
     min_avg_net_r: float = Query(0.02, ge=-5.0, le=5.0),
     min_recent_avg_net_r: float = Query(0.0, ge=-5.0, le=5.0),
+    configuration_hash: str | None = Query(None, min_length=1, max_length=64),
+    experiment_version: str | None = Query(None, min_length=1, max_length=64),
     db: Session = Depends(get_db),
 ) -> dict:
     """Preview read-only delle coorti paper candidabili al live.
@@ -390,6 +412,8 @@ def analytics_live_eligibility(
         min_recent_net_profit_factor=min_recent_net_profit_factor,
         min_avg_net_r=min_avg_net_r,
         min_recent_avg_net_r=min_recent_avg_net_r,
+        configuration_hash=configuration_hash,
+        experiment_version=experiment_version,
     )
 
 
@@ -417,12 +441,21 @@ def analytics_expected_r_calibration(
     senza shrinkage). Questo applica Bayesian shrinkage e usa R-multiple normalizzato
     per rischio iniziale invece di PnL assoluto.
     """
-    table = build_calibration_table_from_db(
-        db,
-        lookback=lookback,
-        enforce_monotonic=enforce_monotonic,
-    )
-    return serialize_table(table)
+    policy = forward_gate_policy(db)
+    if bool(policy.get("forward_ready", False)):
+        table = build_experiment_calibration_table_from_db(
+            db,
+            experiment_version=str(policy["version"]),
+            assignment=str(policy["assignment"]),
+            lookback=lookback,
+        )
+    else:
+        table = build_calibration_table_from_db(
+            db,
+            lookback=lookback,
+            enforce_monotonic=enforce_monotonic,
+        )
+    return {**serialize_table(table), "forward_gate": policy}
 
 
 @router.get("/analytics/pre-tp1-validation")
@@ -432,12 +465,22 @@ def analytics_pre_tp1_validation(
     db: Session = Depends(get_db),
 ) -> dict:
     """Empirical TP1-before-stop cohorts used by the pre-entry validation gate."""
-    table = build_pre_tp1_validation_table_from_db(
-        db,
-        lookback=lookback,
-        min_samples_for_use=min_samples,
-    )
-    return serialize_pre_tp1_table(table)
+    policy = forward_gate_policy(db)
+    if bool(policy.get("forward_ready", False)):
+        table = build_experiment_pre_tp1_validation_table_from_db(
+            db,
+            experiment_version=str(policy["version"]),
+            assignment=str(policy["assignment"]),
+            lookback=lookback,
+            min_samples_for_use=min_samples,
+        )
+    else:
+        table = build_pre_tp1_validation_table_from_db(
+            db,
+            lookback=lookback,
+            min_samples_for_use=min_samples,
+        )
+    return {**serialize_pre_tp1_table(table), "forward_gate": policy}
 
 
 @router.get("/analytics/score-calibration")
@@ -659,4 +702,26 @@ def signal_rejections(db: Session = Depends(get_db), limit: int = Query(50, ge=1
             "timestamp": row.timestamp,
             "reasons": reasons,
         })
+    return {"total": len(rows), "by_reason": reason_counts, "recent": recent[:10]}
+
+
+@router.get("/analytics/signal-candidate-rejections")
+def signal_candidate_rejections(
+    db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=200),
+) -> dict:
+    rows = (
+        db.query(DecisionLog)
+        .filter(DecisionLog.event_type == "signal_candidate_rejected")
+        .order_by(DecisionLog.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    reason_counts: dict[str, int] = {}
+    recent: list[dict[str, Any]] = []
+    for row in rows:
+        data = dict(row.data) if isinstance(row.data, dict) else {}
+        reason = str(data.get("reason") or "unknown")
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        recent.append({"id": row.id, "timestamp": row.timestamp, **data})
     return {"total": len(rows), "by_reason": reason_counts, "recent": recent[:10]}

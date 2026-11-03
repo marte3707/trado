@@ -14,7 +14,7 @@ from app.core.config import get_settings
 from app.core.enums import OrderMode, SignalStatus
 from app.core.runtime_settings import effective_live_execution_settings
 from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, Signal
-from app.engine.execution import make_cloid
+from app.engine.execution import make_cloid, rescale_take_profit_plan_for_min_notional
 from app.engine.position_management import PositionManagementEngine, StopCandidate
 from app.indicators.core import atr
 from app.services.hyperliquid import DEFAULT_GUARD_STATE_CACHE_SECONDS, HyperliquidTradingClient
@@ -851,6 +851,169 @@ def _planned_protection_allocation(position: Position, order_type: str) -> Decim
     return None
 
 
+def _prepare_manual_protection_repair(
+    db: Session,
+    position: Position,
+    coin: str,
+    remote_size: Decimal,
+    sz_decimals: int,
+) -> bool:
+    """Make skipped TP levels eligible for one operator-requested repair.
+
+    Minimum-notional skips are consolidated before they are re-enabled, so the
+    repair cannot repeat the same invalid partial orders. Other skipped levels
+    are re-enabled and pass through the existing breached-target rescue path.
+    """
+    metadata = dict(position.metadata_json or {})
+    plan = metadata.get("take_profit_plan")
+    if not isinstance(plan, list) or not any(
+        isinstance(item, dict)
+        and item.get("skipped")
+        and (
+            not item.get("filled")
+            or item.get("skip_reason") == "below_min_reduce_only_notional"
+        )
+        for item in plan
+    ):
+        return False
+
+    original_plan = [dict(item) for item in plan if isinstance(item, dict)]
+    position_orders = (
+        db.query(Order)
+        .filter(
+            Order.position_id == position.id,
+            Order.mode == OrderMode.LIVE.value,
+            Order.order_type.in_(_RECONCILED_EXIT_TYPES),
+        )
+        .all()
+    )
+    filled_order_types = {
+        order.order_type for order in position_orders if order.status == "filled"
+    }
+    corrected_inferred_levels: list[str] = []
+    working_plan = [dict(item) for item in original_plan]
+    for item in working_plan:
+        level = str(item.get("level", ""))
+        if (
+            level not in {"tp1", "tp2", "tp3"}
+            or level in filled_order_types
+            or not item.get("filled")
+            or not item.get("skipped")
+            or item.get("skip_reason") != "below_min_reduce_only_notional"
+        ):
+            continue
+        item["filled"] = False
+        item.pop("filled_price", None)
+        item.pop("filled_size", None)
+        corrected_inferred_levels.append(level)
+
+    if corrected_inferred_levels:
+        metadata["partial_exit_count"] = sum(
+            1
+            for item in working_plan
+            if item.get("filled") and not item.get("runner")
+        )
+        if "tp1" in corrected_inferred_levels:
+            metadata.pop("tp1_hit", None)
+        if "tp2" in corrected_inferred_levels:
+            metadata.pop("tp2_hit", None)
+            metadata.pop("runner_active", None)
+        if metadata.get("last_exit_reason") in corrected_inferred_levels:
+            metadata.pop("last_exit_reason", None)
+            metadata.pop("last_exit_price", None)
+
+    live_settings = effective_live_execution_settings(db, get_settings())
+    min_reduce_notional = Decimal(str(live_settings["min_reduce_only_notional_usd"]))
+    repaired_plan, changes = rescale_take_profit_plan_for_min_notional(
+        working_plan,
+        remote_size,
+        min_reduce_notional,
+        sz_decimals,
+        repair_skipped=True,
+    )
+
+    reenabled_levels: list[str] = []
+    for entry in repaired_plan:
+        if not isinstance(entry, dict) or entry.get("filled") or not entry.get("skipped"):
+            continue
+        if entry.get("skip_reason") == "below_min_reduce_only_notional":
+            continue
+        level = str(entry.get("level", ""))
+        if level not in {"tp1", "tp2", "tp3"}:
+            continue
+        entry.pop("skipped", None)
+        entry.pop("skip_reason", None)
+        entry.pop("notional_at_skip", None)
+        entry.pop("min_reduce_only_notional", None)
+        reenabled_levels.append(level)
+
+    resolved_min_notional_levels = sorted(
+        {
+            str(item.get("level", ""))
+            for item in original_plan
+            if item.get("skipped")
+            and item.get("skip_reason") == "below_min_reduce_only_notional"
+        }
+        - {
+            str(item.get("level", ""))
+            for item in repaired_plan
+            if item.get("skipped")
+            and item.get("skip_reason") == "below_min_reduce_only_notional"
+        }
+    )
+    changed = (
+        repaired_plan != original_plan
+        or bool(reenabled_levels)
+        or bool(corrected_inferred_levels)
+    )
+    if not changed:
+        return False
+
+    reset_levels = set(reenabled_levels) | set(resolved_min_notional_levels)
+    if reset_levels:
+        for order in position_orders:
+            if order.order_type not in reset_levels:
+                continue
+            raw = dict(order.raw_response or {})
+            raw.pop("resubmit_blocked", None)
+            _set_order_raw_response(order, raw)
+            db.add(order)
+
+    metadata["take_profit_plan"] = repaired_plan
+    metadata["last_manual_protection_plan_repair"] = {
+        "repaired_at": datetime.now(UTC).isoformat(),
+        "coin": coin,
+        "remote_size": str(remote_size),
+        "min_reduce_only_notional_usd": str(min_reduce_notional),
+        "resolved_min_notional_levels": resolved_min_notional_levels,
+        "reenabled_levels": sorted(reenabled_levels),
+        "corrected_inferred_levels": sorted(corrected_inferred_levels),
+        "changes": changes,
+    }
+    position.metadata_json = metadata
+    db.add(position)
+    db.add(
+        DecisionLog(
+            event_type="live_protection_manual_plan_repaired",
+            market_id=position.market_id,
+            position_id=position.id,
+            message="Skipped live take-profit plan prepared for manual repair",
+            data={
+                "coin": coin,
+                "remote_size": str(remote_size),
+                "min_reduce_only_notional_usd": str(min_reduce_notional),
+                "resolved_min_notional_levels": resolved_min_notional_levels,
+                "reenabled_levels": sorted(reenabled_levels),
+                "corrected_inferred_levels": sorted(corrected_inferred_levels),
+                "original_plan": original_plan,
+                "repaired_plan": repaired_plan,
+                "changes": changes,
+            },
+        )
+    )
+    return True
+
+
 def _match_frontend_order_for_missing(
     frontend_orders: list[dict],
     position: Position,
@@ -1191,7 +1354,7 @@ def protection_state_for_live_position(
     return {
         "status": "intervention_required" if needs_intervention else "ok",
         "needs_intervention": needs_intervention,
-        "repairable": bool(missing or rejected or stop_failure),
+        "repairable": bool(missing or rejected or skipped or stop_failure),
         "expected_orders": expected_types,
         "active_orders": active,
         "missing_orders": missing,
@@ -2482,6 +2645,8 @@ def _infer_missing_tp_fills_from_open_position(
         allocation = _decimal(item.get("allocation"))
         if allocation is None or allocation <= 0:
             continue
+        if bool(item.get("skipped")):
+            break
         if bool(item.get("filled")):
             cumulative_allocation += allocation
             if level == "tp1":
@@ -2520,23 +2685,130 @@ def _infer_missing_tp_fills_from_open_position(
     return inferred_levels
 
 
+def _reconcile_live_spot_positions(
+    db: Session,
+    positions: list[Position],
+    trading: HyperliquidTradingClient,
+    address: str,
+) -> int:
+    """Close locally tracked fallback spot positions once their asset is gone.
+
+    A spot asset does not appear in ``user_state.assetPositions``.  The
+    fallback only opens when the local order is protected by one full-size
+    stop, so a zero base-token balance with no active local stop is evidence
+    that the holding was sold.  We intentionally do not invent a fill price;
+    the next account/fill refresh remains the source of accounting truth.
+    """
+    if not positions:
+        return 0
+    try:
+        spot_state = trading.spot_user_state(address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS)
+        open_orders = trading.frontend_open_orders(
+            address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS
+        )
+    except Exception as exc:
+        logger.warning("live_spot_reconciliation_state_failed", error=str(exc))
+        return 0
+
+    balances: dict[str, Decimal] = {}
+    for balance in spot_state.get("balances", []):
+        if not isinstance(balance, dict) or not isinstance(balance.get("coin"), str):
+            continue
+        amount = _decimal(balance.get("total"))
+        if amount is not None:
+            balances[str(balance["coin"]).upper()] = amount
+    open_oids = {
+        str(order["oid"])
+        for order in open_orders
+        if isinstance(order, dict) and order.get("oid") is not None
+    }
+    now = datetime.now(UTC)
+    updated = 0
+    for position in positions:
+        market = position.market
+        if market is None:
+            continue
+        base_balance = balances.get(str(market.base).upper(), Decimal("0"))
+        active_stops = (
+            db.query(Order)
+            .filter(
+                Order.position_id == position.id,
+                Order.mode == OrderMode.LIVE.value,
+                Order.order_type == "stop_loss",
+                Order.status.notin_(_TERMINAL_ORDER_STATUSES),
+            )
+            .all()
+        )
+        stop_is_open = any(
+            order.hyperliquid_order_id is not None
+            and str(order.hyperliquid_order_id) in open_oids
+            for order in active_stops
+        )
+        if base_balance > _POSITION_DUST_THRESHOLD or stop_is_open:
+            continue
+        for order in active_stops:
+            order.status = "filled"
+            db.add(order)
+        metadata = dict(position.metadata_json or {})
+        metadata.update(
+            {
+                "spot_reconciled_closed_at": now.isoformat(),
+                "exit_reason": "spot_balance_depleted",
+                "remaining_size": "0",
+            }
+        )
+        position.status = "closed"
+        position.closed_at = now
+        position.size = Decimal("0")
+        position.unrealized_pnl = Decimal("0")
+        position.metadata_json = metadata
+        db.add(position)
+        db.add(
+            DecisionLog(
+                event_type="live_spot_position_reconciled_closed",
+                market_id=position.market_id,
+                position_id=position.id,
+                message="Tracked spot balance is no longer present on Hyperliquid",
+                data={"base": market.base, "observed_balance": str(base_balance)},
+            )
+        )
+        updated += 1
+    if updated:
+        db.commit()
+    return updated
+
+
 def reconcile_live_positions(
     db: Session,
     trading_client: HyperliquidTradingClient | None = None,
     coins: set[str] | None = None,
     force_repair: bool = False,
 ) -> int:
-    positions = (
+    all_positions = (
         db.query(Position)
         .options(joinedload(Position.market))
         .filter(Position.mode == OrderMode.LIVE.value, Position.status == "open")
         .all()
     )
+    # Spot fallback positions are reconciled from the spot wallet, not from
+    # ``assetPositions`` (which only contains perpetual exposure).
+    spot_positions = [
+        position
+        for position in all_positions
+        if position.market is not None and position.market.market_type == "spot"
+    ]
+    positions = [position for position in all_positions if position not in spot_positions]
 
     settings = get_settings()
     if not settings.hyperliquid_account_address:
         return 0
     trading = trading_client or HyperliquidTradingClient(settings)
+    spot_updated = _reconcile_live_spot_positions(
+        db,
+        spot_positions,
+        trading,
+        settings.hyperliquid_account_address,
+    )
     remote_positions = _position_map(
         trading.user_state(
             settings.hyperliquid_account_address, max_age_seconds=DEFAULT_GUARD_STATE_CACHE_SECONDS
@@ -2634,7 +2906,7 @@ def reconcile_live_positions(
     if not positions:
         if orphan_orders_canceled:
             db.commit()
-        return 0
+        return spot_updated
 
     updated = 0
     now = datetime.now(UTC)
@@ -2814,6 +3086,16 @@ def reconcile_live_positions(
                     )
 
         if open_orders_available:
+            if force_repair and remote_abs is not None and remote_abs > 0:
+                plan_repaired = _prepare_manual_protection_repair(
+                    db,
+                    position,
+                    coin,
+                    remote_abs,
+                    _sz_decimals(position.market),
+                )
+                if plan_repaired:
+                    metadata = dict(position.metadata_json or {})
             market_closed_size = _create_missing_protection_orders(
                 db,
                 position,
@@ -2943,4 +3225,4 @@ def reconcile_live_positions(
 
     if updated or orphan_orders_canceled:
         db.commit()
-    return updated
+    return updated + spot_updated

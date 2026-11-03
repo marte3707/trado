@@ -14,7 +14,6 @@ import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Progress } from "@/components/ui/progress";
 import { StrategyParamsDialog } from "@/components/strategies/StrategyParamsDialog";
 import { useUpdateStrategy } from "@/lib/hooks/mutations";
 import { cn } from "@/lib/utils";
@@ -22,12 +21,11 @@ import type { Strategy } from "@/lib/api";
 
 interface Props {
   strategies: Strategy[];
-  maxWeight: number;
 }
 
 const TF_ORDER = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d"];
 
-export function StrategyTimeframeAccordion({ strategies, maxWeight }: Props) {
+export function StrategyTimeframeAccordion({ strategies }: Props) {
   const [editing, setEditing] = useState<Strategy | null>(null);
 
   const groups: Record<string, Strategy[]> = strategies.reduce(
@@ -54,8 +52,6 @@ export function StrategyTimeframeAccordion({ strategies, maxWeight }: Props) {
             const items = groups[tf];
             const activeCount = items.filter((s) => s.enabled).length;
             const totalWeight = items.reduce((sum, s) => sum + (s.enabled ? s.weight : 0), 0);
-            const weightPct = maxWeight > 0 ? (totalWeight / maxWeight) * 100 : 0;
-            const overWeight = totalWeight > maxWeight;
             return (
               <AccordionItem key={tf} value={tf} className="px-6">
                 <AccordionTrigger>
@@ -64,23 +60,9 @@ export function StrategyTimeframeAccordion({ strategies, maxWeight }: Props) {
                     <Badge variant="outline" className="font-mono">
                       {activeCount}/{items.length} attive
                     </Badge>
-                    <div className="hidden flex-1 flex-col gap-1 md:flex">
-                      <div className="flex items-center justify-between text-[10px] text-fg-3">
-                        <span>Peso totale</span>
-                        <span
-                          className={cn(
-                            "font-mono",
-                            overWeight ? "text-danger" : "text-fg-2",
-                          )}
-                        >
-                          {totalWeight}/{maxWeight}
-                        </span>
-                      </div>
-                      <Progress
-                        value={Math.min(100, weightPct)}
-                        indicatorClassName={cn(overWeight && "bg-danger")}
-                      />
-                    </div>
+                    <span className="hidden flex-1 text-right font-mono text-xs text-fg-3 md:block">
+                      peso attivo {totalWeight}
+                    </span>
                   </div>
                 </AccordionTrigger>
                 <AccordionContent>

@@ -1,13 +1,12 @@
 from app.core.config import Settings
 from app.core.runtime_settings import (
-    DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
     effective_directional_reversal_breaker_settings,
     effective_enabled_timeframes,
-    effective_macro_risk_monitor_settings,
     effective_monitoring_only_timeframes,
+    effective_new_live_entries_enabled,
     effective_portfolio_guard_settings,
+    effective_telegram_notifications_enabled,
 )
-from app.db.init_db import _normalize_macro_risk_monitor_policies
 from app.db.models import AppSetting
 
 
@@ -65,20 +64,30 @@ def test_effective_monitoring_only_timeframes_dedups_and_excludes_enabled() -> N
     assert result == ["5m", "4h"]
 
 
-def test_effective_macro_risk_monitor_defaults_keep_watch_and_high_soft() -> None:
-    db = FakeDb({"risk": AppSetting(key="risk", value={})})
+def test_effective_telegram_notifications_honors_explicit_false() -> None:
+    db = FakeDb(
+        {"alerts": AppSetting(key="alerts", value={"telegram_enabled": False})}
+    )
 
-    result = effective_macro_risk_monitor_settings(db)
+    assert effective_telegram_notifications_enabled(db) is False
 
-    assert result["min_level_hold_minutes"] == {
-        "watch": 30,
-        "high": 60,
-        "extreme": 90,
-        "default": 30,
-    }
-    assert result["policies"]["watch"]["require_mtf_confluence"] is False
-    assert result["policies"]["high"]["require_mtf_confluence"] is False
-    assert result["policies"]["extreme"]["require_mtf_confluence"] is True
+
+def test_effective_telegram_notifications_preserves_legacy_default() -> None:
+    assert effective_telegram_notifications_enabled(FakeDb()) is True
+
+
+def test_new_live_entries_guard_defaults_open_and_honors_pause() -> None:
+    settings = Settings()
+    assert effective_new_live_entries_enabled(FakeDb(), settings) is True
+    db = FakeDb(
+        {
+            "live_execution": AppSetting(
+                key="live_execution",
+                value={"new_live_entries_enabled": False},
+            )
+        }
+    )
+    assert effective_new_live_entries_enabled(db, settings) is False
 
 
 def test_directional_risk_guard_defaults_are_live_only_for_new_caps() -> None:
@@ -98,32 +107,3 @@ def test_directional_risk_guard_defaults_are_live_only_for_new_caps() -> None:
     assert breaker["window_minutes"] == 120
     assert breaker["stop_loss_count"] == 4
     assert breaker["cooldown_minutes"] == 180
-
-
-def test_normalize_macro_risk_monitor_policies_backfills_only_watch_and_high() -> None:
-    value = {
-        **DEFAULT_MACRO_RISK_MONITOR_SETTINGS,
-        "policies": {
-            "watch": {
-                "size_multiplier": 1.0,
-                "require_mtf_confluence": True,
-            },
-            "high": {
-                "size_multiplier": 0.5,
-                "require_mtf_confluence": True,
-            },
-            "extreme": {
-                "size_multiplier": 0.25,
-                "require_mtf_confluence": True,
-            },
-        },
-        "custom_key": {"keep": True},
-    }
-
-    normalized, mutated = _normalize_macro_risk_monitor_policies(value)
-
-    assert mutated is True
-    assert normalized["policies"]["watch"]["require_mtf_confluence"] is False
-    assert normalized["policies"]["high"]["require_mtf_confluence"] is False
-    assert normalized["policies"]["extreme"]["require_mtf_confluence"] is True
-    assert normalized["custom_key"] == {"keep": True}

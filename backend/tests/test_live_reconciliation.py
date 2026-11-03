@@ -689,6 +689,47 @@ def test_reconciliation_infers_tp1_from_remote_size_and_moves_stop_to_breakeven(
     assert "live_reconciliation_size_mismatch" not in events
 
 
+def test_reconciliation_does_not_infer_fill_for_skipped_tp() -> None:
+    position = _make_position(size="0.02")
+    position.market.symbol = "ZEC"
+    position.market.metadata_json = {"hl_coin": "ZEC", "raw": {"szDecimals": 2}}
+    position.metadata_json = {
+        "initial_size": "0.02",
+        "take_profit_plan": [
+            {
+                "level": "tp1",
+                "price": "915.94",
+                "allocation": "0.3",
+                "filled": False,
+                "skipped": True,
+                "skip_reason": "below_min_reduce_only_notional",
+            },
+            {
+                "level": "runner",
+                "price": "",
+                "allocation": "0.7",
+                "filled": False,
+                "runner": True,
+            },
+        ],
+    }
+    db = FakeDb(positions=[position])
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "ZEC", "szi": "0.02", "entryPx": "841.11", "markPx": "923.99"}
+        ],
+        frontend_open_orders=[],
+    )
+
+    reconcile_live_positions(db, trading_client=trading)
+
+    tp1 = position.metadata_json["take_profit_plan"][0]
+    assert tp1["filled"] is False
+    assert tp1["skipped"] is True
+    events = [row.event_type for row in db.added if isinstance(row, DecisionLog)]
+    assert "live_reconciliation_tp1_inferred" not in events
+
+
 def test_reconciliation_sets_runner_active_when_tp2_fills() -> None:
     """Quando tp2 si filla, tp2_hit e runner_active devono essere impostati
     in modo che il trailing stop attivi la modalità runner al ciclo successivo."""
@@ -1420,12 +1461,211 @@ def test_protection_state_flags_skipped_tp_when_absent_from_hl() -> None:
     )
 
     assert state["needs_intervention"] is True
-    assert state["repairable"] is False
+    assert state["repairable"] is True
     assert state["missing_orders"] == []
     assert state["rejected_orders"] == []
     assert state["skipped_orders"] == ["tp2"]
     assert "skipped:tp2" in state["issues"]
     assert state["summary"] == "Skipped tp2"
+
+
+def test_manual_repair_consolidates_skipped_small_tps_before_submission() -> None:
+    position = _make_short_position(size="85")
+    position.entry_price = Decimal("0.32815")
+    position.stop_loss = Decimal("0.3423372295")
+    position.market.symbol = "TRX"
+    position.market.metadata_json = {"hl_coin": "TRX", "raw": {"szDecimals": 0}}
+    position.metadata_json = {
+        "source_signal_id": 42,
+        "initial_size": "85",
+        "take_profit_plan": [
+            {
+                "level": "tp1",
+                "price": "0.3142027705",
+                "allocation": "0.3",
+                "filled": False,
+                "skipped": True,
+                "skip_reason": "below_min_reduce_only_notional",
+            },
+            {
+                "level": "tp2",
+                "price": "0.3001355410",
+                "allocation": "0.2",
+                "filled": False,
+                "skipped": True,
+                "skip_reason": "below_min_reduce_only_notional",
+            },
+            {
+                "level": "runner",
+                "price": "",
+                "allocation": "0.5",
+                "filled": False,
+                "runner": True,
+            },
+        ],
+    }
+    stop = Order(
+        id=1,
+        position_id=position.id,
+        mode="live",
+        order_type="stop_loss",
+        side="buy",
+        price=position.stop_loss,
+        size=position.size,
+        status="ok",
+        hyperliquid_order_id="1234",
+    )
+    db = FakeDb(positions=[position], orders=[stop])
+    trading = FakeTrading(
+        remote_positions=[
+            {
+                "coin": "TRX",
+                "szi": "-85",
+                "entryPx": "0.32815",
+                "markPx": "0.32000",
+            }
+        ],
+        frontend_open_orders=[
+            {
+                "coin": "TRX",
+                "oid": 1234,
+                "orderType": "Stop Market",
+                "isTrigger": True,
+                "reduceOnly": True,
+                "triggerPx": str(position.stop_loss),
+                "sz": "85",
+            }
+        ],
+        resubmit_oid="5678",
+    )
+
+    reconcile_live_positions(
+        db,
+        trading_client=trading,
+        coins={"TRX"},
+        force_repair=True,
+    )
+
+    tp_submissions = [item for item in trading.resubmitted if item["tpsl"] == "tp"]
+    assert tp_submissions == [
+        {"coin": "TRX", "is_buy": True, "size": Decimal("42"), "tpsl": "tp"}
+    ]
+    assert position.metadata_json["take_profit_plan"] == [
+        {
+            "level": "tp1",
+            "price": "0.3142027705",
+            "allocation": "0.5",
+            "filled": False,
+        },
+        {
+            "level": "runner",
+            "price": "",
+            "allocation": "0.5",
+            "filled": False,
+            "runner": True,
+        },
+    ]
+    events = [row.event_type for row in db.added if isinstance(row, DecisionLog)]
+    assert "live_protection_manual_plan_repaired" in events
+    assert "live_protection_order_recreated" in events
+
+
+def test_manual_repair_clears_false_inferred_fill_before_consolidation() -> None:
+    position = _make_position(size="0.02")
+    position.entry_price = Decimal("841.11")
+    position.stop_loss = Decimal("841.11")
+    position.market.symbol = "ZEC"
+    position.market.metadata_json = {"hl_coin": "ZEC", "raw": {"szDecimals": 2}}
+    position.metadata_json = {
+        "source_signal_id": 42,
+        "initial_size": "0.02",
+        "tp1_hit": True,
+        "partial_exit_count": 1,
+        "last_exit_reason": "tp1",
+        "last_exit_price": "923.99",
+        "take_profit_plan": [
+            {
+                "level": "tp1",
+                "price": "915.9449545284",
+                "allocation": "0.3",
+                "filled": True,
+                "filled_price": "923.99",
+                "filled_size": "0.01",
+                "skipped": True,
+                "skip_reason": "below_min_reduce_only_notional",
+            },
+            {
+                "level": "tp2",
+                "price": "991.0199090568",
+                "allocation": "0.2",
+                "filled": False,
+                "skipped": True,
+                "skip_reason": "below_min_reduce_only_notional",
+            },
+            {
+                "level": "runner",
+                "price": "",
+                "allocation": "0.5",
+                "filled": False,
+                "runner": True,
+            },
+        ],
+    }
+    stop = Order(
+        id=1,
+        position_id=position.id,
+        mode="live",
+        order_type="stop_loss",
+        side="sell",
+        price=position.stop_loss,
+        size=position.size,
+        status="ok",
+        hyperliquid_order_id="1234",
+    )
+    db = FakeDb(positions=[position], orders=[stop])
+    trading = FakeTrading(
+        remote_positions=[
+            {"coin": "ZEC", "szi": "0.02", "entryPx": "841.11", "markPx": "900"}
+        ],
+        frontend_open_orders=[
+            {
+                "coin": "ZEC",
+                "oid": 1234,
+                "orderType": "Stop Market",
+                "isTrigger": True,
+                "reduceOnly": True,
+                "triggerPx": str(position.stop_loss),
+                "sz": "0.02",
+            }
+        ],
+        resubmit_oid="5678",
+    )
+
+    reconcile_live_positions(
+        db,
+        trading_client=trading,
+        coins={"ZEC"},
+        force_repair=True,
+    )
+
+    tp_submissions = [item for item in trading.resubmitted if item["tpsl"] == "tp"]
+    assert tp_submissions == [
+        {"coin": "ZEC", "is_buy": False, "size": Decimal("0.02"), "tpsl": "tp"}
+    ]
+    assert position.metadata_json["take_profit_plan"] == [
+        {
+            "level": "tp1",
+            "price": "915.9449545284",
+            "allocation": "1",
+            "filled": False,
+        }
+    ]
+    assert position.metadata_json["partial_exit_count"] == 0
+    assert "tp1_hit" not in position.metadata_json
+    assert "last_exit_reason" not in position.metadata_json
+    assert position.metadata_json["last_manual_protection_plan_repair"][
+        "corrected_inferred_levels"
+    ] == ["tp1"]
 
 
 def test_protection_state_ignores_skipped_tp_when_frontend_order_exists() -> None:

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ArrowRight, Power, RefreshCcw } from "lucide-react";
+import { ArrowRight, Power } from "lucide-react";
 
 import {
   CommandDialog,
@@ -13,7 +13,7 @@ import {
   CommandShortcut,
 } from "@/components/ui/command";
 import { useMarkets, useSettings, useSignals } from "@/lib/hooks/queries";
-import { useAutoTuner, useKillSwitch } from "@/lib/hooks/mutations";
+import { useKillSwitch } from "@/lib/hooks/mutations";
 import { ROUTES, ROUTE_MAP, type Route } from "@/components/shell/routes";
 import type { Market } from "@/lib/api";
 
@@ -29,7 +29,6 @@ export function CommandMenu({ setRoute, onOpenMarket }: CommandMenuProps) {
   const { data: signals } = useSignals("min_score=70&limit=30");
   const { data: settings } = useSettings();
   const { mutate: toggleKill } = useKillSwitch();
-  const { mutate: runTuner } = useAutoTuner();
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -118,13 +117,6 @@ export function CommandMenu({ setRoute, onOpenMarket }: CommandMenuProps) {
           >
             <Power className={killArmed ? "text-success" : "text-danger"} />
             {killArmed ? "Disarma kill switch" : "Arma kill switch"}
-          </CommandItem>
-          <CommandItem
-            value="run auto-tuner step"
-            onSelect={() => runCommand(() => runTuner("run"))}
-          >
-            <RefreshCcw className="text-fg-3" />
-            Esegui auto-tuner
           </CommandItem>
           <CommandItem
             value="apri settings"

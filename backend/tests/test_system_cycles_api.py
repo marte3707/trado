@@ -97,6 +97,40 @@ def test_worker_status_clears_error_after_successful_cycle() -> None:
     assert status["last_error_message"] is None
 
 
+def test_system_cycles_keeps_pending_budget_deferral_visible_after_previous_success() -> None:
+    db = _session()
+    now = datetime.now(UTC)
+    pending = {"deferred_actions": {"unified_account_ratio": (now + timedelta(seconds=30)).isoformat()}}
+    setting = AppSetting(
+        key="system_cycle_status",
+        value={"cycles": {"fast_risk_cycle": {
+            "status": "warn",
+            "last_seen_at": now.isoformat(),
+            "last_ok_at": (now - timedelta(seconds=30)).isoformat(),
+            "data": pending,
+        }}},
+    )
+    db.add_all([setting, _log("fast_risk_cycle_failed", now - timedelta(days=1))])
+    db.commit()
+    client = _client(db)
+
+    payload = client.get("/api/analytics/system-cycles").json()
+    cycle = next(row for row in payload["services"] if row["id"] == "fast_risk_cycle")
+    assert payload["status"] == "degraded"
+    assert cycle["status"] == "warn"
+    assert cycle["data"] == pending
+
+    setting.value = {"cycles": {"fast_risk_cycle": {
+        "status": "ok", "last_seen_at": now.isoformat(), "last_ok_at": now.isoformat(),
+        "data": {"actions": {"unified_account_ratio": {"status": "ok"}}},
+    }}}
+    db.commit()
+    payload = client.get("/api/analytics/system-cycles").json()
+    cycle = next(row for row in payload["services"] if row["id"] == "fast_risk_cycle")
+    assert cycle["status"] == "ok"
+    assert "deferred_actions" not in cycle["data"]
+
+
 def test_worker_status_keeps_unresolved_error() -> None:
     db = _session()
     now = datetime.now(UTC)

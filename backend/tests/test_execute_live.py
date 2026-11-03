@@ -7,7 +7,11 @@ import pytest
 
 from app.core.config import Settings
 from app.db.models import AppSetting, DecisionLog, Market, Order, Position, Signal
-from app.engine.execution import OrderExecutionEngine, _target_leverage
+from app.engine.execution import (
+    OrderExecutionEngine,
+    _target_leverage,
+    rescale_take_profit_plan_for_min_notional,
+)
 from app.engine.order_validation import ValidationResult
 from app.services.hyperliquid import (
     FillableDepthEstimate,
@@ -47,12 +51,12 @@ class FakeDb:
     market: Market
     risk_settings: dict[str, Any] = field(default_factory=dict)
     live_execution_settings: dict[str, Any] = field(default_factory=dict)
+    the_bull_settings: dict[str, Any] = field(default_factory=dict)
     position_management_settings: dict[str, Any] = field(default_factory=dict)
     operation_mode_setting: dict[str, Any] = field(default_factory=lambda: {"value": "AUTO_TRADE"})
     enable_live_setting: dict[str, Any] = field(default_factory=lambda: {"value": True})
     kill_switch: dict[str, Any] | None = None
     portfolio_circuit_state: dict[str, Any] | None = None
-    macro_risk_state: dict[str, Any] | None = None
     added: list[Any] = field(default_factory=list)
     committed: int = 0
     rolled_back: int = 0
@@ -69,6 +73,12 @@ class FakeDb:
                 return AppSetting(key="risk", value=self.risk_settings)
             if pk == "live_execution":
                 return AppSetting(key="live_execution", value=self.live_execution_settings)
+            if pk == "the_bull":
+                return (
+                    AppSetting(key="the_bull", value=self.the_bull_settings)
+                    if self.the_bull_settings
+                    else None
+                )
             if pk == "position_management":
                 return (
                     AppSetting(key="position_management", value=self.position_management_settings)
@@ -85,12 +95,6 @@ class FakeDb:
                 return (
                     AppSetting(key="portfolio_circuit_breaker_state", value=self.portfolio_circuit_state)
                     if self.portfolio_circuit_state
-                    else None
-                )
-            if pk == "macro_risk_state":
-                return (
-                    AppSetting(key="macro_risk_state", value=self.macro_risk_state)
-                    if self.macro_risk_state
                     else None
                 )
         return None
@@ -140,6 +144,7 @@ class FakeTradingClient:
         depth_best_ask: Decimal | None = None,
         depth_error: Exception | None = None,
         account_summary_error: Exception | None = None,
+        available_spot_usdc: Decimal = Decimal("1000"),
     ) -> None:
         self._account_value = account_value
         self.market_status = market_status
@@ -157,14 +162,20 @@ class FakeTradingClient:
         self.depth_best_ask = depth_best_ask
         self.depth_error = depth_error
         self.account_summary_error = account_summary_error
+        self._available_spot_usdc = available_spot_usdc
+        self.account_summary_calls = 0
 
     def account_value(self) -> Decimal:
         return self._account_value
 
     def account_summary(self) -> tuple[Decimal, Decimal]:
+        self.account_summary_calls += 1
         if self.account_summary_error is not None:
             raise self.account_summary_error
         return self._account_value, self._account_value
+
+    def available_spot_usdc(self) -> Decimal:
+        return self._available_spot_usdc
 
     def set_leverage(self, coin: str, leverage: int, is_cross: bool = False) -> None:
         self.leverage_calls.append({"coin": coin, "leverage": leverage, "is_cross": is_cross})
@@ -255,6 +266,7 @@ class FakeTradingClient:
         tpsl: str,
         expires_after_seconds: int,
         cloid: str | None = None,
+        reduce_only: bool = True,
     ) -> HyperliquidOrderResult:
         call = {
             "coin": coin,
@@ -264,6 +276,7 @@ class FakeTradingClient:
             "tpsl": tpsl,
             "expires_after_seconds": expires_after_seconds,
             "cloid": cloid,
+            "reduce_only": reduce_only,
         }
         self.trigger_orders.append(call)
         if tpsl in self.trigger_failures:
@@ -415,6 +428,39 @@ def test_execute_live_long_submits_market_plus_dynamic_triggers(monkeypatch: pyt
     assert len(orders) == 4
 
 
+def test_execute_live_the_bull_spot_fallback_uses_usdc_and_one_full_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    signal.strategy_breakdown = {"_external_source": {"provider": "the_bull"}}
+    market = _build_market()
+    market.market_type = "spot"
+    market.symbol = "BTC/USDC"
+    market.metadata_json = {"hl_coin": "@107", "raw": {"szDecimals": 4}}
+    db = FakeDb(
+        signal=signal,
+        market=market,
+        the_bull_settings={"spot_fallback_enabled": True},
+    )
+    trading = FakeTradingClient(available_spot_usdc=Decimal("50"))
+
+    position = OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert position.metadata_json["instrument_type"] == "spot"
+    assert position.metadata_json["spot_protection"] == "single_stop_loss"
+    assert position.metadata_json["take_profit_plan"] == []
+    assert trading.leverage_calls == []
+    assert len(trading.market_orders) == 1
+    assert trading.market_orders[0]["coin"] == "@107"
+    assert trading.market_orders[0]["is_buy"] is True
+    assert len(trading.trigger_orders) == 1
+    assert trading.trigger_orders[0]["tpsl"] == "sl"
+    assert trading.trigger_orders[0]["is_buy"] is False
+    assert trading.trigger_orders[0]["reduce_only"] is False
+
+
 def test_execute_live_rescales_small_tp2_into_tp1_for_reduce_only_minimum(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -456,6 +502,31 @@ def test_execute_live_rescales_small_tp2_into_tp1_for_reduce_only_minimum(
         row.event_type == "live_take_profit_plan_min_notional_rescaled"
         for row in db.added_of(DecisionLog)
     )
+
+
+def test_rescale_small_position_borrows_runner_to_create_one_valid_tp() -> None:
+    plan = [
+        {"level": "tp1", "price": "915.9449545284", "allocation": "0.3", "filled": False},
+        {"level": "tp2", "price": "991.0199090568", "allocation": "0.2", "filled": False},
+        {"level": "runner", "price": "", "allocation": "0.5", "filled": False, "runner": True},
+    ]
+
+    rescaled, changes = rescale_take_profit_plan_for_min_notional(
+        plan,
+        position_size=Decimal("0.02"),
+        min_reduce_notional=Decimal("10"),
+        sz_decimals=2,
+    )
+
+    assert len(rescaled) == 1
+    assert rescaled[0]["level"] == "tp1"
+    assert rescaled[0]["allocation"] == "1"
+    assert not rescaled[0].get("skipped")
+    assert {change["action"] for change in changes} == {
+        "merged_into_previous_tp",
+        "partially_merged_into_tp",
+        "fully_merged_into_tp",
+    }
 
 
 def test_execute_live_short_uses_sell_market_and_buy_triggers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -709,49 +780,6 @@ def test_execute_live_blocks_before_submit_when_portfolio_breaker_active(
     assert db.added_of(Position) == []
     events = [row.event_type for row in db.added_of(DecisionLog)]
     assert "live_order_rejected_portfolio_guard" in events
-
-
-def test_execute_live_checks_portfolio_guard_before_live_validation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from app.engine.order_validation import OrderValidator
-
-    def fail_if_called(self, db, signal, settings, plan=None):  # noqa: ARG001
-        raise AssertionError("live validation should run after portfolio guard")
-
-    monkeypatch.setattr(OrderValidator, "validate_live_execution", fail_if_called)
-
-    settings = _build_settings()
-    signal = _build_signal()
-    signal.timeframe = "5m"
-    active_until = datetime.now(UTC) + timedelta(hours=1)
-    db = FakeDb(
-        signal=signal,
-        market=_build_market(),
-        macro_risk_state={
-            "active": True,
-            "level": "extreme",
-            "reason": "geopolitical_escalation, market_stress",
-            "sources": ["news", "market_stress"],
-            "active_until": active_until.isoformat(),
-            "policy": {
-                "size_multiplier": 0.25,
-                "min_score_add": 12,
-                "disable_timeframes": ["5m"],
-                "require_mtf_confluence": True,
-            },
-        },
-    )
-    trading = FakeTradingClient()
-
-    with pytest.raises(PermissionError, match="macro risk mode disabled this timeframe"):
-        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
-
-    assert trading.market_orders == []
-    assert trading.leverage_calls == []
-    assert db.added_of(Position) == []
-    events = [row.event_type for row in db.added_of(DecisionLog)]
-    assert events == ["live_order_rejected_portfolio_guard"]
 
 
 def test_execute_live_sets_leverage_before_submitting_order(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1103,3 +1131,228 @@ def test_execute_live_aborts_before_submit_when_kill_switch_enabled(
     assert trading.market_orders == []
     events = [row.event_type for row in db.added_of(DecisionLog)]
     assert "live_order_aborted_kill_switch" in events
+
+
+def test_execute_live_pause_blocks_new_entry_before_account_preflight() -> None:
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(
+        signal=signal,
+        market=_build_market(),
+        live_execution_settings={"new_live_entries_enabled": False},
+    )
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="new live entries are paused"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.account_summary_calls == 0
+    assert trading.market_orders == []
+
+
+def test_execute_live_never_promotes_a_paper_research_candidate() -> None:
+    settings = _build_settings()
+    signal = _build_signal()
+    signal.strategy_breakdown = {
+        "_research_candidate": {"active": True, "name": "four_hour_long"}
+    }
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="research candidate is paper-only"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.account_summary_calls == 0
+    assert trading.market_orders == []
+
+
+def test_execute_live_allows_only_configured_the_bull_during_standard_entry_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_validator_ok(monkeypatch)
+    settings = _build_settings()
+    signal = _build_signal()
+    signal.strategy_breakdown = {
+        "_external_source": {
+            "provider": "the_bull",
+            "channel_username": "thebull_crypto",
+            "message_id": 123,
+            "message_url": "https://t.me/thebull_crypto/123",
+            "risk_multiplier": 0.5,
+        }
+    }
+    db = FakeDb(
+        signal=signal,
+        market=_build_market(),
+        live_execution_settings={"new_live_entries_enabled": False},
+        the_bull_settings={
+            "enabled": True,
+            "execution_mode": "live",
+            "channel_username": "thebull_crypto",
+        },
+    )
+    trading = FakeTradingClient()
+
+    position = OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert position.mode == "live"
+    assert len(trading.market_orders) == 1
+
+
+def test_execute_live_does_not_allow_unconfigured_the_bull_during_standard_entry_pause() -> None:
+    settings = _build_settings()
+    signal = _build_signal()
+    signal.strategy_breakdown = {
+        "_external_source": {
+            "provider": "the_bull",
+            "channel_username": "thebull_crypto",
+            "message_id": 123,
+            "message_url": "https://t.me/thebull_crypto/123",
+        }
+    }
+    db = FakeDb(
+        signal=signal,
+        market=_build_market(),
+        live_execution_settings={"new_live_entries_enabled": False},
+        the_bull_settings={
+            "enabled": True,
+            "execution_mode": "paper",
+            "channel_username": "thebull_crypto",
+        },
+    )
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="new live entries are paused"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.account_summary_calls == 0
+    assert trading.market_orders == []
+
+
+def test_execute_live_does_not_allow_the_bull_label_from_a_different_channel() -> None:
+    settings = _build_settings()
+    signal = _build_signal()
+    signal.strategy_breakdown = {
+        "_external_source": {
+            "provider": "the_bull",
+            "channel_username": "impostor_channel",
+            "message_id": 123,
+            "message_url": "https://t.me/impostor_channel/123",
+        }
+    }
+    db = FakeDb(
+        signal=signal,
+        market=_build_market(),
+        live_execution_settings={"new_live_entries_enabled": False},
+        the_bull_settings={
+            "enabled": True,
+            "execution_mode": "live",
+            "channel_username": "thebull_crypto",
+        },
+    )
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="new live entries are paused"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.account_summary_calls == 0
+    assert trading.market_orders == []
+
+
+def test_execute_live_the_bull_does_not_bypass_kill_switch_during_standard_entry_pause() -> None:
+    settings = _build_settings()
+    signal = _build_signal()
+    signal.strategy_breakdown = {
+        "_external_source": {
+            "provider": "the_bull",
+            "channel_username": "thebull_crypto",
+            "message_id": 123,
+            "message_url": "https://t.me/thebull_crypto/123",
+        }
+    }
+    db = FakeDb(
+        signal=signal,
+        market=_build_market(),
+        live_execution_settings={"new_live_entries_enabled": False},
+        the_bull_settings={
+            "enabled": True,
+            "execution_mode": "live",
+            "channel_username": "thebull_crypto",
+        },
+        kill_switch={"enabled": True},
+    )
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="kill switch enabled"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.account_summary_calls == 0
+    assert trading.market_orders == []
+
+
+def test_execute_live_readiness_gate_blocks_before_account_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.engine.execution.evaluate_live_readiness_gate",
+        lambda db, taker_fee_rate: {
+            "enabled": True,
+            "ready": False,
+            "checks": ["net PF 0.800 < 1.200"],
+            "metrics": {},
+        },
+    )
+    settings = _build_settings()
+    signal = _build_signal()
+    db = FakeDb(signal=signal, market=_build_market())
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="live readiness gate failed"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.account_summary_calls == 0
+    assert trading.market_orders == []
+    assert "live_order_blocked_readiness" in [
+        row.event_type for row in db.added_of(DecisionLog)
+    ]
+
+
+def test_execute_live_the_bull_does_not_bypass_readiness_gate_during_standard_entry_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "app.engine.execution.evaluate_live_readiness_gate",
+        lambda db, taker_fee_rate: {
+            "enabled": True,
+            "ready": False,
+            "checks": ["net PF 0.800 < 1.200"],
+            "metrics": {},
+        },
+    )
+    settings = _build_settings()
+    signal = _build_signal()
+    signal.strategy_breakdown = {
+        "_external_source": {
+            "provider": "the_bull",
+            "channel_username": "thebull_crypto",
+            "message_id": 123,
+            "message_url": "https://t.me/thebull_crypto/123",
+        }
+    }
+    db = FakeDb(
+        signal=signal,
+        market=_build_market(),
+        live_execution_settings={"new_live_entries_enabled": False},
+        the_bull_settings={
+            "enabled": True,
+            "execution_mode": "live",
+            "channel_username": "thebull_crypto",
+        },
+    )
+    trading = FakeTradingClient()
+
+    with pytest.raises(PermissionError, match="live readiness gate failed"):
+        OrderExecutionEngine(settings).execute_live(db, signal, trading_client=trading)
+
+    assert trading.account_summary_calls == 0
+    assert trading.market_orders == []

@@ -30,11 +30,14 @@ class FakeDb:
     def __init__(self, open_positions: int = 0) -> None:
         self._open_positions = open_positions
         self.market = Market(id=1, exchange="hyperliquid", symbol="BTC", base="BTC", quote="USDC", market_type="perp")
+        self.the_bull_settings: dict = {}
 
     def get(self, model, key):
         if model is Market and key == 1:
             return self.market
         if model is AppSetting:
+            if key == "the_bull" and self.the_bull_settings:
+                return AppSetting(key="the_bull", value=self.the_bull_settings)
             return None
         return None
 
@@ -131,7 +134,7 @@ def test_live_validation_blocks_when_notional_below_exchange_minimum() -> None:
     assert any("notional below exchange minimum" in r for r in result.reasons)
 
 
-def test_live_validation_blocks_spot_markets() -> None:
+def test_live_validation_blocks_spot_markets_without_enabled_source_fallback() -> None:
     settings = Settings(
         operation_mode=OperationMode.AUTO_TRADE,
         enable_live_trading=True,
@@ -145,4 +148,32 @@ def test_live_validation_blocks_spot_markets() -> None:
     result = OrderValidator().validate_live_execution(db, _make_signal(), settings)  # type: ignore[arg-type]
 
     assert not result.ok
-    assert "live execution currently supports perp markets only" in result.reasons
+    assert "live spot execution is limited to enabled The Bull fallback" in result.reasons
+
+
+def test_live_validation_allows_enabled_the_bull_usdc_spot_fallback() -> None:
+    settings = Settings(
+        operation_mode=OperationMode.AUTO_TRADE,
+        enable_live_trading=True,
+        hyperliquid_network="testnet",
+        hyperliquid_account_address="0x0000000000000000000000000000000000000001",
+        hyperliquid_private_key="0x" + "1" * 64,
+    )
+    db = FakeDb(open_positions=0)
+    db.market.market_type = "spot"
+    db.the_bull_settings = {"spot_fallback_enabled": True}
+    signal = _make_signal()
+    signal.strategy_breakdown = {"_external_source": {"provider": "the_bull"}}
+    plan = LiveOrderPlan(
+        side="long",
+        size=Decimal("1"),
+        notional=Decimal("100"),
+        leverage=Decimal("0.1"),
+        account_value=Decimal("1000"),
+        risk_amount=Decimal("5"),
+        available_margin=Decimal("100"),
+    )
+
+    result = OrderValidator().validate_live_execution(db, signal, settings, plan)  # type: ignore[arg-type]
+
+    assert result.ok

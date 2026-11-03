@@ -12,7 +12,6 @@ from app.api.routers import (
     account,
     analytics,
     app_settings,
-    calibration,
     leaderboard_alpha,
     markets,
     ops,
@@ -30,7 +29,6 @@ for module in (
     positions,
     analytics,
     leaderboard_alpha,
-    calibration,
     app_settings,
     account,
 ):

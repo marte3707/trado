@@ -88,6 +88,21 @@ class MarketDataEvent(Base):
     )
 
 
+class MarketL2Snapshot(Base):
+    __tablename__ = "market_l2_snapshots"
+
+    market_id: Mapped[int] = mapped_column(
+        ForeignKey("markets.id", ondelete="CASCADE"), primary_key=True
+    )
+    bids: Mapped[list] = mapped_column(JSONB, default=list)
+    asks: Mapped[list] = mapped_column(JSONB, default=list)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    market: Mapped[Market] = relationship()
+
+
 class Indicator(Base):
     __tablename__ = "indicators"
 
@@ -212,6 +227,52 @@ class Position(Base):
         # Copre il count posizioni live aperte nell'OrderValidator (status+mode)
         # e i filtri per stato/modalità della dashboard.
         Index("ix_positions_status_mode", "status", "mode"),
+    )
+
+
+class ExperimentOutcome(Base):
+    """Forward-only outcome attributed to the immutable experiment tag."""
+
+    __tablename__ = "experiment_outcomes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    position_id: Mapped[int] = mapped_column(
+        ForeignKey("positions.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    signal_id: Mapped[int | None] = mapped_column(
+        ForeignKey("signals.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    market_id: Mapped[int] = mapped_column(
+        ForeignKey("markets.id", ondelete="CASCADE"), index=True
+    )
+    experiment_version: Mapped[str] = mapped_column(String(64), index=True)
+    configuration_hash: Mapped[str] = mapped_column(String(64), index=True)
+    assignment: Mapped[str] = mapped_column(String(32), index=True)
+    timeframe: Mapped[str] = mapped_column(String(8), index=True)
+    side: Mapped[str] = mapped_column(String(16))
+    barrier_label: Mapped[str] = mapped_column(String(32), index=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric(28, 10))
+    initial_stop_loss: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    first_target_price: Mapped[Decimal | None] = mapped_column(Numeric(28, 10), nullable=True)
+    gross_r: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    estimated_fee_r: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    net_r: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    mae_r: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    mfe_r: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    first_touch_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    position: Mapped[Position] = relationship()
+    signal: Mapped["Signal | None"] = relationship()
+    market: Mapped[Market] = relationship()
+
+    __table_args__ = (
+        Index("ix_experiment_outcomes_version_closed", "experiment_version", "closed_at"),
     )
 
 

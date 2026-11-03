@@ -14,6 +14,7 @@ import httpx
 
 from app.core.config import Settings
 from app.core.enums import MarketType
+from app.db.models import MarketL2Snapshot
 from app.services._circuit import (
     CircuitBreaker,
     hyperliquid_account_breaker,
@@ -21,6 +22,7 @@ from app.services._circuit import (
     hyperliquid_order_breaker,
 )
 from app.services.hyperliquid_rate_limit import (
+    HyperliquidRateLimitDecision,
     check_hyperliquid_rate_limit,
     record_hyperliquid_rate_limit,
     record_hyperliquid_response_weight,
@@ -35,9 +37,11 @@ _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 # stesso account a cadenze indipendenti ravvicinate — non dai path di
 # pre-trade/pre-close, che richiedono sempre il dato piu' fresco possibile.
 DEFAULT_GUARD_STATE_CACHE_SECONDS = 60.0
+_PREDICTED_FUNDINGS_CACHE_TTL_SECONDS = 300.0
 
 _state_cache_lock = Lock()
 _state_cache: dict[tuple[str, str], tuple[float, Any]] = {}
+_predicted_fundings_cache: dict[str, tuple[float, dict[str, float]]] = {}
 
 
 def _status_code_of(exc: Exception) -> int | None:
@@ -89,11 +93,7 @@ def _call_trading_with_retry(
         live_preflight=live_preflight,
     )
     if not decision.allowed:
-        raise HyperliquidTransientError(
-            "Hyperliquid rate-limit governor skipped "
-            f"{rate_limit_class}:{request_type}; reason={decision.reason}; "
-            f"next_retry_after={decision.next_retry_after}"
-        )
+        raise HyperliquidRateLimitError(request_type, decision)
     if not breaker.allow():
         raise HyperliquidTransientError(f"Hyperliquid {breaker.name} circuit breaker is open")
     last_exc: Exception | None = None
@@ -202,6 +202,39 @@ def fetch_l2_book(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapsho
         return None
 
 
+def l2_book_from_levels(levels: object, n_levels: int = 20) -> L2BookSnapshot | None:
+    """Build an L2 snapshot from the compact levels stored by market-data WS."""
+    if not isinstance(levels, list) or len(levels) < 2:
+        return None
+    try:
+        bids = [
+            OrderBookLevel(price=float(level["px"]), size=float(level["sz"]))
+            for level in levels[0][:n_levels]
+            if isinstance(level, dict)
+        ]
+        asks = [
+            OrderBookLevel(price=float(level["px"]), size=float(level["sz"]))
+            for level in levels[1][:n_levels]
+            if isinstance(level, dict)
+        ]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return L2BookSnapshot(bids=bids, asks=asks) if bids and asks else None
+
+
+def latest_ws_l2_book(db: Any, market_id: int, *, max_age_seconds: float = 15.0) -> L2BookSnapshot | None:
+    """Return a recent market-data websocket book without consuming REST weight."""
+    snapshot = db.get(MarketL2Snapshot, market_id)
+    if snapshot is None or snapshot.updated_at is None:
+        return None
+    updated_at = snapshot.updated_at
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    if (datetime.now(UTC) - updated_at).total_seconds() > max_age_seconds:
+        return None
+    return l2_book_from_levels([snapshot.bids, snapshot.asks])
+
+
 async def fetch_l2_book_async(info_url: str, coin: str, n_levels: int = 20) -> L2BookSnapshot | None:
     """Versione async di fetch_l2_book. None in caso di errore o rate limit.
 
@@ -253,6 +286,10 @@ async def fetch_l2_book_async(info_url: str, coin: str, n_levels: int = 20) -> L
 
 def fetch_predicted_fundings(info_url: str) -> dict[str, float]:
     """Returns coin → predicted 8h funding rate (decimal fraction). Empty dict on failure."""
+    cached = _predicted_fundings_cache.get(info_url)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < _PREDICTED_FUNDINGS_CACHE_TTL_SECONDS:
+        return dict(cached[1])
     if not hyperliquid_market_data_breaker.allow():
         return {}
     decision = check_hyperliquid_rate_limit(
@@ -290,6 +327,8 @@ def fetch_predicted_fundings(info_url: str) -> dict[str, float]:
                             result[coin] = float(venue_entry[1])
                         break
             hyperliquid_market_data_breaker.record_success()
+            if result:
+                _predicted_fundings_cache[info_url] = (now, dict(result))
             return result
     except Exception:
         hyperliquid_market_data_breaker.record_failure()
@@ -348,6 +387,19 @@ class HyperliquidTransientError(HyperliquidError):
     pass
 
 
+class HyperliquidRateLimitError(HyperliquidTransientError):
+    """A local governor deferral with a structured retry deadline."""
+
+    def __init__(self, request_type: str, decision: HyperliquidRateLimitDecision) -> None:
+        self.reason = decision.reason
+        self.next_retry_after = decision.next_retry_after
+        super().__init__(
+            "Hyperliquid rate-limit governor skipped "
+            f"{decision.rate_limit_class}:{request_type}; reason={decision.reason}; "
+            f"next_retry_after={decision.next_retry_after}"
+        )
+
+
 class HyperliquidClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -366,11 +418,7 @@ class HyperliquidClient:
             safety_critical=False,
         )
         if not decision.allowed:
-            raise HyperliquidTransientError(
-                "Hyperliquid rate-limit governor skipped "
-                f"info:{request_type}; reason={decision.reason}; "
-                f"next_retry_after={decision.next_retry_after}"
-            )
+            raise HyperliquidRateLimitError(request_type, decision)
         if not breaker.allow():
             raise HyperliquidTransientError(
                 f"Hyperliquid {breaker.name} circuit breaker is open"
@@ -564,6 +612,11 @@ class HyperliquidClient:
             quote_token = tokens.get(item.get("tokens", [None, None])[1], {})
             hl_coin = item.get("name")
             symbol = hl_coin if "/" in hl_coin else f"{base_token.get('name', hl_coin)}/{quote_token.get('name', 'USDC')}"
+            raw = dict(item)
+            # Spot pair metadata does not carry the lot precision directly;
+            # it belongs to the base token.  Persist it in the same shape used
+            # by the execution rounding helper for perpetual contracts.
+            raw["szDecimals"] = int(base_token.get("szDecimals", 8))
             markets.append(
                 {
                     "symbol": symbol,
@@ -572,7 +625,7 @@ class HyperliquidClient:
                     "market_type": MarketType.SPOT.value,
                     "asset_id": 10000 + int(item["index"]),
                     "hl_coin": hl_coin,
-                    "raw": item,
+                    "raw": raw,
                 }
             )
         return markets
@@ -632,6 +685,23 @@ class HyperliquidTradingClient:
         """Compatibilità: ritorna solo il valore totale del conto."""
         total, _ = self.account_summary()
         return total
+
+    def available_spot_usdc(self) -> Decimal:
+        """Return spendable USDC in the spot wallet immediately before a spot buy.
+
+        A spot order cannot safely use the perp available-margin calculation:
+        Hyperliquid rejects it when the actual USDC balance is held by another
+        spot order.  Fetching the current balance here keeps the pre-flight
+        amount tied to the wallet that will fund the order.
+        """
+        spot_state = self.spot_user_state(max_age_seconds=0)
+        for balance in spot_state.get("balances", []):
+            if not isinstance(balance, dict) or balance.get("coin") != "USDC":
+                continue
+            total = Decimal(str(balance.get("total", "0")))
+            hold = Decimal(str(balance.get("hold", "0")))
+            return max(Decimal("0"), total - hold)
+        return Decimal("0")
 
     def spot_user_state(
         self, address: str | None = None, *, max_age_seconds: float | None = None
@@ -923,6 +993,7 @@ class HyperliquidTradingClient:
         tpsl: str,
         expires_after_seconds: int,
         cloid: str | None = None,
+        reduce_only: bool = True,
     ) -> HyperliquidOrderResult:
         exchange = self._exchange(expires_after_seconds)
         rounded_price = _round_price_for_coin(trigger_price, coin, getattr(exchange, "info", None))
@@ -934,7 +1005,7 @@ class HyperliquidTradingClient:
                     "tpsl": tpsl,
                 }
             },
-            "reduce_only": True,
+            "reduce_only": reduce_only,
         }
         cloid_obj = _build_cloid(cloid)
         if cloid_obj is not None:
@@ -960,6 +1031,7 @@ class HyperliquidTradingClient:
         tpsl: str,
         expires_after_seconds: int,
         cloid: str | None = None,
+        reduce_only: bool = True,
     ) -> HyperliquidOrderResult:
         exchange = self._exchange(expires_after_seconds)
         rounded_price = _round_price_for_coin(trigger_price, coin, getattr(exchange, "info", None))
@@ -979,7 +1051,7 @@ class HyperliquidTradingClient:
                 _size_to_float(size),
                 rounded_price,
                 order_type=order_type,
-                reduce_only=True,
+                reduce_only=reduce_only,
                 cloid=cloid_obj,
             ),
             attempts=1,

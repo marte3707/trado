@@ -1,8 +1,5 @@
 import {
   AppSettings,
-  AutoTunerStatus,
-  Calibration,
-  CalibrationHistoryEntry,
   DecisionLog,
   Health,
   Market,
@@ -55,9 +52,6 @@ export type DashboardData = {
   settings: AppSettings;
   strategies: Strategy[];
   logs: DecisionLog[];
-  calibration: Calibration;
-  calibrationHistory: CalibrationHistoryEntry[];
-  tunerStatus: AutoTunerStatus | null;
   workerCycles: WorkerCycle[];
   signalRejections: SignalRejections;
   marketIntelligence: MarketIntelligence;

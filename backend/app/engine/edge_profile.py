@@ -8,7 +8,12 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.core.enums import Direction
 from app.db.models import Position, Signal
-from app.engine.performance import PerformanceStats, SignalPerformanceAnalyzer, serialize_stats
+from app.engine.performance import (
+    PerformanceStats,
+    SignalPerformanceAnalyzer,
+    aligned_strategy_names,
+    serialize_stats,
+)
 
 DEFAULT_MAX_COMBINED_SCORE_ADJUSTMENT = 15
 
@@ -121,6 +126,10 @@ def compute_edge_adjustments(
     *,
     lookback: int = 500,
     directional_lookback: int | None = None,
+    market_weak_trades: int = 20,
+    market_severe_trades: int = 30,
+    market_weak_adjustment: int = 3,
+    market_severe_adjustment: int = 5,
     analyzer: SignalPerformanceAnalyzer | None = None,
 ) -> dict[str, dict[str, Any]]:
     analyzer = analyzer or SignalPerformanceAnalyzer()
@@ -170,18 +179,13 @@ def compute_edge_adjustments(
     for row in directional_rows:
         if row.signal is None or not isinstance(row.signal.strategy_breakdown, dict):
             continue
-        for strategy_name, payload in row.signal.strategy_breakdown.items():
-            if strategy_name.startswith("_") or not isinstance(payload, dict):
-                continue
-            family = direction_family(payload.get("direction"))
-            if family is None:
-                continue
-            try:
-                contribution = float(payload.get("contribution", 0.0))
-            except (TypeError, ValueError):
-                contribution = 0.0
-            if contribution <= 0:
-                continue
+        family = direction_family(row.signal.direction)
+        if family is None:
+            continue
+        for strategy_name in aligned_strategy_names(
+            row.signal.direction,
+            row.signal.strategy_breakdown,
+        ):
             key = f"{row.signal.timeframe}:{family}:{strategy_name}"
             strategy_direction_groups.setdefault(key, []).append(row.position)
     strategy_direction_stats = {
@@ -227,14 +231,14 @@ def compute_edge_adjustments(
         key: {
             "adjustment": edge_adjustment_for_stats(
                 _stats_from_payload(stats),
-                weak_trades=5,
+                weak_trades=market_weak_trades,
                 weak_pf=0.5,
                 weak_wr=None,
-                weak_adjustment=6,
-                severe_trades=8,
+                weak_adjustment=market_weak_adjustment,
+                severe_trades=market_severe_trades,
                 severe_pf=0.35,
                 severe_wr=None,
-                severe_adjustment=10,
+                severe_adjustment=market_severe_adjustment,
                 require_negative_pnl=True,
             ),
             "stats": stats,
@@ -366,7 +370,11 @@ def signal_threshold_adjustment(
             risk.get("score_bucket_adjustments"),
             f"{family}:{score_bucket(score)}",
         ),
-        "market": _adjustment_value(risk.get("market_score_adjustments"), str(market_id)),
+        "market": _market_adjustment_value(
+            risk.get("market_score_adjustments"),
+            str(market_id),
+            min_trades=_safe_int(risk.get("edge_penalty_min_market_trades"), 20),
+        ),
         "timeframe": _adjustment_value(risk.get("timeframe_score_adjustments"), timeframe),
         "directional_min_score": 0
         if directional_suspended
@@ -394,6 +402,24 @@ def _adjustment_value(raw: object, key: str) -> int:
     if isinstance(value, dict):
         return max(0, _safe_int(value.get("adjustment")))
     return max(0, _safe_int(value))
+
+
+def _market_adjustment_value(raw: object, key: str, *, min_trades: int) -> int:
+    """Ignore auto-derived market penalties that have insufficient evidence.
+
+    Manually configured scalar values are left untouched. Auto-calibration
+    writes the richer ``{adjustment, stats}`` payload, so the guard applies to
+    precisely the noisy per-market overlays without hiding them from the UI.
+    """
+    if not isinstance(raw, dict):
+        return 0
+    value = raw.get(key)
+    if not isinstance(value, dict):
+        return max(0, _safe_int(value))
+    stats = value.get("stats")
+    if isinstance(stats, dict) and _safe_int(stats.get("trades")) < max(0, min_trades):
+        return 0
+    return max(0, _safe_int(value.get("adjustment")))
 
 
 def build_outcome_profile(

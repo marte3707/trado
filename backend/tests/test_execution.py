@@ -2,8 +2,17 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from app.core.config import Settings
-from app.db.models import AppSetting, Candle, DecisionLog, Market, Order, Position, Signal
-from app.engine.execution import OrderExecutionEngine
+from app.db.models import (
+    AppSetting,
+    Candle,
+    DecisionLog,
+    Market,
+    MarketL2Snapshot,
+    Order,
+    Position,
+    Signal,
+)
+from app.engine.execution import OrderExecutionEngine, _paper_l2_fill_price
 from app.services.position_pnl import calculate_unrealized_pnl as _calculate_unrealized_pnl
 
 
@@ -48,12 +57,22 @@ class FakePaperDb:
         *,
         existing_order: Order | None = None,
         existing_position: Position | None = None,
+        book_enabled: bool = True,
+        book: MarketL2Snapshot | None = None,
     ) -> None:
         self.existing_order = existing_order
         self.existing_position = existing_position
         self.added: list[object] = []
         self.committed = 0
         self.next_position_id = 1
+        self.book = (
+            book or MarketL2Snapshot(
+                market_id=1,
+                bids=[{"px": "99.9", "sz": "1000"}],
+                asks=[{"px": "100", "sz": "1000"}],
+                updated_at=datetime.now(UTC),
+            )
+        ) if book_enabled else None
 
     def get(self, model: type[object], row_id: object) -> object | None:
         if model is Position and self.existing_position is not None:
@@ -61,6 +80,8 @@ class FakePaperDb:
                 return self.existing_position
         if model is AppSetting:
             return None
+        if model is MarketL2Snapshot:
+            return self.book
         return None
 
     def query(self, model: type[object], *_args, **_kwargs) -> FakeQuery:
@@ -266,6 +287,12 @@ def test_closing_position_marks_source_signal_closed() -> None:
 def test_execute_paper_opens_position_even_if_same_market_already_has_open_paper() -> None:
     engine = OrderExecutionEngine(Settings())
     signal = _paper_signal()
+    signal.strategy_breakdown = {
+        "_experiment": {
+            "version": "baseline-frozen-v1",
+            "configuration_hash": "abc123",
+        }
+    }
     db = FakePaperDb(
         existing_position=Position(
             id=99,
@@ -284,10 +311,14 @@ def test_execute_paper_opens_position_even_if_same_market_already_has_open_paper
     assert position is not None
     assert position.id != 99
     assert position.metadata_json["source_signal_id"] == signal.id
-    # Fase 4 — forward attribution: la posizione registra il regime di rischio
-    # operativo all'apertura.
+    # Forward attribution: la posizione registra le soglie operative all'apertura.
     assert "risk_at_open" in position.metadata_json
-    assert "deep_defensive_active" in position.metadata_json["risk_at_open"]
+    assert set(position.metadata_json["risk_at_open"]) == {
+        "min_signal_score",
+        "min_risk_reward",
+        "max_risk_per_trade_pct",
+    }
+    assert position.metadata_json["experiment"] == signal.strategy_breakdown["_experiment"]
     assert len(db.added_of(Position)) == 1
     assert len(db.added_of(Order)) == 1
     events = [log.event_type for log in db.added_of(DecisionLog)]
@@ -327,6 +358,96 @@ def test_execute_paper_is_idempotent_for_same_signal() -> None:
     assert position is existing_position
     assert db.added == []
     assert db.committed == 0
+
+
+def test_execute_paper_uses_fresh_book_vwap_for_standard_signal() -> None:
+    engine = OrderExecutionEngine(Settings())
+    signal = _paper_signal()
+    book = MarketL2Snapshot(
+        market_id=1,
+        bids=[{"px": "99.9", "sz": "1000"}],
+        asks=[{"px": "101", "sz": "0.01"}, {"px": "102", "sz": "1000"}],
+        updated_at=datetime.now(UTC),
+    )
+    db = FakePaperDb(book=book)
+
+    position = engine.execute_paper(db, signal)  # type: ignore[arg-type]
+
+    assert position is not None
+    assert Decimal("101") < position.entry_price < Decimal("102")
+    risk_budget = (
+        Decimal(position.metadata_json["account_value_at_entry"])
+        * Decimal(str(Settings().max_risk_per_trade_pct))
+        / Decimal("100")
+    )
+    assert position.size < risk_budget / (signal.entry_price - signal.stop_loss)
+    assert Decimal(position.metadata_json["initial_position_risk"]) <= risk_budget
+    assert position.metadata_json["paper_fill_source"] == "fresh_l2_vwap"
+    assert Decimal(position.metadata_json["initial_risk_per_unit"]) == position.entry_price - Decimal("95")
+    assert Decimal(position.metadata_json["highest_high_since_entry"]) == position.entry_price
+    assert db.added_of(Order)[0].price == position.entry_price
+
+
+def test_execute_paper_skips_standard_signal_without_fresh_book() -> None:
+    engine = OrderExecutionEngine(Settings())
+    db = FakePaperDb(book_enabled=False)
+
+    assert engine.execute_paper(db, _paper_signal()) is None  # type: ignore[arg-type]
+    assert db.added_of(Position) == []
+    assert [row.event_type for row in db.added_of(DecisionLog)] == [
+        "paper_order_skipped_missing_fresh_l2",
+    ]
+
+
+def test_execute_paper_skips_when_current_book_invalidates_original_plan() -> None:
+    engine = OrderExecutionEngine(Settings())
+    book = MarketL2Snapshot(
+        market_id=1,
+        bids=[{"px": "104", "sz": "1000"}],
+        asks=[{"px": "106", "sz": "1000"}],
+        updated_at=datetime.now(UTC),
+    )
+    db = FakePaperDb(book=book)
+
+    assert engine.execute_paper(db, _paper_signal()) is None  # type: ignore[arg-type]
+    assert db.added_of(Position) == []
+    assert [row.event_type for row in db.added_of(DecisionLog)] == [
+        "paper_order_skipped_stale_plan",
+    ]
+
+
+def test_external_paper_signal_keeps_existing_fill_path_without_book() -> None:
+    engine = OrderExecutionEngine(Settings())
+    signal = _paper_signal()
+    signal.strategy_breakdown = {"_external_source": {"provider": "the_bull"}}
+    db = FakePaperDb(book_enabled=False)
+
+    position = engine.execute_paper(db, signal)  # type: ignore[arg-type]
+
+    assert position is not None
+    assert position.entry_price == signal.entry_price
+    assert position.metadata_json["paper_fill_source"] == "external_signal_plan"
+
+
+def test_paper_book_fill_rejects_stale_or_insufficient_depth() -> None:
+    now = datetime(2026, 10, 29, 16, tzinfo=UTC)
+    book = MarketL2Snapshot(
+        market_id=1,
+        bids=[{"px": "100", "sz": "1"}, {"px": "99", "sz": "2"}],
+        asks=[{"px": "101", "sz": "1"}],
+        updated_at=now,
+    )
+    db = FakePaperDb(book=book)
+
+    assert _paper_l2_fill_price(
+        db, 1, side="short", size=Decimal("2"), now=now,
+    ) == Decimal("99.5")
+    assert _paper_l2_fill_price(
+        db, 1, side="long", size=Decimal("2"), now=now,
+    ) is None
+    assert _paper_l2_fill_price(
+        db, 1, side="short", size=Decimal("2"), now=now + timedelta(seconds=16),
+    ) is None
 
 
 def test_take_profit_plan_omits_non_positive_signal_targets() -> None:
@@ -562,7 +683,7 @@ def test_time_stop_closes_stale_unprofitable_paper_position_at_latest_candle_clo
     )
 
 
-def test_time_stop_skips_losing_paper_position_by_default() -> None:
+def test_time_stop_closes_losing_paper_position_by_default() -> None:
     engine = OrderExecutionEngine(Settings())
     opened_at = datetime.now(UTC) - timedelta(hours=9)
     candle_open = datetime.now(UTC) - timedelta(minutes=5)
@@ -602,9 +723,9 @@ def test_time_stop_skips_losing_paper_position_by_default() -> None:
 
     result = engine.apply_time_stops(db)  # type: ignore[arg-type]
 
-    assert result == {"paper_closed": 0, "live_alerted": 0}
-    assert position.status == "open"
-    assert not any(
+    assert result == {"paper_closed": 1, "live_alerted": 0}
+    assert position.status == "closed"
+    assert any(
         isinstance(row, DecisionLog) and row.event_type == "paper_position_time_stop_closed"
         for row in db.added
     )
@@ -905,6 +1026,208 @@ def test_time_stop_does_not_close_without_candle_after_open() -> None:
     assert result == {"paper_closed": 0, "live_alerted": 0}
     assert position.status == "open"
     assert position.closed_at is None
+
+
+def test_stale_market_data_closes_paper_position_at_fresh_mark_without_candles() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=30,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("2"),
+        status="open",
+        opened_at=datetime.now(UTC) - timedelta(hours=12),
+        pnl_updated_at=datetime.now(UTC),
+        metadata_json={
+            "source_timeframe": "1h",
+            "initial_size": "2",
+            "last_mark_price": "96",
+        },
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        position_management={
+            "staleMarketData": {
+                "enabled": True,
+                "paperMode": "close",
+                "freshMarkMaxAgeMinutes": 5,
+                "maxCandleAgeHoursByTimeframe": {"1h": 8},
+            }
+        },
+    )
+
+    result = engine.apply_stale_market_data_guard(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 1, "paper_alerted": 0}
+    assert position.status == "closed"
+    assert position.realized_pnl == Decimal("-8")
+    assert position.metadata_json["exit_reason"] == "stale_market_data"
+    assert any(
+        isinstance(row, DecisionLog)
+        and row.event_type == "paper_position_stale_market_data_closed"
+        for row in db.added
+    )
+
+
+def test_stale_market_data_closes_spot_like_paper_position_with_old_candle() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=31,
+        market_id=99,
+        mode="paper",
+        side="short",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=datetime.now(UTC) - timedelta(days=3),
+        pnl_updated_at=datetime.now(UTC),
+        metadata_json={
+            "source_timeframe": "4h",
+            "initial_size": "1",
+            "last_mark_price": "90",
+        },
+    )
+    stale_candle = Candle(
+        market_id=99,
+        timeframe="4h",
+        open_time=datetime.now(UTC) - timedelta(days=2),
+        open=Decimal("101"),
+        high=Decimal("102"),
+        low=Decimal("99"),
+        close=Decimal("100"),
+        volume=Decimal("1"),
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        candles=[stale_candle],
+        position_management={
+            "staleMarketData": {
+                "enabled": True,
+                "paperMode": "close",
+                "freshMarkMaxAgeMinutes": 5,
+                "maxCandleAgeHoursByTimeframe": {"4h": 24},
+            }
+        },
+    )
+
+    result = engine.apply_stale_market_data_guard(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 1, "paper_alerted": 0}
+    assert position.status == "closed"
+    assert position.realized_pnl == Decimal("10")
+
+
+def test_stale_market_data_alerts_but_does_not_close_without_fresh_mark() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=32,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=datetime.now(UTC) - timedelta(hours=12),
+        pnl_updated_at=datetime.now(UTC) - timedelta(hours=1),
+        metadata_json={"source_timeframe": "1h", "last_mark_price": "98"},
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        position_management={
+            "staleMarketData": {
+                "enabled": True,
+                "paperMode": "close",
+                "freshMarkMaxAgeMinutes": 5,
+                "maxCandleAgeHoursByTimeframe": {"1h": 8},
+            }
+        },
+    )
+
+    result = engine.apply_stale_market_data_guard(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "paper_alerted": 1}
+    assert position.status == "open"
+    assert any(
+        isinstance(row, DecisionLog) and row.event_type == "paper_stale_market_data_alert"
+        for row in db.added
+    )
+
+
+def test_stale_market_data_keeps_position_with_fresh_closed_candle() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=33,
+        market_id=1,
+        mode="paper",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=datetime.now(UTC) - timedelta(hours=12),
+        pnl_updated_at=datetime.now(UTC),
+        metadata_json={"source_timeframe": "1h", "last_mark_price": "98"},
+    )
+    fresh_candle = Candle(
+        market_id=1,
+        timeframe="1h",
+        open_time=datetime.now(UTC) - timedelta(hours=2),
+        open=Decimal("99"),
+        high=Decimal("100"),
+        low=Decimal("97"),
+        close=Decimal("98"),
+        volume=Decimal("1"),
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        candles=[fresh_candle],
+        position_management={
+            "staleMarketData": {
+                "enabled": True,
+                "paperMode": "close",
+                "freshMarkMaxAgeMinutes": 5,
+                "maxCandleAgeHoursByTimeframe": {"1h": 8},
+            }
+        },
+    )
+
+    result = engine.apply_stale_market_data_guard(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "paper_alerted": 0}
+    assert position.status == "open"
+
+
+def test_stale_market_data_guard_never_closes_live_position() -> None:
+    engine = OrderExecutionEngine(Settings())
+    position = Position(
+        id=34,
+        market_id=1,
+        mode="live",
+        side="long",
+        entry_price=Decimal("100"),
+        size=Decimal("1"),
+        status="open",
+        opened_at=datetime.now(UTC) - timedelta(days=2),
+        pnl_updated_at=datetime.now(UTC),
+        metadata_json={"source_timeframe": "1h", "last_mark_price": "90"},
+    )
+    db = FakeTimeStopDb(
+        positions=[position],
+        position_management={
+            "staleMarketData": {
+                "enabled": True,
+                "paperMode": "close",
+                "freshMarkMaxAgeMinutes": 5,
+                "maxCandleAgeHoursByTimeframe": {"1h": 8},
+            }
+        },
+    )
+
+    result = engine.apply_stale_market_data_guard(db)  # type: ignore[arg-type]
+
+    assert result == {"paper_closed": 0, "paper_alerted": 0}
+    assert position.status == "open"
 
 
 def test_time_stop_alerts_stale_live_position_without_closing() -> None:

@@ -55,7 +55,11 @@ class _FakeDb:
 
 
 class _FakeCopyLiveTradingClient:
+    def __init__(self) -> None:
+        self.mids_max_age_seconds = None
+
     def all_mids(self, max_age_seconds=None):  # noqa: ANN001, ARG002
+        self.mids_max_age_seconds = max_age_seconds
         return {"BTC": "100"}
 
 
@@ -536,19 +540,19 @@ def test_copy_live_shadow_plan_selects_best_traders_and_limits_open_positions() 
             address="0x" + "1" * 40,
             label="strong",
             enabled=True,
-            metadata_json={"leaderboard": {"rank": 1}},
+            metadata_json={"leaderboard": {"rank": 1, "imported_at": now.isoformat()}},
         )
         weak_quality = LeaderboardTrader(
             address="0x" + "2" * 40,
             label="weak quality",
             enabled=True,
-            metadata_json={"leaderboard": {"rank": 2}},
+            metadata_json={"leaderboard": {"rank": 2, "imported_at": now.isoformat()}},
         )
         watch = LeaderboardTrader(
             address="0x" + "3" * 40,
             label="watch",
             enabled=True,
-            metadata_json={"leaderboard": {"rank": 3}},
+            metadata_json={"leaderboard": {"rank": 3, "imported_at": now.isoformat()}},
         )
         db.add_all([strong, weak_quality, watch])
         db.flush()
@@ -647,7 +651,7 @@ def test_copy_live_dry_run_uses_effective_margin_and_risk_based_exposure() -> No
             address="0x" + "1" * 40,
             label="strong",
             enabled=True,
-            metadata_json={"leaderboard": {"rank": 1}},
+            metadata_json={"leaderboard": {"rank": 1, "imported_at": now.isoformat()}},
         )
         btc = Market(
             exchange="hyperliquid",
@@ -761,6 +765,71 @@ def test_copy_live_activation_blockers_ignore_configuration_flags() -> None:
     )
 
 
+def test_copy_live_candidate_requires_non_negative_recent_net_pnl() -> None:
+    now = datetime(2026, 7, 9, tzinfo=UTC)
+    trader = LeaderboardTrader(
+        id=1,
+        address="0x" + "1" * 40,
+        label="stale winner",
+        enabled=True,
+        metadata_json={"leaderboard": {"rank": 1, "imported_at": now.isoformat()}},
+    )
+    snapshot = LeaderboardTraderSnapshot(
+        trader_id=trader.id,
+        lookback_days=30,
+        fills_count=40,
+        closing_fills_count=20,
+        open_fills_count=20,
+        net_pnl_usdc=Decimal("100"),
+        closed_pnl_usdc=Decimal("110"),
+        fees_usdc=Decimal("10"),
+        volume_usdc=Decimal("10000"),
+        win_rate=Decimal("0.60"),
+        profit_factor=Decimal("2.0"),
+        quality_score=95,
+        classification="candidate",
+        metrics={},
+    )
+    stats = {
+        "closed_positions": 30,
+        "open_positions": 1,
+        "net_pnl_usdc": Decimal("20"),
+        "avg_trade_pnl_usdc": Decimal("0.67"),
+        "profit_factor": Decimal("2"),
+        "win_rate_pct": Decimal("60"),
+        "recent_closed_positions": 3,
+        "recent_net_pnl_usdc": Decimal("-0.50"),
+    }
+
+    row = alpha._copy_live_candidate_row(
+        trader,
+        snapshot=snapshot,
+        stats=stats,
+        settings=alpha.DEFAULT_LEADERBOARD_ALPHA_SETTINGS,
+        now=now,
+    )
+
+    assert row["eligible"] is False
+    assert "recent_net_pnl_below_live_min" in row["reasons"]
+
+    trader.metadata_json = {
+        "leaderboard": {
+            "rank": 1,
+            "imported_at": (now - timedelta(hours=9)).isoformat(),
+        }
+    }
+    stale_row = alpha._copy_live_candidate_row(
+        trader,
+        snapshot=snapshot,
+        stats={**stats, "recent_net_pnl_usdc": Decimal("1")},
+        settings=alpha.DEFAULT_LEADERBOARD_ALPHA_SETTINGS,
+        now=now,
+    )
+
+    assert stale_row["eligible"] is False
+    assert "leaderboard_rank_stale" in stale_row["reasons"]
+
+
 def test_enable_copy_live_mode_blocks_when_readiness_has_hard_blockers() -> None:
     db = _sqlite_db()
     try:
@@ -782,7 +851,7 @@ def test_run_copy_live_execution_submits_once_and_links_position() -> None:
             address="0x" + "4" * 40,
             label="strong",
             enabled=True,
-            metadata_json={"leaderboard": {"rank": 1}},
+            metadata_json={"leaderboard": {"rank": 1, "imported_at": now.isoformat()}},
         )
         market = Market(
             exchange="hyperliquid",
@@ -853,12 +922,13 @@ def test_run_copy_live_execution_submits_once_and_links_position() -> None:
             "copy_live_promotion_min_shortlist_days": 1,
         }
         executor = _FakeCopyLiveExecutor()
+        trading_client = _FakeCopyLiveTradingClient()
 
         result = alpha.run_copy_live_execution(
             db,
             settings=settings,
             now=now,
-            trading_client=_FakeCopyLiveTradingClient(),
+            trading_client=trading_client,
             executor=executor,
         )
         second = alpha.run_copy_live_execution(
@@ -875,8 +945,18 @@ def test_run_copy_live_execution_submits_once_and_links_position() -> None:
 
         assert result["submitted"] == 1
         assert result["blocked"] == 0
+        assert trading_client.mids_max_age_seconds == 60
         assert second["submitted"] == 0
         assert second["reason"] == "no_would_submit_orders"
+        second_plan = alpha.build_copy_live_shadow_plan(
+            db,
+            settings=settings,
+            now=now,
+        )
+        assert second_plan["status"] == "no_new_eligible_source"
+        assert second_plan["reason"] == "all_eligible_sources_already_copied"
+        assert second_plan["dry_run_orders"][0]["status"] == "blocked"
+        assert "source_position_already_copied" in second_plan["dry_run_orders"][0]["reasons"]
         assert len(executor.executed_signals) == 1
         assert len(live_positions) == 1
         assert len(signals) == 1

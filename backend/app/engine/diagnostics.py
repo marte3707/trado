@@ -10,6 +10,43 @@ from sqlalchemy.orm import Session
 from app.db.models import AppSetting, DecisionLog, Position, Signal
 from app.engine.performance import SignalPerformanceAnalyzer, serialize_stats
 
+ZERO_SIGNAL_CYCLE_LOOKBACK = 1000
+EQUITY_SLOPE_DECLINING_THRESHOLD = -0.1
+
+
+def consecutive_zero_signal_cycles(db: Session, *, limit: int = ZERO_SIGNAL_CYCLE_LOOKBACK) -> int:
+    """Conta gli ultimi cicli worker eleggibili senza segnali generati.
+
+    I tick senza timeframe attivi sono esclusi perché non rappresentano
+    opportunità in cui il worker avrebbe potuto generare un segnale.
+    """
+    recent = (
+        db.query(DecisionLog)
+        .filter(DecisionLog.event_type.in_(["worker_cycle", "worker_cycle_failed"]))
+        .order_by(DecisionLog.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    streak = 0
+    for entry in recent:
+        if entry.event_type == "worker_cycle_failed":
+            streak += 1
+            continue
+        if not isinstance(entry.data, dict):
+            break
+        active_timeframes = entry.data.get("active_timeframes")
+        if isinstance(active_timeframes, list) and not active_timeframes:
+            continue
+        try:
+            generated = int(entry.data.get("generated", 0))
+        except (TypeError, ValueError):
+            break
+        if generated == 0:
+            streak += 1
+        else:
+            break
+    return streak
+
 
 def exit_reason_distribution(positions: list[Position]) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -122,30 +159,8 @@ def build_equity_slope_diagnostics(
 ) -> dict[str, Any]:
     analyzer = SignalPerformanceAnalyzer()
     positions = analyzer.closed_paper_positions(db, limit=lookback)
-    calibration_setting = db.get(AppSetting, "auto_calibration")
-    calibration_state_setting = db.get(AppSetting, "auto_calibration_state")
-    baseline_setting = db.get(AppSetting, "auto_calibration_baseline")
-    risk_setting = db.get(AppSetting, "risk")
 
-    calibration_config = (
-        calibration_setting.value
-        if calibration_setting and isinstance(calibration_setting.value, dict)
-        else {}
-    )
-    calibration_state = (
-        calibration_state_setting.value
-        if calibration_state_setting and isinstance(calibration_state_setting.value, dict)
-        else {}
-    )
-    baseline_value = (
-        baseline_setting.value
-        if baseline_setting and isinstance(baseline_setting.value, dict)
-        else {}
-    )
-    baseline_risk = baseline_value.get("risk", {}) if isinstance(baseline_value.get("risk"), dict) else {}
-    risk_value = risk_setting.value if risk_setting and isinstance(risk_setting.value, dict) else {}
-
-    threshold = float(calibration_config.get("deep_defensive_slope_threshold", -0.1))
+    threshold = EQUITY_SLOPE_DECLINING_THRESHOLD
     window_sizes = [50, 100, 500]
     windows = []
     for size in window_sizes:
@@ -193,7 +208,6 @@ def build_equity_slope_diagnostics(
         except (TypeError, ValueError):
             continue
 
-    risk_keys = ("min_signal_score", "min_risk_reward", "max_risk_per_trade_pct")
     return {
         "lookback": lookback,
         "sample_count": len(positions),
@@ -204,39 +218,11 @@ def build_equity_slope_diagnostics(
         "recent_normalized_slope": recent_normalized,
         "median_abs_pnl": _median_abs_pnl(positions),
         "windows": windows,
-        "deep_defensive_active": calibration_state.get("deep_defensive_active") is True,
-        "starvation_override_active": calibration_state.get("starvation_override_active") is True,
-        "last_reason": calibration_state.get("last_reason"),
-        "last_exit_reason": calibration_state.get("deep_defensive_last_exit_reason"),
-        "positive_streak": calibration_state.get("deep_defensive_positive_streak", 0),
-        "recent_positive_streak": calibration_state.get(
-            "deep_defensive_recent_positive_streak", 0
-        ),
-        "cooldown_remaining": calibration_state.get(
-            "deep_defensive_cooldown_remaining", 0
-        ),
-        "consecutive_zero_signal_cycles": calibration_state.get(
-            "consecutive_zero_signal_cycles", 0
-        ),
-        "exit_conditions": {
-            "full_slope_non_negative_cycles": 2,
-            "recent_slope_non_negative_cycles": int(
-                calibration_config.get("recent_slope_exit_cycles", 3)
-            ),
-            "starvation_hard_cycles": int(
-                calibration_config.get("starvation_hard_cycles", 15)
-            ),
-        },
+        "consecutive_zero_signal_cycles": consecutive_zero_signal_cycles(db),
         "recent_time_stop_impact": {
             "hours": 24,
             "closed_count": len(time_stop_rows),
             "realized_pnl": time_stop_pnl,
-        },
-        "baseline_vs_current": {
-            "risk": {
-                key: {"baseline": baseline_risk.get(key), "current": risk_value.get(key)}
-                for key in risk_keys
-            }
         },
     }
 
@@ -245,7 +231,6 @@ def build_diagnostics_report(
     db: Session,
     *,
     lookback: int = 200,
-    history_limit: int = 50,
 ) -> dict[str, Any]:
     analyzer = SignalPerformanceAnalyzer()
     positions = analyzer.closed_paper_positions(db, limit=lookback)
@@ -263,21 +248,8 @@ def build_diagnostics_report(
         else {}
     )
 
-    history_rows = (
-        db.query(DecisionLog)
-        .filter(DecisionLog.event_type.like("auto_calibration%"))
-        .order_by(DecisionLog.timestamp.desc())
-        .limit(history_limit)
-        .all()
-    )
-
-    baseline_setting = db.get(AppSetting, "auto_calibration_baseline")
     risk_setting = db.get(AppSetting, "risk")
-    state_setting = db.get(AppSetting, "auto_calibration_state")
-    baseline_value = baseline_setting.value if baseline_setting and isinstance(baseline_setting.value, dict) else {}
     risk_value = risk_setting.value if risk_setting and isinstance(risk_setting.value, dict) else {}
-    state_value = state_setting.value if state_setting and isinstance(state_setting.value, dict) else {}
-    baseline_risk = baseline_value.get("risk", {}) if isinstance(baseline_value.get("risk"), dict) else {}
 
     by_timeframe: dict[str, list[Position]] = {}
     for position in positions:
@@ -305,22 +277,5 @@ def build_diagnostics_report(
             name: serialize_stats(stats)
             for name, stats in analyzer.strategy_stats(db, limit=lookback).items()
         },
-        "baseline_vs_current": {
-            "risk": {
-                key: {"baseline": baseline_risk.get(key), "current": risk_value.get(key)}
-                for key in risk_keys
-            }
-        },
-        "calibration_state": state_value,
-        "calibration_history": [
-            {
-                "id": row.id,
-                "timestamp": row.timestamp,
-                "event_type": row.event_type,
-                "status": (row.data or {}).get("status"),
-                "reason": (row.data or {}).get("reason"),
-                "changes_count": len((row.data or {}).get("changes", []) or []),
-            }
-            for row in history_rows
-        ],
+        "current_risk": {key: risk_value.get(key) for key in risk_keys},
     }

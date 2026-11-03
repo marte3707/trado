@@ -32,8 +32,6 @@ import { collectNewLiveAlerts, liveAlertToastContent } from "@/components/alerts
 
 import {
   useAccountMonitor,
-  useCalibration,
-  useCalibrationHistory,
   useDecisionLogs,
   useHealth,
   useMarketIntelligence,
@@ -44,7 +42,6 @@ import {
   useSignalRejections,
   useSignals,
   useStrategies,
-  useTunerStatus,
   useWorkerCycles,
 } from "@/lib/hooks/queries";
 import { hydrateOpenPositionSourceSignals } from "@/lib/signalHydration";
@@ -219,13 +216,6 @@ export function AppShell({ initialData }: AppShellProps) {
     refetchInterval: 5_000,
     refetchIntervalInBackground: true,
     refetchOnMount: "always",
-  });
-  const { data: calibration = initialData.calibration } = useCalibration({ initialData: initialData.calibration });
-  const { data: calibrationHistory = initialData.calibrationHistory } = useCalibrationHistory({
-    initialData: initialData.calibrationHistory,
-  });
-  const { data: tunerStatus = initialData.tunerStatus } = useTunerStatus({
-    initialData: initialData.tunerStatus ?? undefined,
   });
   const { data: workerCycles = initialData.workerCycles } = useWorkerCycles(20, {
     initialData: initialData.workerCycles,
@@ -586,10 +576,7 @@ export function AppShell({ initialData }: AppShellProps) {
 
         {route === "calibration" && (
           <CalibrationScreen
-            calibration={calibration}
-            history={calibrationHistory}
             settings={settingsObj}
-            tunerStatus={tunerStatus ?? null}
             workerCycles={workerCycles}
             signalRejections={signalRejections}
             onRefresh={refresh}

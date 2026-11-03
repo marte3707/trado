@@ -88,8 +88,9 @@ Stessa logica per tutti i parametri runtime → `app/core/runtime_settings.py`.
 
 ### Chiavi `AppSetting` predefinite
 
-`operation_mode`, `timeframes`, `paper`, `live_trading`, `live_execution`,
-`position_management`, `alerts`, `auto_calibration`, `risk_controls`, `btc_macro_protection`
+`operation_mode`, `timeframes`, `paper`, `live_execution`,
+`position_management`, `alerts`, `risk`, `research_experiment`,
+`btc_macro_protection`
 
 ---
 
@@ -105,31 +106,14 @@ Per aggiungerne una nuova: creare file in `backend/app/strategies/`, registrare 
 
 ---
 
-## Engine: Auto-Tuner
+## Engine: Ricerca forward
 
-`backend/app/engine/auto_tuner.py`
+`backend/app/engine/experiment.py` e
+`backend/app/engine/experiment_outcomes.py`
 
-Due modalità:
-- **`sequential`** (default/legacy): attiva filtri uno alla volta, confronta before/after sulla stessa popolazione (min 50 trade per step)
-- **`ab_test`**: randomizzazione per-segnale tra control e test, Welch t-test (min 30 trade per arm)
-
-### Sequenza default (sequential)
-
-| Step | Key | Azione |
-|------|-----|--------|
-| 1 | `regime_filter` | Attiva ADX regime filter |
-| 2 | `mtf_confluence` | Attiva multi-timeframe confluence |
-| 3 | `volatility_filter` | Attiva ATR percentile filter |
-| 4 | `participation_ratio_50` | Alza participation ratio a 0.50 |
-| 5 | `auto_reverse` | Auto-reverse su cambio regime BTC (sequential only) |
-
-### Stato al 22/05/2026
-
-- `regime_filter` → **PROMOSSO** (+3598 USD, WR da 16% → 55%, PF da 0.35 → 2.18)
-- `mtf_confluence` → in corso (47/50 trade al momento dell'ultima osservazione)
-- `volatility_filter`, `participation_ratio` → attivi ma fuori dal flusso auto-tuner (PATCH manuale)
-- Deep defensive attivo: `consecutive_zero_signal_cycles = 13` (hard reset a 15)
-- `risk.min_signal_score = 66`
+Ogni segnale viene attribuito alla versione e all'hash della configurazione
+attiva. Gli outcome paper sono immutabili e alimentano Expected R e pre-TP1
+validation solo dopo il campione minimo. La promozione resta manuale.
 
 ---
 
@@ -146,11 +130,12 @@ Configurazione in `AppSetting("position_management")`, con defaults in `runtime_
 
 ---
 
-## Engine: Calibrazione
+## Engine: Diagnostica
 
-`backend/app/engine/calibration.py`
+`backend/app/engine/diagnostics.py`
 
-`AutoCalibrationEngine` — analizza le performance e suggerisce/applica aggiustamenti ai pesi delle strategie e ai parametri di rischio. Supporta reset baseline via API.
+Equity slope, outcome profile e statistiche per strategia/timeframe sono
+osservative. Il runtime non applica aggiustamenti automatici a pesi o rischio.
 
 ---
 
@@ -177,8 +162,8 @@ Gruppi principali:
 | Segnali | `GET /signals`, `POST /signals/{id}/execute-paper`, `POST /signals/{id}/execute-live` |
 | Posizioni | `GET /positions`, `POST /positions/{id}/close` |
 | Ordini | `GET /orders` |
-| Analytics | `/analytics/signals`, `/analytics/diagnostics`, `/analytics/equity-slope`, `/analytics/calibration`, `/analytics/calibration/stability` |
-| Auto-tuner | `GET /auto-tuner/status`, `POST /auto-tuner/run`, `POST /auto-tuner/rollback`, `POST /auto-tuner/reset` |
+| Analytics | `/analytics/signals`, `/analytics/diagnostics`, `/analytics/equity-slope`, `/analytics/outcome-profile`, `/analytics/strategy-edge` |
+| Ricerca forward | `GET /analytics/experiments`, `GET /analytics/expected-r-calibration`, `GET /analytics/pre-tp1-validation` |
 | Settings | `GET /settings`, `PATCH /settings` |
 | Strategie | `GET /strategies`, `PATCH /strategies/{id}` |
 | Account | `GET /account/snapshot`, ordini e posizioni live da Hyperliquid |
@@ -195,20 +180,15 @@ Gruppi principali:
 | `coin` | CoinScreen | Chart + indicatori per mercato |
 | `account` | AccountMonitorScreen | Posizioni e ordini Hyperliquid |
 | `strategy-lab` | StrategyAnalysisScreen | Ranking e combinazioni strategie |
-| `calibration` | CalibrationScreen | Auto-tuner, stability, equity slope, diagnostics |
+| `calibration` | CalibrationScreen | Evidenza forward, equity slope, diagnostics, score alignment |
 | `history` | HistoryScreen | Posizioni chiuse + exit orders |
 | `strategies` | StrategiesScreen | Pesi e parametri per timeframe |
 | `alerts` | AlertsScreen | Feed alert, push, Telegram |
-| `settings` | SettingsScreen | Operation, risk, services, calibration |
+| `settings` | SettingsScreen | Operation, risk, services, position management |
 
-### Componenti calibration
+### Componenti ricerca
 
-- `AutoTunerTab` — stato auto-tuner, step corrente, storico
-- `AutoTunerHeader` — modale/header con progress AB e sequential
-- `AbAllocationDonut` — donut chart per allocazione A/B
-- `SequenceRoadmap` — roadmap visiva degli step sequential
-- `StabilityTab` / `StabilityMatrix` — matrice stabilità strategie
-- `EquitySlopeTab` — grafico equity slope nel tempo
+- `EquitySlopeTab` — lettura osservativa della curva equity
 - `DiagnosticsTab` — report diagnostico dettagliato
 - `SignalFunnelChart` — funnel segnali generati → filtrati → eseguiti
 - `RejectionReasonsList` — breakdown motivi riezione segnali
@@ -255,8 +235,9 @@ Gruppi principali:
 | `backend/app/db/models.py` | Tutti i modelli SQLAlchemy |
 | `backend/app/db/init_db.py` | Seed defaults strategie e impostazioni |
 | `backend/app/engine/execution.py` | `OrderExecutionEngine` — apertura/chiusura posizioni |
-| `backend/app/engine/auto_tuner.py` | Sequenza e logica AB dell'auto-tuner |
-| `backend/app/engine/calibration.py` | Auto-calibrazione pesi strategie |
+| `backend/app/engine/experiment.py` | Attribuzione e policy dell'esperimento forward |
+| `backend/app/engine/experiment_outcomes.py` | Materializzazione outcome forward |
+| `backend/app/engine/diagnostics.py` | Diagnostica osservativa ed equity slope |
 | `backend/app/engine/position_management.py` | Trailing stop, TP parziali, breakeven |
 | `backend/app/engine/order_validation.py` | Validazione pre-esecuzione live (`OrderValidator`) |
 | `backend/app/engine/risk.py` | Calcolo position size, SL/TP ATR-based |

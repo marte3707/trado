@@ -5,7 +5,7 @@ set -euo pipefail
 
 TARGET_DIR="${HOME}/Library/LaunchAgents"
 
-for label in com.trado.backend com.trado.marketdata com.trado.worker; do
+for label in com.trado.backend com.trado.marketdata com.trado.worker com.trado.watchdog; do
     echo "→ Removing ${label}"
     launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
     rm -f "${TARGET_DIR}/${label}.plist"

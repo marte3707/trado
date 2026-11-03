@@ -50,17 +50,14 @@ export const EVENT_LABELS: Record<string, string> = {
   signal_deleted: "Segnale eliminato",
   position_deleted: "Posizione eliminata",
   take_profit_rescaled: "Take profit riscalato",
-  auto_calibration_applied: "Auto-calibrazione applicata",
-  auto_calibration_checked: "Auto-calibrazione verificata",
-  auto_calibration_skipped: "Auto-calibrazione saltata",
-  auto_calibration_failed: "Auto-calibrazione fallita",
-  auto_tuner_step_started: "Auto-tuner avviato",
-  auto_tuner_paused: "Auto-tuner in pausa",
-  auto_tuner_resumed: "Auto-tuner ripreso",
-  auto_tuner_failed: "Auto-tuner fallito",
   worker_cycle_failed: "Worker cycle fallito",
   kill_switch_enabled: "Kill switch armato",
   kill_switch_disabled: "Kill switch disarmato",
+  the_bull_entry_candidate: "The Bull · ingresso da verificare",
+  the_bull_message_observed: "The Bull · messaggio acquisito",
+  the_bull_chart_candidate: "The Bull · zona grafico individuata",
+  the_bull_chart_reviewed: "The Bull · grafico analizzato",
+  the_bull_chart_analysis_failed: "The Bull · analisi grafico non disponibile",
 };
 
 export function inferMode(eventType: string, data: Record<string, unknown>): AlertMode {
@@ -68,6 +65,7 @@ export function inferMode(eventType: string, data: Record<string, unknown>): Ale
   if (mode === "live" || mode === "paper") return mode;
   if (eventType.startsWith("live_")) return "live";
   if (eventType.startsWith("paper_")) return "paper";
+  if (eventType.startsWith("the_bull_")) return "system";
   if (
     eventType.startsWith("auto_") ||
     eventType.startsWith("worker_") ||
@@ -85,6 +83,7 @@ export function inferLevel(eventType: string, data: Record<string, unknown>): Al
   if (lc.includes("kill_switch_enabled") || lc.includes("time_stop_alert")) return "warn";
   if (lc.includes("submitted") || lc.includes("executed") || lc.includes("opened")) return "good";
   if (lc.includes("closed") || lc.includes("rescaled") || lc.includes("updated")) return "info";
+  if (lc.includes("candidate") || lc.includes("context_review")) return "strong";
   if (lc.includes("ignored") || lc.includes("skipped") || lc.includes("paused")) return "warn";
   if (typeof data.score === "number" && data.score >= 90) return "strong";
   return "info";

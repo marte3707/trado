@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
@@ -19,13 +21,14 @@ HYPERLIQUID_RATE_LIMIT_STATE_KEY = "hyperliquid_rate_limit_state"
 _SKIP_LOG_THROTTLE_SECONDS = 300
 _LOCAL_SKIP_LOGS_LOCK = Lock()
 _LOCAL_SKIP_LOGS: dict[tuple[str, str], datetime] = {}
+_LIVE_RISK_REQUESTS: ContextVar[bool] = ContextVar("hyperliquid_live_risk_requests", default=False)
 
 DEFAULT_HYPERLIQUID_RATE_LIMIT_SETTINGS: dict[str, int] = {
     # HL's documented global REST cap is 1200 request-weight/minute per IP.
     # Stay deliberately below it so browser/API calls and manual checks have headroom.
     "ip_weight_budget_per_minute": 600,
-    # Keep room for three live-entry L2 checks. Non-critical candle/book
-    # prefetch cannot consume this portion of the shared /info budget.
+    # Reserve room for live-entry checks and protection of existing positions.
+    # Non-critical reads cannot consume this portion of the shared /info budget.
     "live_preflight_reserve_weight": 60,
     "noncritical_cooldown_seconds": 600,
     "address_limited_action_spacing_seconds": 10,
@@ -71,6 +74,20 @@ class HyperliquidRateLimitDecision:
     next_retry_after: str | None = None
     weight: int = 0
     rate_limit_class: str = "unknown"
+
+
+@contextmanager
+def live_risk_request_priority() -> Iterator[None]:
+    """Let live risk reads use the reserve, within the total budget and cooldown.
+
+    Context variables propagate through asyncio.to_thread without promoting
+    unrelated market-data requests running concurrently in the same process.
+    """
+    token = _LIVE_RISK_REQUESTS.set(True)
+    try:
+        yield
+    finally:
+        _LIVE_RISK_REQUESTS.reset(token)
 
 
 def _now() -> datetime:
@@ -256,7 +273,7 @@ def check_hyperliquid_rate_limit(
         reserve = min(settings["live_preflight_reserve_weight"], budget)
         effective_budget = (
             budget
-            if live_preflight or rate_limit_class != "info"
+            if live_preflight or _LIVE_RISK_REQUESTS.get() or rate_limit_class != "info"
             else max(0, budget - reserve)
         )
         current_weight = int(state.get("window_weight", 0))

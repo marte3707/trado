@@ -104,7 +104,7 @@ Per ogni ciclo:
 9. `OrderExecutionEngine` apre paper/live in base a modalita' e guardrail.
 10. A fine ciclo gestisce posizioni aperte con trailing stop, TP parziali,
     breakeven, time stop, PnL refresh e reconciliation live.
-11. Auto-calibration e AutoTuner possono aggiornare risk settings e pesi.
+11. Materializza gli outcome immutabili dell'esperimento forward.
 
 La cadenza nominale del worker e' 60 secondi. L'API considera unhealthy un
 heartbeat piu' vecchio di circa 180 secondi.
@@ -153,15 +153,11 @@ Runtime configuration vive in `app_settings` come JSONB:
 - `live_execution`: account floor, notional cap, slippage, mainnet opt-in,
   `close_companion_paper_on_live_reconcile`.
 - `risk`: `min_signal_score`, `min_risk_reward`, risk pct, max daily loss,
-  max positions, exposure, leverage, filtri tuner e Unified Account Ratio.
+  max positions, exposure, leverage, filtri segnale e Unified Account Ratio.
 - `position_management`: trailing stop, take profit, time stop.
 - `timeframes`: timeframe abilitati.
 - `alerts`: dashboard/Telegram/browser push e soglia alert.
-- `auto_calibration`: parametri calibrazione.
-- `auto_calibration_state`: stato dinamico calibrazione.
-- `auto_calibration_baseline`: baseline frozen per rollback/confronti.
-- `auto_tuner_config`: configurazione AutoTuner.
-- `auto_tuner_state`: step corrente e storico AutoTuner.
+- `research_experiment`: versione, assignment e policy della ricerca forward.
 - `btc_macro_protection`: protezione macro BTC e auto-reverse.
 - `worker_heartbeat`: heartbeat e fase corrente worker.
 
@@ -256,65 +252,37 @@ aggiorna stop solo se la modalita effettiva e' `AUTO_TRADE`, live e' abilitato,
 le credenziali sono presenti e il kill switch e' spento.
 
 Quando una live viene riconciliata chiusa su Hyperliquid, la companion paper
-rimane aperta di default per preservare statistiche paper/auto-tuner. Per
+rimane aperta di default per preservare statistiche paper e ricerca forward. Per
 chiuderla automaticamente usare:
 `live_execution.close_companion_paper_on_live_reconcile=true`.
 
-## Auto-calibration
+## Diagnostica osservativa
 
-File: `backend/app/engine/calibration.py`.
+File principale: `backend/app/engine/diagnostics.py`.
 
-`AutoCalibrationEngine` analizza trade paper chiusi, performance e equity slope.
-Puo' aggiornare pesi strategie, `min_signal_score`, `min_risk_reward` e risk pct.
-Usa baseline in `auto_calibration_baseline`.
+Equity slope, cicli consecutivi senza segnali, distribuzione degli exit e
+performance per strategia/timeframe sono read-only. Non aggiornano pesi,
+soglie, sizing o stato operativo. L'AutoCalibration mutante e i suoi endpoint
+sono stati rimossi; eventuali chiavi e log storici nel database sono archivio
+inerte.
 
-Comportamenti:
+## Ricerca forward
 
-- defensive mode se win rate/PnL/profit factor sono deboli;
-- deep defensive se equity slope e' sotto soglia;
-- restore baseline quando metriche tornano sane;
-- auto-disable strategie con performance cronicamente negative, mantenendo una
-  safety floor di strategie attive.
+File principali:
 
-La calibrazione gira dal worker quando ci sono trade chiusi nuovi o quando la
-starvation richiede rivalutazione.
+- `backend/app/engine/experiment.py`
+- `backend/app/engine/experiment_outcomes.py`
 
-Endpoint utili:
-
-- `GET /api/analytics/calibration`
-- `POST /api/auto-calibration/run`
-- `POST /api/auto-calibration/baseline/reset`
-- `GET /api/analytics/calibration/history`
-- `GET /api/analytics/calibration/stability`
-
-## AutoTuner
-
-File: `backend/app/engine/auto_tuner.py`.
-
-L'AutoTuner abilita filtri opt-in uno alla volta e confronta performance prima
-e dopo un numero minimo di trade chiusi. Modalita note:
-
-- `sequential`: sequenza conservativa step-by-step.
-- `ab_test`: randomizzazione per segnale fra control/test, con test statistici.
-
-Step noti:
-
-- `regime_filter`: attiva filtro ADX/regime.
-- `mtf_confluence`: richiede conferma multi-timeframe.
-- `volatility_filter`: scarta ATR percentile estremo.
-- `participation_ratio_50`: alza consensus minimo.
-- `auto_reverse`: reverse su cambio regime BTC, solo nel flusso sequential.
+Ogni nuovo segnale riceve una versione e un hash della configurazione. Gli
+outcome dei trade paper vengono materializzati senza modificare sizing,
+eligibility o impostazioni. La promozione di una configurazione e' manuale.
 
 Endpoint:
 
-- `GET /api/auto-tuner/status`
-- `GET /api/auto-tuner/source-tests`
-- `POST /api/auto-tuner/source-tests/{source}/start`
-- `POST /api/auto-tuner/run`
-- `POST /api/auto-tuner/pause`
-- `POST /api/auto-tuner/resume`
-- `POST /api/auto-tuner/rollback`
-- `POST /api/auto-tuner/reset`
+- `GET /api/analytics/experiments`
+- `GET /api/analytics/expected-r-calibration`
+- `GET /api/analytics/pre-tp1-validation`
+- `GET /api/analytics/live-eligibility`
 
 ## BTC macro protection
 
@@ -368,8 +336,8 @@ Endpoint principali:
   `DELETE /positions/{id}`.
 - Ordini: `GET /orders`.
 - Analytics: `/analytics/signals`, `/analytics/diagnostics`,
-  `/analytics/equity-slope`, `/analytics/calibration`,
-  `/analytics/calibration/history`, `/analytics/calibration/stability`,
+  `/analytics/equity-slope`, `/analytics/outcome-profile`,
+  `/analytics/experiments`, `/analytics/strategy-edge`,
   `/analytics/worker-cycles`, `/analytics/signal-rejections`.
 - Settings/strategie: `GET /settings`, `PATCH /settings`, `GET /strategies`,
   `PATCH /strategies/{id}`.
@@ -402,11 +370,11 @@ Schermate:
 - `CoinScreen`: chart e indicatori mercato.
 - `AccountMonitorScreen`: account, posizioni e ordini live Hyperliquid.
 - `StrategyAnalysisScreen`: strategy lab.
-- `CalibrationScreen`: AutoTuner, stability, diagnostics, equity slope.
+- `CalibrationScreen`: evidenza forward, diagnostics, equity slope e score alignment.
 - `HistoryScreen`: posizioni chiuse e exit orders.
 - `StrategiesScreen`: pesi e params per timeframe.
 - `AlertsScreen`: alert, push, Telegram.
-- `SettingsScreen`: operation, risk, services, calibration, position settings.
+- `SettingsScreen`: operation, risk, services e position settings.
 
 Tutte le chiamate passano da `frontend/lib/api.ts`. Base URL:
 `NEXT_PUBLIC_API_BASE_URL`, default `http://localhost:8000`.
@@ -449,8 +417,8 @@ Test utili per aree sensibili:
 - `backend/tests/test_position_pnl.py`
 - `backend/tests/test_risk.py`
 - `backend/tests/test_scoring.py`
-- `backend/tests/test_calibration.py`
-- `backend/tests/test_auto_tuner.py`
+- `backend/tests/test_experiment.py`
+- `backend/tests/test_experiment_outcomes.py`
 - `backend/tests/test_btc_macro_protection.py`
 - `backend/tests/test_unified_account_ratio.py`
 - `backend/tests/test_api_auth.py`
@@ -474,5 +442,5 @@ Test utili per aree sensibili:
 - `MEMORY.md`: conoscenza progetto estesa.
 - `docs/USAGE.md`: guida avvio e uso.
 - `docs/ARCHITECTURE.md`: architettura e flussi.
-- `docs/AUTO_TUNING.md`: AutoCalibration e AutoTuner.
+- `docs/AUTO_TUNING.md`: ricerca forward e promozione manuale.
 - `docs/AUDIT.md`: audit storico e finding tecnici.

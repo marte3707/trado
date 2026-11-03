@@ -28,7 +28,17 @@ router = APIRouter()
 # worker-written value.
 POSITION_HISTORY_LIMIT = 250
 ORDER_HISTORY_LIMIT = 250
-EXIT_ORDER_TYPES = ("tp1", "tp2", "tp3", "take_profit", "stop_loss", "manual")
+EXIT_ORDER_TYPES = (
+    "tp1",
+    "tp2",
+    "tp3",
+    "take_profit",
+    "stop_loss",
+    "manual",
+    "the_bull_profit_update",
+    "the_bull_close_update",
+    "the_bull_stop_update",
+)
 HISTORY_ORDER_TYPES = (
     *EXIT_ORDER_TYPES,
     "time_stop",
@@ -275,4 +285,3 @@ def orders(db: Session = Depends(get_db)) -> list[dict]:
         signal = signals_by_id.get(row.signal_id) if row.signal_id is not None else None
         result.append(_serialize_order(row, position.market if position else signal.market if signal else None))
     return result
-

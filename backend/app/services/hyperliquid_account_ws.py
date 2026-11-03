@@ -74,6 +74,20 @@ def account_channel_payload(message: dict[str, Any]) -> tuple[str, Any] | None:
     return None
 
 
+def websocket_snapshot_is_fresh(
+    *,
+    ready: bool,
+    last_message_at: datetime | None,
+    stale_seconds: int,
+    now: datetime | None = None,
+) -> bool:
+    """Whether subscribed account state is fresh enough to skip REST recovery."""
+    if not ready or last_message_at is None:
+        return False
+    checked_at = now or datetime.now(UTC)
+    return (checked_at - last_message_at).total_seconds() <= max(1, stale_seconds)
+
+
 class HyperliquidAccountDataService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -181,17 +195,24 @@ class HyperliquidAccountDataService:
             if bool(config["enabled"]) and address:
                 client = HyperliquidClient(self.settings)
                 try:
-                    user_state, spot_state, open_orders = await asyncio.gather(
-                        client.user_state(address),
-                        client.spot_user_state(address),
-                        client.frontend_open_orders(address),
-                    )
-                    # Periodic REST reconciliation recovers any websocket messages
-                    # missed during reconnects without blocking API requests.
-                    self.snapshot["user_state"] = user_state
-                    self.snapshot["spot_state"] = spot_state
-                    self.snapshot["frontend_open_orders"] = open_orders
                     now = time.monotonic()
+                    funding_refreshed = False
+                    ws_fresh = websocket_snapshot_is_fresh(
+                        ready=self.ready,
+                        last_message_at=self.last_message_at,
+                        stale_seconds=int(config["snapshot_stale_seconds"]),
+                    )
+                    if not ws_fresh:
+                        # REST only recovers missed messages while the socket is
+                        # stale or disconnected; the subscribed state is primary.
+                        user_state, spot_state, open_orders = await asyncio.gather(
+                            client.user_state(address),
+                            client.spot_user_state(address),
+                            client.frontend_open_orders(address),
+                        )
+                        self.snapshot["user_state"] = user_state
+                        self.snapshot["spot_state"] = spot_state
+                        self.snapshot["frontend_open_orders"] = open_orders
                     if funding_last_run == 0.0 or now - funding_last_run >= funding_seconds:
                         checked_at = datetime.now(UTC)
                         predicted, user_funding = await asyncio.gather(
@@ -205,7 +226,9 @@ class HyperliquidAccountDataService:
                         self.snapshot["predicted_fundings"] = predicted
                         self.snapshot["user_funding"] = user_funding
                         funding_last_run = now
-                    self.last_enrichment_at = datetime.now(UTC)
+                        funding_refreshed = True
+                    if not ws_fresh or funding_refreshed:
+                        self.last_enrichment_at = datetime.now(UTC)
                     self.snapshot.pop("enrichment_error", None)
                     self._dirty.set()
                 except asyncio.CancelledError:

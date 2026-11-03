@@ -16,6 +16,7 @@ from app.schemas import (
     RiskControlsSettings,
     SettingsPatch,
     StrategyPatch,
+    TheBullSettings,
 )
 
 _logger = structlog.get_logger()
@@ -31,6 +32,7 @@ def settings(db: Session = Depends(get_db)) -> dict:
 _SETTINGS_VALIDATORS: dict[str, type[BaseModel]] = {
     "risk": RiskControlsSettings,
     "live_execution": LiveExecutionSettings,
+    "the_bull": TheBullSettings,
 }
 
 
@@ -111,5 +113,4 @@ def disable_kill_switch(db: Session = Depends(get_db)) -> dict:
     db.add(setting)
     db.commit()
     return {"enabled": False}
-
 
