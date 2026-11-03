@@ -66,9 +66,20 @@ VIBE_TRADING_ALLOWED_RUN_ROOTS=... python -m backtest.runner <trado>/research/do
 python <trado>/research/donchian_ensemble/vibe_trading/periods.py <run_dir>/artifacts/equity.csv
 ```
 
+## Multi-coin result (10 coins, OKX data, run locally on Vibe-Trading)
+
+BTC, ETH, SOL, XRP, DOGE, ADA, AVAX, LINK, DOT, BNB, equal risk budget, 2021-01 → 2026-11:
+CAGR 7.3%, Sharpe 0.94, max DD -10.5% (equal-weight hold: 41.6% / 0.84 / -79.9%).
+Average capital invested was about 10%.
+
+| Year | 2021 | 2022 | 2023 | 2024 | 2025 | 2026 YTD |
+|---|---|---|---|---|---|---|
+| Strategy | +12.8% | -4.8% | +23.7% | +18.7% | -1.5% | -4.5% |
+| Equal-weight hold | +1036% | -72.8% | +159% | +93% | -40.5% | -35.6% |
+
 ## Verdict
 
-Not promoted to Trado (both engines agree). The strategy is an excellent drawdown reducer (max DD ~20% vs ~80%),
+**Dropped.** Multi-coin Sharpe 0.94 < 1.0 and only 1 of the last 3 years positive, so it fails the promotion bar below. Not promoted to Trado (both engines agree). The strategy is an excellent drawdown reducer (max DD ~20% vs ~80%),
 but since 2021 its risk-adjusted return on BTC is no better than buy & hold and it is
 slightly negative over 2025–2026. Perp funding on Hyperliquid eats roughly a third of the gross edge.
 

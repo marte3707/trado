@@ -19,8 +19,13 @@ def st(s: pd.Series) -> str:
 first, last = eq.index[0].year, eq.index[-1].year
 periods = [(str(first), str(last)), ("2016", "2020"), ("2021", str(last)), ("2024", str(last))]
 periods += [(str(y), str(y)) for y in range(first, last + 1)]
+seen = set()
 for a, b in periods:
     s = eq.loc[a:b]
+    if (s.index[0], s.index[-1]) in seen if len(s) else False:
+        continue
+    if len(s):
+        seen.add((s.index[0], s.index[-1]))
     if len(s) < 30:
         continue
     label = a if a == b else f"{a}-{b}"
