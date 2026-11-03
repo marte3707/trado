@@ -530,6 +530,13 @@ class HyperliquidClient:
             breaker=hyperliquid_market_data_breaker,
         )
 
+    async def funding_history(self, coin: str, start_ms: int, end_ms: int | None = None) -> list[dict[str, Any]]:
+        """Hourly funding settlements for one perp (at most 500 rows per call)."""
+        payload: dict[str, Any] = {"type": "fundingHistory", "coin": coin, "startTime": start_ms}
+        if end_ms is not None:
+            payload["endTime"] = end_ms
+        return await self._post_info(payload, breaker=hyperliquid_market_data_breaker)
+
     async def portfolio(self, address: str) -> list[Any]:
         """Returns portfolio history per period (day/week/month/allTime + perp variants).
 

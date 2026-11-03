@@ -45,6 +45,7 @@ _INFO_WEIGHTS: dict[str, int] = {
     # Most other /info requests are documented as weight 20.
     "candleSnapshot": 20,
     "frontendOpenOrders": 20,
+    "fundingHistory": 20,
     "l2Book": 20,
     "meta": 20,
     "metaAndAssetCtxs": 20,

@@ -33,7 +33,9 @@ from app.services.candle_sync import (
     CandleSyncService,
 )
 from app.services.data_retention import prune_old_data
+from app.services.funding_carry_alert import check_funding_carry_regime
 from app.services.hyperliquid import (
+    HyperliquidClient,
     HyperliquidTradingClient,
     HyperliquidTransientError,
     fetch_perp_open_interests,
@@ -58,6 +60,7 @@ from app.worker.live_close_notifications import (
 from app.worker.scheduler import (
     DATA_RETENTION_INTERVAL_SECONDS,
     DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
+    FUNDING_CARRY_ALERT_INTERVAL_SECONDS,
     LEADERBOARD_ALPHA_CHECK_INTERVAL_SECONDS,
     LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
     UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
@@ -82,6 +85,14 @@ _TICK_LOCK = asyncio.Lock()
 
 async def _send_diagnostic_report(db, notifier: TelegramNotifier) -> None:
     await DiagnosticReporter().send(db, notifier)
+
+
+async def _check_funding_carry_regime(db, notifier: TelegramNotifier, client: HyperliquidClient) -> dict:
+    return await check_funding_carry_regime(
+        db,
+        fetch_funding_history=client.funding_history,
+        send_message=notifier.send_funding_carry_alert,
+    )
 
 
 @dataclasses.dataclass
@@ -1120,6 +1131,7 @@ async def main() -> None:
     signal_engine = SignalEngine()
     candle_sync = CandleSyncService()
     notifier = TelegramNotifier(settings)
+    info_client = HyperliquidClient(settings)
     executor = OrderExecutionEngine(settings)
     btc_protection = BtcMacroProtectionEngine(settings)
     _record_heartbeat("starting")
@@ -1232,6 +1244,21 @@ async def main() -> None:
                 work=lambda db: _send_diagnostic_report(db, notifier),
                 ok_message="Diagnostic report sent",
                 failed_message="Diagnostic report failed",
+            )
+
+        if scheduler.due_funding_carry_alert(now):
+            await run_periodic_cycle(
+                cycle_id="funding_carry_alert_cycle",
+                label="Funding Carry Alert Cycle",
+                expected_interval_seconds=FUNDING_CARRY_ALERT_INTERVAL_SECONDS,
+                work=lambda db: _check_funding_carry_regime(db, notifier, info_client),
+                ok_message="Funding carry regime checked",
+                failed_message="Funding carry regime check failed",
+                ok_status=lambda result: (
+                    "skipped"
+                    if (result or {}).get("status") in {"skipped", "disabled"}
+                    else "ok"
+                ),
             )
 
         if scheduler.due_data_retention(now):

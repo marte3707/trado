@@ -826,6 +826,10 @@ class TelegramNotifier:
             f"\n⚙️ Config: modalità <b>{mode}</b> · score min <b>{score}</b>"
         )
 
+    async def send_funding_carry_alert(self, text: str) -> bool:
+        """Admin-only research alert (never the public signals channel)."""
+        return await self._send_text(text)
+
     async def send_worker_error(self, context: str, exc: Exception) -> None:
         now = datetime.now(UTC).strftime("%H:%M UTC")
         error_type = type(exc).__name__
