@@ -9,6 +9,7 @@ Standard library only: runs with any Python 3.10+, no API key needed.
 Writes:
     <out>/funding_hourly.csv  coin,time_utc,funding_rate,premium      (one row per hourly settlement)
     <out>/candles_daily.csv   coin,date,open,high,low,close,volume     (perp daily bars)
+    <out>/coins/<COIN>_*.csv  per-coin parts; a re-run skips coins already exported
     <out>/universe.csv        coin,open_interest_usd,day_volume_usd,current_funding,max_leverage
 """
 
@@ -29,10 +30,14 @@ FUNDING_PAGE = 500          # Hyperliquid returns at most 500 funding rows per c
 CANDLE_LIMIT = 5000         # and at most 5000 candles per call
 HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
-PAUSE_S = 0.35              # stay well under the public info rate limit
+# Hyperliquid allows ~1200 weight/min per IP; a full funding page costs ~45
+# (20 base + 1 per 20 rows), so ~26 pages/min max. Trado's worker shares the
+# same IP budget, hence the conservative pacing.
+FUNDING_PAUSE_S = 3.0
+CANDLE_PAUSE_S = 1.5
 
 
-def post(payload: dict, retries: int = 5) -> object:
+def post(payload: dict, retries: int = 10) -> object:
     body = json.dumps(payload).encode()
     for attempt in range(retries):
         req = urllib.request.Request(INFO_URL, data=body, headers={"Content-Type": "application/json"})
@@ -41,13 +46,13 @@ def post(payload: dict, retries: int = 5) -> object:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             if exc.code == 429 or exc.code >= 500:
-                wait = 2 ** attempt
+                wait = min(90, 10 * 2 ** attempt)
                 print(f"  HTTP {exc.code}, retry in {wait}s", file=sys.stderr)
                 time.sleep(wait)
                 continue
             raise
         except urllib.error.URLError as exc:
-            wait = 2 ** attempt
+            wait = min(90, 5 * 2 ** attempt)
             print(f"  network error {exc.reason}, retry in {wait}s", file=sys.stderr)
             time.sleep(wait)
     raise RuntimeError(f"Hyperliquid request failed after {retries} attempts: {payload}")
@@ -76,7 +81,7 @@ def funding_history(coin: str, start_ms: int, end_ms: int) -> list[dict]:
     cursor = start_ms
     while cursor < end_ms:
         page = post({"type": "fundingHistory", "coin": coin, "startTime": cursor, "endTime": end_ms})
-        time.sleep(PAUSE_S)
+        time.sleep(FUNDING_PAUSE_S)
         if not page:
             break
         for item in page:
@@ -100,7 +105,7 @@ def daily_candles(coin: str, start_ms: int, end_ms: int) -> list[dict]:
     while cursor < end_ms:
         page = post({"type": "candleSnapshot", "req": {
             "coin": coin, "interval": "1d", "startTime": cursor, "endTime": end_ms}})
-        time.sleep(PAUSE_S)
+        time.sleep(CANDLE_PAUSE_S)
         if not page:
             break
         rows.extend(page)
@@ -149,19 +154,33 @@ def main() -> None:
     coins = [c.strip() for c in args.coins.split(",") if c.strip()] if args.coins else [r["coin"] for r in uni[: args.top]]
     print(f"Exporting {len(coins)} coins from {args.start}: {', '.join(coins)}")
 
-    funding_rows: list[dict] = []
-    candle_rows: list[dict] = []
+    per_coin = out / "coins"
+    per_coin.mkdir(exist_ok=True)
+    funding_fields = ["coin", "time_utc", "funding_rate", "premium"]
+    candle_fields = ["coin", "date", "open", "high", "low", "close", "volume"]
     for i, coin in enumerate(coins, 1):
+        f_path, c_path = per_coin / f"{coin}_funding.csv", per_coin / f"{coin}_candles.csv"
+        if f_path.exists() and c_path.exists():
+            print(f"[{i}/{len(coins)}] {coin}: already exported, skipping")
+            continue
         f = funding_history(coin, start_ms, end_ms)
+        for r in f:
+            r["time_utc"] = datetime.fromtimestamp(r["time_ms"] / 1000, UTC).strftime("%Y-%m-%d %H:%M:%S")
         c = daily_candles(coin, start_ms, end_ms)
+        write_csv(c_path, c, candle_fields)
+        write_csv(f_path, f, funding_fields)   # written last: marks the coin complete
         print(f"[{i}/{len(coins)}] {coin}: {len(f)} funding rows, {len(c)} daily candles")
-        funding_rows.extend(f)
-        candle_rows.extend(c)
 
-    for r in funding_rows:
-        r["time_utc"] = datetime.fromtimestamp(r["time_ms"] / 1000, UTC).strftime("%Y-%m-%d %H:%M:%S")
-    write_csv(out / "funding_hourly.csv", funding_rows, ["coin", "time_utc", "funding_rate", "premium"])
-    write_csv(out / "candles_daily.csv", candle_rows, ["coin", "date", "open", "high", "low", "close", "volume"])
+    for name, suffix, fields in (("funding_hourly.csv", "_funding.csv", funding_fields),
+                                 ("candles_daily.csv", "_candles.csv", candle_fields)):
+        with (out / name).open("w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields)
+            writer.writeheader()
+            for coin in coins:
+                part = per_coin / f"{coin}{suffix}"
+                if part.exists():
+                    with part.open(newline="") as src:
+                        writer.writerows(csv.DictReader(src))
     print(f"Done. Files in {out.resolve()}")
 
 
