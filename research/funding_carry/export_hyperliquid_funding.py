@@ -10,7 +10,10 @@ Writes:
     <out>/funding_hourly.csv  coin,time_utc,funding_rate,premium      (one row per hourly settlement)
     <out>/candles_daily.csv   coin,date,open,high,low,close,volume     (perp daily bars)
     <out>/coins/<COIN>_*.csv  per-coin parts; a re-run skips coins already exported
-    <out>/universe.csv        coin,open_interest_usd,day_volume_usd,current_funding,max_leverage
+    <out>/universe.csv        coin,open_interest_usd,day_volume_usd,current_funding,max_leverage,delisted
+
+For cross-sectional tests use every coin, delisted included, candles only:
+    python3 export_hyperliquid_funding.py --top 0 --include-delisted --candles-only --out ./data_all
 """
 
 from __future__ import annotations
@@ -58,11 +61,11 @@ def post(payload: dict, retries: int = 10) -> object:
     raise RuntimeError(f"Hyperliquid request failed after {retries} attempts: {payload}")
 
 
-def universe() -> list[dict]:
+def universe(include_delisted: bool = False) -> list[dict]:
     meta, ctxs = post({"type": "metaAndAssetCtxs"})
     rows = []
     for asset, ctx in zip(meta["universe"], ctxs, strict=False):
-        if asset.get("isDelisted"):
+        if asset.get("isDelisted") and not include_delisted:
             continue
         mark = float(ctx.get("markPx") or 0)
         rows.append({
@@ -71,6 +74,7 @@ def universe() -> list[dict]:
             "day_volume_usd": round(float(ctx.get("dayNtlVlm") or 0), 2),
             "current_funding": ctx.get("funding"),
             "max_leverage": asset.get("maxLeverage"),
+            "delisted": bool(asset.get("isDelisted")),
         })
     rows.sort(key=lambda r: r["open_interest_usd"], reverse=True)
     return rows
@@ -135,7 +139,11 @@ def write_csv(path: Path, rows: list[dict], fields: list[str]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--coins", help="comma separated, e.g. BTC,ETH,SOL (default: top N by open interest)")
-    ap.add_argument("--top", type=int, default=30)
+    ap.add_argument("--top", type=int, default=30, help="0 = every coin")
+    ap.add_argument("--include-delisted", action="store_true",
+                    help="also export delisted perps (removes survivorship bias in cross-sectional tests)")
+    ap.add_argument("--candles-only", action="store_true",
+                    help="skip funding history: one request per coin, minutes instead of hours")
     ap.add_argument("--start", default="2023-05-01", help="YYYY-MM-DD (Hyperliquid hourly funding starts ~May 2023)")
     ap.add_argument("--end", default=None, help="YYYY-MM-DD, default now")
     ap.add_argument("--out", default="./data")
@@ -149,9 +157,14 @@ def main() -> None:
         if args.end else int(time.time() * 1000)
     )
 
-    uni = universe()
-    write_csv(out / "universe.csv", uni, ["coin", "open_interest_usd", "day_volume_usd", "current_funding", "max_leverage"])
-    coins = [c.strip() for c in args.coins.split(",") if c.strip()] if args.coins else [r["coin"] for r in uni[: args.top]]
+    uni = universe(args.include_delisted)
+    write_csv(out / "universe.csv", uni,
+              ["coin", "open_interest_usd", "day_volume_usd", "current_funding", "max_leverage", "delisted"])
+    ranked = [r["coin"] for r in uni]
+    coins = (
+        [c.strip() for c in args.coins.split(",") if c.strip()] if args.coins
+        else ranked if args.top <= 0 else ranked[: args.top]
+    )
     print(f"Exporting {len(coins)} coins from {args.start}: {', '.join(coins)}")
 
     per_coin = out / "coins"
@@ -160,8 +173,13 @@ def main() -> None:
     candle_fields = ["coin", "date", "open", "high", "low", "close", "volume"]
     for i, coin in enumerate(coins, 1):
         f_path, c_path = per_coin / f"{coin}_funding.csv", per_coin / f"{coin}_candles.csv"
-        if f_path.exists() and c_path.exists():
+        if c_path.exists() and (args.candles_only or f_path.exists()):
             print(f"[{i}/{len(coins)}] {coin}: already exported, skipping")
+            continue
+        if args.candles_only:
+            c = daily_candles(coin, start_ms, end_ms)
+            write_csv(c_path, c, candle_fields)
+            print(f"[{i}/{len(coins)}] {coin}: {len(c)} daily candles")
             continue
         f = funding_history(coin, start_ms, end_ms)
         for r in f:
