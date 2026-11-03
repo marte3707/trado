@@ -1,0 +1,26 @@
+{
+  "codes": [
+    "BTC-USDT",
+    "ETH-USDT",
+    "SOL-USDT",
+    "XRP-USDT",
+    "DOGE-USDT",
+    "ADA-USDT",
+    "AVAX-USDT",
+    "LINK-USDT",
+    "DOT-USDT",
+    "BNB-USDT"
+  ],
+  "source": "okx",
+  "start_date": "2020-01-01",
+  "end_date": "2026-11-02",
+  "evaluation_start_date": "2021-01-01",
+  "interval": "1D",
+  "position_adjustment": "rebalance",
+  "rebalance_tolerance": 0.1,
+  "initial_cash": 100000,
+  "taker_rate": 0.00045,
+  "maker_rate": 0.00045,
+  "slippage": 0.0005,
+  "funding_rate": 0.0001
+}

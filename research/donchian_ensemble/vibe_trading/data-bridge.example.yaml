@@ -1,0 +1,5 @@
+sources:
+  - symbol: "BTC-USDT"
+    type: csv
+    path: "/path/to/btc-usd-daily.csv"
+    date_format: "%Y-%m-%d"
