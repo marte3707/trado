@@ -8,6 +8,13 @@ and sends admin Telegram alerts on two kinds of change:
   These are the moments past manipulation attacks (JELLY, POPCAT) showed up, and the
   depositor's cue to look at withdrawing (4-day lockup). It re-arms below
   ``incident_rearm`` (1%).
+* **HLP vs Earn** – Hyperliquid Earn (USDC lending) is the low-risk alternative. The
+  monitor keeps a 30-day average of the Earn USDC supply rate and reports which of the
+  two leads; the leader changes (one alert) only when the other is ahead by at least
+  ``switch_margin`` (3 points), so small oscillations stay silent. The first check only
+  records the leader.
+* **Earn liquidity** – utilisation of the USDC pool at or above ``earn_utilization_alert``
+  (95%) means withdrawals may have to wait for borrowers to repay; re-arms below 90%.
 * **Yield regime** – the 30-day annualised depositor return moved into another band:
   ``negative`` (<0), ``low`` (0..good_yield) or ``good`` (>= good_yield, default 10%).
   The first check only records the band; later band changes send one message each.
@@ -39,9 +46,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "incident_rearm": 0.01,
     "good_yield": 0.10,
     "user_address": None,     # wallet that holds the HLP deposit; defaults to HYPERLIQUID_ACCOUNT_ADDRESS
+    "earn_enabled": True,
+    "earn_token": 0,          # Earn reserve id = spot token index; 0 is USDC
+    "switch_margin": 0.03,
+    "earn_utilization_alert": 0.95,
+    "earn_utilization_rearm": 0.90,
 }
+EARN_SAMPLE_DAYS = 30
 
 VaultDetailsFetcher = Callable[[str, str | None], Awaitable[dict[str, Any]]]
+EarnReservesFetcher = Callable[[], Awaitable[list[Any]]]
+EarnUserFetcher = Callable[[str], Awaitable[dict[str, Any]]]
 MessageSender = Callable[[str], Awaitable[bool]]
 
 
@@ -113,6 +128,47 @@ def _follower_line(details: dict[str, Any]) -> str | None:
     return line
 
 
+def _as_rate(value: object) -> float | None:
+    try:
+        rate = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return rate / 100 if rate > 1 else rate     # tolerate a percentage instead of a fraction
+
+
+def earn_reserve(reserves: object, token: int) -> dict[str, float] | None:
+    """Supply rate, utilisation and size of one Earn reserve from allBorrowLendReserveStates."""
+    if not isinstance(reserves, list):
+        return None
+    for item in reserves:
+        if not (isinstance(item, list | tuple) and len(item) == 2 and isinstance(item[1], dict)):
+            continue
+        if str(item[0]) != str(token):
+            continue
+        data = item[1]
+        rate, util = _as_rate(data.get("supplyYearlyRate")), _as_rate(data.get("utilization"))
+        if rate is None or util is None:
+            return None
+        try:
+            supplied = float(data.get("totalSupplied") or 0)
+        except (TypeError, ValueError):
+            supplied = 0.0
+        return {"supply_rate": rate, "utilization": util, "total_supplied": supplied}
+    return None
+
+
+def earn_user_supply(user_state: object, token: int) -> float | None:
+    if not isinstance(user_state, dict):
+        return None
+    for item in user_state.get("tokenToState") or []:
+        if isinstance(item, list | tuple) and len(item) == 2 and str(item[0]) == str(token):
+            try:
+                return float((item[1].get("supply") or {}).get("value") or 0)
+            except (AttributeError, TypeError, ValueError):
+                return None
+    return 0.0
+
+
 def _message(title: str, lines: list[str], details: dict[str, Any]) -> str:
     follower = _follower_line(details)
     return "\n".join([title, *lines, *([follower] if follower else [])])
@@ -123,6 +179,8 @@ async def check_hlp_vault(
     *,
     fetch_vault_details: VaultDetailsFetcher,
     send_message: MessageSender,
+    fetch_earn_reserves: EarnReservesFetcher | None = None,
+    fetch_earn_user: EarnUserFetcher | None = None,
     user_address: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -189,8 +247,109 @@ async def check_hlp_vault(
         state["yield_band"] = band
     result["yield_band"] = state.get("yield_band")
 
+    if fetch_earn_reserves is not None and settings.get("earn_enabled", True):
+        try:
+            await _check_earn(
+                state, result, settings, metrics, details,
+                fetch_earn_reserves=fetch_earn_reserves,
+                fetch_earn_user=fetch_earn_user,
+                depositor=depositor,
+                send_message=send_message,
+                now=now,
+            )
+        except Exception as exc:  # Earn is secondary: never lose the HLP check because of it
+            result["earn"] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"[:200]}
+
     state["last_check_at"] = now.isoformat()
     state["last_metrics"] = {k: round(v, 6) for k, v in metrics.items()}
     row.value = state
     flag_modified(row, "value")
     return result
+
+
+async def _check_earn(
+    state: dict[str, Any],
+    result: dict[str, Any],
+    settings: dict[str, Any],
+    metrics: dict[str, float],
+    details: dict[str, Any],
+    *,
+    fetch_earn_reserves: EarnReservesFetcher,
+    fetch_earn_user: EarnUserFetcher | None,
+    depositor: str | None,
+    send_message: MessageSender,
+    now: datetime,
+) -> None:
+    token = int(settings.get("earn_token", 0))
+    reserve = earn_reserve(await fetch_earn_reserves(), token)
+    if reserve is None:
+        result["earn"] = {"status": "skipped", "reason": "no_reserve_data"}
+        return
+
+    cutoff = now.timestamp() - EARN_SAMPLE_DAYS * 86400
+    samples = [s for s in state.get("earn_rate_samples") or [] if isinstance(s, list) and len(s) == 2
+               and isinstance(s[0], int | float) and s[0] >= cutoff]
+    samples.append([now.timestamp(), reserve["supply_rate"]])
+    state["earn_rate_samples"] = samples
+    earn_avg = sum(r for _, r in samples) / len(samples)
+    hlp = metrics["annualised_30d"]
+    margin = float(settings.get("switch_margin", 0.03))
+
+    user_line = None
+    if fetch_earn_user is not None and depositor:
+        supplied = earn_user_supply(await fetch_earn_user(depositor), token)
+        if supplied:
+            user_line = f"Tuo supply in Earn: {supplied:,.2f} USDC"
+
+    result["earn"] = {
+        "supply_rate": round(reserve["supply_rate"], 6),
+        "supply_rate_avg_30d": round(earn_avg, 6),
+        "utilization": round(reserve["utilization"], 4),
+        "samples": len(samples),
+    }
+    compare = (
+        f"HLP 30g annualizzato: {hlp * 100:+.1f}%\n"
+        f"Earn USDC: {reserve['supply_rate'] * 100:.2f}% ora, media {len(samples)} campioni "
+        f"{earn_avg * 100:.2f}% · utilizzo {reserve['utilization'] * 100:.0f}%"
+    )
+    extra = [user_line] if user_line else []
+
+    previous = state.get("yield_leader")
+    if previous is None:
+        leader = "hlp" if hlp >= earn_avg else "earn"
+    elif previous == "hlp" and earn_avg >= hlp + margin:
+        leader = "earn"
+    elif previous == "earn" and hlp >= earn_avg + margin:
+        leader = "hlp"
+    else:
+        leader = previous
+    if previous is not None and leader != previous:
+        title = (
+            "🔁 <b>Earn ora rende più di HLP</b>" if leader == "earn"
+            else "🔁 <b>HLP ora rende più di Earn</b>"
+        )
+        hint = (
+            "Valuta di spostare (HLP: Withdraw dopo il lockup di 4 giorni, poi Earn: Supply USDC)."
+            if leader == "earn"
+            else "Valuta di spostare (Earn: Withdraw, poi Vaults → HLP → Deposit; lockup 4 giorni)."
+        )
+        if await send_message(_message(title, [compare, *extra, "", hint], details)):
+            state["yield_leader"] = leader
+            result["alerts"].append(f"leader_{leader}")
+    else:
+        state["yield_leader"] = leader
+    result["earn"]["leader"] = state.get("yield_leader")
+
+    armed = state.get("earn_liquidity_armed", True)
+    util_alert = float(settings.get("earn_utilization_alert", 0.95))
+    if reserve["utilization"] >= util_alert and armed:
+        text = _message(
+            "⚠️ <b>Earn: pool USDC quasi tutto prestato</b>",
+            [compare, *extra, "", "Con utilizzo così alto i prelievi possono dover attendere i rimborsi."],
+            details,
+        )
+        if await send_message(text):
+            state["earn_liquidity_armed"] = False
+            result["alerts"].append("earn_liquidity")
+    elif not armed and reserve["utilization"] < float(settings.get("earn_utilization_rearm", 0.90)):
+        state["earn_liquidity_armed"] = True

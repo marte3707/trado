@@ -176,3 +176,120 @@ def test_scheduler_hlp_every_six_hours() -> None:
     assert s.due_hlp_monitor(first) is True
     assert s.due_hlp_monitor(first + HLP_MONITOR_INTERVAL_SECONDS - 1) is False
     assert s.due_hlp_monitor(first + HLP_MONITOR_INTERVAL_SECONDS) is True
+
+
+# --- Earn (USDC lending) comparison -------------------------------------------------
+
+from app.services.hlp_monitor import earn_reserve, earn_user_supply  # noqa: E402
+
+
+def _reserves(rate: float, util: float = 0.77) -> list:
+    return [
+        [0, {"supplyYearlyRate": str(rate), "utilization": str(util), "totalSupplied": "590987269.41",
+             "borrowYearlyRate": "0.05", "balance": "1", "oraclePx": "1", "ltv": "0", "totalBorrowed": "1"}],
+        [150, {"supplyYearlyRate": "0.0", "utilization": "0.1", "totalSupplied": "15003407"}],
+    ]
+
+
+class _EarnFixture(_Fixture):
+    def __init__(self, details: dict, rate: float, util: float = 0.77, user_supply: str | None = None) -> None:
+        super().__init__(details)
+        self.rate, self.util, self.user_supply = rate, util, user_supply
+        self.user_calls: list[str] = []
+        self.fail_reserves = False
+
+    async def reserves(self) -> list:
+        if self.fail_reserves:
+            raise RuntimeError("boom")
+        return _reserves(self.rate, self.util)
+
+    async def user(self, address: str) -> dict:
+        self.user_calls.append(address)
+        rows = [] if self.user_supply is None else [
+            [0, {"supply": {"basis": "1", "value": self.user_supply}, "borrow": {"basis": "0", "value": "0"}}]]
+        return {"tokenToState": rows, "health": "healthy", "healthFactor": None}
+
+
+def _check_earn(db, fx: _EarnFixture, user: str | None = None, day: int = 5) -> dict:
+    return asyncio.run(check_hlp_vault(
+        db, fetch_vault_details=fx.fetch, send_message=fx.send,
+        fetch_earn_reserves=fx.reserves, fetch_earn_user=fx.user,
+        user_address=user, now=datetime(2026, 11, day, tzinfo=UTC)))
+
+
+def test_earn_reserve_parsing() -> None:
+    r = earn_reserve(_reserves(0.0348), 0)
+    assert r == {"supply_rate": 0.0348, "utilization": 0.77, "total_supplied": 590987269.41}
+    assert earn_reserve(_reserves(3.48), 0)["supply_rate"] == 0.0348   # percentage tolerated
+    assert earn_reserve(_reserves(0.03), 7) is None
+    assert earn_reserve("bad", 0) is None
+    assert earn_user_supply({"tokenToState": [[0, {"supply": {"value": "12.5"}}]]}, 0) == 12.5
+    assert earn_user_supply({"tokenToState": []}, 0) == 0.0
+
+
+def test_first_check_records_leader_silently() -> None:
+    db = _FakeDb()
+    fx = _EarnFixture(_details(_steady(0.01)), rate=0.0348)
+    result = _check_earn(db, fx)
+    assert result["alerts"] == []
+    assert result["earn"]["leader"] == "earn"
+    assert result["earn"]["supply_rate"] == 0.0348
+
+
+def test_leader_switch_needs_margin_and_alerts_once() -> None:
+    db = _FakeDb()
+    fx = _EarnFixture(_details(_steady(0.05)), rate=0.0348)
+    assert _check_earn(db, fx)["earn"]["leader"] == "hlp"           # 5% vs 3.48%
+    fx.rate = 0.06                                                   # avg (3.48+6)/2 = 4.74%: inside margin
+    assert _check_earn(db, fx, day=6)["alerts"] == []
+    fx.rate = 0.20                                                   # avg ~9.8% >= 5% + 3pt
+    result = _check_earn(db, fx, day=7)
+    assert result["alerts"] == ["leader_earn"]
+    assert "Earn ora rende più di HLP" in fx.sent[-1]
+    assert _check_earn(db, fx, day=8)["alerts"] == []                # no repeat
+
+
+def test_earn_samples_expire_after_30_days() -> None:
+    db = _FakeDb()
+    fx = _EarnFixture(_details(_steady(0.05)), rate=0.03)
+    _check_earn(db, fx, day=1)
+    fx.rate = 0.05
+    result = asyncio.run(check_hlp_vault(
+        db, fetch_vault_details=fx.fetch, send_message=fx.send,
+        fetch_earn_reserves=fx.reserves, now=datetime(2026, 12, 15, tzinfo=UTC)))
+    assert result["earn"]["samples"] == 1 and result["earn"]["supply_rate_avg_30d"] == 0.05
+
+
+def test_earn_liquidity_alert_and_rearm() -> None:
+    db = _FakeDb()
+    fx = _EarnFixture(_details(_steady(0.05)), rate=0.03, util=0.97)
+    assert "earn_liquidity" in _check_earn(db, fx)["alerts"]
+    assert "quasi tutto prestato" in fx.sent[-1]
+    assert "earn_liquidity" not in _check_earn(db, fx, day=6)["alerts"]
+    fx.util = 0.85
+    _check_earn(db, fx, day=7)
+    assert db.get(AppSetting, STATE_KEY).value["earn_liquidity_armed"] is True
+
+
+def test_user_earn_position_in_alert() -> None:
+    db = _FakeDb()
+    fx = _EarnFixture(_details(_steady(0.05)), rate=0.03, util=0.97, user_supply="250.0")
+    _check_earn(db, fx, user="0xabc")
+    assert fx.user_calls == ["0xabc"]
+    assert "Tuo supply in Earn: 250.00 USDC" in fx.sent[-1]
+
+
+def test_earn_failure_does_not_break_hlp_check() -> None:
+    db = _FakeDb()
+    fx = _EarnFixture(_details(_steady(0.05)), rate=0.03)
+    fx.fail_reserves = True
+    result = _check_earn(db, fx)
+    assert result["status"] == "ok" and result["earn"]["status"] == "error"
+    assert db.get(AppSetting, STATE_KEY).value["last_check_at"]
+
+
+def test_earn_can_be_disabled() -> None:
+    db = _FakeDb()
+    db.add(AppSetting(key="hlp_monitor", value={"earn_enabled": False}))
+    result = _check_earn(db, _EarnFixture(_details(_steady(0.05)), rate=0.03))
+    assert "earn" not in result

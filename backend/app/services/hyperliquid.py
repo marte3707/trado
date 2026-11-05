@@ -544,6 +544,20 @@ class HyperliquidClient:
             payload["user"] = user
         return await self._post_info(payload, breaker=hyperliquid_market_data_breaker)
 
+    async def borrow_lend_reserve_states(self) -> list[Any]:
+        """Earn (borrow/lend) reserves: [[token_index, {supplyYearlyRate, utilization, ...}], ...]."""
+        return await self._post_info(
+            {"type": "allBorrowLendReserveStates"},
+            breaker=hyperliquid_market_data_breaker,
+        )
+
+    async def borrow_lend_user_state(self, user: str) -> dict[str, Any]:
+        """Earn position of one user: {tokenToState: [[token, {supply, borrow}]], health, healthFactor}."""
+        return await self._post_info(
+            {"type": "borrowLendUserState", "user": user},
+            breaker=hyperliquid_account_breaker,
+        )
+
     async def portfolio(self, address: str) -> list[Any]:
         """Returns portfolio history per period (day/week/month/allTime + perp variants).
 

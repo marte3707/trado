@@ -102,6 +102,8 @@ async def _check_hlp_vault(db, notifier: TelegramNotifier, client: HyperliquidCl
         db,
         fetch_vault_details=client.vault_details,
         send_message=notifier.send_hlp_alert,
+        fetch_earn_reserves=client.borrow_lend_reserve_states,
+        fetch_earn_user=client.borrow_lend_user_state,
         user_address=client.settings.hyperliquid_account_address,
     )
 

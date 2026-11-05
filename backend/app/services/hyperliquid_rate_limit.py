@@ -39,7 +39,9 @@ DEFAULT_HYPERLIQUID_RATE_LIMIT_SETTINGS: dict[str, int] = {
 }
 
 _INFO_WEIGHTS: dict[str, int] = {
+    "allBorrowLendReserveStates": 20,
     "allMids": 2,
+    "borrowLendUserState": 20,
     "clearinghouseState": 2,
     "exchangeStatus": 2,
     # Most other /info requests are documented as weight 20.
