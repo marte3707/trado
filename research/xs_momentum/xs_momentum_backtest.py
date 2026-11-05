@@ -87,7 +87,7 @@ def weights(cfg: Config, close: pd.DataFrame, dollar_vol: pd.DataFrame) -> pd.Da
 
 def run(cfg: Config, close: pd.DataFrame, funding: pd.DataFrame, dollar_vol: pd.DataFrame) -> pd.DataFrame:
     w = weights(cfg, close, dollar_vol)
-    rets = close.pct_change().fillna(0.0)
+    rets = close.pct_change(fill_method=None).fillna(0.0)
     held = w.shift(1).fillna(0.0)                       # decided at close t, earns day t+1
     if cfg.vol_target:
         gross_ret = (held * rets).sum(axis=1)
