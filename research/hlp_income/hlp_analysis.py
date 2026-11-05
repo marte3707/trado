@@ -8,6 +8,10 @@ series has ~1-2 week spacing, so intra-period drawdowns are underestimated;
 the month/week series are used to check the most recent period at finer grain.
 
     python hlp_analysis.py --data ./data
+
+Works for any Hyperliquid vault exported with export_hlp_history.py --vault <address>
+(lower --min-account-value for small user vaults). User vaults pay the leader a share
+of profits, so a depositor's net return is somewhat below the figures shown.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from pathlib import Path
 import pandas as pd
 
 
-def interval_returns(h: pd.DataFrame, period: str) -> pd.DataFrame:
+def interval_returns(h: pd.DataFrame, period: str, min_av: float = 1_000_000) -> pd.DataFrame:
     s = h[h["period"] == period].sort_values("time_utc").reset_index(drop=True)
     s = s[s["account_value"] > 0].reset_index(drop=True)
     out = pd.DataFrame({
@@ -28,7 +32,7 @@ def interval_returns(h: pd.DataFrame, period: str) -> pd.DataFrame:
         "av_start": s["account_value"].shift(1),
         "dpnl": s["pnl"].diff(),
     }).dropna()
-    out = out[out["av_start"] > 1_000_000]          # skip the first weeks with a tiny vault
+    out = out[out["av_start"] > min_av]             # skip the first weeks with a tiny vault
     out["ret"] = out["dpnl"] / out["av_start"]
     out["days"] = (out["end"] - out["start"]).dt.total_seconds() / 86400
     return out.set_index("end")
@@ -55,12 +59,14 @@ def summarise(r: pd.DataFrame) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="./data")
+    ap.add_argument("--min-account-value", type=float, default=1_000_000,
+                    help="ignore intervals while the vault was smaller than this (USD)")
     args = ap.parse_args()
     h = pd.read_csv(Path(args.data) / "hlp_history.csv", parse_dates=["time_utc"])
     h["account_value"] = pd.to_numeric(h["account_value"], errors="coerce")
     h["pnl"] = pd.to_numeric(h["pnl"], errors="coerce")
 
-    r = interval_returns(h, "allTime")
+    r = interval_returns(h, "allTime", args.min_account_value)
     s = summarise(r)
     print(f"allTime: {len(r)} intervals, {r.index[0]:%Y-%m-%d} -> {r.index[-1]:%Y-%m-%d}")
     print(f"  CAGR {s['cagr']*100:.1f}%  vol {s['vol']*100:.1f}%  return/vol {s['sharpe']:.2f}  "
@@ -80,7 +86,7 @@ def main() -> None:
         print(f"  {year} H{half}: {tot*100:+6.1f}%  annualised {((1 + tot) ** (365.25 / days) - 1)*100:+6.1f}%")
 
     for period in ("month", "week"):
-        m = interval_returns(h, period)
+        m = interval_returns(h, period, args.min_account_value)
         if len(m):
             tot = (1 + m["ret"]).prod() - 1
             days = m["days"].sum()
