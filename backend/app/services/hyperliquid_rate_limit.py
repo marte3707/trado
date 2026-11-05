@@ -57,6 +57,7 @@ _INFO_WEIGHTS: dict[str, int] = {
     "userFills": 20,
     "userFillsByTime": 20,
     "userFunding": 20,
+    "vaultDetails": 20,
 }
 
 _ACTION_WEIGHTS: dict[str, int] = {

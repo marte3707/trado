@@ -537,6 +537,13 @@ class HyperliquidClient:
             payload["endTime"] = end_ms
         return await self._post_info(payload, breaker=hyperliquid_market_data_breaker)
 
+    async def vault_details(self, vault_address: str, user: str | None = None) -> dict[str, Any]:
+        """Vault history (portfolio) and, when ``user`` is given, that depositor's followerState."""
+        payload: dict[str, Any] = {"type": "vaultDetails", "vaultAddress": vault_address}
+        if user:
+            payload["user"] = user
+        return await self._post_info(payload, breaker=hyperliquid_market_data_breaker)
+
     async def portfolio(self, address: str) -> list[Any]:
         """Returns portfolio history per period (day/week/month/allTime + perp variants).
 

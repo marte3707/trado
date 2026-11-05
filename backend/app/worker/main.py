@@ -34,6 +34,7 @@ from app.services.candle_sync import (
 )
 from app.services.data_retention import prune_old_data
 from app.services.funding_carry_alert import check_funding_carry_regime
+from app.services.hlp_monitor import check_hlp_vault
 from app.services.hyperliquid import (
     HyperliquidClient,
     HyperliquidTradingClient,
@@ -61,6 +62,7 @@ from app.worker.scheduler import (
     DATA_RETENTION_INTERVAL_SECONDS,
     DIAGNOSTIC_REPORT_INTERVAL_SECONDS,
     FUNDING_CARRY_ALERT_INTERVAL_SECONDS,
+    HLP_MONITOR_INTERVAL_SECONDS,
     LEADERBOARD_ALPHA_CHECK_INTERVAL_SECONDS,
     LIVE_LIQUIDATION_GUARD_INTERVAL_SECONDS,
     UNIFIED_ACCOUNT_RATIO_GUARD_INTERVAL_SECONDS,
@@ -92,6 +94,15 @@ async def _check_funding_carry_regime(db, notifier: TelegramNotifier, client: Hy
         db,
         fetch_funding_history=client.funding_history,
         send_message=notifier.send_funding_carry_alert,
+    )
+
+
+async def _check_hlp_vault(db, notifier: TelegramNotifier, client: HyperliquidClient) -> dict:
+    return await check_hlp_vault(
+        db,
+        fetch_vault_details=client.vault_details,
+        send_message=notifier.send_hlp_alert,
+        user_address=client.settings.hyperliquid_account_address,
     )
 
 
@@ -1254,6 +1265,21 @@ async def main() -> None:
                 work=lambda db: _check_funding_carry_regime(db, notifier, info_client),
                 ok_message="Funding carry regime checked",
                 failed_message="Funding carry regime check failed",
+                ok_status=lambda result: (
+                    "skipped"
+                    if (result or {}).get("status") in {"skipped", "disabled"}
+                    else "ok"
+                ),
+            )
+
+        if scheduler.due_hlp_monitor(now):
+            await run_periodic_cycle(
+                cycle_id="hlp_monitor_cycle",
+                label="HLP Vault Monitor Cycle",
+                expected_interval_seconds=HLP_MONITOR_INTERVAL_SECONDS,
+                work=lambda db: _check_hlp_vault(db, notifier, info_client),
+                ok_message="HLP vault checked",
+                failed_message="HLP vault check failed",
                 ok_status=lambda result: (
                     "skipped"
                     if (result or {}).get("status") in {"skipped", "disabled"}

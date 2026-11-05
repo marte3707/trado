@@ -830,6 +830,10 @@ class TelegramNotifier:
         """Admin-only research alert (never the public signals channel)."""
         return await self._send_text(text)
 
+    async def send_hlp_alert(self, text: str) -> bool:
+        """Admin-only HLP vault monitor alert (never the public signals channel)."""
+        return await self._send_text(text)
+
     async def send_worker_error(self, context: str, exc: Exception) -> None:
         now = datetime.now(UTC).strftime("%H:%M UTC")
         error_type = type(exc).__name__
