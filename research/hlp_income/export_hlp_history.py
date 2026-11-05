@@ -64,7 +64,17 @@ def main() -> None:
 
     details = post({"type": "vaultDetails", "vaultAddress": args.vault})
     if not isinstance(details, dict):
-        raise SystemExit(f"Unexpected response: {str(details)[:300]}")
+        led = post({"type": "leadingVaults", "user": args.vault})
+        if isinstance(led, list) and led:
+            lines = "\n".join(f"  {v.get('address')}  {v.get('name')}" for v in led if isinstance(v, dict))
+            raise SystemExit(
+                f"{args.vault} is not a vault but a vault leader. Vaults led by this address:\n{lines}\n"
+                "Re-run with --vault <one of the addresses above>."
+            )
+        raise SystemExit(
+            f"No vault found at {args.vault}. Copy the address from the vault page "
+            "(the browser URL ends with /vaults/<address>)."
+        )
     (out / "hlp_vault_details.json").write_text(json.dumps(details, indent=1))
     rows = flatten(details)
     with (out / "hlp_history.csv").open("w", newline="") as fh:
